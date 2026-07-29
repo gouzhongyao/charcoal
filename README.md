@@ -1,0 +1,280 @@
+# 本地轻量化能碳管理平台
+
+本项目是一个面向本地使用和临时演示的能碳管理平台。默认采用轻量化单机架构：前端通过 Vite 本地运行，后端使用 Node.js + Express，数据存储在本机 SQLite 文件中。平台聚焦表格导入、能耗统计、基础台账、碳排放核算、预测管理和本地备份恢复，不默认引入远程数据库、Redis、微服务或分布式部署能力。
+
+## 功能概览
+
+- 工作台总览：查看后端状态、导入批次、能耗记录、导入错误等汇总信息。
+- 数据导入：支持 `.xlsx`、`.xls`、`.csv` 表格导入，包含模板下载、字段映射、校验、批次追溯、错误与警告明细。
+- 能耗统计：基于已导入 SQLite 的能耗记录进行查询、统计和明细展示。
+- 基础台账：维护组织/用能单元、计量器具和计量抄表记录。
+- 碳核算：维护碳因子并按能耗数据计算排放量。
+- 预测管理：基于本地历史数据进行轻量预测管理。
+- 系统/备份恢复：查看本地 API 与数据库信息，创建、下载、恢复和删除本机 SQLite 备份。
+
+## 技术栈与本地数据
+
+- 前端：Vite、本地静态前端，入口位于 `client/`。
+- 后端：Node.js + Express，入口位于 `server/src/index.js`。
+- 数据库：SQLite 本地文件，默认路径为 `data/energy-carbon.sqlite`。
+- 上传文件：默认保存到 `data/uploads/`。
+- 备份文件：默认保存到 `data/backups/`。
+
+可用环境变量：
+
+| 变量 | 作用 | 默认值 |
+| --- | --- | --- |
+| `PORT` | 后端 API 端口 | `3002` |
+| `DATA_DIR` | 本地数据根目录 | `data/` |
+| `UPLOADS_DIR` | 上传文件目录 | `DATA_DIR/uploads` |
+| `BACKUPS_DIR` | 备份文件目录 | `DATA_DIR/backups` |
+| `SQLITE_PATH` | SQLite 数据库文件路径 | `DATA_DIR/energy-carbon.sqlite` |
+| `CORS_ALLOWED_ORIGINS` | 额外允许的本地前端来源，逗号分隔 | 空 |
+| `VITE_API_BASE_URL` / `VITE_API_BASE` | 前端构建或启动时的默认 API Base | `http://127.0.0.1:3002/api` |
+
+注意：当前后端 CORS 校验只接受本地来源，例如 `localhost`、`127.0.0.1`。外网完整访问建议使用“同一个公网域名按路径转发前端和 `/api/*`”的方式，避免跨域失败。
+
+## 环境要求
+
+- Node.js 18 或更高版本。
+- npm。
+- 如需外网临时访问，可另行安装 Cloudflare Tunnel 的 `cloudflared` 或 ngrok。
+
+## 安装依赖
+
+在项目根目录执行：
+
+```bash
+npm install
+```
+
+## 本地启动方式
+
+本项目的前端和后端需要分别启动。
+
+终端 1：启动后端 API。
+
+```bash
+npm run dev:server
+```
+
+默认监听地址：
+
+```text
+http://127.0.0.1:3002
+```
+
+终端 2：启动前端页面。
+
+```bash
+npm run dev:client
+```
+
+默认监听地址：
+
+```text
+http://127.0.0.1:7777
+```
+
+前端默认 API Base 为：
+
+```text
+http://127.0.0.1:3002/api
+```
+
+也可以在浏览器地址后追加 `apiBase` 临时指定 API 地址，例如：
+
+```text
+http://127.0.0.1:7777/?apiBase=http://127.0.0.1:3002/api
+```
+
+前端会把该地址写入浏览器 `localStorage`。如需恢复默认值，可在页面的 API Base 输入框中改回默认地址，或清理浏览器站点数据。
+
+## 常用访问地址
+
+| 用途 | 地址 |
+| --- | --- |
+| 前端页面 | `http://127.0.0.1:7777/` |
+| API 根信息 | `http://127.0.0.1:3002/api/` |
+| API 健康检查 | `http://127.0.0.1:3002/api/health` |
+| API 启动信息 | `http://127.0.0.1:3002/api/bootstrap` |
+| API 元信息 | `http://127.0.0.1:3002/api/meta` |
+
+## 常用命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `npm run dev:server` | 启动 Node.js + Express 后端 |
+| `npm run dev:client` | 启动 Vite 前端，监听 `127.0.0.1:7777` |
+| `npm run test:logic` | 运行纯逻辑测试 |
+| `npm run verify:special` | 运行特殊场景验证脚本 |
+| `npm run audit:summary` | 运行审计摘要脚本 |
+| `npm run check` | 对前后端和脚本执行 Node.js 语法检查 |
+
+## 基本使用流程
+
+1. 执行 `npm install` 安装依赖。
+2. 分别执行 `npm run dev:server` 和 `npm run dev:client`。
+3. 打开 `http://127.0.0.1:7777/`。
+4. 在工作台确认后端状态为可用，或直接访问 `http://127.0.0.1:3002/api/health`。
+5. 进入“数据导入”，下载能耗、预测历史等 Excel 模板。
+6. 按模板准备 `.xlsx`、`.xls` 或 `.csv` 文件并提交导入。
+7. 在导入批次中查看成功、失败、跳过和错误明细。
+8. 在“能耗统计”“碳核算”“预测管理”等页面查看基于本地 SQLite 数据生成的结果。
+9. 在“基础台账”维护组织/用能单元、计量器具和抄表记录。
+10. 在“系统/备份恢复”中创建数据库备份；进行恢复前建议先下载一份备份文件。
+
+## 使用 Cloudflare Tunnel 进行外网访问
+
+### 适用场景
+
+Cloudflare Tunnel 适合临时给同事或设备体验本地页面，也可以在拥有 Cloudflare 域名时配置同一个公网域名按路径转发前端和后端。
+
+当前项目不内置登录、权限隔离、审计追踪、生产 HTTPS 终止和公网防护能力。请不要把包含真实企业能耗、碳因子、备份恢复等敏感数据或管理能力的本地实例直接暴露到公网。
+
+### 前置步骤
+
+先在本机启动后端和前端：
+
+```bash
+npm run dev:server
+npm run dev:client
+```
+
+### 临时只展示前端
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:7777
+```
+
+命令会输出一个 `https://*.trycloudflare.com` 临时地址。该方式主要用于查看前端页面。远端浏览器如果仍使用默认 `http://127.0.0.1:3002/api`，会访问远端设备自己的本机地址，无法连接你的后端。
+
+不建议使用两个随机公网地址分别暴露前端和 API 后直接拼接 `apiBase`，因为当前后端只允许本地来源，浏览器跨域请求通常会被 CORS 拦截。
+
+### 推荐的完整临时体验方式：同一域名路径转发
+
+如果你有 Cloudflare 管理的域名，建议使用命名隧道，把同一个域名的 `/api/*` 转发到后端，其余路径转发到前端。示例配置：
+
+```yaml
+tunnel: energy-carbon-demo
+credentials-file: C:\Users\<你的用户名>\.cloudflared\<tunnel-id>.json
+
+ingress:
+  - hostname: energy.example.com
+    path: /api/*
+    service: http://127.0.0.1:3002
+  - hostname: energy.example.com
+    service: http://127.0.0.1:7777
+  - service: http_status:404
+```
+
+常用命令示例：
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create energy-carbon-demo
+cloudflared tunnel route dns energy-carbon-demo energy.example.com
+cloudflared tunnel run energy-carbon-demo
+```
+
+访问时使用同一个域名，并把 API Base 指向同域名下的 `/api`：
+
+```text
+https://energy.example.com/?apiBase=https://energy.example.com/api
+```
+
+这样前端页面和 API 处于同一公网来源，可避免当前本地 CORS 策略带来的跨域问题。
+
+### 生产部署提醒
+
+Cloudflare Tunnel 可以降低临时访问门槛，但不等于生产部署方案。若要长期对外提供服务，应至少补齐身份认证、访问控制、备份策略、HTTPS/域名治理、日志审计、数据脱敏和反向代理安全配置，并评估是否需要从本地 SQLite 升级到更适合多人并发和灾备的架构。
+
+## 使用 ngrok 进行外网访问
+
+### 前置步骤
+
+1. 安装 ngrok 并完成账号登录。
+2. 在本机启动后端和前端：
+
+```bash
+npm run dev:server
+npm run dev:client
+```
+
+### 临时只展示前端
+
+```bash
+ngrok http 7777
+```
+
+命令会输出一个 `https://*.ngrok-free.app` 或你的 ngrok 域名。该方式主要用于查看前端页面。远端浏览器默认无法访问你本机的 `127.0.0.1:3002` 后端。
+
+如果再单独执行 `ngrok http 3002` 暴露后端，并把页面 `apiBase` 指向后端 ngrok 地址，浏览器通常会因为前端域名和 API 域名不同而触发 CORS 限制。当前项目未面向任意公网 Origin 开放 CORS，因此不建议这样做完整演示。
+
+### 完整体验方式
+
+ngrok 的完整外网体验同样建议走“单一公网来源”：先用反向代理把前端和后端合并到同一个本地端口，再用 ngrok 暴露该端口。路径规则应保持：
+
+- `/api/*` 转发到 `http://127.0.0.1:3002`
+- 其他路径转发到 `http://127.0.0.1:7777`
+
+例如你已用本地反向代理合并到 `http://127.0.0.1:8080` 后，可执行：
+
+```bash
+ngrok http 8080
+```
+
+然后用 ngrok 输出的公网地址访问：
+
+```text
+https://<你的-ngrok-域名>/?apiBase=https://<你的-ngrok-域名>/api
+```
+
+如果需要长期稳定地址，请使用 ngrok 静态域名或边缘路由能力，并配合访问控制。不要把没有鉴权的备份恢复、数据导入和台账管理能力直接暴露到公开互联网。
+
+## 安全注意事项
+
+- 本项目默认是本地轻量化单机平台，不是开箱即用的公网生产系统。
+- 不要在公网临时隧道中上传真实敏感能耗、组织、计量器具、碳因子或备份文件。
+- 不要把“系统/备份恢复”能力暴露给不可信访问者；恢复操作会替换当前本地 SQLite 数据库。
+- 外网演示前建议使用脱敏数据或临时数据库，并单独设置 `DATA_DIR` 指向演示目录。
+- 演示结束后及时停止 `cloudflared` 或 `ngrok` 进程。
+- 如需对外长期使用，请先补充认证、授权、日志审计、访问白名单、备份治理和运维监控。
+
+## 常见问题与排查
+
+### 前端提示无法连接本地 API
+
+1. 确认后端已启动：`npm run dev:server`。
+2. 访问 `http://127.0.0.1:3002/api/health`，确认返回成功。
+3. 检查前端页面的 API Base 是否为 `http://127.0.0.1:3002/api`，或是否被 URL 参数、浏览器 `localStorage` 改成了旧地址。
+
+### 端口被占用
+
+- 后端默认使用 `3002`，可通过 `PORT` 调整。
+- 前端命令固定使用 `127.0.0.1:7777`，如需更换端口，需要调整 `package.json` 中的 `dev:client` 脚本。
+
+### 外网地址能打开页面，但数据加载失败
+
+通常是 API Base 指向了远端设备自己的 `127.0.0.1`，或前端和 API 分属不同公网域名导致 CORS 被拦截。完整外网体验请使用同一公网域名路径转发：`/api/*` 到后端，其余路径到前端，并访问 `?apiBase=https://同一域名/api`。
+
+### 导入失败或出现警告
+
+1. 优先下载系统提供的 Excel 模板。
+2. 检查月份是否可标准化为 `YYYY-MM`。
+3. 检查能源类型、单位和数值是否符合模板说明。
+4. 在导入批次中查看错误明细和 warning，按行号修正后重新导入。
+
+### SQLite 数据或备份在哪里
+
+默认在项目根目录下的 `data/` 中：
+
+- 数据库：`data/energy-carbon.sqlite`
+- 上传文件：`data/uploads/`
+- 备份文件：`data/backups/`
+
+如果设置了 `DATA_DIR`、`SQLITE_PATH`、`UPLOADS_DIR` 或 `BACKUPS_DIR`，请以环境变量指向的位置为准。
+
+### 想重置演示数据
+
+先停止前后端服务，备份或移动当前 `data/` 目录，再重新启动后端。后端启动时会初始化本地数据目录和 SQLite 数据库。请谨慎操作，避免误删真实数据。

@@ -1,0 +1,17 @@
+/.git
+/.idea
+*.log
+*.DS_Store
+/node_modules/
+/unpackage/
+/.hbuilderx/
+AGENTS.md
+/.vscode/
+CLAUDE.md
+doc/
+docs/
+/.worktrees/
+/.claude
+/data
+/code-helper-docs
+/.code-helper
