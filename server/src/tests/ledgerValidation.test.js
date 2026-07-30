@@ -26,6 +26,9 @@ const {
   assertImportBatchCanUseGenericDelete
 } = require('../services/importService');
 const {
+  exportEnergyRecordLedgerBackfillPreview
+} = require('../services/energyRecordStatisticsService');
+const {
   getTemplateDefinition,
   getTemplateCsv,
   getTemplateXlsx
@@ -36,6 +39,9 @@ const {
   buildMeterReadingImportIndexes,
   buildMeterReadingPayload,
   calculateUsageValue,
+  executeMeterReadingEnergyRecordGeneration,
+  exportMeterReadingEnergyRecordGenerationPreview,
+  getMeterReadingEnergyRecordGenerationPreview,
   mapMeterReadingImportFields,
   normalizeReadingDate,
   normalizeReadingUnit,
@@ -311,7 +317,9 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const XLSX = require('xlsx');
 
+(async () => {
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'charcoal-ledger-import-export-'));
 try {
   process.env.DATA_DIR = path.join(tmpDir, 'data');
@@ -320,6 +328,11 @@ try {
   process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 
   const { getDatabaseInfo, initDatabase, openDatabase } = require(path.join(process.cwd(), 'server', 'src', 'db', 'database'));
+  const {
+    executeEnergyRecordLedgerBackfill,
+    exportEnergyRecordLedgerBackfillPreview,
+    getEnergyRecordLedgerBackfillPreview
+  } = require(path.join(process.cwd(), 'server', 'src', 'services', 'energyRecordStatisticsService'));
   const {
     createMeter,
     createMeterImportBatchFromUpload,
@@ -430,11 +443,376 @@ try {
   assert(meterCsv.includes('计量器具编码'));
   assert(meterCsv.includes('MT-1'));
   assert(!meterCsv.includes('EXIST-M'));
+
+  const dbForBackfillPreview = openDatabase();
+  const activeMeter = dbForBackfillPreview.prepare("SELECT id FROM meter_devices WHERE meter_code = 'MT-1'").get();
+  dbForBackfillPreview.prepare("INSERT INTO organization_units (unit_code, unit_name, unit_path, unit_type, status, created_at, updated_at) VALUES ('UT-AMB-A', '重名车间', '验收总厂/重名车间A', 'workshop', 'active', datetime('now'), datetime('now'))").run();
+  dbForBackfillPreview.prepare("INSERT INTO organization_units (unit_code, unit_name, unit_path, unit_type, status, created_at, updated_at) VALUES ('UT-AMB-B', '重名车间', '验收总厂/重名车间B', 'workshop', 'active', datetime('now'), datetime('now'))").run();
+  dbForBackfillPreview.prepare("INSERT INTO energy_records (energy_type_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, meter_code, duplicate_key, record_status, created_at, updated_at) VALUES (?, '2026-04', '2026-04', 'kWh', 100, 'kWh', 100, 'UT-1', 'MT-1', 'ledger-backfill-preview-export-smoke', 'active', datetime('now'), datetime('now'))").run(electricity.id);
+  dbForBackfillPreview.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, meter_code, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-04', '2026-04', 'kWh', 100, 'kWh', 100, 'UT-1', 'MT-1', 'ledger-backfill-already-partial-smoke', 'active', datetime('now'), datetime('now'))").run(electricity.id, importedUnit.id);
+  dbForBackfillPreview.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, meter_device_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, meter_code, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, ?, '2026-04', '2026-04', 'kWh', 100, 'kWh', 100, 'UT-1', 'MT-1', 'ledger-backfill-already-linked-smoke', 'active', datetime('now'), datetime('now'))").run(electricity.id, importedUnit.id, activeMeter.id);
+  dbForBackfillPreview.prepare("INSERT INTO energy_records (energy_type_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, meter_code, duplicate_key, record_status, created_at, updated_at) VALUES (?, '2026-04', '2026-04', 'kWh', 100, 'kWh', 100, 'UT-1', 'EXIST-M', 'ledger-backfill-blocked-smoke', 'active', datetime('now'), datetime('now'))").run(electricity.id);
+  dbForBackfillPreview.prepare("INSERT INTO energy_records (energy_type_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, meter_code, duplicate_key, record_status, created_at, updated_at) VALUES (?, '2026-04', '2026-04', 'kWh', 100, 'kWh', 100, '重名车间', '', 'ledger-backfill-ambiguous-smoke', 'active', datetime('now'), datetime('now'))").run(electricity.id);
+  dbForBackfillPreview.prepare("INSERT INTO energy_records (energy_type_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, meter_code, duplicate_key, record_status, created_at, updated_at) VALUES (?, '2026-04', '2026-04', 'kWh', 100, 'kWh', 100, '不存在单元', '不存在仪表', 'ledger-backfill-missing-smoke', 'active', datetime('now'), datetime('now'))").run(electricity.id);
+  const beforeEnergyRecordCount = dbForBackfillPreview.prepare('SELECT COUNT(*) AS total FROM energy_records').get().total;
+  dbForBackfillPreview.close();
+  assert(activeMeter && activeMeter.id, '临时库应已有用于预演的计量器具。');
+
+  const previewExportCsv = exportEnergyRecordLedgerBackfillPreview({ format: 'csv', organization: 'UT-1', detailLimit: '50' });
+  assert.strictEqual(previewExportCsv.format, 'csv');
+  assert.strictEqual(previewExportCsv.contentType, 'text/csv; charset=utf-8');
+  assert.strictEqual(previewExportCsv.rowCount, 4);
+  const previewCsv = previewExportCsv.body.toString('utf8');
+  assert(previewCsv.includes('历史 energy_records 台账回填预演/审计预案'), 'CSV 导出应包含审计预案标题。');
+  assert(previewCsv.includes('preview-only / dry-run / no-write'), 'CSV 导出应包含只读 dry-run 元信息。');
+  assert(previewCsv.includes('writesEnergyRecords'), 'CSV 导出应包含 writesEnergyRecords 元信息。');
+  assert(previewCsv.includes('false'), 'CSV 导出应明确 writesEnergyRecords=false。');
+  assert(previewCsv.includes('能耗记录ID'), 'CSV 导出应包含能耗记录 ID 字段。');
+  assert(previewCsv.includes('候选 organization_unit_id'), 'CSV 导出应包含候选 organization_unit_id 字段。');
+  assert(previewCsv.includes('候选 meter_device_id'), 'CSV 导出应包含候选 meter_device_id 字段。');
+  assert(previewCsv.includes('wouldUpdate'), 'CSV 导出应包含 wouldUpdate 状态。');
+  assert(previewCsv.includes('MT-1'), 'CSV 导出应包含候选计量器具编码。');
+
+  const previewExportXlsx = exportEnergyRecordLedgerBackfillPreview({ format: 'xlsx', organization: 'UT-1', detailLimit: '50' });
+  assert.strictEqual(previewExportXlsx.format, 'xlsx');
+  assert.strictEqual(previewExportXlsx.contentType, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  assert.strictEqual(previewExportXlsx.rowCount, 4);
+  assert(previewExportXlsx.body.length > 0, 'xlsx 导出应返回非空文件。');
+  const workbook = XLSX.read(previewExportXlsx.body, { type: 'buffer' });
+  assert(workbook.SheetNames.includes('预案元信息'), 'xlsx 导出应包含预案元信息工作表。');
+  assert(workbook.SheetNames.includes('预演明细'), 'xlsx 导出应包含预演明细工作表。');
+  const detailSheet = XLSX.utils.sheet_to_json(workbook.Sheets['预演明细']);
+  assert.strictEqual(detailSheet.length, 4);
+  assert(detailSheet.some((row) => row['候选计量器具编码'] === 'MT-1'), 'xlsx 导出明细应包含安全候选计量器具。');
+
+  const executePreview = getEnergyRecordLedgerBackfillPreview({ detailLimit: '50' });
+  assert.strictEqual(executePreview.summary.wouldUpdate, 1, '隔离执行前应只有安全 wouldUpdate 候选。');
+  assert.strictEqual(executePreview.summary.alreadyLinked, 1, '已有完整台账 ID 的记录应识别为 alreadyLinked 并跳过。');
+  assert.strictEqual(executePreview.summary.alreadyPartial, 1, '已有非空台账 ID 的记录应识别为 alreadyPartial 并跳过。');
+  assert.strictEqual(executePreview.summary.ambiguous, 1, 'ambiguous 记录应被识别但不执行。');
+  assert.strictEqual(executePreview.summary.missing, 1, 'missing 记录应被识别但不执行。');
+  assert.strictEqual(executePreview.summary.blocked, 1, 'blocked 记录应被识别但不执行。');
+  assert.strictEqual(executePreview.candidateRecordIds.length, 1, '候选 recordIds 只包含 wouldUpdate 安全记录。');
+  await assert.rejects(
+    () => executeEnergyRecordLedgerBackfill({
+      confirmText: '错误确认文本',
+      previewSignature: executePreview.previewSignature,
+      expectedWouldUpdate: executePreview.summary.wouldUpdate,
+      candidateRecordIds: executePreview.candidateRecordIds,
+      filters: executePreview.filters,
+      acknowledgeSkippedRisks: true,
+      requireBackup: true
+    }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'LEDGER_BACKFILL_CONFIRM_TEXT_MISMATCH'
+  );
+  await assert.rejects(
+    () => executeEnergyRecordLedgerBackfill({
+      confirmText: '确认执行历史能耗台账回填',
+      previewSignature: executePreview.previewSignature,
+      expectedWouldUpdate: executePreview.summary.wouldUpdate + 1,
+      candidateRecordIds: executePreview.candidateRecordIds,
+      filters: executePreview.filters,
+      acknowledgeSkippedRisks: true,
+      requireBackup: true
+    }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'LEDGER_BACKFILL_WOULD_UPDATE_MISMATCH'
+  );
+  await assert.rejects(
+    () => executeEnergyRecordLedgerBackfill({
+      confirmText: '确认执行历史能耗台账回填',
+      previewSignature: executePreview.previewSignature,
+      expectedWouldUpdate: executePreview.summary.wouldUpdate,
+      candidateRecordIds: [999999],
+      filters: executePreview.filters,
+      acknowledgeSkippedRisks: true,
+      requireBackup: true
+    }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'LEDGER_BACKFILL_CANDIDATE_RECORD_IDS_MISMATCH'
+  );
+  await assert.rejects(
+    () => executeEnergyRecordLedgerBackfill({
+      confirmText: '确认执行历史能耗台账回填',
+      previewSignature: executePreview.previewSignature,
+      expectedWouldUpdate: executePreview.summary.wouldUpdate,
+      candidateRecordIds: executePreview.candidateRecordIds,
+      filters: executePreview.filters,
+      acknowledgeSkippedRisks: false,
+      requireBackup: true
+    }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'LEDGER_BACKFILL_SKIPPED_RISKS_ACK_REQUIRED'
+  );
+  await assert.rejects(
+    () => executeEnergyRecordLedgerBackfill({
+      confirmText: '确认执行历史能耗台账回填',
+      previewSignature: executePreview.previewSignature,
+      expectedWouldUpdate: executePreview.summary.wouldUpdate,
+      candidateRecordIds: executePreview.candidateRecordIds,
+      filters: executePreview.filters,
+      acknowledgeSkippedRisks: true
+    }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'LEDGER_BACKFILL_BACKUP_REQUIRED'
+  );
+  await assert.rejects(
+    () => executeEnergyRecordLedgerBackfill({
+      confirmText: '确认执行历史能耗台账回填',
+      previewSignature: 'signature-mismatch',
+      expectedWouldUpdate: executePreview.summary.wouldUpdate,
+      candidateRecordIds: executePreview.candidateRecordIds,
+      filters: executePreview.filters,
+      acknowledgeSkippedRisks: true,
+      requireBackup: true
+    }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'LEDGER_BACKFILL_PREVIEW_SIGNATURE_MISMATCH'
+  );
+  const executeAudit = await executeEnergyRecordLedgerBackfill({
+    confirmText: '确认执行历史能耗台账回填',
+    previewSignature: executePreview.previewSignature,
+    expectedWouldUpdate: executePreview.summary.wouldUpdate,
+    candidateRecordIds: executePreview.candidateRecordIds,
+    filters: executePreview.filters,
+    acknowledgeSkippedRisks: true,
+    requireBackup: true
+  });
+  assert.strictEqual(executeAudit.executed, true);
+  assert.strictEqual(executeAudit.writesEnergyRecords, true);
+  assert.strictEqual(executeAudit.updatedRecords, 1, '只应更新 wouldUpdate 安全候选。');
+  assert.strictEqual(executeAudit.updatedOrganizationUnitId, 1);
+  assert.strictEqual(executeAudit.updatedMeterDeviceId, 1);
+  assert.strictEqual(executeAudit.skippedAlreadyLinked, 1, 'alreadyLinked 不更新，应统计跳过。');
+  assert.strictEqual(executeAudit.skippedAlreadyPartial, 1, '已有非空台账 ID 不覆盖，应统计跳过。');
+  assert.strictEqual(executeAudit.skippedAmbiguous, 1, 'ambiguous 不更新，应统计跳过。');
+  assert.strictEqual(executeAudit.skippedMissing, 1, 'missing 不更新，应统计跳过。');
+  assert.strictEqual(executeAudit.skippedBlocked, 1, 'blocked 不更新，应统计跳过。');
+  assert(executeAudit.backup && executeAudit.backup.reason === 'ledger-backfill', '执行前应自动生成 ledger-backfill 备份。');
+  assert(fs.existsSync(executeAudit.backup.path), '执行备份文件应存在于隔离 BACKUPS_DIR。');
+  assert.strictEqual(path.dirname(executeAudit.backup.path), process.env.BACKUPS_DIR, '执行备份必须写入隔离备份目录。');
+  assert(Array.isArray(executeAudit.items) && executeAudit.items.length === 6, '审计响应应包含 updated 与 skipped 逐条 before/after 明细。');
+  const updatedAuditItem = executeAudit.items.find((item) => item.status === 'updated');
+  assert(updatedAuditItem, '审计响应应包含 updated 明细。');
+  assert.strictEqual(updatedAuditItem.before.organizationUnitId, null);
+  assert.strictEqual(updatedAuditItem.before.meterDeviceId, null);
+  assert.strictEqual(updatedAuditItem.after.organizationUnitId, importedUnit.id);
+  assert.strictEqual(updatedAuditItem.after.meterDeviceId, activeMeter.id);
+  assert(executeAudit.items.some((item) => item.status === 'skipped' && item.previewStatus === 'already-linked'), '审计响应应包含 alreadyLinked 跳过明细。');
+  assert(executeAudit.items.some((item) => item.status === 'skipped' && item.previewStatus === 'already-partial'), '审计响应应包含 alreadyPartial 跳过明细。');
+  assert(executeAudit.items.some((item) => item.status === 'skipped' && item.previewStatus === 'blocked'), '审计响应应包含 blocked 跳过明细。');
+  assert(executeAudit.items.some((item) => item.status === 'skipped' && item.previewStatus === 'ambiguous'), '审计响应应包含 ambiguous 跳过明细。');
+  assert(executeAudit.items.some((item) => item.status === 'skipped' && item.previewStatus === 'missing'), '审计响应应包含 missing 跳过明细。');
+  const dbAfterExecute = openDatabase();
+  const afterEnergyRecordCount = dbAfterExecute.prepare('SELECT COUNT(*) AS total FROM energy_records').get().total;
+  const linkedCandidate = dbAfterExecute.prepare("SELECT organization_unit_id AS organizationUnitId, meter_device_id AS meterDeviceId FROM energy_records WHERE duplicate_key = 'ledger-backfill-preview-export-smoke'").get();
+  const alreadyPartial = dbAfterExecute.prepare("SELECT organization_unit_id AS organizationUnitId, meter_device_id AS meterDeviceId FROM energy_records WHERE duplicate_key = 'ledger-backfill-already-partial-smoke'").get();
+  const alreadyLinked = dbAfterExecute.prepare("SELECT organization_unit_id AS organizationUnitId, meter_device_id AS meterDeviceId FROM energy_records WHERE duplicate_key = 'ledger-backfill-already-linked-smoke'").get();
+  const blockedRecord = dbAfterExecute.prepare("SELECT organization_unit_id AS organizationUnitId, meter_device_id AS meterDeviceId FROM energy_records WHERE duplicate_key = 'ledger-backfill-blocked-smoke'").get();
+  const ambiguousRecord = dbAfterExecute.prepare("SELECT organization_unit_id AS organizationUnitId, meter_device_id AS meterDeviceId FROM energy_records WHERE duplicate_key = 'ledger-backfill-ambiguous-smoke'").get();
+  const missingRecord = dbAfterExecute.prepare("SELECT organization_unit_id AS organizationUnitId, meter_device_id AS meterDeviceId FROM energy_records WHERE duplicate_key = 'ledger-backfill-missing-smoke'").get();
+  dbAfterExecute.close();
+  assert.strictEqual(afterEnergyRecordCount, beforeEnergyRecordCount, '受控执行不得 INSERT/DELETE energy_records。');
+  assert.strictEqual(linkedCandidate.organizationUnitId, importedUnit.id, '安全候选应写入 organization_unit_id。');
+  assert.strictEqual(linkedCandidate.meterDeviceId, activeMeter.id, '安全候选应写入 meter_device_id。');
+  assert.strictEqual(alreadyPartial.organizationUnitId, importedUnit.id, '已有非空 organization_unit_id 不得覆盖。');
+  assert.strictEqual(alreadyPartial.meterDeviceId, null, 'alreadyPartial 不参与执行，不应补写 meter_device_id。');
+  assert.strictEqual(alreadyLinked.organizationUnitId, importedUnit.id, 'alreadyLinked 不应更新 organization_unit_id。');
+  assert.strictEqual(alreadyLinked.meterDeviceId, activeMeter.id, 'alreadyLinked 不应更新 meter_device_id。');
+  assert.strictEqual(blockedRecord.organizationUnitId, null, 'blocked 不应更新 organization_unit_id。');
+  assert.strictEqual(blockedRecord.meterDeviceId, null, 'blocked 不应更新 meter_device_id。');
+  assert.strictEqual(ambiguousRecord.organizationUnitId, null, 'ambiguous 不应更新 organization_unit_id。');
+  assert.strictEqual(ambiguousRecord.meterDeviceId, null, 'ambiguous 不应更新 meter_device_id。');
+  assert.strictEqual(missingRecord.organizationUnitId, null, 'missing 不应更新 organization_unit_id。');
+  assert.strictEqual(missingRecord.meterDeviceId, null, 'missing 不应更新 meter_device_id。');
 } finally {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 }
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
 `;
 execFileSync(process.execPath, ['-e', ledgerImportExportSmokeScript], { cwd: path.join(__dirname, '..', '..', '..'), stdio: 'pipe' });
+
+const meterReadingGenerationSmokeScript = String.raw`
+const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const XLSX = require('xlsx');
+
+(async () => {
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'charcoal-meter-reading-generation-'));
+try {
+  process.env.DATA_DIR = path.join(tmpDir, 'data');
+  process.env.SQLITE_PATH = path.join(process.env.DATA_DIR, 'meter-reading-generation.sqlite');
+  process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
+  process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
+
+  const { getDatabaseInfo, initDatabase, openDatabase } = require(path.join(process.cwd(), 'server', 'src', 'db', 'database'));
+  const { createMeter, createOrganizationUnit } = require(path.join(process.cwd(), 'server', 'src', 'services', 'ledgerService'));
+  const {
+    createMeterReading,
+    executeMeterReadingEnergyRecordGeneration,
+    exportMeterReadingEnergyRecordGenerationPreview,
+    getMeterReadingEnergyRecordGenerationPreview,
+    updateMeterReading
+  } = require(path.join(process.cwd(), 'server', 'src', 'services', 'meterReadingService'));
+
+  initDatabase();
+  assert.strictEqual(getDatabaseInfo().databasePath, process.env.SQLITE_PATH, '抄表生成 smoke 必须使用隔离 SQLite 文件。');
+  const root = createOrganizationUnit({ unitCode: 'GEN-ROOT', unitName: '生成验收总厂', unitType: 'enterprise' });
+  const movedUnit = createOrganizationUnit({ unitCode: 'GEN-MOVED', unitName: '迁移后车间', unitType: 'workshop', parentId: root.id });
+  const dbForType = openDatabase();
+  const electricity = dbForType.prepare("SELECT id FROM energy_types WHERE code = 'electricity' AND is_active = 1").get();
+  dbForType.close();
+  assert(electricity && electricity.id, '临时库应初始化 electricity 能源类型。');
+  function createTestMeter(code, name) {
+    return createMeter({
+      meterCode: code,
+      meterName: name,
+      meterType: 'electricity',
+      energyTypeId: electricity.id,
+      organizationUnitId: root.id,
+      multiplier: 1,
+      allowManualReading: 1,
+      status: 'active'
+    });
+  }
+  const meterGenerate = createTestMeter('GEN-M-1', '可生成电表');
+  const meterConflict = createTestMeter('GEN-M-2', '冲突电表');
+  const meterVoid = createTestMeter('GEN-M-3', '作废电表');
+  const meterAlready = createTestMeter('GEN-M-4', '已生成电表');
+  const meterInvalid = createTestMeter('GEN-M-5', '单位异常电表');
+  const meterMissing = createTestMeter('GEN-M-6', '缺失台账电表');
+  const meterOrgMoved = createTestMeter('GEN-M-7', '归属变更电表');
+
+  const wouldGenerateReading = createMeterReading({ meterDeviceId: meterGenerate.id, readingDate: '2026-05-31', previousValue: 100, currentValue: 150, multiplier: 1, unit: 'kWh' });
+  createMeterReading({ meterDeviceId: meterGenerate.id, readingDate: '2026-05-15', previousValue: 150, currentValue: 170, multiplier: 1, unit: 'kWh' });
+  createMeterReading({ meterDeviceId: meterConflict.id, readingDate: '2026-05-31', previousValue: 10, currentValue: 20, multiplier: 1, unit: 'kWh' });
+  createMeterReading({ meterDeviceId: meterVoid.id, readingDate: '2026-05-31', previousValue: 20, currentValue: 30, multiplier: 1, unit: 'kWh', recordStatus: 'void' });
+  const orgMismatchReading = createMeterReading({ meterDeviceId: meterOrgMoved.id, readingDate: '2026-09-30', previousValue: 0, currentValue: 30, multiplier: 1, unit: 'kWh' });
+
+  const dbSeed = openDatabase();
+  const existingEnergyId = dbSeed.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, meter_device_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, meter_code, business_dimension, remark, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, ?, '2026-05-31', '2026-05', 'kWh', 10, 'kWh', 10, '生成验收总厂', 'GEN-M-2', 'manual-seed', '冲突样例', 'conflict-seed', 'active', datetime('now'), datetime('now'))").run(electricity.id, root.id, meterConflict.id).lastInsertRowid;
+  const alreadyEnergyId = dbSeed.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, meter_device_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, meter_code, business_dimension, remark, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, ?, '2026-06-30', '2026-06', 'kWh', 20, 'kWh', 20, '生成验收总厂', 'GEN-M-4', 'manual-seed', '已生成样例', 'already-generated-seed', 'active', datetime('now'), datetime('now'))").run(electricity.id, root.id, meterAlready.id).lastInsertRowid;
+  dbSeed.prepare('UPDATE meter_devices SET organization_unit_id = ?, updated_at = datetime(\'now\') WHERE id = ?').run(movedUnit.id, meterOrgMoved.id);
+  dbSeed.close();
+  createMeterReading({ meterDeviceId: meterAlready.id, readingDate: '2026-06-30', previousValue: 0, currentValue: 20, multiplier: 1, unit: 'kWh', generatedEnergyRecordId: alreadyEnergyId });
+  const dbInvalid = openDatabase();
+  dbInvalid.prepare("INSERT INTO meter_reading_records (meter_device_id, organization_unit_id, energy_type_id, reading_date, normalized_month, previous_value, current_value, multiplier, usage_value, original_unit, normalized_unit, normalized_usage_value, data_source, record_status, remark, created_at, updated_at) VALUES (?, ?, ?, '2026-07-31', '2026-07', 0, 1, 1, 1, 'kWh', '', 1, 'manual', 'active', 'invalid unit smoke', datetime('now'), datetime('now'))").run(meterInvalid.id, root.id, electricity.id);
+  dbInvalid.pragma('foreign_keys = OFF');
+  dbInvalid.prepare("INSERT INTO meter_reading_records (meter_device_id, organization_unit_id, energy_type_id, reading_date, normalized_month, previous_value, current_value, multiplier, usage_value, original_unit, normalized_unit, normalized_usage_value, data_source, record_status, remark, created_at, updated_at) VALUES (?, ?, ?, '2026-08-31', '2026-08', 0, 1, 1, 1, 'kWh', 'kWh', 1, 'manual', 'active', 'missing ledger smoke', datetime('now'), datetime('now'))").run(999999, root.id, electricity.id);
+  dbInvalid.pragma('foreign_keys = ON');
+  const beforeCount = dbInvalid.prepare('SELECT COUNT(*) AS total FROM energy_records').get().total;
+  dbInvalid.close();
+
+  const preview = getMeterReadingEnergyRecordGenerationPreview({ detailLimit: '50' });
+  assert.strictEqual(preview.dryRun, true);
+  assert.strictEqual(preview.previewOnly, true);
+  assert.strictEqual(preview.writesEnergyRecords, false);
+  assert.strictEqual(preview.carbonAccountingDeferred, true);
+  assert.strictEqual(preview.confirmText, '确认由抄表生成能耗记录');
+  assert.strictEqual(preview.summary.wouldGenerate, 1, '应只有一条 active 抄表可生成。');
+  assert.strictEqual(preview.summary.conflict, 2, '同仪表同月同能源类型已有 active 能耗记录或预演内重复候选应冲突跳过。');
+  assert.strictEqual(preview.summary.void, 1, 'void 抄表应跳过。');
+  assert.strictEqual(preview.summary.alreadyGenerated, 1, '已有 generated_energy_record_id 应跳过。');
+  assert.strictEqual(preview.summary.invalidUnit, 1, '单位/标准化字段异常应跳过。');
+  assert.strictEqual(preview.summary.missingLedger, 1, '台账字段缺失应跳过。');
+  assert.strictEqual(preview.summary.blocked, 1, '抄表记录用能单元与仪表当前归属不一致应阻断生成。');
+  const orgMismatchPreviewItem = preview.items.find((item) => item.readingId === orgMismatchReading.id);
+  assert(orgMismatchPreviewItem && orgMismatchPreviewItem.status === 'blocked', '仪表归属变更后的旧抄表记录应归为 blocked。');
+  assert(orgMismatchPreviewItem.reasons.some((reason) => reason.code === 'METER_READING_ORG_MISMATCH'), 'blocked 原因应包含 METER_READING_ORG_MISMATCH。');
+  assert.deepStrictEqual(preview.candidateReadingIds, [wouldGenerateReading.id]);
+
+  const exportCsv = exportMeterReadingEnergyRecordGenerationPreview({ format: 'csv', detailLimit: '50' });
+  assert.strictEqual(exportCsv.format, 'csv');
+  const csvText = exportCsv.body.toString('utf8');
+  assert(csvText.includes('抄表生成 energy_records 预演/审计预案'));
+  assert(csvText.includes('preview-only / dry-run / controlled-generate'));
+  assert(csvText.includes('fixedConfirmText'));
+  assert(csvText.includes('确认由抄表生成能耗记录'));
+  assert(csvText.includes('拟生成 duplicate_key'));
+  const exportXlsx = exportMeterReadingEnergyRecordGenerationPreview({ format: 'xlsx', detailLimit: '50' });
+  const workbook = XLSX.read(exportXlsx.body, { type: 'buffer' });
+  assert(workbook.SheetNames.includes('预案元信息'));
+  assert(workbook.SheetNames.includes('预演明细'));
+
+  await assert.rejects(
+    () => executeMeterReadingEnergyRecordGeneration({ confirmText: '错误确认文本', previewSignature: preview.previewSignature, expectedWouldGenerate: preview.summary.wouldGenerate, candidateReadingIds: preview.candidateReadingIds, filters: preview.filters, acknowledgeSkippedRisks: true, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'METER_READING_GENERATION_CONFIRM_TEXT_MISMATCH'
+  );
+  await assert.rejects(
+    () => executeMeterReadingEnergyRecordGeneration({ confirmText: '确认由抄表生成能耗记录', previewSignature: 'signature-mismatch', expectedWouldGenerate: preview.summary.wouldGenerate, candidateReadingIds: preview.candidateReadingIds, filters: preview.filters, acknowledgeSkippedRisks: true, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'METER_READING_GENERATION_PREVIEW_SIGNATURE_MISMATCH'
+  );
+  await assert.rejects(
+    () => executeMeterReadingEnergyRecordGeneration({ confirmText: '确认由抄表生成能耗记录', previewSignature: preview.previewSignature, expectedWouldGenerate: preview.summary.wouldGenerate + 1, candidateReadingIds: preview.candidateReadingIds, filters: preview.filters, acknowledgeSkippedRisks: true, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'METER_READING_GENERATION_WOULD_GENERATE_MISMATCH'
+  );
+  await assert.rejects(
+    () => executeMeterReadingEnergyRecordGeneration({ confirmText: '确认由抄表生成能耗记录', previewSignature: preview.previewSignature, expectedWouldGenerate: preview.summary.wouldGenerate, candidateReadingIds: [999999], filters: preview.filters, acknowledgeSkippedRisks: true, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'METER_READING_GENERATION_CANDIDATE_READING_IDS_MISMATCH'
+  );
+  await assert.rejects(
+    () => executeMeterReadingEnergyRecordGeneration({ confirmText: '确认由抄表生成能耗记录', previewSignature: preview.previewSignature, expectedWouldGenerate: preview.summary.wouldGenerate, candidateReadingIds: preview.candidateReadingIds, filters: preview.filters, acknowledgeSkippedRisks: false, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'METER_READING_GENERATION_SKIPPED_RISKS_ACK_REQUIRED'
+  );
+  await assert.rejects(
+    () => executeMeterReadingEnergyRecordGeneration({ confirmText: '确认由抄表生成能耗记录', previewSignature: preview.previewSignature, expectedWouldGenerate: preview.summary.wouldGenerate, candidateReadingIds: preview.candidateReadingIds, filters: preview.filters, acknowledgeSkippedRisks: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'METER_READING_GENERATION_BACKUP_REQUIRED'
+  );
+
+  const audit = await executeMeterReadingEnergyRecordGeneration({
+    confirmText: '确认由抄表生成能耗记录',
+    previewSignature: preview.previewSignature,
+    expectedWouldGenerate: preview.summary.wouldGenerate,
+    candidateReadingIds: preview.candidateReadingIds,
+    filters: preview.filters,
+    acknowledgeSkippedRisks: true,
+    requireBackup: true
+  });
+  assert.strictEqual(audit.generated, 1);
+  assert.strictEqual(audit.updatedReadings, 1);
+  assert.strictEqual(audit.skippedConflict, 2);
+  assert.strictEqual(audit.skippedVoid, 1);
+  assert.strictEqual(audit.skippedAlreadyGenerated, 1);
+  assert.strictEqual(audit.skippedMissingLedger, 1);
+  assert.strictEqual(audit.skippedInvalidUnit, 1);
+  assert.strictEqual(audit.skippedBlocked, 1);
+  assert(audit.items.some((item) => item.readingId === orgMismatchReading.id && item.status === 'skipped' && item.previewStatus === 'blocked'), '归属不一致的抄表记录执行时应自然跳过。');
+  assert(audit.backup && audit.backup.reason === 'meter-reading-energy-record-generation', '执行前应自动生成抄表生成专用 reason 备份。');
+  assert(fs.existsSync(audit.backup.path), '抄表生成备份应存在于隔离 BACKUPS_DIR。');
+  assert.strictEqual(path.dirname(audit.backup.path), process.env.BACKUPS_DIR, '抄表生成备份必须写入隔离目录。');
+  const generatedItem = audit.items.find((item) => item.status === 'generated');
+  assert(generatedItem && generatedItem.energyRecordId, '审计明细应包含 generated energyRecordId。');
+  const dbAfter = openDatabase();
+  const afterCount = dbAfter.prepare('SELECT COUNT(*) AS total FROM energy_records').get().total;
+  const generatedEnergy = dbAfter.prepare('SELECT id, record_status AS recordStatus, business_dimension AS businessDimension, remark, duplicate_key AS duplicateKey FROM energy_records WHERE id = ?').get(generatedItem.energyRecordId);
+  const updatedReading = dbAfter.prepare('SELECT generated_energy_record_id AS generatedEnergyRecordId FROM meter_reading_records WHERE id = ?').get(wouldGenerateReading.id);
+  const orgMismatchDbRow = dbAfter.prepare('SELECT generated_energy_record_id AS generatedEnergyRecordId FROM meter_reading_records WHERE id = ?').get(orgMismatchReading.id);
+  dbAfter.close();
+  assert.strictEqual(afterCount, beforeCount + 1, '成功执行只应新增预期条数的 energy_records。');
+  assert.strictEqual(generatedEnergy.recordStatus, 'active');
+  assert.strictEqual(generatedEnergy.businessDimension, 'meter-reading-generation');
+  assert(generatedEnergy.remark.includes('meter_reading_record_id='));
+  assert.strictEqual(generatedEnergy.duplicateKey, 'meter-reading-month:' + meterGenerate.id + ':2026-05:' + electricity.id);
+  assert.strictEqual(updatedReading.generatedEnergyRecordId, generatedItem.energyRecordId, '应回写 generated_energy_record_id。');
+  assert.strictEqual(orgMismatchDbRow.generatedEnergyRecordId, null, '归属不一致 blocked 抄表不得生成或回写 energy_records。');
+  const editedGeneratedReading = updateMeterReading(wouldGenerateReading.id, { meterDeviceId: meterGenerate.id, readingDate: '2026-05-31', previousValue: 100, currentValue: 151, multiplier: 1, unit: 'kWh', dataSource: 'manual', recordStatus: 'active', remark: '生成后编辑不应清空关联' });
+  assert.strictEqual(editedGeneratedReading.generatedEnergyRecordId, generatedItem.energyRecordId, '生成后编辑抄表记录且请求体未传 generatedEnergyRecordId 时应保留关联。');
+  const dbAfterEdit = openDatabase();
+  const persistedEditedReading = dbAfterEdit.prepare('SELECT generated_energy_record_id AS generatedEnergyRecordId FROM meter_reading_records WHERE id = ?').get(wouldGenerateReading.id);
+  dbAfterEdit.close();
+  assert.strictEqual(persistedEditedReading.generatedEnergyRecordId, generatedItem.energyRecordId, '数据库中 generated_energy_record_id 不应被编辑清空。');
+  const previewAfter = getMeterReadingEnergyRecordGenerationPreview({ detailLimit: '50' });
+  assert.strictEqual(previewAfter.summary.wouldGenerate, 0, '再次预演不应出现重复生成候选。');
+  assert(previewAfter.items.some((item) => item.readingId === wouldGenerateReading.id && item.status === 'alreadyGenerated'), '已生成抄表应归入 alreadyGenerated。');
+} finally {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+}
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+`;
+execFileSync(process.execPath, ['-e', meterReadingGenerationSmokeScript], { cwd: path.join(__dirname, '..', '..', '..'), stdio: 'pipe' });
 
 assert.strictEqual(normalizeReadingDate('2026-02-28'), '2026-02-28');
 assert.strictEqual(normalizeReadingDate('2026/2/8 12:30:00'), '2026-02-08');
@@ -638,6 +1016,15 @@ assert(importServiceJs.includes('import_type AS importType'), '通用导入批�
 assert(importServiceJs.includes('METER_READING_IMPORT_BATCH_DELETE_FORBIDDEN'), '通用批次删除应拒绝 meter_reading 批次。');
 assert(clientMainJs.includes("{ key: 'importType', label: '批次类型'"), '前端通用导入批次列表应展示批次类型。');
 assert(clientMainJs.includes('禁止通用删除'), '前端应标识抄表批次禁止通用删除。');
+assert(clientMainJs.includes("dataset: { action: 'export-energy-ledger-backfill-preview' }"), '前端应提供台账回填预演审计预案下载按钮。');
+assert(clientMainJs.includes('/energy-records/ledger-backfill/preview/export'), '前端应通过 preview/export 下载审计预案。');
+assert(clientMainJs.includes("dataset: { action: 'execute-energy-ledger-backfill' }"), '前端应提供受控执行回填入口。');
+assert(clientMainJs.includes("window.prompt") && clientMainJs.includes('确认执行历史能耗台账回填'), '前端受控执行必须要求输入固定确认文本。');
+assert(clientMainJs.includes('acknowledgeSkippedRisks: true'), '前端执行请求必须显式确认跳过风险。');
+assert(clientMainJs.includes('requireBackup: true'), '前端执行请求必须要求服务端备份。');
+assert(clientMainJs.includes('/energy-records/ledger-backfill/execute'), '前端应仅通过 execute 端点发起受控执行。');
+assert(!/safeApi\(`?\/energy-records\/ledger-backfill\/(?!execute)[^`)]*\{\s*method:\s*['"]POST['"]/i.test(clientMainJs), '前端不得对 preview/export 等 ledger-backfill 路径发起 POST。');
+assert(!/safeApi\(`?\/energy-records\/ledger-backfill[^`)]*\{\s*method:\s*['"](?:PUT|PATCH|DELETE)['"]/i.test(clientMainJs), '前端不得对 ledger-backfill 发起 PUT/PATCH/DELETE 写调用。');
 assert(schemaSql.includes('CREATE TABLE IF NOT EXISTS organization_units'), 'schema 应包含 organization_units 表。');
 assert(schemaSql.includes('CREATE TABLE IF NOT EXISTS meter_devices'), 'schema 应包含 meter_devices 表。');
 assert(schemaSql.includes("import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device'))"), 'import_batches 应支持 energy_record、meter_reading、organization_unit 和 meter_device 导入类型。');

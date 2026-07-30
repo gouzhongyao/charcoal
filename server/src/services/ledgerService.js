@@ -1049,6 +1049,8 @@ function buildEnergyRecordLedgerBackfillPreview(record, indexes) {
     source: {
       energyTypeId: record.energyTypeId,
       energyTypeCode: record.energyTypeCode,
+      energyTypeName: record.energyTypeName || null,
+      normalizedMonth: record.normalizedMonth || null,
       organization: record.organization || null,
       site: record.site || null,
       department: record.department || null,

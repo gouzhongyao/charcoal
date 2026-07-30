@@ -4,6 +4,7 @@ const XLSX = require('xlsx');
 const { openDatabase } = require('../db/database');
 const { badRequest, notFound } = require('../utils/errors');
 const { decodeUploadOriginalName } = require('../utils/filenameEncoding');
+const { createBackup } = require('./backupService');
 const { assertSupportedImportFile, parseImportFile } = require('./import/parser');
 const { normalizeMonth, normalizeUnitAndValue } = require('./import/normalization');
 const { normalizePagination } = require('./ledgerService');
@@ -13,6 +14,30 @@ const READING_DATA_SOURCES = Object.freeze(['manual', 'upload', 'calculation']);
 const METER_READING_IMPORT_TYPE = 'meter_reading';
 const UTF8_BOM = '﻿';
 const MAX_METER_READING_EXPORT_ROWS = 5000;
+const METER_READING_GENERATION_CONFIRM_TEXT = '确认由抄表生成能耗记录';
+const METER_READING_GENERATION_SIGNATURE_VERSION = 'meter-reading-energy-record-generation-preview:v1';
+const METER_READING_GENERATION_BACKUP_REASON = 'meter-reading-energy-record-generation';
+const METER_READING_GENERATION_EXPORT_FIELDS = Object.freeze([
+  { key: 'readingId', header: '抄表记录ID' },
+  { key: 'meterCode', header: '仪表编码' },
+  { key: 'meterName', header: '仪表名称' },
+  { key: 'organizationUnitPath', header: '用能单元' },
+  { key: 'energyTypeCode', header: '能源类型编码' },
+  { key: 'energyTypeName', header: '能源类型名称' },
+  { key: 'readingDate', header: '抄表日期' },
+  { key: 'normalizedMonth', header: '月份' },
+  { key: 'usageValue', header: '原始用量' },
+  { key: 'originalUnit', header: '原始单位' },
+  { key: 'normalizedUsageValue', header: '标准化用量' },
+  { key: 'normalizedUnit', header: '标准单位' },
+  { key: 'status', header: '预演状态' },
+  { key: 'wouldGenerate', header: '是否可生成' },
+  { key: 'reasonCodes', header: '原因编码' },
+  { key: 'reasons', header: '原因说明' },
+  { key: 'existingGeneratedEnergyRecordId', header: '已有 generated_energy_record_id' },
+  { key: 'conflictEnergyRecordId', header: '冲突 energy_record_id' },
+  { key: 'duplicateKey', header: '拟生成 duplicate_key' }
+]);
 const EXPORT_FIELDS = Object.freeze([
   { key: 'meterCode', header: '仪表编码' },
   { key: 'meterName', header: '仪表名称' },
@@ -526,10 +551,14 @@ function updateMeterReading(readingId, input = {}) {
   const db = openDatabase();
   try {
     const transaction = db.transaction(() => {
-      selectMeterReadingById(db, id);
+      const existing = selectMeterReadingById(db, id);
       const meterDeviceId = parsePositiveInteger(firstDefined(input, ['meterDeviceId', 'meter_device_id', 'meterId', 'meter_id']), 'meterDeviceId', { required: true });
       const meter = getActiveMeterForReading(db, meterDeviceId);
       const payload = buildMeterReadingPayload(input, meter);
+      const providedGeneratedEnergyRecordId = normalizeText(firstDefined(input, ['generatedEnergyRecordId', 'generated_energy_record_id']));
+      if (!providedGeneratedEnergyRecordId) {
+        payload.generatedEnergyRecordId = existing.generatedEnergyRecordId || null;
+      }
       ensureOrganizationMatchesMeter(db, payload.organizationUnitId, meter);
       db.prepare(
         `UPDATE meter_reading_records
@@ -834,8 +863,459 @@ function exportMeterReadings(query = {}) {
   }
 }
 
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256Json(value) {
+  return crypto.createHash('sha256').update(stableStringify(value)).digest('hex');
+}
+
+function normalizeGenerationDetailLimit(query = {}) {
+  const requestedLimit = parsePositiveInteger(firstDefined(query, ['detailLimit', 'limit']), 'detailLimit') || 500;
+  return Math.min(requestedLimit, 500);
+}
+
+function normalizeGenerationFilters(input = {}) {
+  const filters = {};
+  const organizationUnitId = parsePositiveInteger(firstDefined(input, ['organizationUnitId', 'organization_unit_id']), 'organizationUnitId');
+  if (organizationUnitId) filters.organizationUnitId = organizationUnitId;
+  const meterId = parsePositiveInteger(firstDefined(input, ['meterId', 'meterDeviceId', 'meter_device_id']), 'meterId');
+  if (meterId) filters.meterId = meterId;
+  const energyTypeCode = normalizeText(firstDefined(input, ['energyTypeCode', 'energy_type_code']));
+  if (energyTypeCode) filters.energyTypeCode = energyTypeCode;
+  const monthStart = normalizeText(input.monthStart);
+  if (monthStart) {
+    const normalized = normalizeMonth(monthStart);
+    if (!normalized) throw badRequest('monthStart 必须可标准化为 YYYY-MM。', { code: 'INVALID_MONTH', fieldName: 'monthStart', rawValue: monthStart });
+    filters.monthStart = normalized;
+  }
+  const monthEnd = normalizeText(input.monthEnd);
+  if (monthEnd) {
+    const normalized = normalizeMonth(monthEnd);
+    if (!normalized) throw badRequest('monthEnd 必须可标准化为 YYYY-MM。', { code: 'INVALID_MONTH', fieldName: 'monthEnd', rawValue: monthEnd });
+    filters.monthEnd = normalized;
+  }
+  if (filters.monthStart && filters.monthEnd && filters.monthStart > filters.monthEnd) {
+    throw badRequest('monthStart 不能晚于 monthEnd。', { code: 'INVALID_MONTH_RANGE', monthStart: filters.monthStart, monthEnd: filters.monthEnd });
+  }
+  const status = normalizeText(firstDefined(input, ['status', 'recordStatus', 'record_status']));
+  if (status) {
+    assertWhitelist(status, 'status', READING_STATUSES);
+    filters.status = status;
+  }
+  return filters;
+}
+
+function buildGenerationPreviewWhere(filters = {}) {
+  const where = [];
+  const params = {};
+  if (filters.organizationUnitId) {
+    where.push('mrr.organization_unit_id = @organizationUnitId');
+    params.organizationUnitId = filters.organizationUnitId;
+  }
+  if (filters.meterId) {
+    where.push('mrr.meter_device_id = @meterId');
+    params.meterId = filters.meterId;
+  }
+  if (filters.energyTypeCode) {
+    where.push('et.code = @energyTypeCode');
+    params.energyTypeCode = filters.energyTypeCode;
+  }
+  if (filters.monthStart) {
+    where.push('mrr.normalized_month >= @monthStart');
+    params.monthStart = filters.monthStart;
+  }
+  if (filters.monthEnd) {
+    where.push('mrr.normalized_month <= @monthEnd');
+    params.monthEnd = filters.monthEnd;
+  }
+  if (filters.status) {
+    where.push('mrr.record_status = @status');
+    params.status = filters.status;
+  }
+  return { whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
+}
+
+function buildMeterReadingGenerationDuplicateKey(row = {}) {
+  return `meter-reading-month:${row.meterDeviceId}:${row.normalizedMonth}:${row.energyTypeId}`;
+}
+
+function summarizeGenerationItems(items = []) {
+  const summary = {
+    totalScanned: items.length,
+    wouldGenerate: 0,
+    conflict: 0,
+    void: 0,
+    alreadyGenerated: 0,
+    missingLedger: 0,
+    invalidUnit: 0,
+    blocked: 0,
+    skipped: 0
+  };
+  items.forEach((item) => {
+    if (item.wouldGenerate) {
+      summary.wouldGenerate += 1;
+      return;
+    }
+    if (Object.prototype.hasOwnProperty.call(summary, item.status)) {
+      summary[item.status] += 1;
+    }
+    summary.skipped += 1;
+  });
+  return summary;
+}
+
+function buildGenerationPreviewSignature(preview) {
+  return sha256Json({
+    version: METER_READING_GENERATION_SIGNATURE_VERSION,
+    filters: preview.filters,
+    summary: preview.summary,
+    candidateReadingIds: preview.candidateReadingIds
+  });
+}
+
+function mapGenerationPreviewRow(row, conflictRow) {
+  const duplicateKey = row.meterDeviceId && row.normalizedMonth && row.energyTypeId
+    ? buildMeterReadingGenerationDuplicateKey(row)
+    : null;
+  const item = {
+    readingId: row.id,
+    meterDeviceId: row.meterDeviceId,
+    meterCode: row.meterCode,
+    meterName: row.meterName,
+    organizationUnitId: row.organizationUnitId,
+    organizationUnitPath: row.organizationUnitPath,
+    meterOrganizationUnitId: row.meterOrganizationUnitId,
+    energyTypeId: row.energyTypeId,
+    energyTypeCode: row.energyTypeCode,
+    energyTypeName: row.energyTypeName,
+    readingDate: row.readingDate,
+    normalizedMonth: row.normalizedMonth,
+    usageValue: row.usageValue,
+    originalUnit: row.originalUnit,
+    normalizedUsageValue: row.normalizedUsageValue,
+    normalizedUnit: row.normalizedUnit,
+    recordStatus: row.recordStatus,
+    existingGeneratedEnergyRecordId: row.generatedEnergyRecordId || null,
+    conflictEnergyRecordId: conflictRow?.id || null,
+    duplicateKey,
+    wouldGenerate: false,
+    status: 'blocked',
+    reasons: []
+  };
+  if (row.recordStatus === 'void') {
+    item.status = 'void';
+    item.reasons.push({ code: 'METER_READING_VOID', message: '抄表记录已作废，跳过生成。' });
+  } else if (row.generatedEnergyRecordId) {
+    item.status = 'alreadyGenerated';
+    item.reasons.push({ code: 'METER_READING_ALREADY_GENERATED', message: '抄表记录已有 generated_energy_record_id，跳过生成。' });
+  } else if (!row.meterDeviceId || !row.organizationUnitId || !row.energyTypeId || !row.meterCode || !row.energyTypeCode) {
+    item.status = 'missingLedger';
+    item.reasons.push({ code: 'MISSING_LEDGER_FIELDS', message: '抄表记录缺少计量器具、用能单元或能源类型台账字段。' });
+  } else if (row.meterOrganizationUnitId && Number(row.organizationUnitId) !== Number(row.meterOrganizationUnitId)) {
+    item.status = 'blocked';
+    item.reasons.push({ code: 'METER_READING_ORG_MISMATCH', message: '抄表记录所属用能单元与计量器具当前归属不一致，跳过生成以避免矛盾台账关联。' });
+  } else if (row.meterStatus !== 'active' || row.organizationUnitStatus !== 'active' || Number(row.energyTypeActive) !== 1) {
+    item.status = 'blocked';
+    item.reasons.push({ code: 'INACTIVE_LEDGER', message: '计量器具、用能单元或能源类型未启用，跳过生成。' });
+  } else if (!row.normalizedMonth || !row.normalizedUnit || row.normalizedUsageValue === null || row.normalizedUsageValue === undefined || Number(row.normalizedUsageValue) < 0) {
+    item.status = 'invalidUnit';
+    item.reasons.push({ code: 'INVALID_USAGE_OR_UNIT', message: '抄表记录标准化月份、单位或用量不完整，跳过生成。' });
+  } else if (conflictRow) {
+    item.status = 'conflict';
+    item.reasons.push({ code: 'MONTHLY_ACTIVE_ENERGY_RECORD_EXISTS', message: '同仪表、同月份、同能源类型已有 active 能耗记录，按策略跳过且不覆盖。' });
+  } else {
+    item.status = 'wouldGenerate';
+    item.wouldGenerate = true;
+    item.reasons.push({ code: 'READY_TO_GENERATE', message: '满足 active、未生成、字段完整且无月度 active 冲突，可受控生成 energy_records。' });
+  }
+  item.reasonCodes = item.reasons.map((reason) => reason.code).join('|');
+  item.reasonText = item.reasons.map((reason) => reason.message).join('；');
+  return item;
+}
+
+function buildMeterReadingEnergyRecordGenerationPreviewWithDb(db, query = {}) {
+  const filters = normalizeGenerationFilters(query);
+  const detailLimit = normalizeGenerationDetailLimit(query);
+  const { whereSql, params } = buildGenerationPreviewWhere(filters);
+  const rows = db.prepare(
+    `SELECT mrr.id, mrr.meter_device_id AS meterDeviceId, md.meter_code AS meterCode, md.meter_name AS meterName,
+            md.status AS meterStatus, md.organization_unit_id AS meterOrganizationUnitId,
+            mrr.organization_unit_id AS organizationUnitId, ou.unit_path AS organizationUnitPath,
+            ou.status AS organizationUnitStatus, mrr.energy_type_id AS energyTypeId, et.code AS energyTypeCode,
+            et.name AS energyTypeName, et.is_active AS energyTypeActive, mrr.reading_date AS readingDate,
+            mrr.normalized_month AS normalizedMonth, mrr.usage_value AS usageValue, mrr.original_unit AS originalUnit,
+            mrr.normalized_unit AS normalizedUnit, mrr.normalized_usage_value AS normalizedUsageValue,
+            mrr.record_status AS recordStatus, mrr.generated_energy_record_id AS generatedEnergyRecordId
+     FROM meter_reading_records mrr
+     LEFT JOIN meter_devices md ON md.id = mrr.meter_device_id
+     LEFT JOIN organization_units ou ON ou.id = mrr.organization_unit_id
+     LEFT JOIN energy_types et ON et.id = mrr.energy_type_id
+     ${whereSql}
+     ORDER BY mrr.normalized_month ASC, mrr.id ASC
+     LIMIT @detailLimit`
+  ).all({ ...params, detailLimit });
+  const conflictStatement = db.prepare(
+    `SELECT id, duplicate_key AS duplicateKey
+     FROM energy_records
+     WHERE record_status = 'active'
+       AND meter_device_id = ?
+       AND normalized_month = ?
+       AND energy_type_id = ?
+     ORDER BY id ASC
+     LIMIT 1`
+  );
+  const seenGenerationKeys = new Set();
+  const items = rows.map((row) => {
+    const conflict = row.meterDeviceId && row.normalizedMonth && row.energyTypeId
+      ? conflictStatement.get(row.meterDeviceId, row.normalizedMonth, row.energyTypeId)
+      : null;
+    const item = mapGenerationPreviewRow(row, conflict);
+    if (item.wouldGenerate && seenGenerationKeys.has(item.duplicateKey)) {
+      item.wouldGenerate = false;
+      item.status = 'conflict';
+      item.reasons = [{ code: 'MONTHLY_CANDIDATE_CONFLICT', message: '同一预演范围内已有同仪表、同月份、同能源类型 wouldGenerate 候选，本条跳过以保持月度唯一。' }];
+      item.reasonCodes = item.reasons.map((reason) => reason.code).join('|');
+      item.reasonText = item.reasons.map((reason) => reason.message).join('；');
+    }
+    if (item.wouldGenerate) {
+      seenGenerationKeys.add(item.duplicateKey);
+    }
+    return item;
+  });
+  const summary = summarizeGenerationItems(items);
+  const candidateReadingIds = items.filter((item) => item.wouldGenerate).map((item) => item.readingId).sort((a, b) => a - b);
+  const preview = {
+    dryRun: true,
+    previewOnly: true,
+    writesEnergyRecords: false,
+    carbonAccountingDeferred: true,
+    confirmText: METER_READING_GENERATION_CONFIRM_TEXT,
+    backupReason: METER_READING_GENERATION_BACKUP_REASON,
+    filters,
+    detailLimit,
+    summary,
+    candidateReadingIds,
+    items,
+    notices: [
+      '预演不写库；只有 POST execute 且固定确认文本匹配后才会生成 active energy_records。',
+      '同仪表 + 同月份 + 同能源类型已有 active energy_records 时跳过冲突，不覆盖、不新增、不自动关联。',
+      '生成后的 active energy_records 会立即纳入能耗统计；碳核算联动后置，本轮不自动计算碳排放。'
+    ]
+  };
+  preview.previewSignature = buildGenerationPreviewSignature(preview);
+  return preview;
+}
+
+function getMeterReadingEnergyRecordGenerationPreview(query = {}) {
+  const db = openDatabase();
+  try {
+    return buildMeterReadingEnergyRecordGenerationPreviewWithDb(db, query);
+  } finally {
+    db.close();
+  }
+}
+
+function buildGenerationExportRows(items = []) {
+  return items.map((item) => {
+    const output = {};
+    METER_READING_GENERATION_EXPORT_FIELDS.forEach((field) => {
+      if (field.key === 'reasons') output[field.header] = item.reasonText || '';
+      else output[field.header] = item[field.key] ?? '';
+    });
+    return output;
+  });
+}
+
+function exportMeterReadingEnergyRecordGenerationPreview(query = {}) {
+  const format = String(query.format || 'xlsx').toLowerCase() === 'csv' ? 'csv' : 'xlsx';
+  const preview = getMeterReadingEnergyRecordGenerationPreview({ ...query, detailLimit: normalizeGenerationDetailLimit({ ...query, detailLimit: query.detailLimit || query.limit || 500 }) });
+  const headers = METER_READING_GENERATION_EXPORT_FIELDS.map((field) => field.header);
+  const exportRows = buildGenerationExportRows(preview.items);
+  const metaRows = [
+    ['预案类型', '抄表生成 energy_records 预演/审计预案'],
+    ['preview-only / dry-run / controlled-generate', 'true'],
+    ['writesEnergyRecords', 'false'],
+    ['carbonAccountingDeferred', 'true'],
+    ['fixedConfirmText', METER_READING_GENERATION_CONFIRM_TEXT],
+    ['backupReason', METER_READING_GENERATION_BACKUP_REASON],
+    ['previewSignature', preview.previewSignature],
+    ['wouldGenerate', preview.summary.wouldGenerate],
+    ['conflictSkipped', preview.summary.conflict],
+    ['filters', stableStringify(preview.filters)]
+  ];
+  const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const fileName = `抄表生成能耗记录预演审计预案-${date}.${format}`;
+  if (format === 'csv') {
+    const lines = [
+      ['抄表生成 energy_records 预演/审计预案'],
+      ...metaRows,
+      [],
+      headers,
+      ...exportRows.map((row) => headers.map((header) => row[header]))
+    ].map((row) => row.map(escapeCsvCell).join(','));
+    return { fileName, format, contentType: 'text/csv; charset=utf-8', body: Buffer.from(`${UTF8_BOM}${lines.join('\n')}\n`, 'utf8'), rowCount: preview.items.length, fields: headers, previewSignature: preview.previewSignature };
+  }
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(metaRows), '预案元信息');
+  const detailSheet = XLSX.utils.json_to_sheet(exportRows, { header: headers });
+  detailSheet['!cols'] = headers.map((header) => ({ wch: Math.min(Math.max(String(header).length + 8, 12), 32) }));
+  XLSX.utils.book_append_sheet(workbook, detailSheet, '预演明细');
+  return { fileName, format, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' }), rowCount: preview.items.length, fields: headers, previewSignature: preview.previewSignature };
+}
+
+function normalizeCandidateReadingIds(value) {
+  if (!Array.isArray(value)) {
+    throw badRequest('candidateReadingIds 必须是数组。', { code: 'METER_READING_GENERATION_CANDIDATE_IDS_REQUIRED' });
+  }
+  return value.map((id) => parsePositiveInteger(id, 'candidateReadingIds', { required: true })).sort((a, b) => a - b);
+}
+
+function assertSameArray(actual, expected, code, message) {
+  if (actual.length !== expected.length || actual.some((value, index) => Number(value) !== Number(expected[index]))) {
+    throw badRequest(message, { code, actual, expected });
+  }
+}
+
+function buildEnergyRecordInsertPayloadFromGenerationItem(item, now = getNow()) {
+  return {
+    sourceBatchId: null,
+    sourceRowNumber: null,
+    energyTypeId: item.energyTypeId,
+    organizationUnitId: item.organizationUnitId,
+    meterDeviceId: item.meterDeviceId,
+    originalMonth: item.readingDate || item.normalizedMonth,
+    normalizedMonth: item.normalizedMonth,
+    originalUnit: item.originalUnit,
+    originalValue: item.usageValue,
+    normalizedUnit: item.normalizedUnit,
+    normalizedValue: item.normalizedUsageValue,
+    organization: item.organizationUnitPath,
+    meterCode: item.meterCode,
+    businessDimension: 'meter-reading-generation',
+    remark: `由抄表记录生成；meter_reading_record_id=${item.readingId}；碳核算联动后置。`,
+    duplicateKey: item.duplicateKey,
+    now
+  };
+}
+
+async function executeMeterReadingEnergyRecordGeneration(body = {}) {
+  const confirmText = normalizeText(body.confirmText);
+  if (confirmText !== METER_READING_GENERATION_CONFIRM_TEXT) {
+    throw badRequest('确认文本不匹配，已拒绝由抄表生成能耗记录。', { code: 'METER_READING_GENERATION_CONFIRM_TEXT_MISMATCH', requiredConfirmText: METER_READING_GENERATION_CONFIRM_TEXT });
+  }
+  if (body.acknowledgeSkippedRisks !== true) {
+    throw badRequest('必须确认已知晓冲突、作废、已生成、缺失和阻断记录会被跳过。', { code: 'METER_READING_GENERATION_SKIPPED_RISKS_ACK_REQUIRED' });
+  }
+  if (body.requireBackup !== true) {
+    throw badRequest('执行前必须要求自动备份，requireBackup 必须显式为 true。', { code: 'METER_READING_GENERATION_BACKUP_REQUIRED' });
+  }
+  const previewSignature = normalizeText(body.previewSignature);
+  if (!previewSignature) {
+    throw badRequest('previewSignature 为必填项。', { code: 'METER_READING_GENERATION_PREVIEW_SIGNATURE_REQUIRED' });
+  }
+  const expectedWouldGenerate = parsePositiveInteger(body.expectedWouldGenerate, 'expectedWouldGenerate', { required: true });
+  const candidateReadingIds = normalizeCandidateReadingIds(body.candidateReadingIds);
+  const filters = normalizeGenerationFilters(body.filters || {});
+  const backup = await createBackup({ reason: METER_READING_GENERATION_BACKUP_REASON });
+  const db = openDatabase();
+  try {
+    const transaction = db.transaction(() => {
+      const preview = buildMeterReadingEnergyRecordGenerationPreviewWithDb(db, filters);
+      if (preview.previewSignature !== previewSignature) {
+        throw badRequest('当前 previewSignature 与执行前重新计算结果不一致，已拒绝执行。', { code: 'METER_READING_GENERATION_PREVIEW_SIGNATURE_MISMATCH', expected: preview.previewSignature, actual: previewSignature });
+      }
+      if (Number(preview.summary.wouldGenerate || 0) !== Number(expectedWouldGenerate || 0)) {
+        throw badRequest('expectedWouldGenerate 与执行前重新计算结果不一致，已拒绝执行。', { code: 'METER_READING_GENERATION_WOULD_GENERATE_MISMATCH', expected: preview.summary.wouldGenerate, actual: expectedWouldGenerate });
+      }
+      assertSameArray(preview.candidateReadingIds, candidateReadingIds, 'METER_READING_GENERATION_CANDIDATE_READING_IDS_MISMATCH', 'candidateReadingIds 与执行前重新计算结果不一致，已拒绝执行。');
+      const insertEnergyRecord = db.prepare(
+        `INSERT INTO energy_records (
+           source_batch_id, source_row_number, energy_type_id, organization_unit_id, meter_device_id,
+           original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value,
+           organization, meter_code, business_dimension, remark, duplicate_key, record_status, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+      );
+      const updateReading = db.prepare('UPDATE meter_reading_records SET generated_energy_record_id = ?, updated_at = ? WHERE id = ? AND record_status = \'active\' AND generated_energy_record_id IS NULL');
+      const items = [];
+      let generated = 0;
+      let updatedReadings = 0;
+      preview.items.forEach((item) => {
+        if (!item.wouldGenerate) {
+          items.push({ readingId: item.readingId, status: 'skipped', previewStatus: item.status, reason: item.reasonText, conflictEnergyRecordId: item.conflictEnergyRecordId || null });
+          return;
+        }
+        const payload = buildEnergyRecordInsertPayloadFromGenerationItem(item, getNow());
+        const insertResult = insertEnergyRecord.run(
+          payload.sourceBatchId,
+          payload.sourceRowNumber,
+          payload.energyTypeId,
+          payload.organizationUnitId,
+          payload.meterDeviceId,
+          payload.originalMonth,
+          payload.normalizedMonth,
+          payload.originalUnit,
+          payload.originalValue,
+          payload.normalizedUnit,
+          payload.normalizedValue,
+          payload.organization,
+          payload.meterCode,
+          payload.businessDimension,
+          payload.remark,
+          payload.duplicateKey,
+          payload.now,
+          payload.now
+        );
+        const energyRecordId = Number(insertResult.lastInsertRowid);
+        const updateResult = updateReading.run(energyRecordId, getNow(), item.readingId);
+        if (updateResult.changes !== 1) {
+          throw badRequest('抄表记录回写 generated_energy_record_id 失败，事务已回滚。', { code: 'METER_READING_GENERATION_BACK_REFERENCE_FAILED', readingId: item.readingId, energyRecordId });
+        }
+        generated += 1;
+        updatedReadings += updateResult.changes;
+        items.push({ readingId: item.readingId, energyRecordId, status: 'generated', previewStatus: item.status, duplicateKey: item.duplicateKey, reason: '已生成 active energy_records 并回写 generated_energy_record_id。' });
+      });
+      return {
+        executed: true,
+        dryRun: false,
+        writesEnergyRecords: true,
+        carbonAccountingDeferred: true,
+        generated,
+        updatedReadings,
+        skipped: items.filter((item) => item.status === 'skipped').length,
+        skippedConflict: preview.summary.conflict,
+        skippedVoid: preview.summary.void,
+        skippedAlreadyGenerated: preview.summary.alreadyGenerated,
+        skippedMissingLedger: preview.summary.missingLedger,
+        skippedInvalidUnit: preview.summary.invalidUnit,
+        skippedBlocked: preview.summary.blocked,
+        previewSignature: preview.previewSignature,
+        expectedWouldGenerate,
+        candidateReadingIds: preview.candidateReadingIds,
+        filters: preview.filters,
+        backup,
+        summary: preview.summary,
+        items,
+        note: '已按预演 wouldGenerate 候选受控生成 active energy_records；冲突和风险状态均跳过。生成后立即纳入能耗统计，碳核算联动后置。'
+      };
+    });
+    return transaction();
+  } finally {
+    db.close();
+  }
+}
+
 module.exports = {
   EXPORT_FIELDS,
+  METER_READING_GENERATION_BACKUP_REASON,
+  METER_READING_GENERATION_CONFIRM_TEXT,
   METER_READING_IMPORT_TYPE,
   READING_DATA_SOURCES,
   READING_STATUSES,
@@ -846,7 +1326,10 @@ module.exports = {
   calculateUsageValue,
   createMeterReading,
   createMeterReadingImportBatchFromUpload,
+  executeMeterReadingEnergyRecordGeneration,
+  exportMeterReadingEnergyRecordGenerationPreview,
   exportMeterReadings,
+  getMeterReadingEnergyRecordGenerationPreview,
   listMeterReadings,
   mapMeterReadingImportFields,
   normalizeReadingDate,

@@ -7,7 +7,10 @@ const { getMeterReadingContract } = require('../services/contractService');
 const {
   createMeterReading,
   createMeterReadingImportBatchFromUpload,
+  executeMeterReadingEnergyRecordGeneration,
+  exportMeterReadingEnergyRecordGenerationPreview,
   exportMeterReadings,
+  getMeterReadingEnergyRecordGenerationPreview,
   listMeterReadings,
   updateMeterReading,
   voidMeterReading
@@ -32,6 +35,29 @@ router.get('/export', asyncHandler(async (req, res) => {
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);
+}));
+
+router.get('/energy-record-generation/preview/export', asyncHandler(async (req, res) => {
+  const result = exportMeterReadingEnergyRecordGenerationPreview(req.query);
+  res.setHeader('Content-Type', result.contentType);
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `meter-reading-energy-record-generation-preview.${result.format}`));
+  res.setHeader('Content-Length', String(result.body.length));
+  res.setHeader('X-Dry-Run', 'true');
+  res.setHeader('X-Preview-Only', 'true');
+  res.setHeader('X-Writes-Energy-Records', 'false');
+  res.setHeader('X-Preview-Signature', result.previewSignature || '');
+  res.setHeader('X-Export-Row-Count', String(result.rowCount));
+  res.status(200).send(result.body);
+}));
+
+router.get('/energy-record-generation/preview', asyncHandler(async (req, res) => {
+  const preview = getMeterReadingEnergyRecordGenerationPreview(req.query);
+  sendSuccess(res, preview, { meta: { dryRun: true, previewOnly: true, writesEnergyRecords: false, carbonAccountingDeferred: true } });
+}));
+
+router.post('/energy-record-generation/execute', requireWritable('meter-readings:energy-record-generation:execute'), asyncHandler(async (req, res) => {
+  const audit = await executeMeterReadingEnergyRecordGeneration(req.body || {});
+  sendSuccess(res, audit);
 }));
 
 router.post('/import', requireWritable('meter-readings:import'), (req, res, next) => {

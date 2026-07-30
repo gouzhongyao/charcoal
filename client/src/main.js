@@ -43,10 +43,22 @@ const state = {
   backupActionName: null,
   backupActionType: null,
   energyFilters: {},
+  energyLedgerBackfillPreview: null,
+  energyLedgerBackfillPreviewLoading: false,
+  energyLedgerBackfillPreviewError: null,
+  energyLedgerBackfillExecuteLoading: false,
+  energyLedgerBackfillExecuteResult: null,
+  energyLedgerBackfillExecuteError: null,
   ledgerTab: 'units',
   ledgerUnitFilters: {},
   ledgerMeterFilters: {},
   ledgerReadingFilters: {},
+  meterReadingGenerationPreview: null,
+  meterReadingGenerationPreviewLoading: false,
+  meterReadingGenerationPreviewError: null,
+  meterReadingGenerationExecuteLoading: false,
+  meterReadingGenerationExecuteResult: null,
+  meterReadingGenerationExecuteError: null,
   ledgerImportResults: {
     units: null,
     meters: null
@@ -1394,6 +1406,7 @@ async function renderEnergy() {
     { name: 'energyTypeCode', label: '能源类型', type: 'select', value: state.energyFilters.energyTypeCode || '', options: typeOptions },
     { name: 'organization', label: '组织', value: state.energyFilters.organization, placeholder: '可选' }
   ]));
+  root.append(renderEnergyLedgerBackfillPreviewCard());
 
   const summaryData = summary.ok ? summary.value.data : {};
   root.append(createElement('section', { className: 'stat-grid' }, [
@@ -1505,6 +1518,160 @@ function renderEnergyLedgerAssociation(row = {}) {
   return createElement('span', { className: 'muted', text: '未关联台账' });
 }
 
+const LEDGER_BACKFILL_STATUS_LABELS = {
+  'already-linked': 'alreadyLinked：已完整关联',
+  'already-partial': 'alreadyPartial：已有部分关联',
+  'candidate-by-meter': 'wouldUpdate：按计量器具候选',
+  'candidate-by-organization': 'wouldUpdate：按用能单元候选',
+  ambiguous: 'ambiguous：候选不唯一',
+  missing: 'missing：未匹配到台账',
+  blocked: 'blocked：规则阻断'
+};
+
+function formatLedgerBackfillPreviewStatus(row = {}) {
+  if (row.wouldUpdate && !['candidate-by-meter', 'candidate-by-organization'].includes(row.status)) {
+    return 'wouldUpdate：可回填候选';
+  }
+  return LEDGER_BACKFILL_STATUS_LABELS[row.status] || formatText(row.status, '未知状态');
+}
+
+function getLedgerBackfillPreviewRecordText(row = {}) {
+  const record = row.energyRecord || row.record || row.source || {};
+  const id = row.energyRecordId || row.recordId || row.energyRecordID || record.id || row.id;
+  const month = row.normalizedMonth || row.month || record.normalizedMonth || record.month;
+  const energyType = row.energyTypeName || row.energyTypeCode || record.energyTypeName || record.energyTypeCode;
+  const organization = row.organization || record.organization || record.site || record.department;
+  const meter = row.meterCode || row.meterName || record.meterCode || record.meterName;
+  return [`#${formatText(id)}`, month, energyType, organization, meter].filter(Boolean).join(' / ');
+}
+
+function getLedgerBackfillPreviewCandidateText(row = {}) {
+  const matched = row.matched || {};
+  const meterCandidate = row.meterCandidate || row.candidateMeter || row.matchedMeter || matched.meterDevice || {};
+  const organizationCandidate = row.organizationCandidate || row.candidateOrganization || row.matchedOrganization || matched.organizationUnit || {};
+  const meterText = row.meterDeviceName || row.ledgerMeterCode || meterCandidate.meterName || meterCandidate.meterCode
+    ? `仪表 ${formatText(row.meterDeviceName || meterCandidate.meterName || row.ledgerMeterCode || meterCandidate.meterCode)}`
+    : '';
+  const unitText = row.organizationUnitPath || row.organizationUnitName || organizationCandidate.unitPath || organizationCandidate.unitName || organizationCandidate.unitCode
+    ? `用能单元 ${formatText(row.organizationUnitPath || row.organizationUnitName || organizationCandidate.unitPath || organizationCandidate.unitName || organizationCandidate.unitCode)}`
+    : '';
+  return [meterText, unitText].filter(Boolean).join('；') || formatText(row.candidateSummary || row.target, '-');
+}
+
+function getLedgerBackfillPreviewReasonText(row = {}) {
+  const reason = row.reason || row.reasonCode || row.message || row.note || row.blockReason || row.missingReason;
+  if (reason) return reason;
+  if (Array.isArray(row.reasons) && row.reasons.length > 0) return row.reasons.map((item) => item?.message || item?.code || item).join('；');
+  if (Array.isArray(row.candidates)) return `候选数量：${formatNumber(row.candidates.length, 0)}`;
+  return row.wouldUpdate ? '预演判断存在可回填候选；当前仅展示，不写入。' : '-';
+}
+
+function renderEnergyLedgerBackfillPreviewCard() {
+  const preview = state.energyLedgerBackfillPreview;
+  const summary = preview?.summary || {};
+  const items = Array.isArray(preview?.items) ? preview.items : [];
+  const canExecuteBackfill = Boolean(preview?.previewSignature && Number(summary.wouldUpdate || 0) > 0 && Array.isArray(preview?.candidateRecordIds) && preview.candidateRecordIds.length === Number(summary.wouldUpdate || 0));
+  const children = [
+    renderMessage('info', '台账回填预演 / dry-run', '先调用 GET /api/energy-records/ledger-backfill/preview 做预演；受控执行仅使用最新 preview 的 wouldUpdate 候选，并要求固定确认文本、自动备份、事务执行和 NULL 防覆盖。'),
+    renderMessage('warning', '受控执行边界', '执行前会重新计算 preview 并校验 signature、wouldUpdate 数量、candidateRecordIds 和 filters；ambiguous/missing/blocked/alreadyLinked/alreadyPartial 全部跳过；不会删除或新增 energy_records，不会覆盖已有非空台账 ID。'),
+    createElement('div', { className: 'template-actions' }, [
+      createElement('button', {
+        type: 'button',
+        className: 'btn btn-primary',
+        text: state.energyLedgerBackfillPreviewLoading ? '预演读取中...' : '运行台账回填预演（只读）',
+        disabled: state.energyLedgerBackfillPreviewLoading || state.energyLedgerBackfillExecuteLoading ? 'disabled' : undefined,
+        dataset: { action: 'run-energy-ledger-backfill-preview' }
+      }),
+      createElement('button', {
+        type: 'button',
+        className: 'btn btn-ghost',
+        text: '下载预演计划/审计预案',
+        disabled: state.energyLedgerBackfillPreviewLoading || state.energyLedgerBackfillExecuteLoading ? 'disabled' : undefined,
+        dataset: { action: 'export-energy-ledger-backfill-preview' }
+      }),
+      createElement('button', {
+        type: 'button',
+        className: 'btn btn-danger',
+        text: state.energyLedgerBackfillExecuteLoading ? '受控执行中...' : '受控执行回填',
+        disabled: canExecuteBackfill && !state.energyLedgerBackfillPreviewLoading && !state.energyLedgerBackfillExecuteLoading ? undefined : 'disabled',
+        dataset: { action: 'execute-energy-ledger-backfill' }
+      })
+    ])
+  ];
+
+  if (state.energyLedgerBackfillPreviewLoading) {
+    children.push(renderLoading('正在读取台账回填预演结果，只读 dry-run 不会写入 energy_records...'));
+  }
+  if (state.energyLedgerBackfillPreviewError) {
+    children.push(renderMessage('error', '台账回填预演读取失败', state.energyLedgerBackfillPreviewError));
+  }
+  if (state.energyLedgerBackfillExecuteError) {
+    children.push(renderMessage('error', '受控执行失败', state.energyLedgerBackfillExecuteError));
+  }
+  if (state.energyLedgerBackfillExecuteResult) {
+    const audit = state.energyLedgerBackfillExecuteResult;
+    children.push(renderMessage('success', '受控执行已返回审计摘要', `已更新记录 ${formatNumber(audit.updatedRecords, 0)} 条；写入用能单元 ID ${formatNumber(audit.updatedOrganizationUnitId, 0)} 项，写入计量器具 ID ${formatNumber(audit.updatedMeterDeviceId, 0)} 项；备份 ${formatText(audit.backup?.backupName)}。`));
+    children.push(renderKeyValueList([
+      { label: 'backupName', value: audit.backup?.backupName || '-' },
+      { label: 'previewSignature', value: audit.previewSignature || '-' },
+      { label: 'updatedRecords', value: formatNumber(audit.updatedRecords, 0) },
+      { label: 'skippedDefensiveNoop', value: formatNumber(audit.skippedDefensiveNoop, 0) },
+      { label: 'skippedAmbiguous/Missing/Blocked', value: `${formatNumber(audit.skippedAmbiguous, 0)} / ${formatNumber(audit.skippedMissing, 0)} / ${formatNumber(audit.skippedBlocked, 0)}` },
+      { label: 'skippedAlreadyLinked/Partial', value: `${formatNumber(audit.skippedAlreadyLinked, 0)} / ${formatNumber(audit.skippedAlreadyPartial, 0)}` }
+    ]));
+    children.push(renderTable([
+      { key: 'recordId', label: '能耗记录ID' },
+      { key: 'status', label: '执行状态', render: (row) => renderStatusPill(row.status) },
+      { key: 'before', label: '执行前', render: (row) => createElement('span', { text: `OU ${formatText(row.before?.organizationUnitId)} / Meter ${formatText(row.before?.meterDeviceId)}` }) },
+      { key: 'after', label: '执行后', render: (row) => createElement('span', { text: `OU ${formatText(row.after?.organizationUnitId)} / Meter ${formatText(row.after?.meterDeviceId)}` }) },
+      { key: 'reason', label: '原因' }
+    ], Array.isArray(audit.items) ? audit.items : [], '本次执行未返回逐条审计明细。'));
+  }
+  if (!preview) {
+    children.push(renderMessage('empty', '尚未运行预演', '点击“运行台账回填预演（只读）”后，将按当前能耗筛选条件加 limit/detailLimit 调用 preview 接口，并展示 summary 与明细状态。'));
+    return renderCard('历史能耗台账回填预演（只读）', children);
+  }
+
+  children.push(renderKeyValueList([
+    { label: 'dryRun', value: String(preview.dryRun === true) },
+    { label: 'previewOnly', value: String(preview.previewOnly === true) },
+    { label: 'writesEnergyRecords', value: String(preview.writesEnergyRecords === true) },
+    { label: 'detailLimit', value: formatNumber(preview.detailLimit || items.length, 0) },
+    { label: '只读边界', value: preview.writesEnergyRecords === false ? '确认不会写入 energy_records' : '接口未返回 writesEnergyRecords=false，请停止执行并检查后端。' }
+  ]));
+  if (Array.isArray(preview.notices) && preview.notices.length > 0) {
+    children.push(createElement('ul', { className: 'compact-list' }, preview.notices.map((notice) => createElement('li', { text: notice }))));
+  }
+  children.push(createElement('section', { className: 'stat-grid' }, [
+    renderStat('扫描记录', formatNumber(summary.totalScanned, 0), 'totalScanned'),
+    renderStat('可回填候选', formatNumber(summary.wouldUpdate, 0), 'wouldUpdate，仅预演不写库', 'green'),
+    renderStat('不唯一/缺失', `${formatNumber(summary.ambiguous, 0)} / ${formatNumber(summary.missing, 0)}`, 'ambiguous / missing', 'orange'),
+    renderStat('规则阻断', formatNumber(summary.blocked, 0), `已完整 ${formatNumber(summary.alreadyLinked, 0)}，部分 ${formatNumber(summary.alreadyPartial, 0)}`)
+  ]));
+  children.push(renderTable([
+    { key: 'name', label: '统计项' },
+    { key: 'value', label: '数量', render: (row) => createElement('span', { text: formatNumber(row.value, 0) }) }
+  ], [
+    { name: 'totalScanned', value: summary.totalScanned },
+    { name: 'alreadyLinked', value: summary.alreadyLinked },
+    { name: 'alreadyPartial', value: summary.alreadyPartial },
+    { name: 'wouldUpdate', value: summary.wouldUpdate },
+    { name: 'candidateByMeter', value: summary.candidateByMeter },
+    { name: 'candidateByOrganization', value: summary.candidateByOrganization },
+    { name: 'ambiguous', value: summary.ambiguous },
+    { name: 'missing', value: summary.missing },
+    { name: 'blocked', value: summary.blocked }
+  ], '暂无 summary。'));
+  children.push(renderTable([
+    { key: 'record', label: '能耗记录', render: getLedgerBackfillPreviewRecordText },
+    { key: 'status', label: '预演状态', render: (row) => renderStatusPill(row.wouldUpdate ? 'wouldUpdate' : row.status) },
+    { key: 'statusText', label: '状态说明', render: (row) => createElement('span', { text: formatLedgerBackfillPreviewStatus(row) }) },
+    { key: 'candidate', label: '候选台账', render: (row) => createElement('span', { text: getLedgerBackfillPreviewCandidateText(row) }) },
+    { key: 'reason', label: '原因', render: (row) => createElement('span', { text: getLedgerBackfillPreviewReasonText(row) }) }
+  ], items, '暂无预演明细；请调整筛选或确认当前记录是否已全部关联。'));
+  return renderCard('历史能耗台账回填预演（只读）', children);
+}
+
 function renderMeterReadingTrace(row = {}) {
   const trace = row.energyTrace || {};
   if (!trace.relatedEnergyRecordCount) {
@@ -1518,6 +1685,108 @@ function renderMeterReadingTrace(row = {}) {
     title: trace.note || '',
     text: `${trace.label || '疑似关联'}：${formatNumber(trace.relatedEnergyRecordCount, 0)} 条${latestText}`
   });
+}
+
+function getMeterReadingGenerationItemText(row = {}) {
+  const energyType = row.energyTypeName || row.energyTypeCode;
+  return [`#${formatText(row.readingId)}`, row.normalizedMonth, row.meterName || row.meterCode, energyType].filter(Boolean).join(' / ');
+}
+
+function getMeterReadingGenerationReasonText(row = {}) {
+  if (row.reasonText) return row.reasonText;
+  if (Array.isArray(row.reasons) && row.reasons.length > 0) return row.reasons.map((item) => item?.message || item?.code || item).join('；');
+  return row.wouldGenerate ? '可受控生成。' : '-';
+}
+
+function renderMeterReadingGenerationCard() {
+  const preview = state.meterReadingGenerationPreview;
+  const summary = preview?.summary || {};
+  const items = Array.isArray(preview?.items) ? preview.items : [];
+  const canExecute = Boolean(preview?.previewSignature && Number(summary.wouldGenerate || 0) > 0 && Array.isArray(preview?.candidateReadingIds) && preview.candidateReadingIds.length === Number(summary.wouldGenerate || 0));
+  const children = [
+    renderMessage('info', '抄表生成 energy_records 预演', '先只读预演并下载审计预案；受控生成会写入 active energy_records 并立即纳入能耗统计，碳核算联动后置。'),
+    renderMessage('warning', '生成与跳过策略', '固定确认文本：确认由抄表生成能耗记录。同仪表 + 同月份 + 同能源类型已有 active 能耗记录时跳过冲突，不覆盖、不新增、不自动关联；void、已 generated、台账/字段缺失和单位异常均跳过。'),
+    createElement('div', { className: 'template-actions' }, [
+      createElement('button', {
+        type: 'button',
+        className: 'btn btn-primary',
+        text: state.meterReadingGenerationPreviewLoading ? '生成预演中...' : '生成预演（只读）',
+        disabled: state.meterReadingGenerationPreviewLoading || state.meterReadingGenerationExecuteLoading ? 'disabled' : undefined,
+        dataset: { action: 'run-meter-reading-generation-preview' }
+      }),
+      createElement('button', {
+        type: 'button',
+        className: 'btn btn-ghost',
+        text: '下载审计预案',
+        disabled: state.meterReadingGenerationPreviewLoading || state.meterReadingGenerationExecuteLoading ? 'disabled' : undefined,
+        dataset: { action: 'export-meter-reading-generation-preview' }
+      }),
+      createElement('button', {
+        type: 'button',
+        className: 'btn btn-danger',
+        text: state.meterReadingGenerationExecuteLoading ? '受控生成中...' : '受控生成能耗记录',
+        disabled: canExecute && !state.meterReadingGenerationPreviewLoading && !state.meterReadingGenerationExecuteLoading ? undefined : 'disabled',
+        dataset: { action: 'execute-meter-reading-generation' }
+      })
+    ])
+  ];
+  if (state.meterReadingGenerationPreviewLoading) {
+    children.push(renderLoading('正在只读预演抄表生成 energy_records 候选...'));
+  }
+  if (state.meterReadingGenerationPreviewError) {
+    children.push(renderMessage('error', '抄表生成预演失败', state.meterReadingGenerationPreviewError));
+  }
+  if (state.meterReadingGenerationExecuteError) {
+    children.push(renderMessage('error', '受控生成失败', state.meterReadingGenerationExecuteError));
+  }
+  if (state.meterReadingGenerationExecuteResult) {
+    const audit = state.meterReadingGenerationExecuteResult;
+    children.push(renderMessage('success', '受控生成已返回审计摘要', `已生成 ${formatNumber(audit.generated, 0)} 条 active energy_records，回写抄表记录 ${formatNumber(audit.updatedReadings, 0)} 条，跳过 ${formatNumber(audit.skipped, 0)} 条；备份 ${formatText(audit.backup?.backupName)}。`));
+    children.push(renderKeyValueList([
+      { label: 'backupName', value: audit.backup?.backupName || '-' },
+      { label: 'previewSignature', value: audit.previewSignature || '-' },
+      { label: 'generated', value: formatNumber(audit.generated, 0) },
+      { label: 'updatedReadings', value: formatNumber(audit.updatedReadings, 0) },
+      { label: 'skippedConflict/Void/Already', value: `${formatNumber(audit.skippedConflict, 0)} / ${formatNumber(audit.skippedVoid, 0)} / ${formatNumber(audit.skippedAlreadyGenerated, 0)}` },
+      { label: 'skippedMissing/Invalid/Blocked', value: `${formatNumber(audit.skippedMissingLedger, 0)} / ${formatNumber(audit.skippedInvalidUnit, 0)} / ${formatNumber(audit.skippedBlocked, 0)}` }
+    ]));
+    children.push(renderTable([
+      { key: 'readingId', label: '抄表ID' },
+      { key: 'energyRecordId', label: '能耗记录ID' },
+      { key: 'status', label: '执行状态', render: (row) => renderStatusPill(row.status) },
+      { key: 'previewStatus', label: '预演状态', render: (row) => renderStatusPill(row.previewStatus) },
+      { key: 'reason', label: '原因' }
+    ], Array.isArray(audit.items) ? audit.items : [], '本次执行未返回逐条审计明细。'));
+  }
+  if (!preview) {
+    children.push(renderMessage('empty', '尚未运行生成预演', '点击“生成预演（只读）”后，将按当前计量抄表筛选调用 preview 接口，并展示 wouldGenerate、冲突和跳过明细。'));
+    return renderCard('抄表生成能耗记录（预演 + 受控生成）', children);
+  }
+  children.push(renderKeyValueList([
+    { label: 'dryRun', value: String(preview.dryRun === true) },
+    { label: 'previewOnly', value: String(preview.previewOnly === true) },
+    { label: 'writesEnergyRecords', value: String(preview.writesEnergyRecords === true) },
+    { label: 'carbonAccountingDeferred', value: String(preview.carbonAccountingDeferred === true) },
+    { label: 'fixedConfirmText', value: preview.confirmText || '确认由抄表生成能耗记录' },
+    { label: 'previewSignature', value: preview.previewSignature || '-' }
+  ]));
+  if (Array.isArray(preview.notices) && preview.notices.length > 0) {
+    children.push(createElement('ul', { className: 'compact-list' }, preview.notices.map((notice) => createElement('li', { text: notice }))));
+  }
+  children.push(createElement('section', { className: 'stat-grid' }, [
+    renderStat('扫描抄表', formatNumber(summary.totalScanned, 0), 'totalScanned'),
+    renderStat('可生成', formatNumber(summary.wouldGenerate, 0), 'wouldGenerate', 'green'),
+    renderStat('冲突/已生成', `${formatNumber(summary.conflict, 0)} / ${formatNumber(summary.alreadyGenerated, 0)}`, 'conflict / alreadyGenerated', 'orange'),
+    renderStat('作废/缺失/阻断', `${formatNumber(summary.void, 0)} / ${formatNumber(summary.missingLedger, 0)} / ${formatNumber(summary.blocked, 0)}`)
+  ]));
+  children.push(renderTable([
+    { key: 'reading', label: '抄表记录', render: getMeterReadingGenerationItemText },
+    { key: 'status', label: '预演状态', render: (row) => renderStatusPill(row.wouldGenerate ? 'wouldGenerate' : row.status) },
+    { key: 'usage', label: '标准化用量', render: (row) => createElement('span', { text: `${formatNumber(row.normalizedUsageValue, 6)} ${formatText(row.normalizedUnit, '')}` }) },
+    { key: 'conflictEnergyRecordId', label: '冲突能耗ID', render: (row) => createElement('span', { text: formatText(row.conflictEnergyRecordId) }) },
+    { key: 'reason', label: '原因', render: (row) => createElement('span', { text: getMeterReadingGenerationReasonText(row) }) }
+  ], items, '暂无预演明细；请调整计量抄表筛选。'));
+  return renderCard('抄表生成能耗记录（预演 + 受控生成）', children);
 }
 
 function findById(rows = [], id) {
@@ -1912,6 +2181,7 @@ async function renderLedger(edit = {}) {
       ])
     ])
   ]));
+  root.append(renderMeterReadingGenerationCard());
   root.append(renderFilterRow('ledger-readings', [
     { name: 'organizationUnitId', label: '用能单元', type: 'select', value: state.ledgerReadingFilters.organizationUnitId || '', options: getLedgerUnitOptions(units.filter((unit) => unit.status === 'active'), true, '全部用能单元') },
     { name: 'meterId', label: '计量器具', type: 'select', value: state.ledgerReadingFilters.meterId || '', options: getLedgerMeterOptions(activeMeters, true) },
@@ -1933,6 +2203,91 @@ async function renderLedger(edit = {}) {
       { key: 'actions', label: '操作', render: renderMeterReadingActions }
     ], readings, '暂无计量抄表记录。请先确认计量器具允许手工抄表，再使用上方表单补录。') : renderMessage('error', '计量抄表读取失败', formatApiError(readingsResponse.error))
   ]));
+}
+
+async function runEnergyLedgerBackfillPreview() {
+  state.energyLedgerBackfillPreviewLoading = true;
+  state.energyLedgerBackfillPreviewError = null;
+  state.energyLedgerBackfillExecuteError = null;
+  state.energyLedgerBackfillExecuteResult = null;
+  state.energyLedgerBackfillPreview = null;
+  await renderEnergy();
+  const query = toQuery({ ...state.energyFilters, limit: 100, detailLimit: 100 });
+  const response = await safeApi(`/energy-records/ledger-backfill/preview${query}`);
+  state.energyLedgerBackfillPreviewLoading = false;
+  if (!response.ok) {
+    state.energyLedgerBackfillPreviewError = formatApiError(response.error);
+    await renderEnergy();
+    return;
+  }
+  state.energyLedgerBackfillPreview = response.value.data || {};
+  await renderEnergy();
+}
+
+async function runMeterReadingGenerationPreview() {
+  state.meterReadingGenerationPreviewLoading = true;
+  state.meterReadingGenerationPreviewError = null;
+  state.meterReadingGenerationExecuteError = null;
+  state.meterReadingGenerationExecuteResult = null;
+  state.meterReadingGenerationPreview = null;
+  state.ledgerTab = 'readings';
+  await renderLedger();
+  const query = toQuery({ ...state.ledgerReadingFilters, detailLimit: 500 });
+  const response = await safeApi(`/meter-readings/energy-record-generation/preview${query}`);
+  state.meterReadingGenerationPreviewLoading = false;
+  if (!response.ok) {
+    state.meterReadingGenerationPreviewError = formatApiError(response.error);
+    await renderLedger();
+    return;
+  }
+  state.meterReadingGenerationPreview = response.value.data || {};
+  await renderLedger();
+}
+
+async function exportMeterReadingGenerationPreview() {
+  const query = toQuery({ ...state.ledgerReadingFilters, format: 'xlsx', detailLimit: 500 });
+  await downloadLedgerExport(`/meter-readings/energy-record-generation/preview/export${query}`, '抄表生成能耗记录预演审计预案.xlsx', '抄表生成能耗记录审计预案下载已触发', '抄表生成能耗记录审计预案下载');
+}
+
+async function executeMeterReadingGeneration() {
+  const preview = state.meterReadingGenerationPreview;
+  const summary = preview?.summary || {};
+  const candidateReadingIds = Array.isArray(preview?.candidateReadingIds) ? preview.candidateReadingIds : [];
+  if (!preview?.previewSignature || Number(summary.wouldGenerate || 0) <= 0 || candidateReadingIds.length === 0) {
+    window.alert('请先运行抄表生成预演，并确认存在 wouldGenerate 候选后再执行。');
+    return;
+  }
+  const confirmText = window.prompt(`受控生成会自动创建备份，并只将最新 preview 中 wouldGenerate=true 的抄表记录写入 active energy_records。\n\n生成后会立即纳入能耗统计；碳核算联动后置。本次会跳过冲突、作废、已 generated、台账/字段缺失和阻断记录，不覆盖、不删除既有 energy_records。\n\n如确认执行，请输入固定确认文本：确认由抄表生成能耗记录`);
+  if (confirmText !== '确认由抄表生成能耗记录') {
+    window.alert('确认文本不匹配，已取消受控生成。');
+    return;
+  }
+  state.meterReadingGenerationExecuteLoading = true;
+  state.meterReadingGenerationExecuteError = null;
+  state.meterReadingGenerationExecuteResult = null;
+  state.ledgerTab = 'readings';
+  await renderLedger();
+  const response = await safeApi('/meter-readings/energy-record-generation/execute', {
+    method: 'POST',
+    body: {
+      confirmText,
+      previewSignature: preview.previewSignature,
+      expectedWouldGenerate: Number(summary.wouldGenerate || 0),
+      candidateReadingIds,
+      filters: preview.filters || state.ledgerReadingFilters || {},
+      acknowledgeSkippedRisks: true,
+      requireBackup: true
+    }
+  });
+  state.meterReadingGenerationExecuteLoading = false;
+  if (!response.ok) {
+    state.meterReadingGenerationExecuteError = formatApiError(response.error);
+    await renderLedger();
+    return;
+  }
+  state.meterReadingGenerationExecuteResult = response.value.data || {};
+  state.meterReadingGenerationPreview = null;
+  await renderLedger();
 }
 
 async function handleLedgerUnitSubmit(event) {
@@ -2161,6 +2516,50 @@ async function exportLedgerMeters() {
 async function exportLedgerReadings() {
   const query = toQuery({ ...state.ledgerReadingFilters, format: 'xlsx' });
   await downloadLedgerExport(`/meter-readings/export${query}`, '计量抄表导出.xlsx', '抄表导出已触发', '抄表导出');
+}
+
+async function exportEnergyLedgerBackfillPreview() {
+  const query = toQuery({ ...state.energyFilters, format: 'xlsx', detailLimit: 500 });
+  await downloadLedgerExport(`/energy-records/ledger-backfill/preview/export${query}`, 'energy-records-台账回填预演审计预案.xlsx', '台账回填预演审计预案下载已触发', '台账回填预演审计预案下载');
+}
+
+async function executeEnergyLedgerBackfill() {
+  const preview = state.energyLedgerBackfillPreview;
+  const summary = preview?.summary || {};
+  const candidateRecordIds = Array.isArray(preview?.candidateRecordIds) ? preview.candidateRecordIds : [];
+  if (!preview?.previewSignature || Number(summary.wouldUpdate || 0) <= 0 || candidateRecordIds.length === 0) {
+    window.alert('请先运行台账回填预演，并确认存在 wouldUpdate 候选后再执行。');
+    return;
+  }
+  const confirmText = window.prompt(`受控执行会自动创建备份，并只更新最新 preview 中 wouldUpdate=true 的候选记录。\n\n跳过 ambiguous/missing/blocked/alreadyLinked/alreadyPartial；不会删除或新增 energy_records；不会覆盖已有非空 organization_unit_id / meter_device_id。\n\n如确认执行，请输入固定确认文本：确认执行历史能耗台账回填`);
+  if (confirmText !== '确认执行历史能耗台账回填') {
+    window.alert('确认文本不匹配，已取消受控执行。');
+    return;
+  }
+  state.energyLedgerBackfillExecuteLoading = true;
+  state.energyLedgerBackfillExecuteError = null;
+  state.energyLedgerBackfillExecuteResult = null;
+  await renderEnergy();
+  const response = await safeApi('/energy-records/ledger-backfill/execute', {
+    method: 'POST',
+    body: {
+      confirmText,
+      previewSignature: preview.previewSignature,
+      expectedWouldUpdate: Number(summary.wouldUpdate || 0),
+      candidateRecordIds,
+      filters: preview.filters || state.energyFilters || {},
+      acknowledgeSkippedRisks: true,
+      requireBackup: true
+    }
+  });
+  state.energyLedgerBackfillExecuteLoading = false;
+  if (!response.ok) {
+    state.energyLedgerBackfillExecuteError = formatApiError(response.error);
+    await renderEnergy();
+    return;
+  }
+  state.energyLedgerBackfillExecuteResult = response.value.data || {};
+  await renderEnergy();
 }
 
 async function renderCarbon() {
@@ -2548,8 +2947,24 @@ function bindEvents() {
       await exportLedgerMeters();
     } else if (action === 'export-ledger-readings') {
       await exportLedgerReadings();
+    } else if (action === 'run-meter-reading-generation-preview') {
+      await runMeterReadingGenerationPreview();
+    } else if (action === 'export-meter-reading-generation-preview') {
+      await exportMeterReadingGenerationPreview();
+    } else if (action === 'execute-meter-reading-generation') {
+      await executeMeterReadingGeneration();
+    } else if (action === 'run-energy-ledger-backfill-preview') {
+      await runEnergyLedgerBackfillPreview();
+    } else if (action === 'export-energy-ledger-backfill-preview') {
+      await exportEnergyLedgerBackfillPreview();
+    } else if (action === 'execute-energy-ledger-backfill') {
+      await executeEnergyLedgerBackfill();
     } else if (action === 'reset-energy-filters') {
       state.energyFilters = {};
+      state.energyLedgerBackfillPreview = null;
+      state.energyLedgerBackfillPreviewError = null;
+      state.energyLedgerBackfillExecuteError = null;
+      state.energyLedgerBackfillExecuteResult = null;
       await renderEnergy();
     } else if (action === 'reset-ledger-units-filters') {
       state.ledgerUnitFilters = {};
@@ -2561,6 +2976,10 @@ function bindEvents() {
       await renderLedger();
     } else if (action === 'reset-ledger-readings-filters') {
       state.ledgerReadingFilters = {};
+      state.meterReadingGenerationPreview = null;
+      state.meterReadingGenerationPreviewError = null;
+      state.meterReadingGenerationExecuteError = null;
+      state.meterReadingGenerationExecuteResult = null;
       state.ledgerTab = 'readings';
       await renderLedger();
     }
@@ -2585,6 +3004,8 @@ function bindEvents() {
       } else if (form.id === 'energy-filters') {
         event.preventDefault();
         state.energyFilters = collectFormValues(form);
+        state.energyLedgerBackfillPreview = null;
+        state.energyLedgerBackfillPreviewError = null;
         await renderEnergy();
       } else if (form.id === 'ledger-unit-form') {
         await handleLedgerUnitSubmit(event);
@@ -2611,6 +3032,10 @@ function bindEvents() {
       } else if (form.id === 'ledger-readings-filters') {
         event.preventDefault();
         state.ledgerReadingFilters = collectFormValues(form);
+        state.meterReadingGenerationPreview = null;
+        state.meterReadingGenerationPreviewError = null;
+        state.meterReadingGenerationExecuteError = null;
+        state.meterReadingGenerationExecuteResult = null;
         state.ledgerTab = 'readings';
         await renderLedger();
       } else if (form.id === 'factor-form') {

@@ -657,7 +657,14 @@ tbody tr:hover td {
 
 .pill.completed,
 .pill.calculated,
-.pill.active {
+.pill.active,
+.pill.updated,
+.pill.generated,
+.pill.wouldGenerate,
+.pill.wouldUpdate,
+.pill.candidate-by-meter,
+.pill.candidate-by-organization,
+.pill.already-linked {
   color: #046c4e;
   background: #dcfce7;
 }
@@ -666,14 +673,23 @@ tbody tr:hover td {
 .pill.factor_missing,
 .pill.failed,
 .pill.inactive,
-.pill.void {
+.pill.void,
+.pill.conflict,
+.pill.invalidUnit,
+.pill.blocked {
   color: #9f1239;
   background: #ffe4e6;
 }
 
 .pill.running,
 .pill.processing,
-.pill.pending {
+.pill.pending,
+.pill.skipped,
+.pill.ambiguous,
+.pill.missing,
+.pill.missingLedger,
+.pill.alreadyGenerated,
+.pill.already-partial {
   color: #805200;
   background: #fff4d8;
 }
