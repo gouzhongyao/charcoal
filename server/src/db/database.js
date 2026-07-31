@@ -95,6 +95,43 @@ CREATE TABLE IF NOT EXISTS meter_reading_records (
   CHECK (current_value >= previous_value)
 );`;
 
+const PRODUCTION_TABLES_SQL = `CREATE TABLE IF NOT EXISTS production_units (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  unit_code TEXT NOT NULL UNIQUE,
+  unit_name TEXT NOT NULL,
+  organization_unit_id INTEGER NOT NULL,
+  product_name TEXT NOT NULL,
+  output_unit TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  remark TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS production_output_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_unit_id INTEGER NOT NULL,
+  normalized_month TEXT NOT NULL CHECK (
+    normalized_month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
+    AND CAST(substr(normalized_month, 6, 2) AS INTEGER) BETWEEN 1 AND 12
+  ),
+  output_value REAL NOT NULL CHECK (output_value > 0),
+  output_unit TEXT NOT NULL,
+  data_source TEXT NOT NULL DEFAULT 'manual' CHECK (data_source IN ('manual', 'upload', 'calculation')),
+  record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
+  remark TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (production_unit_id) REFERENCES production_units(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_production_units_org_status ON production_units(organization_unit_id, status);
+CREATE INDEX IF NOT EXISTS idx_production_units_product_status ON production_units(product_name, status);
+CREATE INDEX IF NOT EXISTS idx_production_output_records_unit_month ON production_output_records(production_unit_id, normalized_month);
+CREATE INDEX IF NOT EXISTS idx_production_output_records_status_month ON production_output_records(record_status, normalized_month);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_production_output_records_active_unit_month ON production_output_records(production_unit_id, normalized_month) WHERE record_status = 'active';`;
+
 const IMPORT_BATCHES_TABLE_WITH_LEDGER_TYPES_SQL = `CREATE TABLE import_batches__migration_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device')),
@@ -323,6 +360,7 @@ function migrateEnergyRecordLedgerColumns(db) {
   }
 
   db.exec(LEDGER_TABLES_SQL);
+  db.exec(PRODUCTION_TABLES_SQL);
   const addedImportType = addColumnIfMissing(
     db,
     'import_batches',
@@ -359,7 +397,7 @@ function initDatabase() {
        ON CONFLICT(key) DO UPDATE SET
          value = excluded.value,
          updated_at = excluded.updated_at`
-    ).run('schema_stage', 'ledger-basic');
+    ).run('schema_stage', 'production-basic');
   } finally {
     db.close();
   }

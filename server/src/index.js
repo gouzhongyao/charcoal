@@ -14,6 +14,7 @@ const backupRoutes = require('./routes/backups');
 const organizationRoutes = require('./routes/organization');
 const meterRoutes = require('./routes/meters');
 const meterReadingRoutes = require('./routes/meterReadings');
+const productionRoutes = require('./routes/production');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
 
 const app = express();
@@ -74,6 +75,7 @@ app.use('/api/system/backups', backupRoutes);
 app.use('/api/organization', organizationRoutes);
 app.use('/api/meters', meterRoutes);
 app.use('/api/meter-readings', meterReadingRoutes);
+app.use('/api/production', productionRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

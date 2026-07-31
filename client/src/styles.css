@@ -657,6 +657,7 @@ tbody tr:hover td {
 
 .pill.completed,
 .pill.calculated,
+.pill.calculable,
 .pill.active,
 .pill.updated,
 .pill.generated,
@@ -685,6 +686,9 @@ tbody tr:hover td {
 .pill.processing,
 .pill.pending,
 .pill.skipped,
+.pill.no-output,
+.pill.no-energy,
+.pill.zero-output,
 .pill.ambiguous,
 .pill.missing,
 .pill.missingLedger,
@@ -698,6 +702,30 @@ tbody tr:hover td {
   display: grid;
   gap: 12px;
   margin-top: 16px;
+}
+
+.nested-detail {
+  display: grid;
+  gap: 7px;
+  min-width: 220px;
+}
+
+.nested-detail-row {
+  display: grid;
+  gap: 2px;
+  padding: 8px 9px;
+  background: #f8fbff;
+  border: 1px solid #edf2f9;
+  border-radius: 10px;
+}
+
+.nested-detail-row strong {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.nested-detail-row small {
+  color: var(--text-muted);
 }
 
 .ledger-tabs {
@@ -816,5 +844,9 @@ tbody tr:hover td {
 
   .filter-row {
     grid-template-columns: repeat(2, minmax(0, 1fr)) auto auto;
+  }
+
+  .nested-detail {
+    min-width: 180px;
   }
 }

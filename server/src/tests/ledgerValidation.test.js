@@ -34,6 +34,19 @@ const {
   getTemplateXlsx
 } = require('../services/templateService');
 const {
+  buildEnergyIntensityRow,
+  createProductionOutput,
+  createProductionUnit,
+  deactivateProductionUnit,
+  getUnitEnergyIntensity,
+  normalizeMonth,
+  normalizeProductionOutputPayload,
+  normalizeProductionUnitPayload,
+  updateProductionOutput,
+  updateProductionUnit,
+  voidProductionOutput
+} = require('../services/productionService');
+const {
   buildMeterReadingEnergyTrace,
   buildMeterReadingExportRows,
   buildMeterReadingImportIndexes,
@@ -84,6 +97,63 @@ assert.throws(
   () => normalizeUnitPayload({ unitCode: 'OU-003', unitName: '负面积', unitType: 'department', area: '-1' }),
   (error) => error.code === 'BAD_REQUEST' && error.details.code === 'INVALID_NON_NEGATIVE_NUMBER'
 );
+
+assert.strictEqual(normalizeMonth('2026/7'), '2026-07');
+assert.strictEqual(normalizeMonth('2026-12-31'), '2026-12');
+assert.throws(
+  () => normalizeMonth('2026-13'),
+  (error) => error.code === 'BAD_REQUEST' && error.details.code === 'INVALID_MONTH'
+);
+const productionPayload = normalizeProductionUnitPayload({
+  unitCode: ' PU-001 ',
+  unitName: ' 一线产能单元 ',
+  organizationUnitId: '3',
+  productName: ' 产品A ',
+  outputUnit: ' t ',
+  status: 'active',
+  remark: '测试'
+});
+assert.deepStrictEqual(productionPayload, {
+  unitCode: 'PU-001',
+  unitName: '一线产能单元',
+  organizationUnitId: 3,
+  productName: '产品A',
+  outputUnit: 't',
+  status: 'active',
+  remark: '测试'
+});
+assert.throws(
+  () => normalizeProductionUnitPayload({ unitCode: 'PU-002', unitName: '缺组织', productName: '产品A', outputUnit: 't' }),
+  (error) => error.code === 'BAD_REQUEST' && error.details.code === 'REQUIRED_FIELD_MISSING' && error.details.fieldName === 'organizationUnitId'
+);
+assert.deepStrictEqual(normalizeProductionOutputPayload({ productionUnitId: '5', normalizedMonth: '2026/8', outputValue: '12.5', outputUnit: '件', dataSource: 'manual' }), {
+  productionUnitId: 5,
+  normalizedMonth: '2026-08',
+  outputValue: 12.5,
+  outputUnit: '件',
+  dataSource: 'manual',
+  recordStatus: 'active',
+  remark: null
+});
+assert.throws(
+  () => normalizeProductionOutputPayload({ productionUnitId: '5', normalizedMonth: '2026-08', outputValue: '0', outputUnit: '件' }),
+  (error) => error.code === 'BAD_REQUEST' && error.details.code === 'INVALID_POSITIVE_NUMBER'
+);
+assert.strictEqual(buildEnergyIntensityRow({ id: 1, unitCode: 'PU-1', unitName: '产线', organizationUnitId: 10, organizationUnitPath: '总厂/一车间', productName: '产品A', outputUnit: 't' }, '2026-01', null, []).status, 'no-output');
+assert.strictEqual(buildEnergyIntensityRow({ id: 1, unitCode: 'PU-1', unitName: '产线', organizationUnitId: 10, organizationUnitPath: '总厂/一车间', productName: '产品A', outputUnit: 't' }, '2026-01', { outputValue: 10, outputUnit: 't' }, []).status, 'no-energy');
+const mixedIntensity = buildEnergyIntensityRow(
+  { id: 1, unitCode: 'PU-1', unitName: '产线', organizationUnitId: 10, organizationUnitPath: '总厂/一车间', productName: '产品A', outputUnit: 't' },
+  '2026-01',
+  { outputValue: 10, outputUnit: 't' },
+  [
+    { energyTypeCode: 'electricity', energyTypeName: '电力', normalizedUnit: 'kWh', totalNormalizedValue: 100, recordCount: 1 },
+    { energyTypeCode: 'heat', energyTypeName: '热力', normalizedUnit: 'MJ', totalNormalizedValue: 50, recordCount: 1 }
+  ]
+);
+assert.strictEqual(mixedIntensity.status, 'calculable');
+assert.strictEqual(mixedIntensity.energyIntensity, 15);
+assert.strictEqual(mixedIntensity.energyUnit, 'mixed');
+assert(mixedIntensity.notice.includes('不做跨能源等价换算'), '跨能源类型汇总必须提示谨慎解读。');
 
 const meterPayload = normalizeMeterPayload({
   meterCode: ' M-001 ',
@@ -1009,6 +1079,108 @@ assert.deepStrictEqual(buildMeterReadingExportRows([{ meterCode: 'M-20', meterNa
   '导入批次': 7
 });
 
+const productionSmokeScript = String.raw`
+const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'charcoal-production-p2-'));
+try {
+  process.env.DATA_DIR = path.join(tmpDir, 'data');
+  process.env.SQLITE_PATH = path.join(process.env.DATA_DIR, 'production-p2.sqlite');
+  process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
+  process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
+
+  const { getDatabaseInfo, initDatabase, openDatabase } = require(path.join(process.cwd(), 'server', 'src', 'db', 'database'));
+  const { createOrganizationUnit } = require(path.join(process.cwd(), 'server', 'src', 'services', 'ledgerService'));
+  const {
+    createProductionOutput,
+    createProductionUnit,
+    deactivateProductionUnit,
+    getUnitEnergyIntensity,
+    listProductionOutputs,
+    listProductionUnits,
+    updateProductionOutput,
+    updateProductionUnit,
+    voidProductionOutput
+  } = require(path.join(process.cwd(), 'server', 'src', 'services', 'productionService'));
+
+  initDatabase();
+  assert.strictEqual(getDatabaseInfo().databasePath, process.env.SQLITE_PATH, '产能 P2 smoke 必须使用隔离 SQLite 文件。');
+  const root = createOrganizationUnit({ unitCode: 'P2-ROOT', unitName: 'P2验收总厂', unitType: 'enterprise' });
+  const workshop = createOrganizationUnit({ unitCode: 'P2-WS-1', unitName: 'P2一车间', unitType: 'workshop', parentId: root.id });
+  const inactive = createOrganizationUnit({ unitCode: 'P2-INACTIVE', unitName: 'P2停用车间', unitType: 'workshop', parentId: root.id, status: 'inactive' });
+  assert.throws(
+    () => createProductionUnit({ unitCode: 'PU-INACTIVE', unitName: '停用组织产线', organizationUnitId: inactive.id, productName: '产品A', outputUnit: 't' }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'INACTIVE_ORGANIZATION_UNIT'
+  );
+
+  const unit = createProductionUnit({ unitCode: 'PU-001', unitName: '一线产能单元', organizationUnitId: workshop.id, productName: '产品A', outputUnit: 't', remark: '初始' });
+  assert.strictEqual(unit.status, 'active');
+  assert.strictEqual(unit.organizationUnitId, workshop.id);
+  assert.throws(
+    () => createProductionUnit({ unitCode: 'PU-001', unitName: '重复编码', organizationUnitId: workshop.id, productName: '产品A', outputUnit: 't' }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'DUPLICATE_PRODUCTION_UNIT_CODE'
+  );
+  const updatedUnit = updateProductionUnit(unit.id, { unitCode: 'PU-001A', unitName: '一线产能单元-改', organizationUnitId: workshop.id, productName: '产品A-改', outputUnit: '件', status: 'active' });
+  assert.strictEqual(updatedUnit.unitCode, 'PU-001A');
+  assert.strictEqual(updatedUnit.outputUnit, '件');
+  assert.strictEqual(listProductionUnits({ keyword: 'PU-001A' }).rows.length, 1);
+
+  const janOutput = createProductionOutput({ productionUnitId: unit.id, normalizedMonth: '2026-01', outputValue: 10, outputUnit: '件' });
+  assert.strictEqual(janOutput.recordStatus, 'active');
+  assert.throws(
+    () => createProductionOutput({ productionUnitId: unit.id, normalizedMonth: '2026-01', outputValue: 12, outputUnit: '件' }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'DUPLICATE_ACTIVE_PRODUCTION_OUTPUT'
+  );
+  const febOutput = createProductionOutput({ productionUnitId: unit.id, normalizedMonth: '2026-02', outputValue: 20, outputUnit: '件' });
+  const voided = voidProductionOutput(febOutput.id);
+  assert.strictEqual(voided.recordStatus, 'void');
+  const febOutput2 = createProductionOutput({ productionUnitId: unit.id, normalizedMonth: '2026-02', outputValue: 25, outputUnit: '件' });
+  const updatedOutput = updateProductionOutput(febOutput2.id, { outputValue: 30, remark: '更新产量' });
+  assert.strictEqual(updatedOutput.outputValue, 30);
+  assert.strictEqual(listProductionOutputs({ productionUnitId: unit.id, status: 'active' }).rows.length, 2);
+
+  const db = openDatabase();
+  const electricity = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity' AND is_active = 1").get();
+  const heat = db.prepare("SELECT id FROM energy_types WHERE code = 'heat' AND is_active = 1").get();
+  assert(electricity && heat, '临时库应初始化 electricity/heat 能源类型。');
+  db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-01', '2026-01', 'kWh', 100, 'kWh', 100, 'P2一车间', 'p2-energy-active-electricity', 'active', datetime('now'), datetime('now'))").run(electricity.id, workshop.id);
+  db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-01', '2026-01', 'MJ', 50, 'MJ', 50, 'P2一车间', 'p2-energy-active-heat', 'active', datetime('now'), datetime('now'))").run(heat.id, workshop.id);
+  db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-01', '2026-01', 'kWh', 999, 'kWh', 999, 'P2一车间', 'p2-energy-void', 'void', datetime('now'), datetime('now'))").run(electricity.id, workshop.id);
+  db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-03', '2026-03', 'kWh', 30, 'kWh', 30, 'P2一车间', 'p2-energy-no-output', 'active', datetime('now'), datetime('now'))").run(electricity.id, workshop.id);
+  db.close();
+
+  const intensity = getUnitEnergyIntensity({ productionUnitId: unit.id, monthStart: '2026-01', monthEnd: '2026-03' });
+  assert.strictEqual(intensity.meta.generationIncluded, false, 'P2 首期不得纳入发电/自发自用。');
+  assert.strictEqual(intensity.meta.carbonAccountingIncluded, false, 'P2 首期不得纳入碳核算联动。');
+  const jan = intensity.rows.find((row) => row.normalizedMonth === '2026-01');
+  assert.strictEqual(jan.status, 'calculable');
+  assert.strictEqual(jan.energyTotal, 150);
+  assert.strictEqual(jan.energyIntensity, 15);
+  assert.strictEqual(jan.energyByType.length, 2);
+  assert(jan.notice.includes('不做跨能源等价换算'), '跨能源类型单位产品能耗应提示谨慎解释。');
+  const feb = intensity.rows.find((row) => row.normalizedMonth === '2026-02');
+  assert.strictEqual(feb.status, 'no-energy', 'void 产量不参与，active 产量无能耗时应明确 no-energy。');
+  assert.strictEqual(feb.outputValue, 30);
+  const mar = intensity.rows.find((row) => row.normalizedMonth === '2026-03');
+  assert.strictEqual(mar.status, 'no-output', '有能耗但无 active 产量时应明确不可计算。');
+  assert.strictEqual(mar.energyTotal, 30);
+
+  const deactivated = deactivateProductionUnit(unit.id);
+  assert.strictEqual(deactivated.deactivated, true);
+  assert.strictEqual(deactivated.referenceCounts.activeOutputs, 2);
+  assert.throws(
+    () => createProductionOutput({ productionUnitId: unit.id, normalizedMonth: '2026-04', outputValue: 1, outputUnit: '件' }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'INACTIVE_PRODUCTION_UNIT'
+  );
+} finally {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+}
+`;
+execFileSync(process.execPath, ['-e', productionSmokeScript], { cwd: path.join(__dirname, '..', '..', '..'), stdio: 'pipe' });
+
 const schemaSql = fs.readFileSync(path.join(__dirname, '..', 'db', 'schema.sql'), 'utf8');
 const importServiceJs = fs.readFileSync(path.join(__dirname, '..', 'services', 'importService.js'), 'utf8');
 const clientMainJs = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'client', 'src', 'main.js'), 'utf8');
@@ -1033,6 +1205,14 @@ assert(schemaSql.includes('normalized_usage_value REAL NOT NULL'), 'meter_readin
 assert(schemaSql.includes("record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void'))"), '抄表记录应支持 active/void 状态。');
 assert(schemaSql.includes('generated_energy_record_id INTEGER'), '抄表记录应预留生成能耗记录追溯字段。');
 assert(schemaSql.includes('idx_meter_reading_records_meter_date'), 'schema 应包含抄表记录仪表日期索引。');
+assert(schemaSql.includes('CREATE TABLE IF NOT EXISTS production_units'), 'schema 应包含 production_units 表。');
+assert(schemaSql.includes('unit_code TEXT NOT NULL UNIQUE'), 'production_units 应包含唯一产能单元编码。');
+assert(schemaSql.includes('organization_unit_id INTEGER NOT NULL'), 'production_units 应强关联所属用能单元。');
+assert(schemaSql.includes('CREATE TABLE IF NOT EXISTS production_output_records'), 'schema 应包含 production_output_records 表。');
+assert(schemaSql.includes('output_value REAL NOT NULL CHECK (output_value > 0)'), '月度产量应要求 output_value > 0。');
+assert(schemaSql.includes('ux_production_output_records_active_unit_month'), 'schema 应用唯一索引阻断同产能单元同月份 active 产量重复。');
+assert(schemaSql.includes('idx_production_units_org_status'), 'schema 应包含产能单元所属用能单元索引。');
+assert(schemaSql.includes('idx_production_output_records_status_month'), 'schema 应包含月度产量状态月份索引。');
 assert(schemaSql.includes('organization_unit_id INTEGER'), 'energy_records 应包含 organization_unit_id。');
 assert(schemaSql.includes('meter_device_id INTEGER'), 'energy_records 应包含 meter_device_id。');
 assert(schemaSql.includes("unit_type IN ('enterprise', 'department', 'workshop', 'process', 'equipment')"), 'unit_type 应有白名单约束。');

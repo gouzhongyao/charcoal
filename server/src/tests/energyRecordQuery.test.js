@@ -110,6 +110,10 @@ const statisticsServiceJs = fs.readFileSync(path.join(__dirname, '..', 'services
 const energyRecordsRouteJs = fs.readFileSync(path.join(__dirname, '..', 'routes', 'energyRecords.js'), 'utf8');
 const meterReadingServiceJs = fs.readFileSync(path.join(__dirname, '..', 'services', 'meterReadingService.js'), 'utf8');
 const meterReadingsRouteJs = fs.readFileSync(path.join(__dirname, '..', 'routes', 'meterReadings.js'), 'utf8');
+const productionServiceJs = fs.readFileSync(path.join(__dirname, '..', 'services', 'productionService.js'), 'utf8');
+const productionRouteJs = fs.readFileSync(path.join(__dirname, '..', 'routes', 'production.js'), 'utf8');
+const serverIndexJs = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+const clientMainJs = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'client', 'src', 'main.js'), 'utf8');
 assert(statisticsServiceJs.includes('LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id'), '能耗明细应左关联用能单元，未关联记录不能因此查询失败。');
 assert(statisticsServiceJs.includes('LEFT JOIN meter_devices md ON md.id = er.meter_device_id'), '能耗明细应左关联计量器具，未关联记录不能因此查询失败。');
 assert(statisticsServiceJs.includes('ou.unit_path AS organizationUnitPath'), '能耗明细应返回用能单元路径展示字段。');
@@ -179,5 +183,60 @@ assert(meterReadingsRouteJs.includes("router.post('/energy-record-generation/exe
 assert(meterReadingsRouteJs.includes("requireWritable('meter-readings:energy-record-generation:execute')"), '抄表生成执行路由必须使用写保护。');
 assert(meterReadingsRouteJs.includes("X-Writes-Energy-Records', 'false'"), '抄表生成预演导出响应头必须明确不写入 energy_records。');
 assert(!/router\.(put|patch|delete)\('\/energy-record-generation/i.test(meterReadingsRouteJs), '不得提供 PUT/PATCH/DELETE 抄表生成写接口。');
+assert.strictEqual(
+  typeof require('../services/productionService').createProductionUnit,
+  'function',
+  '应导出产能单元新增服务。'
+);
+assert.strictEqual(
+  typeof require('../services/productionService').getUnitEnergyIntensity,
+  'function',
+  '应导出单位产品能耗统计服务。'
+);
+assert(serverIndexJs.includes("const productionRoutes = require('./routes/production')"), '路由入口应加载 production 路由。');
+assert(serverIndexJs.includes("app.use('/api/production', productionRoutes)"), '路由入口应挂载 /api/production。');
+assert(productionRouteJs.includes("router.get('/statistics/unit-energy-intensity'"), '应提供单位产品能耗统计 GET 接口。');
+assert(productionRouteJs.includes("router.get('/units'"), '应提供产能单元查询接口。');
+assert(productionRouteJs.includes("router.post('/units'"), '应提供产能单元新增接口。');
+assert(productionRouteJs.includes("router.put('/units/:id'"), '应提供产能单元编辑接口。');
+assert(productionRouteJs.includes("router.delete('/units/:id'"), '应提供产能单元停用接口。');
+assert(productionRouteJs.includes("router.get('/outputs'"), '应提供月度产量查询接口。');
+assert(productionRouteJs.includes("router.post('/outputs'"), '应提供月度产量新增接口。');
+assert(productionRouteJs.includes("router.put('/outputs/:id'"), '应提供月度产量编辑接口。');
+assert(productionRouteJs.includes("router.delete('/outputs/:id'"), '应提供月度产量作废接口。');
+assert(productionRouteJs.includes("requireWritable('production:create-unit')"), '产能单元新增路由必须使用写保护。');
+assert(productionRouteJs.includes("requireWritable('production:void-output')"), '月度产量作废路由必须使用写保护。');
+assert(productionServiceJs.includes("FROM energy_records er"), '单位产品能耗统计应读取 energy_records。');
+assert(productionServiceJs.includes("er.record_status = 'active'"), '单位产品能耗统计只应纳入 active energy_records。');
+assert(productionServiceJs.includes('er.organization_unit_id = @organizationUnitId'), '单位产品能耗统计应按产能单元所属用能单元汇总。');
+assert(productionServiceJs.includes('production_output_records') && productionServiceJs.includes("record_status = 'active'"), '单位产品能耗统计应按 active 月度产量计算。');
+assert(productionServiceJs.includes('energyByType'), '单位产品能耗响应应包含能源类型明细，避免混合能源误解。');
+assert(productionServiceJs.includes('不做跨能源等价换算'), '跨能源类型汇总必须提示谨慎解释。');
+assert(productionServiceJs.includes('generationIncluded: false'), 'P2 首期不得纳入发电/自发自用。');
+assert(productionServiceJs.includes('carbonAccountingIncluded: false'), 'P2 首期不得纳入碳核算联动。');
+assert(!/photovoltaic-generation|self-use|carbon_emissions/i.test(productionRouteJs), 'P2 首期 production 路由不得实现发电、自发自用或碳核算联动。');
+assert(!/INSERT\s+INTO\s+carbon_emissions|UPDATE\s+carbon_emissions/i.test(productionServiceJs), 'P2 首期产能服务不得写入碳核算结果。');
+assert(clientMainJs.includes("tab: 'production'") && clientMainJs.includes('产能单元'), '前端基础台账应存在产能单元页签/入口。');
+assert(clientMainJs.includes("safeApi('/production/units") || clientMainJs.includes('safeApi(`/production/units'), '前端应调用 /production/units。');
+assert(clientMainJs.includes("safeApi('/production/outputs") || clientMainJs.includes('safeApi(`/production/outputs'), '前端应调用 /production/outputs。');
+assert(clientMainJs.includes('/production/statistics/unit-energy-intensity'), '前端应调用 /production/statistics/unit-energy-intensity。');
+assert(clientMainJs.includes('所属用能单元当月 active energy_records'), '前端应展示所属用能单元当月 active energy_records 口径提示。');
+assert(clientMainJs.includes('发电/自发自用后置'), '前端应保留发电/自发自用后置提示。');
+assert(clientMainJs.includes('碳核算联动后置'), '前端应保留碳核算联动后置提示。');
+assert(clientMainJs.includes('energyByType 明细'), '前端应展示 energyByType 明细，避免跨能源类型汇总误解。');
+assert(clientMainJs.includes('function renderLockedProductionUnitOrganizationField'), '编辑产能单元时应提供锁定所属用能单元的渲染函数。');
+assert(clientMainJs.includes("type: 'hidden', name: 'organizationUnitId'"), '编辑产能单元时应通过隐藏字段保留原 organizationUnitId。');
+assert(clientMainJs.includes("disabled: 'disabled', 'aria-label': '产能单元所属用能单元已锁定'"), '编辑产能单元时所属用能单元下拉应锁定，避免用户误以为可普通改挂。');
+assert(clientMainJs.includes('原用能单元已停用；编辑产能单元时锁定所属用能单元，不会静默改挂到其它 active 用能单元。'), '编辑所属 inactive 用能单元的产能单元时应明确提示已停用且不会静默改挂。');
+assert(clientMainJs.includes('? renderLockedProductionUnitOrganizationField(editingProductionUnit, selectedOrganizationUnit)'), '产能单元编辑模式必须使用锁定归属字段，而不是仅渲染 active 用能单元下拉。');
+assert(!/ledgerSelectField\('organizationUnitId', '所属用能单元', getLedgerUnitOptions\(activeUnits, false\), editingProductionUnit\?\.organizationUnitId \|\| activeUnits\[0\]\?\.id \|\| ''\)/.test(clientMainJs), '产能单元编辑模式不得继续复用 active-only 可变用能单元下拉，避免浏览器提交首个 active 选项。');
+assert(clientMainJs.includes('function renderLockedProductionOutputUnitField'), '编辑月度产量时应提供锁定所属产能单元的渲染函数。');
+assert(clientMainJs.includes("type: 'hidden', name: 'productionUnitId'"), '编辑月度产量时应通过隐藏字段保留原 productionUnitId。');
+assert(clientMainJs.includes("disabled: 'disabled', 'aria-label': '月度产量所属产能单元已锁定'"), '编辑月度产量时所属产能单元下拉应锁定，避免用户误以为可普通改挂。');
+assert(clientMainJs.includes('原产能单元已停用；编辑月度产量时锁定所属产能单元，不会静默改挂到其它 active 产能单元。'), '编辑 inactive 原产能单元下的月度产量时应明确提示已停用且不会静默改挂。');
+assert(clientMainJs.includes('? renderLockedProductionOutputUnitField(editingOutput, selectedUnit)'), '月度产量编辑模式必须使用锁定归属字段，而不是仅渲染 active 产能单元下拉。');
+assert(!/editingOutput\?\.productionUnitId \|\| selectedUnit\?\.id \|\| '', \{ dataset: \{ role: 'ledger-production-output-unit' \} \}/.test(clientMainJs), '月度产量编辑模式不得继续复用可变 active 产能单元下拉，避免浏览器提交首个 active 选项。');
+assert(!/production\/(?:units|outputs)\/(?:import|export)|production\/(?:import|export)|产量导入|导入产量|产量导出|导出产量/i.test(clientMainJs), 'P2 首期前端不得提供产量导入/导出入口。');
+assert(!/data-action=['"][^'"]*(?:self-use|photovoltaic|carbon-accounting)|\/production\/[^`'"\s]*(?:self-use|photovoltaic|carbon)|carbonAccountingIncluded:\s*true|carbon_emissions/i.test(clientMainJs), 'P2 首期前端不得实现自发自用计算、发电或碳核算联动入口。');
 
 console.log('energy record query tests passed');

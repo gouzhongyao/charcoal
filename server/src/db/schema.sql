@@ -149,6 +149,37 @@ CREATE TABLE IF NOT EXISTS meter_reading_records (
   CHECK (current_value >= previous_value)
 );
 
+CREATE TABLE IF NOT EXISTS production_units (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  unit_code TEXT NOT NULL UNIQUE,
+  unit_name TEXT NOT NULL,
+  organization_unit_id INTEGER NOT NULL,
+  product_name TEXT NOT NULL,
+  output_unit TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  remark TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS production_output_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_unit_id INTEGER NOT NULL,
+  normalized_month TEXT NOT NULL CHECK (
+    normalized_month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
+    AND CAST(substr(normalized_month, 6, 2) AS INTEGER) BETWEEN 1 AND 12
+  ),
+  output_value REAL NOT NULL CHECK (output_value > 0),
+  output_unit TEXT NOT NULL,
+  data_source TEXT NOT NULL DEFAULT 'manual' CHECK (data_source IN ('manual', 'upload', 'calculation')),
+  record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
+  remark TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (production_unit_id) REFERENCES production_units(id) ON DELETE RESTRICT
+);
+
 CREATE TABLE IF NOT EXISTS energy_records (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   source_batch_id INTEGER,
@@ -276,6 +307,11 @@ CREATE INDEX IF NOT EXISTS idx_meter_reading_records_meter_date ON meter_reading
 CREATE INDEX IF NOT EXISTS idx_meter_reading_records_org_month ON meter_reading_records(organization_unit_id, normalized_month);
 CREATE INDEX IF NOT EXISTS idx_meter_reading_records_energy_month ON meter_reading_records(energy_type_id, normalized_month);
 CREATE INDEX IF NOT EXISTS idx_meter_reading_records_status_month ON meter_reading_records(record_status, normalized_month);
+CREATE INDEX IF NOT EXISTS idx_production_units_org_status ON production_units(organization_unit_id, status);
+CREATE INDEX IF NOT EXISTS idx_production_units_product_status ON production_units(product_name, status);
+CREATE INDEX IF NOT EXISTS idx_production_output_records_unit_month ON production_output_records(production_unit_id, normalized_month);
+CREATE INDEX IF NOT EXISTS idx_production_output_records_status_month ON production_output_records(record_status, normalized_month);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_production_output_records_active_unit_month ON production_output_records(production_unit_id, normalized_month) WHERE record_status = 'active';
 CREATE INDEX IF NOT EXISTS idx_energy_records_month_type ON energy_records(normalized_month, energy_type_id);
 CREATE INDEX IF NOT EXISTS idx_energy_records_batch ON energy_records(source_batch_id);
 CREATE INDEX IF NOT EXISTS idx_energy_records_organization_unit ON energy_records(organization_unit_id);
@@ -315,4 +351,4 @@ WHERE code = 'heat'
 
 INSERT OR IGNORE INTO app_meta (key, value) VALUES
   ('schema_stage', 'ledger-basic'),
-  ('schema_version', '2026-07-27-ledger-basic');
+  ('schema_version', '2026-07-30-production-basic');
