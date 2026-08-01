@@ -39,6 +39,23 @@ const TEMPLATE_DEFINITIONS = {
       ['2026-02-28', '', '锅炉房热量表', '100', '110', '10', '', 'MJ', '烟测集团/锅炉房', 'meter_code 为空时用 用能单元 + meter_name 匹配']
     ]
   },
+  'production-outputs': {
+    type: 'production-outputs',
+    name: '月度产量导入模板',
+    baseFileName: '月度产量导入模板',
+    sheetName: '月度产量导入模板',
+    route: '/api/templates/production-outputs.xlsx',
+    csvRoute: '/api/templates/production-outputs.csv',
+    recommendedFormat: 'xlsx',
+    appliesTo: ['基础台账', '产能单元', '月度产量'],
+    contractRoute: 'POST /api/production/outputs/import/preview -> POST /api/production/outputs/import/execute',
+    description: '用于预演并受控导入月度产量记录；产能单元编码必填且必须匹配 active 产能单元，同产能单元同月份已有 active 产量时 skip warning，不覆盖、不作废旧记录。',
+    headers: ['产能单元编码', '产能单元名称', '月份', '产量值', '产量单位', '数据来源', '备注'],
+    rows: [
+      ['PU-001', '一线产能单元', '2026-01', '1000', 't', 'upload', '编码优先；名称仅用于辅助校验/展示'],
+      ['PU-002', '二线产能单元', '2026/02', '2500', '件', '', 'data_source 为空时默认 upload']
+    ]
+  },
   'organization-units': {
     type: 'organization-units',
     name: '用能单元导入模板',

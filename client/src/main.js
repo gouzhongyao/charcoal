@@ -56,6 +56,12 @@ const state = {
   ledgerProductionUnitFilters: {},
   ledgerProductionOutputFilters: {},
   ledgerProductionIntensityFilters: {},
+  productionOutputImportPreview: null,
+  productionOutputImportPreviewLoading: false,
+  productionOutputImportPreviewError: null,
+  productionOutputImportExecuteLoading: false,
+  productionOutputImportExecuteResult: null,
+  productionOutputImportExecuteError: null,
   meterReadingGenerationPreview: null,
   meterReadingGenerationPreviewLoading: false,
   meterReadingGenerationPreviewError: null,
@@ -530,6 +536,7 @@ const TEMPLATE_FILE_NAMES = {
   'organization-units': '用能单元导入模板.xlsx',
   meters: '计量器具导入模板.xlsx',
   'meter-readings': '计量抄表导入模板.xlsx',
+  'production-outputs': '月度产量导入模板.xlsx',
   'carbon-factors': '碳因子维护模板.xlsx',
   'prediction-history': '预测历史数据模板.xlsx'
 };
@@ -2199,6 +2206,66 @@ function renderLedgerImportPanel(kind, result) {
   return createElement('div', { id: selector, className: 'inline-result', 'aria-live': 'polite' }, content);
 }
 
+function renderProductionOutputImportAudit(audit = {}) {
+  const summary = audit.summary || {};
+  const items = Array.isArray(audit.items) ? audit.items : [];
+  return [
+    renderMessage(
+      audit.executed ? 'success' : 'info',
+      audit.executed ? '月度产量导入已执行' : '月度产量导入预演结果',
+      `总行数 ${formatNumber(summary.totalRows, 0)}，可导入 ${formatNumber(summary.wouldImport, 0)}，已导入 ${formatNumber(audit.imported || summary.imported || 0, 0)}，跳过 ${formatNumber(summary.skipped || audit.skipped || 0, 0)}，阻断 ${formatNumber(summary.blocked || 0, 0)}，警告 ${formatNumber(summary.warnings || 0, 0)}，错误 ${formatNumber(summary.errors || 0, 0)}。${audit.backup?.backupName ? `备份：${audit.backup.backupName}。` : ''}`
+    ),
+    renderTable([
+      { key: 'rowNumber', label: '行号' },
+      { key: 'status', label: '状态', render: (row) => renderStatusPill(row.status || row.previewStatus) },
+      { key: 'productionUnitCode', label: '产能单元编码', render: (row) => createElement('span', { text: formatText(row.productionUnitCode || row.unitCode) }) },
+      { key: 'productionUnitName', label: '产能单元名称', render: (row) => createElement('span', { text: formatText(row.productionUnitName || row.unitName) }) },
+      { key: 'normalizedMonth', label: '月份' },
+      { key: 'outputValue', label: '产量值', render: (row) => createElement('span', { text: `${formatText(row.outputValue)} ${formatText(row.outputUnit, '')}` }) },
+      { key: 'reasonText', label: '错误/警告/说明', render: (row) => createElement('span', { text: row.reasonText || row.reason || row.reasonCodes || '-' }) }
+    ], items, '暂无行级明细。')
+  ];
+}
+
+function renderProductionOutputImportPanel() {
+  const preview = state.productionOutputImportPreview;
+  const executeResult = state.productionOutputImportExecuteResult;
+  const canExecute = preview?.previewSignature && Number(preview?.summary?.wouldImport || 0) > 0 && Array.isArray(preview?.candidateRowIds) && preview.candidateRowIds.length > 0;
+  const children = [
+    createElement('p', { className: 'muted', text: '月度产量导入采用 preview + signature + candidate rows + 自动备份 + 固定确认文本受控 execute。产能单元编码必填并优先匹配；名称仅辅助校验/展示；同产能单元同月份已有 active 产量时 skip warning，不覆盖、不作废旧记录。' }),
+    renderTemplateActions([{ type: 'production-outputs', label: '下载产量导入模板（Excel）' }]),
+    createElement('form', { id: 'production-output-import-preview-form', className: 'form-card' }, [
+      createElement('label', { className: 'field' }, [
+        createElement('span', { text: '导入月度产量文件（.xlsx / .xls / .csv）' }),
+        createElement('input', { type: 'file', name: 'file', accept: '.xlsx,.xls,.csv' })
+      ]),
+      createElement('div', { className: 'template-actions' }, [
+        createElement('button', { type: 'submit', className: 'btn btn-primary', text: state.productionOutputImportPreviewLoading ? '预演中...' : '运行导入预演', disabled: state.productionOutputImportPreviewLoading || state.productionOutputImportExecuteLoading ? 'disabled' : undefined }),
+        createElement('button', { type: 'button', className: 'btn btn-ghost', text: '导出当前筛选', dataset: { action: 'export-production-outputs' } }),
+        createElement('button', { type: 'button', className: 'btn btn-danger', text: '受控执行导入', disabled: canExecute && !state.productionOutputImportPreviewLoading && !state.productionOutputImportExecuteLoading ? undefined : 'disabled', dataset: { action: 'execute-production-output-import' } })
+      ]),
+      createElement('small', { className: 'muted', text: '受控执行固定确认文本：确认导入月度产量记录；请求体会携带 confirmText、previewSignature、expectedWouldImport、candidateRowIds、candidateRows、acknowledgeSkippedRisks=true、requireBackup=true。' })
+    ])
+  ];
+  if (state.productionOutputImportPreviewLoading || state.productionOutputImportExecuteLoading) {
+    children.push(renderLoading(state.productionOutputImportExecuteLoading ? '正在受控导入月度产量...' : '正在预演月度产量导入...'));
+  }
+  if (state.productionOutputImportPreviewError) {
+    children.push(renderMessage('error', '月度产量导入预演失败', state.productionOutputImportPreviewError));
+  }
+  if (state.productionOutputImportExecuteError) {
+    children.push(renderMessage('error', '月度产量受控导入失败', state.productionOutputImportExecuteError));
+  }
+  if (executeResult) {
+    children.push(...renderProductionOutputImportAudit(executeResult));
+  } else if (preview) {
+    children.push(...renderProductionOutputImportAudit(preview));
+  } else {
+    children.push(renderMessage('info', '月度产量导入预演', '选择文件并运行预演后，这里会展示 summary、行级状态、错误/警告、skipped 和 wouldImport 明细。'));
+  }
+  return renderCard('月度产量导入/导出', children);
+}
+
 function renderMeterReadingActions(row) {
   return createElement('div', { className: 'table-actions' }, [
     createElement('button', { type: 'button', className: 'btn btn-small', text: '编辑', dataset: { action: 'edit-ledger-reading', id: row.id } }),
@@ -2369,7 +2436,8 @@ async function renderLedger(edit = {}) {
       unitsResponse.ok ? renderProductionUnitForm(units, editingProductionUnit) : renderMessage('error', '用能单元读取失败', formatApiError(unitsResponse.error)),
       productionUnitsResponse.ok ? renderProductionOutputForm(productionUnits, editingProductionOutput) : renderMessage('error', '产能单元读取失败', formatApiError(productionUnitsResponse.error))
     ]));
-    root.append(renderMessage('info', 'P2 产能单元首期口径', '本页首期仅维护产能单元 + 月度产量 + 单位产品能耗；单位产品能耗分子为所属用能单元当月 active energy_records 汇总。跨能源类型/单位直接汇总仅作管理参考，需查看 energyByType 明细；发电/自发自用后置；碳核算联动后置。'));
+    root.append(renderMessage('info', 'P2 产能单元首期口径', '本页首期维护产能单元 + 月度产量 + 单位产品能耗；本轮新增月度产量模板下载、当前筛选导出、导入 preview 和固定确认文本受控 execute。单位产品能耗分子为所属用能单元当月 active energy_records 汇总；发电/自发自用后置；碳核算联动后置。'));
+    root.append(renderProductionOutputImportPanel());
     root.append(renderFilterRow('ledger-production-units', [
       { name: 'keyword', label: '产能单元关键词', value: state.ledgerProductionUnitFilters.keyword || '', placeholder: '编码/名称/产品/用能单元' },
       { name: 'organizationUnitId', label: '所属用能单元', type: 'select', value: state.ledgerProductionUnitFilters.organizationUnitId || '', options: getLedgerUnitOptions(units.filter((unit) => unit.status === 'active'), true, '全部用能单元') },
@@ -2614,6 +2682,79 @@ async function handleProductionUnitSubmit(event) {
   await renderLedger();
 }
 
+async function handleProductionOutputImportPreviewSubmit(event) {
+  event.preventDefault();
+  const form = getSubmittedForm(event, 'production-output-import-preview-form');
+  const fileInput = form?.querySelector('input[type="file"][name="file"]');
+  const file = fileInput?.files?.[0];
+  state.productionOutputImportPreviewError = null;
+  state.productionOutputImportExecuteError = null;
+  state.productionOutputImportExecuteResult = null;
+  state.productionOutputImportPreview = null;
+  if (!file) {
+    state.productionOutputImportPreviewError = '请先选择 .xlsx / .xls / .csv 月度产量导入文件。';
+    state.ledgerTab = 'production';
+    await renderLedger();
+    return;
+  }
+  const body = new FormData();
+  body.append('file', file);
+  state.productionOutputImportPreviewLoading = true;
+  state.ledgerTab = 'production';
+  await renderLedger();
+  const response = await safeApi('/production/outputs/import/preview', { method: 'POST', body });
+  state.productionOutputImportPreviewLoading = false;
+  if (!response.ok) {
+    state.productionOutputImportPreviewError = formatApiError(response.error);
+    await renderLedger();
+    return;
+  }
+  state.productionOutputImportPreview = response.value.data || {};
+  await renderLedger();
+}
+
+async function executeProductionOutputImport() {
+  const preview = state.productionOutputImportPreview;
+  const summary = preview?.summary || {};
+  const candidateRowIds = Array.isArray(preview?.candidateRowIds) ? preview.candidateRowIds : [];
+  if (!preview?.previewSignature || Number(summary.wouldImport || 0) <= 0 || candidateRowIds.length === 0) {
+    window.alert('请先运行月度产量导入预演，并确认存在 wouldImport 候选后再执行。');
+    return;
+  }
+  const confirmText = window.prompt(`受控导入会自动创建备份，并只写入最新 preview 中 wouldImport=true 的月度产量候选。\n\n已有 active 产量冲突、重复候选、无效行和阻断行均会 skipped，不覆盖、不作废旧记录，不自动创建产能单元。\n\n如确认执行，请输入固定确认文本：确认导入月度产量记录`);
+  if (confirmText !== '确认导入月度产量记录') {
+    window.alert('确认文本不匹配，已取消月度产量受控导入。');
+    return;
+  }
+  state.productionOutputImportExecuteLoading = true;
+  state.productionOutputImportExecuteError = null;
+  state.productionOutputImportExecuteResult = null;
+  state.ledgerTab = 'production';
+  await renderLedger();
+  const response = await safeApi('/production/outputs/import/execute', {
+    method: 'POST',
+    body: {
+      confirmText,
+      previewSignature: preview.previewSignature,
+      expectedWouldImport: Number(summary.wouldImport || 0),
+      candidateRowIds,
+      candidateRows: preview.candidateRows || [],
+      acknowledgeSkippedRisks: true,
+      requireBackup: true
+    }
+  });
+  state.productionOutputImportExecuteLoading = false;
+  if (!response.ok) {
+    state.productionOutputImportExecuteError = formatApiError(response.error);
+    await renderLedger();
+    return;
+  }
+  state.productionOutputImportExecuteResult = response.value.data || {};
+  state.productionOutputImportPreview = null;
+  state.ledgerProductionOutputFilters.productionUnitId = state.ledgerProductionOutputFilters.productionUnitId || '';
+  await renderLedger();
+}
+
 async function handleProductionOutputSubmit(event) {
   event.preventDefault();
   const form = getSubmittedForm(event, 'ledger-production-output-form');
@@ -2842,6 +2983,11 @@ async function exportLedgerMeters() {
 async function exportLedgerReadings() {
   const query = toQuery({ ...state.ledgerReadingFilters, format: 'xlsx' });
   await downloadLedgerExport(`/meter-readings/export${query}`, '计量抄表导出.xlsx', '抄表导出已触发', '抄表导出');
+}
+
+async function exportProductionOutputs() {
+  const query = toQuery({ ...state.ledgerProductionOutputFilters, format: 'xlsx' });
+  await downloadLedgerExport(`/production/outputs/export${query}`, '月度产量导出.xlsx', '月度产量导出已触发', '月度产量导出');
 }
 
 async function exportEnergyLedgerBackfillPreview() {
@@ -3283,6 +3429,10 @@ function bindEvents() {
       await exportLedgerMeters();
     } else if (action === 'export-ledger-readings') {
       await exportLedgerReadings();
+    } else if (action === 'export-production-outputs') {
+      await exportProductionOutputs();
+    } else if (action === 'execute-production-output-import') {
+      await executeProductionOutputImport();
     } else if (action === 'run-meter-reading-generation-preview') {
       await runMeterReadingGenerationPreview();
     } else if (action === 'export-meter-reading-generation-preview') {
@@ -3373,6 +3523,8 @@ function bindEvents() {
         await handleProductionUnitSubmit(event);
       } else if (form.id === 'ledger-production-output-form') {
         await handleProductionOutputSubmit(event);
+      } else if (form.id === 'production-output-import-preview-form') {
+        await handleProductionOutputImportPreviewSubmit(event);
       } else if (form.id === 'ledger-reading-import-form') {
         await handleMeterReadingImportSubmit(event);
       } else if (form.id === 'ledger-units-filters') {

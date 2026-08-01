@@ -35,15 +35,23 @@ const {
 } = require('../services/templateService');
 const {
   buildEnergyIntensityRow,
+  buildProductionOutputExportRows,
+  buildProductionOutputImportIndexes,
+  buildProductionOutputImportPreviewFromRows,
   createProductionOutput,
+  createProductionOutputImportPreviewFromUpload,
   createProductionUnit,
   deactivateProductionUnit,
+  executeProductionOutputImport,
+  exportProductionOutputs,
   getUnitEnergyIntensity,
+  mapProductionOutputImportFields,
   normalizeMonth,
   normalizeProductionOutputPayload,
   normalizeProductionUnitPayload,
   updateProductionOutput,
   updateProductionUnit,
+  validateAndNormalizeProductionOutputImportRow,
   voidProductionOutput
 } = require('../services/productionService');
 const {
@@ -154,6 +162,54 @@ assert.strictEqual(mixedIntensity.status, 'calculable');
 assert.strictEqual(mixedIntensity.energyIntensity, 15);
 assert.strictEqual(mixedIntensity.energyUnit, 'mixed');
 assert(mixedIntensity.notice.includes('不做跨能源等价换算'), '跨能源类型汇总必须提示谨慎解读。');
+const productionImportIndexes = buildProductionOutputImportIndexes({
+  productionUnits: [
+    { id: 1, unitCode: 'PU-A', unitName: '一线', organizationUnitId: 10, organizationUnitPath: '总厂/一线', productName: '产品A', outputUnit: 't', status: 'active' },
+    { id: 2, unitCode: 'PU-B', unitName: '重名', organizationUnitId: 11, organizationUnitPath: '总厂/二线', productName: '产品B', outputUnit: '件', status: 'active' },
+    { id: 3, unitCode: 'PU-C', unitName: '重名', organizationUnitId: 12, organizationUnitPath: '总厂/三线', productName: '产品C', outputUnit: '件', status: 'active' },
+    { id: 4, unitCode: 'PU-D', unitName: '停用产能', organizationUnitId: 13, organizationUnitPath: '总厂/停用', productName: '产品D', outputUnit: 't', status: 'inactive' }
+  ],
+  activeOutputs: [{ id: 99, productionUnitId: 1, normalizedMonth: '2026-01' }]
+});
+assert.deepStrictEqual(mapProductionOutputImportFields({ 产能单元编码: 'PU-A', 月份: '2026-02', 产量值: '10', 产量单位: 't' }).mapped, {
+  unitCode: 'PU-A',
+  normalizedMonth: '2026-02',
+  outputValue: '10',
+  outputUnit: 't'
+});
+const validProductionImport = validateAndNormalizeProductionOutputImportRow({ unit_code: 'PU-A', unit_name: '一线', normalized_month: '2026/02', output_value: '10', output_unit: 't', data_source: 'upload' }, 2, productionImportIndexes, new Set());
+assert.strictEqual(validProductionImport.status, 'wouldImport', '有效月度产量导入行应为 wouldImport。');
+const missingProductionCode = validateAndNormalizeProductionOutputImportRow({ unit_name: '一线', normalized_month: '2026-02', output_value: '10', output_unit: 't' }, 3, productionImportIndexes, new Set());
+assert(missingProductionCode.reasons.some((reason) => reason.code === 'REQUIRED_FIELD_MISSING'), '缺 unitCode 应明确报错。');
+const unknownProductionCode = validateAndNormalizeProductionOutputImportRow({ unit_code: 'PU-X', normalized_month: '2026-02', output_value: '10', output_unit: 't' }, 4, productionImportIndexes, new Set());
+assert(unknownProductionCode.reasons.some((reason) => reason.code === 'UNKNOWN_PRODUCTION_UNIT'), '未知 unitCode 应明确报错且不自动创建。');
+const inactiveProductionImport = validateAndNormalizeProductionOutputImportRow({ unit_code: 'PU-D', unit_name: '停用产能', normalized_month: '2026-02', output_value: '10', output_unit: 't' }, 5, productionImportIndexes, new Set());
+assert(inactiveProductionImport.reasons.some((reason) => reason.code === 'INACTIVE_PRODUCTION_UNIT'), 'inactive 产能单元应阻断导入。');
+const nameMismatchProductionImport = validateAndNormalizeProductionOutputImportRow({ unit_code: 'PU-A', unit_name: '错误名称', normalized_month: '2026-02', output_value: '10', output_unit: 't' }, 6, productionImportIndexes, new Set());
+assert(nameMismatchProductionImport.reasons.some((reason) => reason.code === 'PRODUCTION_UNIT_NAME_MISMATCH'), 'unitName 与编码匹配结果不一致应报错。');
+const ambiguousProductionName = validateAndNormalizeProductionOutputImportRow({ unit_code: 'PU-B', unit_name: '重名', normalized_month: '2026-02', output_value: '10', output_unit: '件' }, 7, productionImportIndexes, new Set());
+assert(ambiguousProductionName.reasons.some((reason) => reason.code === 'AMBIGUOUS_PRODUCTION_UNIT_NAME'), 'unitName 名称歧义应报错。');
+const invalidProductionMonth = validateAndNormalizeProductionOutputImportRow({ unit_code: 'PU-A', normalized_month: '2026-13', output_value: '10', output_unit: 't' }, 8, productionImportIndexes, new Set());
+assert(invalidProductionMonth.reasons.some((reason) => reason.code === 'INVALID_MONTH'), '月份无效应明确报错。');
+const invalidProductionValue = validateAndNormalizeProductionOutputImportRow({ unit_code: 'PU-A', normalized_month: '2026-02', output_value: '0', output_unit: 't' }, 9, productionImportIndexes, new Set());
+assert(invalidProductionValue.reasons.some((reason) => reason.code === 'INVALID_POSITIVE_NUMBER'), '产量 <= 0 应明确报错。');
+const unitMismatchProductionImport = validateAndNormalizeProductionOutputImportRow({ unit_code: 'PU-A', unit_name: '一线', normalized_month: '2026-02', output_value: '10', output_unit: 'kg' }, 10, productionImportIndexes, new Set());
+assert(unitMismatchProductionImport.reasons.some((reason) => reason.code === 'OUTPUT_UNIT_MISMATCH'), '单位不一致应明确 warning/block。');
+const conflictProductionImport = validateAndNormalizeProductionOutputImportRow({ unit_code: 'PU-A', unit_name: '一线', normalized_month: '2026-01', output_value: '10', output_unit: 't' }, 11, productionImportIndexes, new Set());
+assert.strictEqual(conflictProductionImport.status, 'skipped', '同月 active 冲突应 skipped。');
+assert(conflictProductionImport.reasons.some((reason) => reason.code === 'DUPLICATE_ACTIVE_PRODUCTION_OUTPUT_SKIPPED'), '同月 active 冲突应有 warning 明细。');
+assert.deepStrictEqual(buildProductionOutputExportRows([{ productionUnitCode: 'PU-A', productionUnitName: '一线', organizationUnitPath: '总厂/一线', productName: '产品A', normalizedMonth: '2026-01', outputValue: 10, outputUnit: 't', dataSource: 'upload', recordStatus: 'active', remark: '导出' }])[0], {
+  '产能单元编码': 'PU-A',
+  '产能单元名称': '一线',
+  '所属用能单元': '总厂/一线',
+  '产品名称': '产品A',
+  '月份': '2026-01',
+  '产量值': 10,
+  '产量单位': 't',
+  '数据来源': 'upload',
+  '状态': 'active',
+  '备注': '导出'
+});
 
 const meterPayload = normalizeMeterPayload({
   meterCode: ' M-001 ',
@@ -277,12 +333,20 @@ assert.deepStrictEqual(createDeactivationResult({ id: 1 }, { energyRecords: 2, m
 
 const organizationTemplate = getTemplateDefinition('organization-units');
 const meterTemplate = getTemplateDefinition('meters');
+const productionOutputTemplate = getTemplateDefinition('production-outputs');
 assert(organizationTemplate, '应提供 organization-units 台账导入模板。');
 assert(meterTemplate, '应提供 meters 台账导入模板。');
+assert(productionOutputTemplate, '应提供 production-outputs 月度产量导入模板。');
 assert.strictEqual(organizationTemplate.contractRoute, 'POST /api/organization/units/import');
 assert.strictEqual(meterTemplate.contractRoute, 'POST /api/meters/import');
+assert.strictEqual(productionOutputTemplate.contractRoute, 'POST /api/production/outputs/import/preview -> POST /api/production/outputs/import/execute');
+['产能单元编码', '产能单元名称', '月份', '产量值', '产量单位', '数据来源', '备注'].forEach((header) => {
+  assert(productionOutputTemplate.headers.includes(header), `production-outputs 模板应包含 ${header}。`);
+});
 assert(getTemplateCsv('organization-units').csv.includes('unit_code'), '用能单元模板应支持 CSV 下载。');
+assert(getTemplateCsv('production-outputs').csv.includes('产量值'), '月度产量模板应支持 CSV 下载。');
 assert(getTemplateXlsx('meters').buffer.length > 0, '计量器具模板应支持 xlsx 下载。');
+assert(getTemplateXlsx('production-outputs').buffer.length > 0, '月度产量模板应支持 xlsx 下载。');
 
 assert(importBatchesImportTypeCheckAllowsLedgerTypes("CREATE TABLE import_batches (import_type TEXT CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device')))"), 'import_batches 新 CHECK 应允许台账导入类型。');
 assert(!importBatchesImportTypeCheckAllowsLedgerTypes("CREATE TABLE import_batches (import_type TEXT CHECK (import_type IN ('energy_record', 'meter_reading')))"), '旧 import_batches CHECK 应被识别为需迁移。');
@@ -1081,23 +1145,30 @@ assert.deepStrictEqual(buildMeterReadingExportRows([{ meterCode: 'M-20', meterNa
 
 const productionSmokeScript = String.raw`
 const assert = require('assert');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+(async () => {
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'charcoal-production-p2-'));
 try {
   process.env.DATA_DIR = path.join(tmpDir, 'data');
   process.env.SQLITE_PATH = path.join(process.env.DATA_DIR, 'production-p2.sqlite');
   process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
   process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
+  process.env.PRODUCTION_OUTPUT_IMPORT_HMAC_SECRET = 'test-production-output-import-hmac-secret';
 
   const { getDatabaseInfo, initDatabase, openDatabase } = require(path.join(process.cwd(), 'server', 'src', 'db', 'database'));
   const { createOrganizationUnit } = require(path.join(process.cwd(), 'server', 'src', 'services', 'ledgerService'));
   const {
+    buildProductionOutputImportPreviewFromRows,
     createProductionOutput,
+    createProductionOutputImportPreviewFromUpload,
     createProductionUnit,
     deactivateProductionUnit,
+    executeProductionOutputImport,
+    exportProductionOutputs,
     getUnitEnergyIntensity,
     listProductionOutputs,
     listProductionUnits,
@@ -1105,6 +1176,20 @@ try {
     updateProductionUnit,
     voidProductionOutput
   } = require(path.join(process.cwd(), 'server', 'src', 'services', 'productionService'));
+
+  function stableStringify(value) {
+    if (Array.isArray(value)) {
+      return '[' + value.map(stableStringify).join(',') + ']';
+    }
+    if (value && typeof value === 'object') {
+      return '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + stableStringify(value[key])).join(',') + '}';
+    }
+    return JSON.stringify(value);
+  }
+
+  function sha256Json(value) {
+    return crypto.createHash('sha256').update(stableStringify(value)).digest('hex');
+  }
 
   initDatabase();
   assert.strictEqual(getDatabaseInfo().databasePath, process.env.SQLITE_PATH, '产能 P2 smoke 必须使用隔离 SQLite 文件。');
@@ -1141,6 +1226,87 @@ try {
   const updatedOutput = updateProductionOutput(febOutput2.id, { outputValue: 30, remark: '更新产量' });
   assert.strictEqual(updatedOutput.outputValue, 30);
   assert.strictEqual(listProductionOutputs({ productionUnitId: unit.id, status: 'active' }).rows.length, 2);
+  const importOnlyUnit = createProductionUnit({ unitCode: 'PU-IMP', unitName: '导入产能单元', organizationUnitId: workshop.id, productName: '产品导入', outputUnit: 't' });
+  const inactiveImportUnit = createProductionUnit({ unitCode: 'PU-OLD', unitName: '已停用产能单元', organizationUnitId: workshop.id, productName: '产品旧', outputUnit: 't' });
+  deactivateProductionUnit(inactiveImportUnit.id);
+  const exportCsv = exportProductionOutputs({ format: 'csv', productionUnitId: unit.id });
+  assert.strictEqual(exportCsv.format, 'csv');
+  assert(exportCsv.body.toString('utf8').includes('产能单元编码'), '月度产量 CSV 导出应包含字段表头。');
+  assert(exportCsv.body.toString('utf8').includes('PU-001A'), '月度产量 CSV 导出应包含当前筛选产能单元。');
+  const exportXlsx = exportProductionOutputs({ format: 'xlsx', productionUnitId: unit.id });
+  assert.strictEqual(exportXlsx.format, 'xlsx');
+  assert(exportXlsx.body.length > 0, '月度产量 xlsx 导出应返回非空文件。');
+
+  const productionImportCsvPath = path.join(tmpDir, 'production-outputs.csv');
+  fs.writeFileSync(productionImportCsvPath, '﻿unit_code,unit_name,normalized_month,output_value,output_unit,data_source,remark\nPU-IMP,导入产能单元,2026-04,100,t,upload,可导入\nPU-001A,一线产能单元-改,2026-01,100,件,upload,已有 active 冲突\n,一线产能单元-改,2026-05,100,件,upload,缺编码\nPU-MISSING,未知,2026-05,100,件,upload,未知编码\nPU-OLD,已停用产能单元,2026-05,100,t,upload,停用产能\nPU-IMP,错误名称,2026-05,100,t,upload,名称不匹配\nPU-IMP,导入产能单元,2026-13,100,t,upload,月份无效\nPU-IMP,导入产能单元,2026-05,0,t,upload,产量无效\nPU-IMP,导入产能单元,2026-05,100,kg,upload,单位不一致\n', 'utf8');
+  const uploadPreview = createProductionOutputImportPreviewFromUpload({ path: productionImportCsvPath, originalname: 'production-outputs.csv', filename: 'production-outputs.csv', size: fs.statSync(productionImportCsvPath).size });
+  assert.strictEqual(uploadPreview.dryRun, true);
+  assert.strictEqual(uploadPreview.writesProductionOutputs, false);
+  assert.strictEqual(uploadPreview.persistsImportBatch, false);
+  assert.strictEqual(uploadPreview.summary.wouldImport, 1, '有效行应为 wouldImport。');
+  assert.strictEqual(uploadPreview.summary.skipped, 1, '已有 active 产量冲突应 skipped。');
+  assert(uploadPreview.items.some((item) => item.status === 'skipped' && item.reasonCodes.includes('DUPLICATE_ACTIVE_PRODUCTION_OUTPUT_SKIPPED')), '冲突行应 skipped 并带 warning。');
+  ['REQUIRED_FIELD_MISSING', 'UNKNOWN_PRODUCTION_UNIT', 'INACTIVE_PRODUCTION_UNIT', 'PRODUCTION_UNIT_NAME_MISMATCH', 'INVALID_MONTH', 'INVALID_POSITIVE_NUMBER', 'OUTPUT_UNIT_MISMATCH'].forEach((code) => {
+    assert(uploadPreview.items.some((item) => String(item.reasonCodes || '').includes(code)), 'preview 应包含 ' + code + ' 明细。');
+  });
+  assert.deepStrictEqual(uploadPreview.candidateRowIds, [2], 'candidateRowIds 只包含 wouldImport 行号。');
+  assert(uploadPreview.previewSignature.startsWith('hmac-sha256:v2:'), 'previewSignature 应使用服务端 HMAC 版本前缀。');
+  assert(!JSON.stringify(uploadPreview).includes(process.env.PRODUCTION_OUTPUT_IMPORT_HMAC_SECRET), 'preview 响应不得泄露 HMAC secret。');
+  const tamperedCandidateRows = uploadPreview.candidateRows.map((row) => ({ ...row }));
+  tamperedCandidateRows[0].outputValue = 101;
+  const plainShaForgedSignature = sha256Json({
+    version: 'production-output-import-preview:v2',
+    summary: uploadPreview.summary,
+    candidateRowIds: uploadPreview.candidateRowIds,
+    candidateRows: tamperedCandidateRows
+  });
+  await assert.rejects(
+    () => executeProductionOutputImport({ confirmText: '确认导入月度产量记录', previewSignature: plainShaForgedSignature, expectedWouldImport: uploadPreview.summary.wouldImport, candidateRowIds: uploadPreview.candidateRowIds, candidateRows: tamperedCandidateRows, acknowledgeSkippedRisks: true, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PRODUCTION_OUTPUT_IMPORT_PREVIEW_SIGNATURE_MISMATCH' && !JSON.stringify(error.details).includes(process.env.PRODUCTION_OUTPUT_IMPORT_HMAC_SECRET)
+  );
+  const tamperedSummaryCandidateRows = uploadPreview.candidateRows.map((row) => ({ ...row, unitCode: row.rowNumber === 2 ? 'PU-MISSING' : row.unitCode }));
+  await assert.rejects(
+    () => executeProductionOutputImport({ confirmText: '确认导入月度产量记录', previewSignature: uploadPreview.previewSignature, expectedWouldImport: uploadPreview.summary.wouldImport, candidateRowIds: uploadPreview.candidateRowIds, candidateRows: tamperedSummaryCandidateRows, acknowledgeSkippedRisks: true, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PRODUCTION_OUTPUT_IMPORT_PREVIEW_SIGNATURE_MISMATCH'
+  );
+  const beforeImportOutputCount = listProductionOutputs({ productionUnitId: importOnlyUnit.id, status: 'active' }).rows.length;
+  await assert.rejects(
+    () => executeProductionOutputImport({ confirmText: '错误确认文本', previewSignature: uploadPreview.previewSignature, expectedWouldImport: uploadPreview.summary.wouldImport, candidateRowIds: uploadPreview.candidateRowIds, candidateRows: uploadPreview.candidateRows, acknowledgeSkippedRisks: true, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PRODUCTION_OUTPUT_IMPORT_CONFIRM_TEXT_MISMATCH'
+  );
+  await assert.rejects(
+    () => executeProductionOutputImport({ confirmText: '确认导入月度产量记录', previewSignature: 'signature-mismatch', expectedWouldImport: uploadPreview.summary.wouldImport, candidateRowIds: uploadPreview.candidateRowIds, candidateRows: uploadPreview.candidateRows, acknowledgeSkippedRisks: true, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PRODUCTION_OUTPUT_IMPORT_PREVIEW_SIGNATURE_MISMATCH'
+  );
+  await assert.rejects(
+    () => executeProductionOutputImport({ confirmText: '确认导入月度产量记录', previewSignature: uploadPreview.previewSignature, expectedWouldImport: uploadPreview.summary.wouldImport + 1, candidateRowIds: uploadPreview.candidateRowIds, candidateRows: uploadPreview.candidateRows, acknowledgeSkippedRisks: true, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PRODUCTION_OUTPUT_IMPORT_WOULD_IMPORT_MISMATCH'
+  );
+  await assert.rejects(
+    () => executeProductionOutputImport({ confirmText: '确认导入月度产量记录', previewSignature: uploadPreview.previewSignature, expectedWouldImport: uploadPreview.summary.wouldImport, candidateRowIds: [999], candidateRows: uploadPreview.candidateRows, acknowledgeSkippedRisks: true, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PRODUCTION_OUTPUT_IMPORT_CANDIDATE_ROW_IDS_MISMATCH'
+  );
+  await assert.rejects(
+    () => executeProductionOutputImport({ confirmText: '确认导入月度产量记录', previewSignature: uploadPreview.previewSignature, expectedWouldImport: uploadPreview.summary.wouldImport, candidateRowIds: uploadPreview.candidateRowIds, candidateRows: uploadPreview.candidateRows, acknowledgeSkippedRisks: false, requireBackup: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PRODUCTION_OUTPUT_IMPORT_SKIPPED_RISKS_ACK_REQUIRED'
+  );
+  await assert.rejects(
+    () => executeProductionOutputImport({ confirmText: '确认导入月度产量记录', previewSignature: uploadPreview.previewSignature, expectedWouldImport: uploadPreview.summary.wouldImport, candidateRowIds: uploadPreview.candidateRowIds, candidateRows: uploadPreview.candidateRows, acknowledgeSkippedRisks: true }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PRODUCTION_OUTPUT_IMPORT_BACKUP_REQUIRED'
+  );
+  const importAudit = await executeProductionOutputImport({ confirmText: '确认导入月度产量记录', previewSignature: uploadPreview.previewSignature, expectedWouldImport: uploadPreview.summary.wouldImport, candidateRowIds: uploadPreview.candidateRowIds, candidateRows: uploadPreview.candidateRows, acknowledgeSkippedRisks: true, requireBackup: true });
+  assert(!JSON.stringify(importAudit).includes(process.env.PRODUCTION_OUTPUT_IMPORT_HMAC_SECRET), 'execute 审计响应不得泄露 HMAC secret。');
+  assert.strictEqual(importAudit.imported, 1, '成功 execute 只应插入 wouldImport 行。');
+  assert.strictEqual(importAudit.skipped, 8, '冲突和错误/阻断行均应跳过。');
+  assert(importAudit.backup && importAudit.backup.reason === 'production-output-import', '执行前应自动生成 production-output-import 备份。');
+  assert(fs.existsSync(importAudit.backup.path), '月度产量导入备份应存在于隔离 BACKUPS_DIR。');
+  assert.strictEqual(path.dirname(importAudit.backup.path), process.env.BACKUPS_DIR, '月度产量导入备份必须写入隔离目录。');
+  const afterImportOutputs = listProductionOutputs({ productionUnitId: importOnlyUnit.id, status: 'active' }).rows;
+  assert.strictEqual(afterImportOutputs.length, beforeImportOutputCount + 1, 'execute 后只应新增一条 active 产量。');
+  assert(afterImportOutputs.some((row) => row.normalizedMonth === '2026-04' && row.outputValue === 100), 'wouldImport 行应写入 2026-04 产量。');
+  assert.strictEqual(listProductionOutputs({ productionUnitId: unit.id, status: 'active' }).rows.filter((row) => row.normalizedMonth === '2026-01').length, 1, '冲突行不得覆盖或新增同月 active 产量。');
+  const replayPreview = buildProductionOutputImportPreviewFromRows(uploadPreview.candidateRows);
+  assert.strictEqual(replayPreview.summary.wouldImport, 0, '导入成功后重新预演同一候选应不再 wouldImport。');
 
   const db = openDatabase();
   const electricity = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity' AND is_active = 1").get();
@@ -1178,6 +1344,10 @@ try {
 } finally {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 }
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
 `;
 execFileSync(process.execPath, ['-e', productionSmokeScript], { cwd: path.join(__dirname, '..', '..', '..'), stdio: 'pipe' });
 
