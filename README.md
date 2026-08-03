@@ -29,10 +29,10 @@
 | `UPLOADS_DIR` | 上传文件目录 | `DATA_DIR/uploads` |
 | `BACKUPS_DIR` | 备份文件目录 | `DATA_DIR/backups` |
 | `SQLITE_PATH` | SQLite 数据库文件路径 | `DATA_DIR/energy-carbon.sqlite` |
-| `CORS_ALLOWED_ORIGINS` | 额外允许的本地前端来源，逗号分隔 | 空 |
+| `CORS_ALLOWED_ORIGINS` | 额外允许的前端 Origin，逗号分隔；仅接受合法 `http:` / `https:` 精确 Origin | 空 |
 | `VITE_API_BASE_URL` / `VITE_API_BASE` | 前端构建或启动时的默认 API Base | `http://127.0.0.1:3002/api` |
 
-注意：当前后端 CORS 校验只接受本地来源，例如 `localhost`、`127.0.0.1`。外网完整访问建议使用“同一个公网域名按路径转发前端和 `/api/*`”的方式，避免跨域失败。
+注意：后端 CORS 默认只接受本地来源，例如 `localhost`、`127.0.0.1`、`[::1]`。外网完整访问优先推荐“同一个公网域名按路径转发前端和 `/api/*`”的方式；如使用前端和 API 两个随机公网隧道，必须把前端公网 Origin 精确配置到 `CORS_ALLOWED_ORIGINS`，仅适合可信短期演示。
 
 ## 环境要求
 
@@ -149,7 +149,7 @@ cloudflared tunnel --url http://127.0.0.1:7777
 
 命令会输出一个 `https://*.trycloudflare.com` 临时地址。该方式主要用于查看前端页面。远端浏览器如果仍使用默认 `http://127.0.0.1:3002/api`，会访问远端设备自己的本机地址，无法连接你的后端。
 
-不建议使用两个随机公网地址分别暴露前端和 API 后直接拼接 `apiBase`，因为当前后端只允许本地来源，浏览器跨域请求通常会被 CORS 拦截。
+更推荐使用下方“同一域名路径转发”。如果只能使用两个随机公网地址分别暴露前端和 API，也必须先把前端公网 Origin 精确配置到后端 `CORS_ALLOWED_ORIGINS`，再把页面 `apiBase` 指向 API 隧道；该方式仅适合可信短期演示，不要使用 `*` 或任意公网 Origin 放行。
 
 ### 推荐的完整临时体验方式：同一域名路径转发
 
@@ -183,7 +183,7 @@ cloudflared tunnel run energy-carbon-demo
 https://energy.example.com/?apiBase=https://energy.example.com/api
 ```
 
-这样前端页面和 API 处于同一公网来源，可避免当前本地 CORS 策略带来的跨域问题。
+这样前端页面和 API 处于同一公网来源，可避免双随机隧道带来的跨域配置复杂度。
 
 ### 生产部署提醒
 
@@ -209,7 +209,7 @@ ngrok http 7777
 
 命令会输出一个 `https://*.ngrok-free.app` 或你的 ngrok 域名。该方式主要用于查看前端页面。远端浏览器默认无法访问你本机的 `127.0.0.1:3002` 后端。
 
-如果再单独执行 `ngrok http 3002` 暴露后端，并把页面 `apiBase` 指向后端 ngrok 地址，浏览器通常会因为前端域名和 API 域名不同而触发 CORS 限制。当前项目未面向任意公网 Origin 开放 CORS，因此不建议这样做完整演示。
+如果再单独执行 `ngrok http 3002` 暴露后端，并把页面 `apiBase` 指向后端 ngrok 地址，浏览器会因为前端域名和 API 域名不同而触发跨域校验。只有将前端 ngrok Origin 精确配置到后端 `CORS_ALLOWED_ORIGINS` 后，才适合可信短期演示；当前项目不会面向任意公网 Origin 自动开放 CORS。
 
 ### 完整体验方式
 
@@ -256,7 +256,7 @@ https://<你的-ngrok-域名>/?apiBase=https://<你的-ngrok-域名>/api
 
 ### 外网地址能打开页面，但数据加载失败
 
-通常是 API Base 指向了远端设备自己的 `127.0.0.1`，或前端和 API 分属不同公网域名导致 CORS 被拦截。完整外网体验请使用同一公网域名路径转发：`/api/*` 到后端，其余路径到前端，并访问 `?apiBase=https://同一域名/api`。
+通常是 API Base 指向了远端设备自己的 `127.0.0.1`，或前端和 API 分属不同公网域名但后端未精确放行前端公网 Origin。完整外网体验优先使用同一公网域名路径转发：`/api/*` 到后端，其余路径到前端，并访问 `?apiBase=https://同一域名/api`；双随机隧道只适合将前端 Origin 写入 `CORS_ALLOWED_ORIGINS` 后做可信短期演示。
 
 ### 导入失败或出现警告
 

@@ -22,20 +22,29 @@ const port = Number(process.env.PORT || 3002);
 const defaultAllowedOrigins = [
   'http://127.0.0.1:5173',
   'http://localhost:5173',
+  'http://[::1]:5173',
   'http://127.0.0.1:7777',
-  'http://localhost:7777'
+  'http://localhost:7777',
+  'http://[::1]:7777'
 ];
 
 function parseAllowedOrigin(origin) {
   const rawOrigin = String(origin || '').trim();
-  if (!rawOrigin) {
+  if (!rawOrigin || rawOrigin.includes('*')) {
     return '';
   }
   try {
     const parsedOrigin = new URL(rawOrigin);
-    const hostname = parsedOrigin.hostname.toLowerCase();
-    const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
-    if (!['http:', 'https:'].includes(parsedOrigin.protocol) || !isLocalHost) {
+    if (!['http:', 'https:'].includes(parsedOrigin.protocol)) {
+      return '';
+    }
+    if (!parsedOrigin.hostname || parsedOrigin.username || parsedOrigin.password) {
+      return '';
+    }
+    if (parsedOrigin.pathname !== '/' || parsedOrigin.search || parsedOrigin.hash) {
+      return '';
+    }
+    if (parsedOrigin.origin === 'null') {
       return '';
     }
     return parsedOrigin.origin;
@@ -44,15 +53,23 @@ function parseAllowedOrigin(origin) {
   }
 }
 
-const envAllowedOrigins = String(process.env.CORS_ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(parseAllowedOrigin)
-  .filter(Boolean);
-const allowedOrigins = new Set([...defaultAllowedOrigins, ...envAllowedOrigins]);
+function buildAllowedOrigins(corsAllowedOrigins = process.env.CORS_ALLOWED_ORIGINS || '') {
+  const envAllowedOrigins = String(corsAllowedOrigins)
+    .split(',')
+    .map(parseAllowedOrigin)
+    .filter(Boolean);
+  return new Set([...defaultAllowedOrigins, ...envAllowedOrigins]);
+}
+
+function isCorsOriginAllowed(origin, allowedOriginsSet = allowedOrigins) {
+  return !origin || allowedOriginsSet.has(origin);
+}
+
+const allowedOrigins = buildAllowedOrigins();
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin)) {
+    if (isCorsOriginAllowed(origin)) {
       callback(null, true);
       return;
     }
@@ -91,4 +108,11 @@ if (require.main === module) {
   start();
 }
 
-module.exports = { app, start };
+module.exports = {
+  app,
+  start,
+  defaultAllowedOrigins,
+  parseAllowedOrigin,
+  buildAllowedOrigins,
+  isCorsOriginAllowed
+};
