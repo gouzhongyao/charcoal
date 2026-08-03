@@ -14,8 +14,8 @@ const importOptionalFields = [
   { key: 'data_time', internalKey: 'dataTime', label: '数据时间；period 为空时可用于月份标准化' },
   { key: 'site', label: '厂区/站点' },
   { key: 'department', label: '部门' },
-  { key: 'productionLine', label: '产线' },
-  { key: 'businessDimension', label: '业务维度' },
+  { key: 'production_line', internalKey: 'productionLine', label: '产线' },
+  { key: 'business_dimension', internalKey: 'businessDimension', label: '业务维度' },
   { key: 'remark', label: '备注' }
 ];
 
@@ -58,8 +58,12 @@ function getImportContract() {
       value: ['value', '用量', '消费量', '数值'],
       unit: ['unit', '单位', '计量单位'],
       organization_unit: ['organization_unit', '用能单元', '部门', '车间', '工序'],
+      site: ['site', '地点', '厂区/站点'],
+      department: ['department', '部门', '车间'],
+      production_line: ['production_line', 'productionLine', '产线', '生产线'],
       meter_name: ['meter_name', '仪表', '表计', '计量点'],
       data_time: ['data_time', '数据时间', '采集时间'],
+      business_dimension: ['business_dimension', 'businessDimension', '业务维度'],
       remark: ['remark', '备注']
     },
     deletion: {
@@ -99,7 +103,7 @@ function getMeterReadingContract() {
     },
     importFields: ['reading_date', 'meter_code', 'meter_name', 'previous_value', 'current_value', 'multiplier', 'usage_value', 'unit', 'organization_unit', 'remark'],
     importPolicy: '支持 .xlsx/.xls/.csv；计量器具按 meter_code 精确匹配，或 organization_unit + meter_name 匹配；必须 active 且 allow_manual_reading=1；重复按 meter_device_id + reading_date + upload 来源 active 记录默认 skip 并写 warning。',
-    exportFields: ['仪表编码', '仪表名称', '用能单元', '能源类型', '抄表日期', '表码', '倍率', '用量', '标准化用量', '状态', '备注'],
+    exportFields: ['仪表编码', '仪表名称', '用能单元', '能源类型编码', '能源类型', '抄表日期', '上期表码', '本期表码', '倍率', '用量', '单位', '标准化用量', '标准单位', '状态', '备注', '导入批次'],
     statisticsPolicy: '抄表导入只写入 meter_reading_records，不自动写入 energy_records，也不自动进入能耗统计。'
   };
 }
@@ -153,7 +157,7 @@ function getCarbonContract() {
       recommendedFormat: 'xlsx',
       carbonFactors: 'GET /api/templates/carbon-factors.xlsx',
       csvCompatibility: 'GET /api/templates/carbon-factors.csv',
-      note: '当前碳因子模板用于维护参考和字段整理，默认下载 Excel .xlsx，CSV 仅保留兼容；字段包含有效开始日期、有效结束日期和是否启用；页面按表单逐条保存，未提供碳因子批量上传接口。'
+      note: '当前碳因子模板用于维护参考和字段整理，默认下载 Excel .xlsx，CSV 仅保留兼容；字段使用能源类型编码、有效开始日期、有效结束日期和 true/false 是否启用；页面按表单逐条保存，未提供碳因子批量上传接口。'
     }
   };
 }

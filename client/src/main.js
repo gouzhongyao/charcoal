@@ -899,7 +899,7 @@ async function renderImports() {
           { type: 'energy-records', label: '下载能耗数据导入模板（Excel）' },
           { type: 'prediction-history', label: '下载预测历史模板（Excel）' }
         ]),
-        createElement('p', { className: 'muted', text: '模板由本地后端生成，能耗导入首期字段覆盖 period、energy_type/energy_name、value、unit、organization_unit、meter_name、data_time、remark；上传支持 .xlsx / .xls / .csv，默认后端 API Base 保留为 http://127.0.0.1:3002/api。' }),
+        createElement('p', { className: 'muted', text: '模板由本地后端生成，能耗导入首期字段覆盖 period、energy_type/energy_name、value、unit、organization_unit、site、department、production_line、meter_name、data_time、business_dimension、remark；上传支持 .xlsx / .xls / .csv，默认后端 API Base 保留为 http://127.0.0.1:3002/api。' }),
         createElement('form', { id: 'import-form', className: 'form-card' }, [
           createElement('label', { className: 'field' }, [
             createElement('span', { text: '表格文件（.xlsx / .xls / .csv，最大 10MB）' }),
@@ -914,7 +914,7 @@ async function renderImports() {
           ]),
           createElement('label', { className: 'field' }, [
             createElement('span', { text: '字段映射 JSON（可选）' }),
-            createElement('textarea', { name: 'fieldMapping', rows: '5', placeholder: '{\n  "month": "period",\n  "energyType": "energy_type",\n  "value": "value",\n  "unit": "unit",\n  "organization": "organization_unit",\n  "meterCode": "meter_name"\n}' })
+            createElement('textarea', { name: 'fieldMapping', rows: '6', placeholder: '{\n  "month": "period",\n  "energyType": "energy_type",\n  "value": "value",\n  "unit": "unit",\n  "organization": "organization_unit",\n  "site": "site",\n  "department": "department",\n  "productionLine": "production_line",\n  "meterCode": "meter_name",\n  "businessDimension": "business_dimension"\n}' })
           ]),
           createElement('button', { className: 'btn btn-primary', type: 'submit', text: '提交导入' }),
           createElement('div', { id: 'import-result', className: 'inline-result', 'aria-live': 'polite' })
@@ -3049,7 +3049,7 @@ async function renderCarbon() {
 
   const carbonTemplateCard = renderCard('碳因子模板', [
     renderTemplateActions([{ type: 'carbon-factors', label: '下载碳因子维护模板（Excel）' }]),
-    createElement('p', { className: 'muted', text: '碳因子模板默认下载 Excel .xlsx，用于维护参考和字段整理，包含有效开始日期、有效结束日期和是否启用；当前页面按表单逐条保存，暂未提供碳因子批量上传接口。后端未启动时按钮仍保持可见；点击后会通过 fetch 获取模板并触发本地 blob 下载，失败时请确认后端已启动且 API Base 正确。' })
+    createElement('p', { className: 'muted', text: '碳因子模板默认下载 Excel .xlsx，用于维护参考和字段整理，字段按页面表单使用能源类型编码、有效开始日期、有效结束日期和 true/false 是否启用；当前页面按表单逐条保存，暂未提供碳因子批量上传接口。后端未启动时按钮仍保持可见；点击后会通过 fetch 获取模板并触发本地 blob 下载，失败时请确认后端已启动且 API Base 正确。' })
   ]);
 
   if (!factors.ok && !missing.ok && !emissions.ok) {

@@ -14,12 +14,12 @@ const TEMPLATE_DEFINITIONS = {
     appliesTo: ['数据导入', '能耗统计', '预测管理历史数据'],
     contractRoute: 'POST /api/imports/batches',
     description: '用于上传能耗记录；预测管理的历史数据沿用此能耗记录导入结构，导入后按训练月份读取历史能耗。',
-    headers: ['period', 'energy_type', 'energy_name', 'value', 'unit', 'organization_unit', 'meter_name', 'data_time', 'remark'],
+    headers: ['period', 'energy_type', 'energy_name', 'value', 'unit', 'organization_unit', 'site', 'department', 'production_line', 'meter_name', 'data_time', 'business_dimension', 'remark'],
     rows: [
-      ['2026-01', 'electricity', '电力', '1000', 'kWh', '烟测集团/生产部', 'E-001', '2026-01-01 00:00:00', '能耗导入与预测历史样例'],
-      ['2026/02', 'natural_gas', '天然气', '50', 'm3', '烟测集团/动力部', 'G-001', '2026-02-01 00:00:00', '碳核算缺失因子样例'],
-      ['2026-03', 'photovoltaic', '光伏', '1.5', 'MWh', '烟测集团/能源站', 'PV-001', '2026-03-01 00:00:00', '光伏 MWh 自动标准化为 kWh'],
-      ['2026-04', 'oil', '油', '800', 'kg', '烟测集团/锅炉房', 'OIL-001', '2026-04-01 00:00:00', '通用油 kg 自动标准化为 t']
+      ['2026-01', 'electricity', '电力', '1000', 'kWh', '烟测集团/生产部', '烟测园区', '生产部', '一线', 'E-001', '2026-01-01 00:00:00', 'monthly-energy', '能耗导入与预测历史样例'],
+      ['2026/02', 'natural_gas', '天然气', '50', 'm3', '烟测集团/动力部', '烟测园区', '动力部', '', 'G-001', '2026-02-01 00:00:00', 'monthly-energy', '碳核算缺失因子样例'],
+      ['2026-03', 'photovoltaic', '光伏', '1.5', 'MWh', '烟测集团/能源站', '屋顶光伏区', '能源站', '', 'PV-001', '2026-03-01 00:00:00', 'self-generation', '光伏 MWh 自动标准化为 kWh'],
+      ['2026-04', 'oil', '油', '800', 'kg', '烟测集团/锅炉房', '烟测园区', '锅炉房', '', 'OIL-001', '2026-04-01 00:00:00', 'monthly-energy', '通用油 kg 自动标准化为 t']
     ]
   },
   'meter-readings': {
@@ -101,10 +101,10 @@ const TEMPLATE_DEFINITIONS = {
     appliesTo: ['碳核算', '碳因子维护'],
     contractRoute: 'POST /api/carbon/factors',
     description: '用于维护参考和字段整理；模板字段与后端 upsert 契约一致，当前碳因子页面按表单逐条保存，未提供碳因子批量上传接口。',
-    headers: ['能源类型', '地区', '年份', '单位', '因子值', '因子单位', '来源', '来源链接', '有效开始日期', '有效结束日期', '是否启用'],
+    headers: ['能源类型编码', '地区', '年份', '单位', '因子值', '排放单位', '来源', '来源链接', '有效开始日期', '有效结束日期', '是否启用'],
     rows: [
-      ['电力', 'default', '2026', 'kWh', '0.5703', 'kgCO2e', '业务维护', 'https://example.com/electricity-factor', '2026-01-01', '2026-12-31', '是'],
-      ['天然气', 'default', '2026', 'm3', '2.1622', 'kgCO2e', '业务维护', '', '2026-01-01', '', '是']
+      ['electricity', 'default', '2026', 'kWh', '0.5703', 'kgCO2e', '业务维护', 'https://example.com/electricity-factor', '2026-01-01', '2026-12-31', 'true'],
+      ['natural_gas', 'default', '2026', 'm3', '2.1622', 'kgCO2e', '业务维护', '', '2026-01-01', '', 'true']
     ]
   },
   'prediction-history': {
@@ -119,11 +119,11 @@ const TEMPLATE_DEFINITIONS = {
     contractRoute: 'POST /api/imports/batches',
     reusableTemplateType: 'energy-records',
     description: '预测历史数据复用能耗记录导入结构；请先下载/填写并导入本模板或能耗数据导入模板，再在预测管理中选择训练月份。',
-    headers: ['period', 'energy_type', 'energy_name', 'value', 'unit', 'organization_unit', 'meter_name', 'data_time', 'remark'],
+    headers: ['period', 'energy_type', 'energy_name', 'value', 'unit', 'organization_unit', 'site', 'department', 'production_line', 'meter_name', 'data_time', 'business_dimension', 'remark'],
     rows: [
-      ['2026-01', 'electricity', '电力', '1000', 'kWh', '烟测集团/生产部', 'E-001', '2026-01-01 00:00:00', '预测训练历史第 1 月'],
-      ['2026-02', 'electricity', '电力', '1100', 'kWh', '烟测集团/生产部', 'E-001', '2026-02-01 00:00:00', '预测训练历史第 2 月'],
-      ['2026-03', 'electricity', '电力', '1200', 'kWh', '烟测集团/生产部', 'E-001', '2026-03-01 00:00:00', '预测训练历史第 3 月；移动平均至少需要 3 个历史月份']
+      ['2026-01', 'electricity', '电力', '1000', 'kWh', '烟测集团/生产部', '烟测园区', '生产部', '一线', 'E-001', '2026-01-01 00:00:00', 'prediction-history', '预测训练历史第 1 月'],
+      ['2026-02', 'electricity', '电力', '1100', 'kWh', '烟测集团/生产部', '烟测园区', '生产部', '一线', 'E-001', '2026-02-01 00:00:00', 'prediction-history', '预测训练历史第 2 月'],
+      ['2026-03', 'electricity', '电力', '1200', 'kWh', '烟测集团/生产部', '烟测园区', '生产部', '一线', 'E-001', '2026-03-01 00:00:00', 'prediction-history', '移动平均至少需要 3 个历史月份']
     ]
   }
 };
