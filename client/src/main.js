@@ -53,6 +53,7 @@ const state = {
   ledgerUnitFilters: {},
   ledgerMeterFilters: {},
   ledgerReadingFilters: {},
+  ledgerGenerationFilters: {},
   ledgerProductionUnitFilters: {},
   ledgerProductionOutputFilters: {},
   ledgerProductionIntensityFilters: {},
@@ -1458,6 +1459,7 @@ function optionList(items, selectedValue = '') {
     value: option.value,
     text: option.label,
     selected: String(option.value) === String(selectedValue) ? 'selected' : undefined,
+    disabled: option.disabled ? 'disabled' : undefined,
     dataset: option.dataset
   }));
 }
@@ -1808,6 +1810,7 @@ function renderLedgerTabs() {
     createElement('button', { type: 'button', className: `btn ${state.ledgerTab === 'units' ? 'btn-primary' : 'btn-ghost'}`, text: '用能单元', dataset: { action: 'switch-ledger-tab', tab: 'units' } }),
     createElement('button', { type: 'button', className: `btn ${state.ledgerTab === 'meters' ? 'btn-primary' : 'btn-ghost'}`, text: '计量器具', dataset: { action: 'switch-ledger-tab', tab: 'meters' } }),
     createElement('button', { type: 'button', className: `btn ${state.ledgerTab === 'readings' ? 'btn-primary' : 'btn-ghost'}`, text: '计量抄表', dataset: { action: 'switch-ledger-tab', tab: 'readings' } }),
+    createElement('button', { type: 'button', className: `btn ${state.ledgerTab === 'generation' ? 'btn-primary' : 'btn-ghost'}`, text: '发电自用', dataset: { action: 'switch-ledger-tab', tab: 'generation' } }),
     createElement('button', { type: 'button', className: `btn ${state.ledgerTab === 'production' ? 'btn-primary' : 'btn-ghost'}`, text: '产能单元', dataset: { action: 'switch-ledger-tab', tab: 'production' } })
   ]);
 }
@@ -1990,7 +1993,12 @@ function renderProductionUnitForm(units = [], editingProductionUnit = null) {
     { value: 'inactive', label: 'inactive：停用' }
   ];
   const activeUnits = units.filter((unit) => unit.status === 'active');
+  const hasActiveUnits = activeUnits.length > 0;
   const selectedOrganizationUnit = editingProductionUnit ? findById(units, editingProductionUnit.organizationUnitId) : activeUnits[0] || null;
+  const organizationUnitOptions = hasActiveUnits
+    ? getLedgerUnitOptions(activeUnits, false)
+    : [{ value: '', label: '请先新增或启用用能单元', disabled: true }];
+  const disableCreate = !editingProductionUnit && !hasActiveUnits;
   return renderCard(editingProductionUnit ? '编辑产能单元' : '新增产能单元', [
     createElement('form', { id: 'ledger-production-unit-form', className: 'form-card' }, [
       editingProductionUnit ? createElement('input', { type: 'hidden', name: 'id', value: editingProductionUnit.id }) : null,
@@ -1999,15 +2007,16 @@ function renderProductionUnitForm(units = [], editingProductionUnit = null) {
         ledgerInputField('unitName', '产能单元名称', editingProductionUnit?.unitName || '', 'text', '一线产能单元'),
         editingProductionUnit
           ? renderLockedProductionUnitOrganizationField(editingProductionUnit, selectedOrganizationUnit)
-          : ledgerSelectField('organizationUnitId', '所属用能单元', getLedgerUnitOptions(activeUnits, false), selectedOrganizationUnit?.id || ''),
+          : ledgerSelectField('organizationUnitId', '所属用能单元', organizationUnitOptions, selectedOrganizationUnit?.id || '', disableCreate ? { disabled: 'disabled' } : {}),
         ledgerInputField('productName', '产品名称', editingProductionUnit?.productName || '', 'text', '产品A'),
         ledgerInputField('outputUnit', '产量单位', editingProductionUnit?.outputUnit || '', 'text', 't / 件 / MWh'),
         ledgerSelectField('status', '状态', statusOptions, editingProductionUnit?.status || 'active')
       ]),
       ledgerTextareaField('remark', '备注', editingProductionUnit?.remark || ''),
       createElement('p', { className: 'muted', text: editingProductionUnit ? '编辑产能单元时锁定所属用能单元，避免历史归属和单位产品能耗统计范围被静默改挂；新增产能单元必须归属于 active 用能单元。' : '产能单元必须归属于 active 用能单元；DELETE 为停用语义，不物理删除历史产量或统计追溯。' }),
+      disableCreate ? createElement('p', { className: 'muted', text: '请先到“用能单元”页签新增或启用 active 用能单元，再新增产能单元。' }) : null,
       createElement('div', { className: 'template-actions' }, [
-        createElement('button', { type: 'submit', className: 'btn btn-primary', text: editingProductionUnit ? '保存产能单元' : '新增产能单元' }),
+        createElement('button', { type: 'submit', className: 'btn btn-primary', disabled: disableCreate ? 'disabled' : undefined, text: editingProductionUnit ? '保存产能单元' : '新增产能单元' }),
         editingProductionUnit ? createElement('button', { type: 'button', className: 'btn btn-ghost', text: '取消编辑', dataset: { action: 'cancel-ledger-edit' } }) : null
       ]),
       createElement('div', { id: 'ledger-production-unit-result', className: 'inline-result', 'aria-live': 'polite' })
@@ -2017,7 +2026,12 @@ function renderProductionUnitForm(units = [], editingProductionUnit = null) {
 
 function renderProductionOutputForm(productionUnits = [], editingOutput = null) {
   const activeProductionUnits = productionUnits.filter((unit) => unit.status === 'active');
-  const selectedUnit = editingOutput ? findById(productionUnits, editingOutput.productionUnitId) : activeProductionUnits[0] || productionUnits[0] || null;
+  const hasActiveProductionUnits = activeProductionUnits.length > 0;
+  const selectedUnit = editingOutput ? findById(productionUnits, editingOutput.productionUnitId) : activeProductionUnits[0] || null;
+  const productionUnitOptions = hasActiveProductionUnits
+    ? getProductionUnitOptions(activeProductionUnits, false)
+    : [{ value: '', label: '请先新增或启用产能单元', disabled: true }];
+  const disableCreate = !editingOutput && !hasActiveProductionUnits;
   const dataSourceOptions = [
     { value: 'manual', label: 'manual：页面维护' },
     { value: 'upload', label: 'upload：历史导入来源' },
@@ -2033,7 +2047,7 @@ function renderProductionOutputForm(productionUnits = [], editingOutput = null) 
       createElement('div', { className: 'form-grid' }, [
         editingOutput
           ? renderLockedProductionOutputUnitField(editingOutput, selectedUnit)
-          : ledgerSelectField('productionUnitId', '产能单元', getProductionUnitOptions(activeProductionUnits.length > 0 ? activeProductionUnits : productionUnits, false), selectedUnit?.id || '', { dataset: { role: 'ledger-production-output-unit' } }),
+          : ledgerSelectField('productionUnitId', '产能单元', productionUnitOptions, selectedUnit?.id || '', { dataset: { role: 'ledger-production-output-unit' }, disabled: disableCreate ? 'disabled' : undefined }),
         ledgerInputField('normalizedMonth', '月份', editingOutput?.normalizedMonth || '', 'month'),
         ledgerInputField('outputValue', '产量值', editingOutput?.outputValue ?? '', 'number', '1000', '0.000001'),
         ledgerInputField('outputUnit', '产量单位', editingOutput?.outputUnit || selectedUnit?.outputUnit || '', 'text', '默认取产能单元产量单位'),
@@ -2041,9 +2055,10 @@ function renderProductionOutputForm(productionUnits = [], editingOutput = null) 
         ledgerSelectField('recordStatus', '记录状态', statusOptions, editingOutput?.recordStatus || 'active')
       ]),
       ledgerTextareaField('remark', '备注', editingOutput?.remark || ''),
-      createElement('p', { className: 'muted', text: '同一产能单元同一月份只能存在一条 active 月度产量；DELETE 为作废语义，作废后不作为单位产品能耗分母。' }),
+      createElement('p', { className: 'muted', text: '新增月度产量只能选择 active 产能单元；同一产能单元同一月份只能存在一条 active 月度产量；DELETE 为作废语义，作废后不作为单位产品能耗分母。' }),
+      disableCreate ? createElement('p', { className: 'muted', text: '请先新增或启用 active 产能单元，再新增月度产量。' }) : null,
       createElement('div', { className: 'template-actions' }, [
-        createElement('button', { type: 'submit', className: 'btn btn-primary', text: editingOutput ? '保存月度产量' : '新增月度产量' }),
+        createElement('button', { type: 'submit', className: 'btn btn-primary', disabled: disableCreate ? 'disabled' : undefined, text: editingOutput ? '保存月度产量' : '新增月度产量' }),
         editingOutput ? createElement('button', { type: 'button', className: 'btn btn-ghost', text: '取消编辑', dataset: { action: 'cancel-ledger-edit' } }) : null
       ]),
       createElement('div', { id: 'ledger-production-output-result', className: 'inline-result', 'aria-live': 'polite' })
@@ -2095,7 +2110,7 @@ function renderProductionIntensityCard(intensityResponse, selectedProductionUnit
   const noEnergyCount = rows.filter((row) => row.status === 'no-energy').length;
   const children = [
     renderMessage('info', '单位产品能耗口径提示', '分子为产能单元所属用能单元当月 active energy_records.normalized_value 汇总；分母为该产能单元当月 active 月度产量。跨能源类型/单位直接汇总仅作管理参考，必须查看 energyByType 明细。'),
-    renderMessage('warning', 'P2 首期边界', '发电/自发自用后置；碳核算联动后置。本页不实现发电趋势、自发自用计算或碳核算结果写入。')
+    renderMessage('warning', 'P2 首期边界', '发电自用已由基础台账“发电自用”页签独立维护；当前单位产品能耗仍不纳入发电、自发自用或碳核算结果写入。碳核算联动后置。')
   ];
   if (!selectedProductionUnitId) {
     children.push(renderMessage('empty', '请选择产能单元', '先新增或选择 active 产能单元后，再查看单位产品能耗。'));
@@ -2273,6 +2288,168 @@ function renderMeterReadingActions(row) {
   ]);
 }
 
+function formatPercent(value, digits = 2) {
+  if (value === undefined || value === null || value === '') {
+    return '-';
+  }
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) {
+    return '-';
+  }
+  return `${formatNumber(numericValue * 100, digits)}%`;
+}
+
+function getGenerationRecordName(row = {}) {
+  return `${row.organizationUnitPath || row.organizationUnitName || row.organizationUnitCode || `用能单元 #${row.organizationUnitId}`} ${row.normalizedMonth || ''}`.trim();
+}
+
+function renderGenerationForm(units = [], editingRecord = null) {
+  const activeUnits = units.filter((unit) => unit.status === 'active');
+  const selectedUnit = editingRecord ? findById(units, editingRecord.organizationUnitId) : activeUnits[0] || null;
+  return renderCard(editingRecord ? '编辑发电自用记录' : '新增发电自用记录', [
+    createElement('form', { id: 'ledger-generation-form', className: 'form-card' }, [
+      editingRecord ? createElement('input', { type: 'hidden', name: 'id', value: editingRecord.id }) : null,
+      createElement('input', { type: 'hidden', name: 'energyTypeCode', value: 'photovoltaic' }),
+      createElement('div', { className: 'form-grid' }, [
+        editingRecord
+          ? createElement('label', { className: 'field' }, [
+            createElement('span', { text: '用能单元' }),
+            createElement('input', { type: 'hidden', name: 'organizationUnitId', value: editingRecord.organizationUnitId || '' }),
+            createElement('select', { disabled: 'disabled', 'aria-label': '编辑发电记录时用能单元已锁定' }, [
+              createElement('option', { value: editingRecord.organizationUnitId || '', selected: 'selected', text: selectedUnit ? `${selectedUnit.unitPath || selectedUnit.unitName}（${selectedUnit.unitCode}${selectedUnit.status === 'inactive' ? ' / 已停用' : ''}）` : `原用能单元 #${editingRecord.organizationUnitId || '-'}` })
+            ]),
+            createElement('small', { text: '编辑时锁定用能单元；如需调整归属，请作废后重建，避免追溯口径漂移。' })
+          ])
+          : ledgerSelectField('organizationUnitId', '用能单元', getLedgerUnitOptions(activeUnits, false), selectedUnit?.id || ''),
+        ledgerInputField('normalizedMonth', '月份', editingRecord?.normalizedMonth || '', 'month'),
+        ledgerInputField('generationValueKwh', '发电量 kWh', editingRecord?.generationValueKwh ?? '', 'number', '1000', '0.000001'),
+        ledgerInputField('selfUseValueKwh', '自发自用 kWh', editingRecord?.selfUseValueKwh ?? '', 'number', '800', '0.000001'),
+        ledgerInputField('gridExportValueKwh', '上网电量 kWh', editingRecord?.gridExportValueKwh ?? '', 'number', '200', '0.000001'),
+        createElement('label', { className: 'field' }, [
+          createElement('span', { text: '能源类型' }),
+          createElement('input', { value: '光伏（photovoltaic，首期固定）', disabled: 'disabled' }),
+          createElement('small', { text: '首期固定为 photovoltaic / 光伏，不要求用户选择。' })
+        ])
+      ]),
+      ledgerTextareaField('remark', '备注', editingRecord?.remark || ''),
+      createElement('p', { className: 'muted', text: '同一用能单元 + 同一月份 + photovoltaic 只允许一条 active 发电记录；发电量、自发自用和上网电量均为 kWh，且自发自用 + 上网电量不能大于发电量。' }),
+      createElement('div', { className: 'template-actions' }, [
+        createElement('button', { type: 'submit', className: 'btn btn-primary', text: editingRecord ? '保存发电记录' : '新增发电记录' }),
+        editingRecord ? createElement('button', { type: 'button', className: 'btn btn-ghost', text: '取消编辑', dataset: { action: 'cancel-ledger-edit' } }) : null
+      ]),
+      createElement('div', { id: 'ledger-generation-result', className: 'inline-result', 'aria-live': 'polite' })
+    ])
+  ]);
+}
+
+function renderGenerationBoundaryCard(meta = {}) {
+  return renderCard('首期边界说明', [
+    renderMessage('info', '外购电参考口径', '外购电参考来自 active energy_records 中 electricity + 同用能单元 + 同月份汇总，仅供参考，不自动抵扣、不入账。'),
+    renderKeyValueList([
+      { label: '固定能源类型', value: 'photovoltaic / 光伏；标准单位 kWh。' },
+      { label: '不写 energy_records', value: meta.writesEnergyRecords === false ? '确认：不会自动写入或回填 energy_records。' : '接口未返回确认，需以后端实际逻辑为准。' },
+      { label: '不写 carbon_emissions', value: meta.writesCarbonEmissions === false ? '确认：不会自动写入 carbon_emissions。' : '接口未返回确认，需以后端实际逻辑为准。' },
+      { label: '不影响单位产品能耗', value: meta.affectsProductionIntensity === false ? '确认：不影响单位产品能耗统计。' : '接口未返回确认，需以后端实际逻辑为准。' },
+      { label: '首期不含导入/导出', value: meta.importExportIncluded === false ? '确认：页面不提供发电导入、导出或模板下载。' : '当前页面仍不提供导入/导出入口。' },
+      { label: '不含实时采集/外部网关', value: meta.realtimeCollectionIncluded === false ? '确认：不引入实时采集、自动同步或外部网关。' : '当前页面仅支持手工录入。' }
+    ])
+  ]);
+}
+
+function renderGenerationActions(row) {
+  if (row.recordStatus !== 'active') {
+    return createElement('span', { className: 'muted', text: '已作废，仅追溯' });
+  }
+  return createElement('div', { className: 'table-actions' }, [
+    createElement('button', { type: 'button', className: 'btn btn-small', text: '编辑', dataset: { action: 'edit-ledger-generation', id: row.id } }),
+    createElement('button', { type: 'button', className: 'btn btn-small btn-danger', text: '作废', dataset: { action: 'void-ledger-generation', id: row.id, name: getGenerationRecordName(row) } })
+  ]);
+}
+
+function renderGenerationSummaryCard(statisticsResponse) {
+  if (!statisticsResponse?.ok) {
+    return renderCard('月度汇总与外购电参考', [
+      renderMessage('error', '发电汇总读取失败', formatApiError(statisticsResponse?.error))
+    ]);
+  }
+  const rows = statisticsResponse.value.data || [];
+  const meta = statisticsResponse.value.meta || {};
+  const summary = meta.summary || {};
+  return renderCard('月度汇总与外购电参考', [
+    renderMessage('info', '参考值说明', '外购电参考来自能耗记录，仅供参考，不自动抵扣、不入账；汇总只统计 active 发电记录。'),
+    createElement('section', { className: 'stat-grid' }, [
+      renderStat('发电量合计', `${formatNumber(summary.generationValueKwh, 6)} kWh`, 'active generation_records'),
+      renderStat('自发自用合计', `${formatNumber(summary.selfUseValueKwh, 6)} kWh`, `自用率 ${formatPercent(summary.selfUseRate)}`, 'green'),
+      renderStat('上网电量合计', `${formatNumber(summary.gridExportValueKwh, 6)} kWh`, `上网率 ${formatPercent(summary.gridExportRate)}`, 'orange'),
+      renderStat('外购电参考合计', `${formatNumber(summary.purchasedElectricityReferenceKwh, 6)} kWh`, '仅参考，不抵扣不入账')
+    ]),
+    renderTable([
+      { key: 'normalizedMonth', label: '月份' },
+      { key: 'organizationUnitPath', label: '用能单元', render: (row) => createElement('span', { text: formatText(row.organizationUnitPath || row.organizationUnitName || row.organizationUnitCode) }) },
+      { key: 'generationValueKwh', label: '发电量', render: (row) => createElement('span', { text: `${formatNumber(row.generationValueKwh, 6)} kWh` }) },
+      { key: 'selfUseValueKwh', label: '自发自用', render: (row) => createElement('span', { text: `${formatNumber(row.selfUseValueKwh, 6)} kWh / ${formatPercent(row.selfUseRate)}` }) },
+      { key: 'gridExportValueKwh', label: '上网电量', render: (row) => createElement('span', { text: `${formatNumber(row.gridExportValueKwh, 6)} kWh / ${formatPercent(row.gridExportRate)}` }) },
+      { key: 'purchasedElectricityReferenceKwh', label: '外购电参考值', render: (row) => createElement('span', { text: `${formatNumber(row.purchasedElectricityReferenceKwh, 6)} ${formatText(row.purchasedElectricityReferenceUnit, 'kWh')}（能耗记录 ${formatNumber(row.purchasedElectricityReferenceRecordCount, 0)} 条，仅参考）` }) }
+    ], rows, '暂无 active 发电汇总。请先新增有效发电记录，或调整用能单元/月分筛选。')
+  ]);
+}
+
+function validateGenerationFormPayload(payload = {}) {
+  if (!payload.organizationUnitId) return '请选择用能单元。';
+  if (!payload.normalizedMonth) return '请选择月份。';
+  const generation = Number(payload.generationValueKwh);
+  const selfUse = Number(payload.selfUseValueKwh || 0);
+  const gridExport = Number(payload.gridExportValueKwh || 0);
+  if (!Number.isFinite(generation) || generation < 0) return '发电量必须是大于等于 0 的数字。';
+  if (!Number.isFinite(selfUse) || selfUse < 0) return '自发自用必须是大于等于 0 的数字。';
+  if (!Number.isFinite(gridExport) || gridExport < 0) return '上网电量必须是大于等于 0 的数字。';
+  if (selfUse + gridExport > generation + 0.000001) return '自发自用 + 上网电量不能大于发电量。';
+  return '';
+}
+
+async function handleGenerationSubmit(event) {
+  event.preventDefault();
+  const form = getSubmittedForm(event, 'ledger-generation-form');
+  const resultBox = getInlineResultBox('#ledger-generation-result');
+  clearNode(resultBox);
+  const payload = collectFormValues(form);
+  const id = payload.id;
+  delete payload.id;
+  payload.energyTypeCode = 'photovoltaic';
+  payload.dataSource = 'manual';
+  const validationMessage = validateGenerationFormPayload(payload);
+  if (validationMessage) {
+    resultBox.append(renderMessage('error', '发电记录校验失败', validationMessage));
+    return;
+  }
+  const response = await safeApi(id ? `/generation/records/${id}` : '/generation/records', { method: id ? 'PUT' : 'POST', body: payload });
+  if (!response.ok) {
+    const detail = response.error.code ? `错误码：${response.error.code}；${formatApiError(response.error)}` : formatApiError(response.error);
+    resultBox.append(renderMessage('error', '发电记录保存失败', detail));
+    return;
+  }
+  state.ledgerGenerationFilters.organizationUnitId = payload.organizationUnitId || state.ledgerGenerationFilters.organizationUnitId;
+  state.ledgerGenerationFilters.monthStart = state.ledgerGenerationFilters.monthStart || payload.normalizedMonth;
+  state.ledgerGenerationFilters.monthEnd = state.ledgerGenerationFilters.monthEnd || payload.normalizedMonth;
+  state.ledgerTab = 'generation';
+  await renderLedger();
+}
+
+async function voidGenerationRecord(id, name) {
+  const confirmed = window.confirm(`确认作废发电记录 ${name || id}？\n\n作废不会物理删除记录；该记录不再计入 active 发电汇总，也不会写入 energy_records、carbon_emissions 或单位产品能耗。`);
+  if (!confirmed) return;
+  const response = await safeApi(`/generation/records/${id}`, {
+    method: 'DELETE',
+    body: { voidReason: '页面作废' }
+  });
+  if (!response.ok) {
+    window.alert(`作废失败：${formatApiError(response.error)}`);
+    return;
+  }
+  state.ledgerTab = 'generation';
+  await renderLedger();
+}
+
 async function renderLedger(edit = {}) {
   const root = getViewRoot();
   clearNode(root);
@@ -2280,15 +2457,23 @@ async function renderLedger(edit = {}) {
   const unitQuery = toQuery({ ...state.ledgerUnitFilters, page: 1, pageSize: 500 });
   const meterQuery = toQuery({ ...state.ledgerMeterFilters, page: 1, pageSize: 500 });
   const readingQuery = toQuery({ ...state.ledgerReadingFilters, page: 1, pageSize: 100 });
+  const generationQuery = toQuery({ ...state.ledgerGenerationFilters, page: 1, pageSize: 100 });
+  const generationStatisticsQuery = toQuery({
+    organizationUnitId: state.ledgerGenerationFilters.organizationUnitId || '',
+    monthStart: state.ledgerGenerationFilters.monthStart || '',
+    monthEnd: state.ledgerGenerationFilters.monthEnd || ''
+  });
   const productionUnitQuery = toQuery({ ...state.ledgerProductionUnitFilters, page: 1, pageSize: 500 });
   const productionOutputQuery = toQuery({ ...state.ledgerProductionOutputFilters, page: 1, pageSize: 100 });
-  const [unitsResponse, filteredUnitsResponse, metersResponse, filteredMetersResponse, readingsResponse, energyTypesResponse, productionUnitsResponse, filteredProductionUnitsResponse, productionOutputsResponse] = await Promise.all([
+  const [unitsResponse, filteredUnitsResponse, metersResponse, filteredMetersResponse, readingsResponse, energyTypesResponse, generationRecordsResponse, generationStatisticsResponse, productionUnitsResponse, filteredProductionUnitsResponse, productionOutputsResponse] = await Promise.all([
     safeApi('/organization/units?page=1&pageSize=500'),
     safeApi(`/organization/units${unitQuery}`),
     safeApi('/meters?page=1&pageSize=500'),
     safeApi(`/meters${meterQuery}`),
     safeApi(`/meter-readings${readingQuery}`),
     safeApi('/energy-types'),
+    safeApi(`/generation/records${generationQuery}`),
+    safeApi(`/generation/statistics/monthly${generationStatisticsQuery}`),
     safeApi('/production/units?page=1&pageSize=500'),
     safeApi(`/production/units${productionUnitQuery}`),
     safeApi(`/production/outputs${productionOutputQuery}`)
@@ -2309,6 +2494,8 @@ async function renderLedger(edit = {}) {
   const filteredMeters = filteredMetersResponse.ok ? filteredMetersResponse.value.data : meters;
   const readings = readingsResponse.ok ? readingsResponse.value.data : [];
   const energyTypes = energyTypesResponse.ok ? energyTypesResponse.value.data : [];
+  const generationRecords = generationRecordsResponse.ok ? generationRecordsResponse.value.data : [];
+  const generationMeta = generationStatisticsResponse.ok ? generationStatisticsResponse.value.meta || {} : generationRecordsResponse.value?.meta || {};
   const productionUnits = productionUnitsResponse.ok ? productionUnitsResponse.value.data : [];
   const filteredProductionUnits = filteredProductionUnitsResponse.ok ? filteredProductionUnitsResponse.value.data : productionUnits;
   const productionOutputs = productionOutputsResponse.ok ? productionOutputsResponse.value.data : [];
@@ -2422,6 +2609,37 @@ async function renderLedger(edit = {}) {
     return;
   }
 
+  if (state.ledgerTab === 'generation') {
+    const editingGenerationRecord = edit.type === 'generation' ? findById(generationRecords, edit.id) : null;
+    root.append(createElement('section', { className: 'grid two' }, [
+      unitsResponse.ok ? renderGenerationForm(units, editingGenerationRecord) : renderMessage('error', '用能单元读取失败', formatApiError(unitsResponse.error)),
+      renderGenerationBoundaryCard(generationMeta)
+    ]));
+    root.append(renderMessage('info', '发电自发自用首期口径', '本页仅支持 photovoltaic / 光伏发电记录页面录入、编辑、作废、查询和汇总；外购电参考来自能耗记录，仅供参考，不自动抵扣、不入账。'));
+    root.append(renderFilterRow('ledger-generation', [
+      { name: 'organizationUnitId', label: '用能单元', type: 'select', value: state.ledgerGenerationFilters.organizationUnitId || '', options: getLedgerUnitOptions(units.filter((unit) => unit.status === 'active'), true, '全部用能单元') },
+      { name: 'monthStart', label: '开始月份', type: 'month', value: state.ledgerGenerationFilters.monthStart || '' },
+      { name: 'monthEnd', label: '结束月份', type: 'month', value: state.ledgerGenerationFilters.monthEnd || '' },
+      { name: 'recordStatus', label: '状态', type: 'select', value: state.ledgerGenerationFilters.recordStatus || '', options: [{ value: '', label: '全部状态' }, { value: 'active', label: 'active：有效' }, { value: 'void', label: 'void：作废' }] }
+    ]));
+    root.append(renderGenerationSummaryCard(generationStatisticsResponse));
+    root.append(renderCard('发电记录列表', [
+      generationRecordsResponse.ok ? renderTable([
+        { key: 'normalizedMonth', label: '月份' },
+        { key: 'organizationUnitPath', label: '用能单元', render: (row) => createElement('span', { text: formatText(row.organizationUnitPath || row.organizationUnitName || row.organizationUnitCode) }) },
+        { key: 'generationValueKwh', label: '发电量', render: (row) => createElement('span', { text: `${formatNumber(row.generationValueKwh, 6)} kWh` }) },
+        { key: 'selfUseValueKwh', label: '自发自用', render: (row) => createElement('span', { text: `${formatNumber(row.selfUseValueKwh, 6)} kWh` }) },
+        { key: 'gridExportValueKwh', label: '上网电量', render: (row) => createElement('span', { text: `${formatNumber(row.gridExportValueKwh, 6)} kWh` }) },
+        { key: 'selfUseRate', label: '自用率', render: (row) => createElement('span', { text: formatPercent(row.selfUseRate) }) },
+        { key: 'gridExportRate', label: '上网率', render: (row) => createElement('span', { text: formatPercent(row.gridExportRate) }) },
+        { key: 'recordStatus', label: '状态', render: (row) => renderStatusPill(row.recordStatus) },
+        { key: 'remark', label: '备注', render: (row) => createElement('span', { text: formatText(row.remark) }) },
+        { key: 'actions', label: '操作', render: renderGenerationActions }
+      ], generationRecords, '暂无发电记录。请先在上方新增光伏发电、自发自用和上网电量。') : renderMessage('error', '发电记录读取失败', formatApiError(generationRecordsResponse.error))
+    ]));
+    return;
+  }
+
   if (state.ledgerTab === 'production') {
     const editingProductionUnit = edit.type === 'production-unit' ? findById(productionUnits, edit.id) : null;
     const editingProductionOutput = edit.type === 'production-output' ? findById(productionOutputs, edit.id) : null;
@@ -2436,7 +2654,7 @@ async function renderLedger(edit = {}) {
       unitsResponse.ok ? renderProductionUnitForm(units, editingProductionUnit) : renderMessage('error', '用能单元读取失败', formatApiError(unitsResponse.error)),
       productionUnitsResponse.ok ? renderProductionOutputForm(productionUnits, editingProductionOutput) : renderMessage('error', '产能单元读取失败', formatApiError(productionUnitsResponse.error))
     ]));
-    root.append(renderMessage('info', 'P2 产能单元首期口径', '本页首期维护产能单元 + 月度产量 + 单位产品能耗；本轮新增月度产量模板下载、当前筛选导出、导入 preview 和固定确认文本受控 execute。单位产品能耗分子为所属用能单元当月 active energy_records 汇总；发电/自发自用后置；碳核算联动后置。'));
+    root.append(renderMessage('info', 'P2 产能单元首期口径', '本页首期维护产能单元 + 月度产量 + 单位产品能耗；本轮新增月度产量模板下载、当前筛选导出、导入 preview 和固定确认文本受控 execute。单位产品能耗分子为所属用能单元当月 active energy_records 汇总；发电自用已独立维护但不纳入单位产品能耗；碳核算联动后置。'));
     root.append(renderProductionOutputImportPanel());
     root.append(renderFilterRow('ledger-production-units', [
       { name: 'keyword', label: '产能单元关键词', value: state.ledgerProductionUnitFilters.keyword || '', placeholder: '编码/名称/产品/用能单元' },
@@ -2673,6 +2891,10 @@ async function handleProductionUnitSubmit(event) {
   const payload = collectFormValues(form);
   const id = payload.id;
   delete payload.id;
+  if (!payload.organizationUnitId) {
+    resultBox.append(renderMessage('error', '缺少所属用能单元', '新增产能单元前，请先在“用能单元”页签新增或启用 active 用能单元，并选择所属用能单元。'));
+    return;
+  }
   const response = await safeApi(id ? `/production/units/${id}` : '/production/units', { method: id ? 'PUT' : 'POST', body: payload });
   if (!response.ok) {
     resultBox.append(renderMessage('error', '产能单元保存失败', formatApiError(response.error)));
@@ -2763,6 +2985,10 @@ async function handleProductionOutputSubmit(event) {
   const payload = collectFormValues(form);
   const id = payload.id;
   delete payload.id;
+  if (!payload.productionUnitId) {
+    resultBox.append(renderMessage('error', '缺少产能单元', '新增月度产量前，请先新增或启用 active 产能单元，并选择产能单元。'));
+    return;
+  }
   const response = await safeApi(id ? `/production/outputs/${id}` : '/production/outputs', { method: id ? 'PUT' : 'POST', body: payload });
   if (!response.ok) {
     resultBox.append(renderMessage('error', '月度产量保存失败', formatApiError(response.error)));
@@ -3405,6 +3631,9 @@ function bindEvents() {
     } else if (action === 'edit-ledger-reading') {
       state.ledgerTab = 'readings';
       await renderLedger({ type: 'reading', id: actionButton.dataset.id });
+    } else if (action === 'edit-ledger-generation') {
+      state.ledgerTab = 'generation';
+      await renderLedger({ type: 'generation', id: actionButton.dataset.id });
     } else if (action === 'edit-production-unit') {
       state.ledgerTab = 'production';
       await renderLedger({ type: 'production-unit', id: actionButton.dataset.id });
@@ -3419,6 +3648,8 @@ function bindEvents() {
       await deactivateLedgerMeter(actionButton.dataset.id, actionButton.dataset.name);
     } else if (action === 'void-ledger-reading') {
       await voidMeterReading(actionButton.dataset.id, actionButton.dataset.name);
+    } else if (action === 'void-ledger-generation') {
+      await voidGenerationRecord(actionButton.dataset.id, actionButton.dataset.name);
     } else if (action === 'deactivate-production-unit') {
       await deactivateProductionUnit(actionButton.dataset.id, actionButton.dataset.name);
     } else if (action === 'void-production-output') {
@@ -3467,6 +3698,10 @@ function bindEvents() {
       state.meterReadingGenerationExecuteError = null;
       state.meterReadingGenerationExecuteResult = null;
       state.ledgerTab = 'readings';
+      await renderLedger();
+    } else if (action === 'reset-ledger-generation-filters') {
+      state.ledgerGenerationFilters = {};
+      state.ledgerTab = 'generation';
       await renderLedger();
     } else if (action === 'reset-ledger-production-units-filters') {
       state.ledgerProductionUnitFilters = {};
@@ -3519,6 +3754,8 @@ function bindEvents() {
         await handleLedgerMeterImportSubmit(event);
       } else if (form.id === 'ledger-reading-form') {
         await handleMeterReadingSubmit(event);
+      } else if (form.id === 'ledger-generation-form') {
+        await handleGenerationSubmit(event);
       } else if (form.id === 'ledger-production-unit-form') {
         await handleProductionUnitSubmit(event);
       } else if (form.id === 'ledger-production-output-form') {
@@ -3545,6 +3782,11 @@ function bindEvents() {
         state.meterReadingGenerationExecuteError = null;
         state.meterReadingGenerationExecuteResult = null;
         state.ledgerTab = 'readings';
+        await renderLedger();
+      } else if (form.id === 'ledger-generation-filters') {
+        event.preventDefault();
+        state.ledgerGenerationFilters = collectFormValues(form);
+        state.ledgerTab = 'generation';
         await renderLedger();
       } else if (form.id === 'ledger-production-units-filters') {
         event.preventDefault();

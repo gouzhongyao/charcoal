@@ -397,7 +397,7 @@ function initDatabase() {
        ON CONFLICT(key) DO UPDATE SET
          value = excluded.value,
          updated_at = excluded.updated_at`
-    ).run('schema_stage', 'production-basic');
+    ).run('schema_stage', 'generation-basic');
   } finally {
     db.close();
   }

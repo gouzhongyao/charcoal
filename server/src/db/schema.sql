@@ -213,6 +213,29 @@ CREATE TABLE IF NOT EXISTS energy_records (
   FOREIGN KEY (meter_device_id) REFERENCES meter_devices(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS generation_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  organization_unit_id INTEGER NOT NULL,
+  energy_type_id INTEGER NOT NULL,
+  normalized_month TEXT NOT NULL CHECK (
+    normalized_month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
+    AND CAST(substr(normalized_month, 6, 2) AS INTEGER) BETWEEN 1 AND 12
+  ),
+  generation_value_kwh REAL NOT NULL CHECK (generation_value_kwh >= 0),
+  self_use_value_kwh REAL NOT NULL DEFAULT 0 CHECK (self_use_value_kwh >= 0),
+  grid_export_value_kwh REAL NOT NULL DEFAULT 0 CHECK (grid_export_value_kwh >= 0),
+  data_source TEXT NOT NULL DEFAULT 'manual' CHECK (data_source IN ('manual', 'calculation')),
+  record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
+  remark TEXT,
+  void_reason TEXT,
+  voided_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE RESTRICT,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+  CHECK (self_use_value_kwh + grid_export_value_kwh <= generation_value_kwh + 0.000001)
+);
+
 CREATE TABLE IF NOT EXISTS carbon_emissions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   energy_record_id INTEGER NOT NULL,
@@ -317,6 +340,10 @@ CREATE INDEX IF NOT EXISTS idx_energy_records_batch ON energy_records(source_bat
 CREATE INDEX IF NOT EXISTS idx_energy_records_organization_unit ON energy_records(organization_unit_id);
 CREATE INDEX IF NOT EXISTS idx_energy_records_meter_device ON energy_records(meter_device_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_energy_records_active_duplicate_key ON energy_records(duplicate_key) WHERE record_status = 'active';
+CREATE INDEX IF NOT EXISTS idx_generation_records_org_month ON generation_records(organization_unit_id, normalized_month);
+CREATE INDEX IF NOT EXISTS idx_generation_records_energy_status ON generation_records(energy_type_id, record_status);
+CREATE INDEX IF NOT EXISTS idx_generation_records_status_month ON generation_records(record_status, normalized_month);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_generation_records_active_org_month_energy ON generation_records(organization_unit_id, normalized_month, energy_type_id) WHERE record_status = 'active';
 CREATE INDEX IF NOT EXISTS idx_carbon_factors_match ON carbon_factors(energy_type_id, region, factor_year, unit, is_active);
 CREATE INDEX IF NOT EXISTS idx_carbon_emissions_record ON carbon_emissions(energy_record_id, status);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_carbon_emissions_record_method ON carbon_emissions(energy_record_id, calculation_method) WHERE status <> 'superseded';
@@ -350,5 +377,5 @@ WHERE code = 'heat'
   AND (default_unit <> 'MJ' OR standard_unit <> 'MJ');
 
 INSERT OR IGNORE INTO app_meta (key, value) VALUES
-  ('schema_stage', 'ledger-basic'),
-  ('schema_version', '2026-07-30-production-basic');
+  ('schema_stage', 'generation-basic'),
+  ('schema_version', '2026-08-03-generation-basic');

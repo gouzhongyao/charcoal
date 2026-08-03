@@ -252,7 +252,7 @@ assert(clientMainJs.includes("safeApi('/production/units") || clientMainJs.inclu
 assert(clientMainJs.includes("safeApi('/production/outputs") || clientMainJs.includes('safeApi(`/production/outputs'), '前端应调用 /production/outputs。');
 assert(clientMainJs.includes('/production/statistics/unit-energy-intensity'), '前端应调用 /production/statistics/unit-energy-intensity。');
 assert(clientMainJs.includes('所属用能单元当月 active energy_records'), '前端应展示所属用能单元当月 active energy_records 口径提示。');
-assert(clientMainJs.includes('发电/自发自用后置'), '前端应保留发电/自发自用后置提示。');
+assert(clientMainJs.includes('发电自用已独立维护但不纳入单位产品能耗'), '产能单元页应提示发电自用独立维护且不纳入单位产品能耗。');
 assert(clientMainJs.includes('碳核算联动后置'), '前端应保留碳核算联动后置提示。');
 assert(clientMainJs.includes('energyByType 明细'), '前端应展示 energyByType 明细，避免跨能源类型汇总误解。');
 assert(clientMainJs.includes('function renderLockedProductionUnitOrganizationField'), '编辑产能单元时应提供锁定所属用能单元的渲染函数。');
@@ -267,6 +267,16 @@ assert(clientMainJs.includes("disabled: 'disabled', 'aria-label': '月度产量�
 assert(clientMainJs.includes('原产能单元已停用；编辑月度产量时锁定所属产能单元，不会静默改挂到其它 active 产能单元。'), '编辑 inactive 原产能单元下的月度产量时应明确提示已停用且不会静默改挂。');
 assert(clientMainJs.includes('? renderLockedProductionOutputUnitField(editingOutput, selectedUnit)'), '月度产量编辑模式必须使用锁定归属字段，而不是仅渲染 active 产能单元下拉。');
 assert(!/editingOutput\?\.productionUnitId \|\| selectedUnit\?\.id \|\| '', \{ dataset: \{ role: 'ledger-production-output-unit' \} \}/.test(clientMainJs), '月度产量编辑模式不得继续复用可变 active 产能单元下拉，避免浏览器提交首个 active 选项。');
+assert(clientMainJs.includes('请先新增或启用用能单元'), '新增产能单元在没有 active 用能单元时应显示明确占位。');
+assert(clientMainJs.includes('请先到“用能单元”页签新增或启用 active 用能单元，再新增产能单元。'), '新增产能单元在没有 active 用能单元时应提示去用能单元页签处理。');
+assert(clientMainJs.includes('新增产能单元前，请先在“用能单元”页签新增或启用 active 用能单元，并选择所属用能单元。'), '产能单元提交前应补充缺少 organizationUnitId 的明确错误提示。');
+assert(clientMainJs.includes('请先新增或启用产能单元'), '新增月度产量在没有 active 产能单元时应显示明确占位。');
+assert(clientMainJs.includes('请先新增或启用 active 产能单元，再新增月度产量。'), '新增月度产量在没有 active 产能单元时应提示先新增 active 产能单元。');
+assert(clientMainJs.includes('新增月度产量只能选择 active 产能单元'), '新增月度产量应明确只允许 active 产能单元。');
+assert(clientMainJs.includes('新增月度产量前，请先新增或启用 active 产能单元，并选择产能单元。'), '月度产量提交前应补充缺少 productionUnitId 的明确错误提示。');
+assert(clientMainJs.includes("disabled: disableCreate ? 'disabled' : undefined"), '没有 active 前置数据时新增产能单元/月度产量提交按钮应具备禁用标记。');
+assert(clientMainJs.includes('disabled: option.disabled'), '下拉空态占位选项应支持禁用标记。');
+assert(!clientMainJs.includes('activeProductionUnits.length > 0 ? activeProductionUnits : productionUnits'), '新增月度产量不得在没有 active 产能单元时回退展示 inactive 产能单元。');
 assert(clientMainJs.includes('production-outputs'), '前端应提供月度产量导入模板下载入口。');
 assert(clientMainJs.includes('/production/outputs/export'), '前端应提供月度产量当前筛选导出入口。');
 assert(clientMainJs.includes('/production/outputs/import/preview'), '前端应提供月度产量导入 preview 请求。');
@@ -278,6 +288,6 @@ assert(clientMainJs.includes('candidateRows'), '前端受控执行请求体必�
 assert(clientMainJs.includes('acknowledgeSkippedRisks: true'), '前端受控执行请求体必须显式确认跳过风险。');
 assert(clientMainJs.includes('requireBackup: true'), '前端受控执行请求体必须要求服务端备份。');
 assert(clientMainJs.includes('不覆盖、不作废旧记录，不自动创建产能单元'), '前端必须展示月度产量导入非目标边界。');
-assert(!/data-action=['"][^'"]*(?:self-use|photovoltaic|carbon-accounting)|\/production\/[^`'"\s]*(?:self-use|photovoltaic|carbon)|carbonAccountingIncluded:\s*true|carbon_emissions/i.test(clientMainJs), 'P2 首期前端不得实现自发自用计算、发电或碳核算联动入口。');
+assert(!/data-action=['"][^'"]*(?:self-use|carbon-accounting)|\/production\/[^`'"\s]*(?:self-use|photovoltaic|carbon)|carbonAccountingIncluded:\s*true/i.test(clientMainJs), 'P2 首期前端不得在产能单元中实现自发自用计算、发电或碳核算联动入口。');
 
 console.log('energy record query tests passed');
