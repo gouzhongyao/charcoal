@@ -3,6 +3,13 @@ const XLSX = require('xlsx');
 const { openDatabase } = require('../db/database');
 const { badRequest, notFound } = require('../utils/errors');
 const { createBackup } = require('./backupService');
+const {
+  createPreviewAuditBatch,
+  getImportAuditBatchDetail,
+  getImportAuditSummary,
+  replaceImportAuditIssues,
+  updateExecuteAuditResult
+} = require('./importAuditService');
 const { assertSupportedImportFile, parseImportFile } = require('./import/parser');
 
 const DEFAULT_PAGE_SIZE = 50;
@@ -917,7 +924,7 @@ function buildProductionOutputImportPreviewWithDb(db, rows = []) {
       dryRun: true,
       previewOnly: true,
       writesProductionOutputs: false,
-      persistsImportBatch: false,
+      persistsImportBatch: true,
       confirmText: PRODUCTION_OUTPUT_IMPORT_CONFIRM_TEXT,
       backupReason: PRODUCTION_OUTPUT_IMPORT_BACKUP_REASON,
       fieldMapping,
@@ -926,7 +933,7 @@ function buildProductionOutputImportPreviewWithDb(db, rows = []) {
       candidateRows,
       items,
       notices: [
-        '本轮产量导入 preview 不写入 production_output_records，也不持久化 import_batches/import_errors；审计明细随响应返回。',
+        '本轮产量导入 preview 不写入 production_output_records；原始文件元数据、批次状态和 error/warning 明细会持久化到 import_batches/import_errors。',
         'execute 必须携带固定确认文本、previewSignature、expectedWouldImport、candidateRowIds、candidateRows、acknowledgeSkippedRisks=true、requireBackup=true。',
         '同产能单元同月份已有 active 产量时跳过并警告；不覆盖、不作废旧记录，不自动创建产能单元。'
       ]
@@ -948,7 +955,9 @@ function createProductionOutputImportPreviewFromUpload(file) {
   if (!file) throw badRequest('请使用 multipart/form-data 上传字段名为 file 的月度产量表格文件。', { code: 'IMPORT_FILE_REQUIRED', fieldName: 'file' });
   assertSupportedImportFile(file.originalname);
   const parsed = parseImportFile(file.path, file.originalname);
-  return buildProductionOutputImportPreviewFromRows(parsed.rows || []);
+  const preview = buildProductionOutputImportPreviewFromRows(parsed.rows || []);
+  const auditBatch = createProductionOutputImportAuditBatch(preview, file);
+  return attachProductionOutputAuditBatch(preview, auditBatch);
 }
 
 function normalizeCandidateRowIds(value) {
@@ -958,13 +967,179 @@ function normalizeCandidateRowIds(value) {
   return value.map((id) => parsePositiveInteger(id, 'candidateRowIds', { required: true })).sort((a, b) => a - b);
 }
 
+function normalizeOptionalProductionOutputImportBatchId(value) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return null;
+  }
+  return parsePositiveInteger(value, 'batchId', { required: true });
+}
+
+function buildProductionOutputAuditBatchResponse(batch) {
+  if (!batch) return null;
+  return {
+    id: batch.id,
+    importType: batch.importType,
+    status: batch.status,
+    auditPhase: batch.auditPhase,
+    originalFilename: batch.originalFilename,
+    fileSha256: batch.fileSha256,
+    fileSizeBytes: batch.fileSizeBytes,
+    previewSignature: batch.previewSignature,
+    counts: batch.counts || {
+      totalRows: batch.totalRows,
+      successCount: batch.successCount,
+      failureCount: batch.failureCount,
+      skippedCount: batch.skippedCount
+    },
+    issueCounts: batch.issueCounts,
+    hasBackup: Object.prototype.hasOwnProperty.call(batch, 'hasBackup') ? batch.hasBackup : Boolean(batch.backup),
+    createdAt: batch.createdAt,
+    updatedAt: batch.updatedAt,
+    completedAt: batch.completedAt
+  };
+}
+
+function attachProductionOutputAuditBatch(result, batch) {
+  if (!batch) return result;
+  const auditBatch = buildProductionOutputAuditBatchResponse(batch);
+  return {
+    ...result,
+    persistsImportBatch: true,
+    batchId: batch.id,
+    auditBatch
+  };
+}
+
+function collectProductionOutputImportAuditIssues(preview = {}) {
+  return (preview.items || []).flatMap((item) => (item.reasons || [])
+    .filter((reason) => ['error', 'warning'].includes(reason.severity))
+    .map((reason) => ({
+      rowNumber: item.rowNumber,
+      fieldName: reason.fieldName,
+      rawValue: reason.rawValue,
+      code: reason.code,
+      message: reason.message,
+      severity: reason.severity
+    })));
+}
+
+function buildProductionOutputImportErrorSummary(summary = {}) {
+  const parts = [];
+  if (summary.blocked > 0) parts.push(`${summary.blocked} 行阻断`);
+  if (summary.skipped > 0) parts.push(`${summary.skipped} 行跳过`);
+  if (summary.warnings > 0) parts.push(`${summary.warnings} 条警告`);
+  if (summary.errors > 0) parts.push(`${summary.errors} 条错误`);
+  return parts.length ? `月度产量导入存在 ${parts.join('、')}。` : null;
+}
+
+function createProductionOutputImportAuditBatch(preview, file) {
+  const auditBatch = createPreviewAuditBatch({
+    importType: 'production_output',
+    originalFilename: file.originalname,
+    storedFilename: file.filename || null,
+    filePath: file.path,
+    fileType: String(file.originalname || '').split('.').pop().toLowerCase(),
+    fileSizeBytes: file.size,
+    duplicateStrategy: 'skip',
+    fieldMapping: preview.fieldMapping,
+    previewSignature: preview.previewSignature,
+    auditContext: {
+      confirmText: preview.confirmText,
+      backupReason: preview.backupReason,
+      summary: preview.summary,
+      candidateRowIds: preview.candidateRowIds,
+      candidateRows: preview.candidateRows,
+      notices: preview.notices
+    },
+    statistics: {
+      totalRows: preview.summary.totalRows,
+      successCount: preview.summary.wouldImport,
+      failureCount: preview.summary.blocked,
+      skippedCount: preview.summary.skipped
+    },
+    errorSummary: buildProductionOutputImportErrorSummary(preview.summary)
+  });
+  const withIssues = replaceImportAuditIssues(auditBatch.id, collectProductionOutputImportAuditIssues(preview));
+  return getImportAuditSummary(withIssues.id);
+}
+
+function findProductionOutputAuditBatchIdForExecute(previewSignature, requestedBatchId = null) {
+  if (requestedBatchId) {
+    const batch = getImportAuditBatchDetail(requestedBatchId, { includeIssues: false });
+    if (batch.importType !== 'production_output') {
+      throw badRequest('batchId 不是月度产量导入审计批次。', { code: 'PRODUCTION_OUTPUT_IMPORT_AUDIT_BATCH_TYPE_MISMATCH', batchId: requestedBatchId, importType: batch.importType });
+    }
+    if (batch.previewSignature && !timingSafeEqualText(batch.previewSignature, previewSignature)) {
+      throw badRequest('batchId 与 previewSignature 不匹配，已拒绝执行月度产量导入。', { code: 'PRODUCTION_OUTPUT_IMPORT_AUDIT_BATCH_SIGNATURE_MISMATCH', batchId: requestedBatchId });
+    }
+    return requestedBatchId;
+  }
+  const db = openDatabase();
+  try {
+    const row = db.prepare(
+      `SELECT id
+       FROM import_batches
+       WHERE import_type = 'production_output'
+         AND preview_signature = ?
+       ORDER BY id DESC
+       LIMIT 1`
+    ).get(previewSignature);
+    return row ? Number(row.id) : null;
+  } finally {
+    db.close();
+  }
+}
+
+function buildProductionOutputAuditFailureStatistics(batch) {
+  if (!batch) {
+    return { totalRows: 0, successCount: 0, failureCount: 0, skippedCount: 0 };
+  }
+  return {
+    totalRows: Number(batch.totalRows || 0),
+    successCount: 0,
+    failureCount: Number(batch.failureCount || 0),
+    skippedCount: Number(batch.skippedCount || 0)
+  };
+}
+
+function markProductionOutputImportAuditFailure(body = {}, error) {
+  try {
+    const requestedBatchId = normalizeOptionalProductionOutputImportBatchId(body.batchId);
+    const previewSignature = normalizeText(body.previewSignature);
+    const batchId = requestedBatchId || (previewSignature ? findProductionOutputAuditBatchIdForExecute(previewSignature, null) : null);
+    if (!batchId) return;
+    const batch = getImportAuditBatchDetail(batchId, { includeIssues: false });
+    if (batch.importType !== 'production_output') return;
+    if (batch.auditPhase === 'execute' && ['completed', 'completed_with_errors'].includes(batch.status)) return;
+    updateExecuteAuditResult(batchId, {
+      status: 'failed',
+      statistics: buildProductionOutputAuditFailureStatistics(batch),
+      executeResult: {
+        executed: false,
+        writesProductionOutputs: false,
+        errorCode: error?.details?.code || error?.code || 'PRODUCTION_OUTPUT_IMPORT_EXECUTE_FAILED',
+        errorMessage: error?.message || '月度产量导入执行失败。',
+        previewSignatureProvided: Boolean(body.previewSignature),
+        expectedWouldImport: body.expectedWouldImport ?? null,
+        candidateRowIds: Array.isArray(body.candidateRowIds) ? body.candidateRowIds : null,
+        requireBackup: body.requireBackup === true,
+        acknowledgeSkippedRisks: body.acknowledgeSkippedRisks === true
+      },
+      backup: null,
+      errorSummary: error?.message || '月度产量导入执行失败。'
+    });
+  } catch (_) {
+    // 审计失败标记不能掩盖原始业务拒绝原因。
+  }
+}
+
 function assertSameArray(actual, expected, code, message) {
   if (actual.length !== expected.length || actual.some((value, index) => Number(value) !== Number(expected[index]))) {
     throw badRequest(message, { code, actual, expected });
   }
 }
 
-async function executeProductionOutputImport(body = {}) {
+async function executeProductionOutputImportInternal(body = {}) {
   const confirmText = normalizeText(body.confirmText);
   if (confirmText !== PRODUCTION_OUTPUT_IMPORT_CONFIRM_TEXT) {
     throw badRequest('确认文本不匹配，已拒绝导入月度产量记录。', { code: 'PRODUCTION_OUTPUT_IMPORT_CONFIRM_TEXT_MISMATCH', requiredConfirmText: PRODUCTION_OUTPUT_IMPORT_CONFIRM_TEXT });
@@ -984,6 +1159,8 @@ async function executeProductionOutputImport(body = {}) {
   if (!Array.isArray(body.candidateRows) || body.candidateRows.length === 0) {
     throw badRequest('candidateRows 为必填数组，必须来自最新导入预演响应。', { code: 'PRODUCTION_OUTPUT_IMPORT_CANDIDATE_ROWS_REQUIRED' });
   }
+  const requestedBatchId = normalizeOptionalProductionOutputImportBatchId(body.batchId);
+  const auditBatchId = findProductionOutputAuditBatchIdForExecute(previewSignature, requestedBatchId);
   const db = openDatabase();
   let preview;
   try {
@@ -1009,8 +1186,8 @@ async function executeProductionOutputImport(body = {}) {
       }
       const insertOutput = writeDb.prepare(
         `INSERT INTO production_output_records (
-           production_unit_id, normalized_month, output_value, output_unit, data_source, record_status, remark, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`
+           source_batch_id, source_row_number, production_unit_id, normalized_month, output_value, output_unit, data_source, record_status, remark, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`
       );
       const now = getNow();
       const items = [];
@@ -1020,15 +1197,16 @@ async function executeProductionOutputImport(body = {}) {
           items.push({ rowNumber: item.rowNumber, status: 'skipped', previewStatus: item.status, reasonCodes: item.reasonCodes, reason: item.reasonText, existingOutputId: item.existingOutputId || null });
           return;
         }
-        const insertResult = insertOutput.run(item.productionUnitId, item.normalizedMonth, item.outputValue, item.outputUnit, item.dataSource || 'upload', item.remark || null, now, now);
+        const sourceBatchId = auditBatchId || null;
+        const insertResult = insertOutput.run(sourceBatchId, sourceBatchId ? item.rowNumber : null, item.productionUnitId, item.normalizedMonth, item.outputValue, item.outputUnit, item.dataSource || 'upload', item.remark || null, now, now);
         imported += 1;
-        items.push({ rowNumber: item.rowNumber, status: 'imported', outputRecordId: Number(insertResult.lastInsertRowid), productionUnitId: item.productionUnitId, normalizedMonth: item.normalizedMonth, outputValue: item.outputValue, outputUnit: item.outputUnit, reason: '已按受控导入写入 active 月度产量记录。' });
+        items.push({ rowNumber: item.rowNumber, status: 'imported', outputRecordId: Number(insertResult.lastInsertRowid), productionUnitId: item.productionUnitId, normalizedMonth: item.normalizedMonth, outputValue: item.outputValue, outputUnit: item.outputUnit, sourceBatchId, sourceRowNumber: sourceBatchId ? item.rowNumber : null, reason: '已按受控导入写入 active 月度产量记录。' });
       });
-      return {
+      const result = {
         executed: true,
         dryRun: false,
         writesProductionOutputs: true,
-        persistsImportBatch: false,
+        persistsImportBatch: Boolean(auditBatchId),
         imported,
         skipped: items.filter((item) => item.status === 'skipped').length,
         previewSignature: latestPreview.previewSignature,
@@ -1041,10 +1219,47 @@ async function executeProductionOutputImport(body = {}) {
         items,
         note: '已按最新 preview 的 wouldImport 候选受控导入；冲突、重复、无效和阻断状态均跳过，不覆盖、不作废既有 active 产量。'
       };
+      if (!auditBatchId) {
+        return result;
+      }
+      const auditBatch = updateExecuteAuditResult(auditBatchId, {
+        status: latestPreview.summary.blocked > 0 || latestPreview.summary.skipped > 0 ? 'completed_with_errors' : 'completed',
+        statistics: {
+          totalRows: latestPreview.summary.totalRows,
+          successCount: imported,
+          failureCount: latestPreview.summary.blocked,
+          skippedCount: latestPreview.summary.skipped
+        },
+        executeResult: {
+          executed: true,
+          writesProductionOutputs: true,
+          imported,
+          skipped: result.skipped,
+          previewSignature: latestPreview.previewSignature,
+          expectedWouldImport,
+          candidateRowIds: latestPreview.candidateRowIds,
+          importedItems: result.importedItems,
+          skippedItems: result.skippedItems,
+          summary: result.summary,
+          note: result.note
+        },
+        backup,
+        errorSummary: buildProductionOutputImportErrorSummary(latestPreview.summary)
+      }, { db: writeDb });
+      return attachProductionOutputAuditBatch(result, auditBatch);
     });
     return transaction();
   } finally {
     writeDb.close();
+  }
+}
+
+async function executeProductionOutputImport(body = {}) {
+  try {
+    return await executeProductionOutputImportInternal(body);
+  } catch (error) {
+    markProductionOutputImportAuditFailure(body, error);
+    throw error;
   }
 }
 

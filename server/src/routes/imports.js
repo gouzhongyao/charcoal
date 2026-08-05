@@ -4,7 +4,7 @@ const { requireWritable } = require('../middleware/maintenance');
 const { assertWritableAllowed } = require('../services/maintenanceState');
 const { normalizeUploadError, uploadImportFile } = require('../middleware/upload');
 const { getImportContract } = require('../services/contractService');
-const { createImportBatchFromUpload, deleteImportBatch, getImportBatchFileDownload, listImportBatches, listImportErrors } = require('../services/importService');
+const { createImportBatchFromUpload, deleteImportBatch, getImportBatchFileDownload, getImportBatchQueryDetail, listImportBatches, listImportErrors } = require('../services/importService');
 const { sendSuccess } = require('../utils/response');
 
 const router = express.Router();
@@ -59,16 +59,25 @@ router.post('/batches', requireWritable('imports:create-batch'), (req, res, next
   });
 });
 
+router.get('/batches/:batchId', asyncHandler(async (req, res) => {
+  const result = getImportBatchQueryDetail(req.params.batchId);
+  sendSuccess(res, result);
+}));
+
 router.delete('/batches/:batchId', requireWritable('imports:delete-batch'), asyncHandler(async (req, res) => {
   const result = deleteImportBatch(req.params.batchId);
   sendSuccess(res, result);
 }));
 
-router.get('/batches/:batchId/download', asyncHandler(async (req, res) => {
+router.get('/batches/:batchId/download', asyncHandler(async (req, res, next) => {
   const result = getImportBatchFileDownload(req.params.batchId);
   res.setHeader('Content-Type', getImportFileContentType(result.fileType));
   res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `import-batch-${result.batchId}.${result.fileType}`));
-  res.download(result.filePath, result.fileName);
+  res.sendFile(result.filePath, (error) => {
+    if (error && !res.headersSent) {
+      next(error);
+    }
+  });
 }));
 
 router.get('/batches/:batchId/errors', asyncHandler(async (req, res) => {

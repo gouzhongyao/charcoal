@@ -111,6 +111,8 @@ const PRODUCTION_TABLES_SQL = `CREATE TABLE IF NOT EXISTS production_units (
 
 CREATE TABLE IF NOT EXISTS production_output_records (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
   production_unit_id INTEGER NOT NULL,
   normalized_month TEXT NOT NULL CHECK (
     normalized_month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
@@ -123,6 +125,7 @@ CREATE TABLE IF NOT EXISTS production_output_records (
   remark TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
   FOREIGN KEY (production_unit_id) REFERENCES production_units(id) ON DELETE RESTRICT
 );
 
@@ -132,15 +135,91 @@ CREATE INDEX IF NOT EXISTS idx_production_output_records_unit_month ON productio
 CREATE INDEX IF NOT EXISTS idx_production_output_records_status_month ON production_output_records(record_status, normalized_month);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_production_output_records_active_unit_month ON production_output_records(production_unit_id, normalized_month) WHERE record_status = 'active';`;
 
+const GENERATION_RECORDS_TABLE_WITH_UPLOAD_DATA_SOURCE_SQL = `CREATE TABLE generation_records__migration_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  organization_unit_id INTEGER NOT NULL,
+  energy_type_id INTEGER NOT NULL,
+  normalized_month TEXT NOT NULL CHECK (
+    normalized_month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
+    AND CAST(substr(normalized_month, 6, 2) AS INTEGER) BETWEEN 1 AND 12
+  ),
+  generation_value_kwh REAL NOT NULL CHECK (generation_value_kwh >= 0),
+  self_use_value_kwh REAL NOT NULL DEFAULT 0 CHECK (self_use_value_kwh >= 0),
+  grid_export_value_kwh REAL NOT NULL DEFAULT 0 CHECK (grid_export_value_kwh >= 0),
+  data_source TEXT NOT NULL DEFAULT 'manual' CHECK (data_source IN ('manual', 'upload', 'calculation')),
+  record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
+  remark TEXT,
+  void_reason TEXT,
+  voided_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE RESTRICT,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+  CHECK (self_use_value_kwh + grid_export_value_kwh <= generation_value_kwh + 0.000001)
+)`;
+
+function buildGenerationRecordsCopySql(existingColumns = []) {
+  const sourceBatchExpression = existingColumns.includes('source_batch_id') ? 'source_batch_id' : 'NULL';
+  const sourceRowExpression = existingColumns.includes('source_row_number') ? 'source_row_number' : 'NULL';
+  return `INSERT INTO generation_records__migration_new (
+  id,
+  source_batch_id,
+  source_row_number,
+  organization_unit_id,
+  energy_type_id,
+  normalized_month,
+  generation_value_kwh,
+  self_use_value_kwh,
+  grid_export_value_kwh,
+  data_source,
+  record_status,
+  remark,
+  void_reason,
+  voided_at,
+  created_at,
+  updated_at
+)
+SELECT
+  id,
+  ${sourceBatchExpression} AS source_batch_id,
+  ${sourceRowExpression} AS source_row_number,
+  organization_unit_id,
+  energy_type_id,
+  normalized_month,
+  generation_value_kwh,
+  self_use_value_kwh,
+  grid_export_value_kwh,
+  CASE
+    WHEN data_source IN ('manual', 'upload', 'calculation') THEN data_source
+    ELSE 'manual'
+  END AS data_source,
+  record_status,
+  remark,
+  void_reason,
+  voided_at,
+  created_at,
+  updated_at
+FROM generation_records`;
+}
+
 const IMPORT_BATCHES_TABLE_WITH_LEDGER_TYPES_SQL = `CREATE TABLE import_batches__migration_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device')),
+  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_output', 'generation_record')),
   original_filename TEXT NOT NULL,
   stored_filename TEXT,
   file_type TEXT NOT NULL CHECK (file_type IN ('xlsx', 'xls', 'csv')),
   file_size_bytes INTEGER CHECK (file_size_bytes IS NULL OR file_size_bytes >= 0),
   file_sha256 TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'completed_with_errors', 'failed', 'cancelled')),
+  audit_phase TEXT CHECK (audit_phase IS NULL OR audit_phase IN ('preview', 'execute')),
+  preview_signature TEXT,
+  preview_audit_digest TEXT,
+  audit_context_json TEXT,
+  execute_result_json TEXT,
+  backup_json TEXT,
   total_rows INTEGER NOT NULL DEFAULT 0 CHECK (total_rows >= 0),
   success_count INTEGER NOT NULL DEFAULT 0 CHECK (success_count >= 0),
   failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
@@ -167,6 +246,12 @@ const IMPORT_BATCHES_COPY_SQL = `INSERT INTO import_batches__migration_new (
   file_size_bytes,
   file_sha256,
   status,
+  audit_phase,
+  preview_signature,
+  preview_audit_digest,
+  audit_context_json,
+  execute_result_json,
+  backup_json,
   total_rows,
   success_count,
   failure_count,
@@ -188,6 +273,12 @@ SELECT
   file_size_bytes,
   file_sha256,
   status,
+  audit_phase,
+  preview_signature,
+  preview_audit_digest,
+  audit_context_json,
+  execute_result_json,
+  backup_json,
   total_rows,
   success_count,
   failure_count,
@@ -266,13 +357,50 @@ function importBatchesImportTypeCheckAllowsLedgerTypes(createTableSql) {
   return /import_type\s+TEXT[\s\S]*CHECK\s*\([\s\S]*import_type\s+IN\s*\([\s\S]*'organization_unit'[\s\S]*'meter_device'/i.test(createTableSql || '');
 }
 
+function importBatchesImportTypeCheckAllowsAuditTypes(createTableSql) {
+  const sql = createTableSql || '';
+  return /import_type\s+TEXT[\s\S]*CHECK\s*\([\s\S]*import_type\s+IN\s*\([\s\S]*'organization_unit'[\s\S]*'meter_device'[\s\S]*'production_output'[\s\S]*'generation_record'/i.test(sql);
+}
+
+function importBatchesHasAuditColumns(columns) {
+  return [
+    'audit_phase',
+    'preview_signature',
+    'preview_audit_digest',
+    'audit_context_json',
+    'execute_result_json',
+    'backup_json'
+  ].every((columnName) => columns.includes(columnName));
+}
+
+function generationRecordsDataSourceCheckAllowsUpload(createTableSql) {
+  return /data_source\s+TEXT[\s\S]*CHECK\s*\([\s\S]*data_source\s+IN\s*\([\s\S]*'upload'/i.test(createTableSql || '');
+}
+
 function buildImportBatchesImportTypeMigrationSql() {
   return [
     'DROP TABLE IF EXISTS import_batches__migration_new',
     IMPORT_BATCHES_TABLE_WITH_LEDGER_TYPES_SQL,
     IMPORT_BATCHES_COPY_SQL,
     'DROP TABLE import_batches',
-    'ALTER TABLE import_batches__migration_new RENAME TO import_batches'
+    'ALTER TABLE import_batches__migration_new RENAME TO import_batches',
+    'CREATE INDEX IF NOT EXISTS idx_import_batches_type_status_created ON import_batches(import_type, status, created_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_import_batches_status_created ON import_batches(status, created_at DESC)'
+  ];
+}
+
+function buildGenerationRecordsDataSourceMigrationSql(existingColumns = []) {
+  return [
+    'DROP TABLE IF EXISTS generation_records__migration_new',
+    GENERATION_RECORDS_TABLE_WITH_UPLOAD_DATA_SOURCE_SQL,
+    buildGenerationRecordsCopySql(existingColumns),
+    'DROP TABLE generation_records',
+    'ALTER TABLE generation_records__migration_new RENAME TO generation_records',
+    'CREATE INDEX IF NOT EXISTS idx_generation_records_org_month ON generation_records(organization_unit_id, normalized_month)',
+    'CREATE INDEX IF NOT EXISTS idx_generation_records_batch ON generation_records(source_batch_id)',
+    'CREATE INDEX IF NOT EXISTS idx_generation_records_energy_status ON generation_records(energy_type_id, record_status)',
+    'CREATE INDEX IF NOT EXISTS idx_generation_records_status_month ON generation_records(record_status, normalized_month)',
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_generation_records_active_org_month_energy ON generation_records(organization_unit_id, normalized_month, energy_type_id) WHERE record_status = 'active'"
   ];
 }
 
@@ -282,7 +410,8 @@ function buildCarbonEmissionsStatusMigrationSql() {
     CARBON_EMISSIONS_TABLE_WITH_SUPERSEDED_SQL,
     CARBON_EMISSIONS_COPY_SQL,
     'DROP TABLE carbon_emissions',
-    'ALTER TABLE carbon_emissions__migration_new RENAME TO carbon_emissions'
+    'ALTER TABLE carbon_emissions__migration_new RENAME TO carbon_emissions',
+    'CREATE INDEX IF NOT EXISTS idx_carbon_emissions_record ON carbon_emissions(energy_record_id, status)'
   ];
 }
 
@@ -315,7 +444,14 @@ function migrateCarbonEmissionsStatusCheck(db) {
 
 function migrateImportBatchesImportTypeCheck(db) {
   const createTableSql = getTableCreateSql(db, 'import_batches');
-  if (!createTableSql || importBatchesImportTypeCheckAllowsLedgerTypes(createTableSql)) {
+  if (!createTableSql) {
+    return false;
+  }
+
+  const columns = getTableColumns(db, 'import_batches');
+  const needsImportTypeCheckMigration = !importBatchesImportTypeCheckAllowsAuditTypes(createTableSql);
+  const needsAuditColumns = !importBatchesHasAuditColumns(columns);
+  if (!needsImportTypeCheckMigration && !needsAuditColumns) {
     return false;
   }
 
@@ -325,7 +461,42 @@ function migrateImportBatchesImportTypeCheck(db) {
   try {
     db.exec('BEGIN IMMEDIATE');
     try {
-      buildImportBatchesImportTypeMigrationSql().forEach((sql) => db.exec(sql));
+      addColumnIfMissing(db, 'import_batches', 'audit_phase', "audit_phase TEXT CHECK (audit_phase IS NULL OR audit_phase IN ('preview', 'execute'))");
+      addColumnIfMissing(db, 'import_batches', 'preview_signature', 'preview_signature TEXT');
+      addColumnIfMissing(db, 'import_batches', 'preview_audit_digest', 'preview_audit_digest TEXT');
+      addColumnIfMissing(db, 'import_batches', 'audit_context_json', 'audit_context_json TEXT');
+      addColumnIfMissing(db, 'import_batches', 'execute_result_json', 'execute_result_json TEXT');
+      addColumnIfMissing(db, 'import_batches', 'backup_json', 'backup_json TEXT');
+      if (needsImportTypeCheckMigration) {
+        buildImportBatchesImportTypeMigrationSql().forEach((sql) => db.exec(sql));
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  } finally {
+    if (wasForeignKeysEnabled) {
+      db.pragma('foreign_keys = ON');
+    }
+  }
+
+  return true;
+}
+
+function migrateGenerationRecordsDataSourceCheck(db) {
+  const createTableSql = getTableCreateSql(db, 'generation_records');
+  if (!createTableSql || generationRecordsDataSourceCheckAllowsUpload(createTableSql)) {
+    return false;
+  }
+
+  const wasForeignKeysEnabled = db.pragma('foreign_keys', { simple: true }) === 1;
+  db.pragma('foreign_keys = OFF');
+
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      buildGenerationRecordsDataSourceMigrationSql(getTableColumns(db, 'generation_records')).forEach((sql) => db.exec(sql));
       db.exec('COMMIT');
     } catch (error) {
       db.exec('ROLLBACK');
@@ -365,7 +536,7 @@ function migrateEnergyRecordLedgerColumns(db) {
     db,
     'import_batches',
     'import_type',
-    "import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device'))"
+    "import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_output', 'generation_record'))"
   );
   const addedOrganizationUnit = addColumnIfMissing(
     db,
@@ -382,6 +553,46 @@ function migrateEnergyRecordLedgerColumns(db) {
   return addedImportType || addedOrganizationUnit || addedMeterDevice;
 }
 
+function migrateImportAuditSourceColumns(db) {
+  let changed = false;
+
+  if (getTableCreateSql(db, 'production_output_records')) {
+    // 旧库用可空补列而非重建业务表，保留既有唯一索引与写入语义；新库 schema 仍声明完整 FK/CHECK。
+    changed = addColumnIfMissing(
+      db,
+      'production_output_records',
+      'source_batch_id',
+      'source_batch_id INTEGER REFERENCES import_batches(id) ON DELETE SET NULL'
+    ) || changed;
+    changed = addColumnIfMissing(
+      db,
+      'production_output_records',
+      'source_row_number',
+      'source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1)'
+    ) || changed;
+    db.exec('CREATE INDEX IF NOT EXISTS idx_production_output_records_batch ON production_output_records(source_batch_id)');
+  }
+
+  if (getTableCreateSql(db, 'generation_records')) {
+    // 旧库用可空补列而非重建业务表，保留发电记录非联动边界与 active 唯一约束。
+    changed = addColumnIfMissing(
+      db,
+      'generation_records',
+      'source_batch_id',
+      'source_batch_id INTEGER REFERENCES import_batches(id) ON DELETE SET NULL'
+    ) || changed;
+    changed = addColumnIfMissing(
+      db,
+      'generation_records',
+      'source_row_number',
+      'source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1)'
+    ) || changed;
+    db.exec('CREATE INDEX IF NOT EXISTS idx_generation_records_batch ON generation_records(source_batch_id)');
+  }
+
+  return changed;
+}
+
 function initDatabase() {
   const db = openDatabase();
   try {
@@ -389,6 +600,8 @@ function initDatabase() {
     migrateCarbonEmissionsStatusCheck(db);
     migrateEnergyRecordLedgerColumns(db);
     migrateImportBatchesImportTypeCheck(db);
+    migrateGenerationRecordsDataSourceCheck(db);
+    migrateImportAuditSourceColumns(db);
     db.exec('DROP INDEX IF EXISTS ux_carbon_emissions_record_method');
     db.exec(schema);
     db.prepare(
@@ -424,15 +637,21 @@ module.exports = {
   databasePath,
   schemaPath,
   buildCarbonEmissionsStatusMigrationSql,
+  buildGenerationRecordsDataSourceMigrationSql,
   buildImportBatchesImportTypeMigrationSql,
   carbonEmissionsStatusCheckAllowsSuperseded,
   ensureLocalDataDirectories,
+  generationRecordsDataSourceCheckAllowsUpload,
   getDatabaseInfo,
   getTableColumns,
+  importBatchesHasAuditColumns,
+  importBatchesImportTypeCheckAllowsAuditTypes,
   importBatchesImportTypeCheckAllowsLedgerTypes,
   initDatabase,
   migrateCarbonEmissionsStatusCheck,
   migrateEnergyRecordLedgerColumns,
+  migrateGenerationRecordsDataSourceCheck,
+  migrateImportAuditSourceColumns,
   migrateImportBatchesImportTypeCheck,
   openDatabase
 };

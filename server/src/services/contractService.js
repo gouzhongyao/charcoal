@@ -1,4 +1,5 @@
 const { getImportParseLimits } = require('./import/parser');
+const { getGenerationImportExportContract } = require('./generationService');
 
 const importRequiredFields = [
   { key: 'period', internalKey: 'month', label: '月份', normalizedTo: 'YYYY-MM', required: true, examples: ['2026-01', '2026/01', '2026.01', '2026-01-01 00:00:00', 'Excel 日期单元格'] },
@@ -106,6 +107,10 @@ function getMeterReadingContract() {
     exportFields: ['仪表编码', '仪表名称', '用能单元', '能源类型编码', '能源类型', '抄表日期', '上期表码', '本期表码', '倍率', '用量', '单位', '标准化用量', '标准单位', '状态', '备注', '导入批次'],
     statisticsPolicy: '抄表导入只写入 meter_reading_records，不自动写入 energy_records，也不自动进入能耗统计。'
   };
+}
+
+function getGenerationContract() {
+  return getGenerationImportExportContract();
 }
 
 function getEnergyRecordContract() {
@@ -234,6 +239,7 @@ function getApiContract() {
       organizationUnits: 'GET/POST/PUT/DELETE /api/organization/units 基础台账用能单元 CRUD；POST /api/organization/units/import 导入；GET /api/organization/units/export?format=xlsx|csv 导出当前筛选结果；DELETE 返回停用结果',
       meters: 'GET/POST/PUT/DELETE /api/meters 计量器具 CRUD；POST /api/meters/import 导入；GET /api/meters/export?format=xlsx|csv 导出当前筛选结果；DELETE 返回停用结果；在线状态和网关 ID 仅为台账字段',
       meterReadings: 'GET/POST/PUT/DELETE /api/meter-readings；POST /api/meter-readings/import 导入抄表；GET /api/meter-readings/export 导出当前筛选结果；抄表不自动进入 energy_records',
+      generation: 'GET/POST/PUT/DELETE /api/generation/records；GET /api/generation/contract 查看发电自用导入导出契约；GET /api/generation/records/export 导出当前筛选结果；POST /api/generation/records/import/preview 预演不写库；POST /api/generation/records/import/execute 受控导入只写 generation_records',
       energyRecords: 'GET /api/energy-records 查询已导入 active 能耗记录，兼容 organization/site/department 文本筛选并支持 organizationUnitId/meterDeviceId；GET /api/energy-records/contract 查看契约',
       energyStatistics: 'GET /api/energy-records/statistics/summary、monthly-trend、energy-type-breakdown、dimension-breakdown 查询基础统计聚合',
       dashboardSummary: 'GET /api/dashboard/summary 查询仅基于能耗记录、导入批次和错误数量的工作台摘要',
@@ -252,6 +258,7 @@ module.exports = {
   getBackupContract,
   getCarbonContract,
   getEnergyRecordContract,
+  getGenerationContract,
   getImportContract,
   getMeterReadingContract,
   getPredictionContract

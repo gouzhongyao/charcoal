@@ -5,6 +5,7 @@ const { openDatabase, uploadsDir } = require('../db/database');
 const { assertWritableAllowed } = require('./maintenanceState');
 const { badRequest, notFound } = require('../utils/errors');
 const { decodeUploadOriginalName } = require('../utils/filenameEncoding');
+const { assertAuditBatchCanUseGenericDelete, getImportAuditBatchDetail, parseStoredAuditJson } = require('./importAuditService');
 const { assertSupportedImportFile, parseImportFile } = require('./import/parser');
 const { buildEnergyTypeIndex, detectEnergyImportTemplateMismatch, validateAndNormalizeRow } = require('./import/normalization');
 const { findLedgerAssociationsForImportRecord, loadActiveLedgerIndexes } = require('./ledgerService');
@@ -12,6 +13,15 @@ const { findLedgerAssociationsForImportRecord, loadActiveLedgerIndexes } = requi
 const MAX_PAGE_SIZE = 500;
 const ENERGY_RECORD_IMPORT_TYPE = 'energy_record';
 const METER_READING_IMPORT_TYPE = 'meter_reading';
+const IMPORT_TYPE_LABELS = Object.freeze({
+  energy_record: '能耗数据导入',
+  meter_reading: '计量抄表导入',
+  organization_unit: '组织/用能单元导入',
+  meter_device: '计量器具导入',
+  production_output: '月度产量导入',
+  generation_record: '发电记录导入'
+});
+const IMPORT_TYPE_VALUES = Object.freeze(Object.keys(IMPORT_TYPE_LABELS));
 
 function getNow() {
   return new Date().toISOString();
@@ -30,14 +40,35 @@ function parseBatchId(batchId) {
   return numericBatchId;
 }
 
+function normalizeImportTypeFilter(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized) {
+    return null;
+  }
+  if (!IMPORT_TYPE_VALUES.includes(normalized)) {
+    throw badRequest('importType 不在支持范围内。', {
+      code: 'UNSUPPORTED_IMPORT_TYPE_FILTER',
+      importType: value,
+      supportedImportTypes: IMPORT_TYPE_VALUES
+    });
+  }
+  return normalized;
+}
+
+function getImportTypeLabel(importType) {
+  return IMPORT_TYPE_LABELS[importType] || importType || IMPORT_TYPE_LABELS[ENERGY_RECORD_IMPORT_TYPE];
+}
+
 function normalizeImportBatchRow(row) {
   if (!row || typeof row !== 'object') {
     return row;
   }
+  const importType = row.importType || ENERGY_RECORD_IMPORT_TYPE;
   const displayFilename = decodeUploadOriginalName(row.originalFilename);
   return {
     ...row,
-    importType: row.importType || ENERGY_RECORD_IMPORT_TYPE,
+    importType,
+    importTypeLabel: getImportTypeLabel(importType),
     originalFilename: displayFilename,
     displayFilename
   };
@@ -53,7 +84,7 @@ function assertImportBatchCanUseGenericDelete(batch) {
       allowedGenericDeleteImportTypes: [ENERGY_RECORD_IMPORT_TYPE]
     });
   }
-  return true;
+  return assertAuditBatchCanUseGenericDelete(batch);
 }
 
 function sha256File(filePath) {
@@ -480,10 +511,55 @@ function getImportBatchDetail(db, batchId, extra = {}) {
 
   return {
     ...normalizeImportBatchRow(row),
-    fieldMapping: row.fieldMappingJson ? JSON.parse(row.fieldMappingJson) : null,
+    fieldMapping: parseStoredAuditJson(row.fieldMappingJson),
     fieldMappingJson: undefined,
     ...extra
   };
+}
+
+function getImportIssueSummaryRows(db, batchId) {
+  return db.prepare(
+    `SELECT
+       severity,
+       error_code AS errorCode,
+       COUNT(*) AS count,
+       MIN(row_number) AS firstRowNumber,
+       MIN(error_reason) AS sampleMessage
+     FROM import_errors
+     WHERE batch_id = ?
+     GROUP BY severity, error_code
+     ORDER BY severity ASC, firstRowNumber ASC, error_code ASC
+     LIMIT 20`
+  ).all(batchId);
+}
+
+function getImportBatchQueryDetail(batchId) {
+  const numericBatchId = parseBatchId(batchId);
+  const detail = getImportAuditBatchDetail(numericBatchId, { includeIssues: false });
+  const db = openDatabase();
+  try {
+    return {
+      ...normalizeImportBatchRow(detail),
+      counts: {
+        totalRows: detail.totalRows,
+        successCount: detail.successCount,
+        failureCount: detail.failureCount,
+        skippedCount: detail.skippedCount
+      },
+      issueSummary: getImportIssueSummaryRows(db, numericBatchId),
+      download: {
+        available: Boolean(detail.storedFilename),
+        url: `/api/imports/batches/${numericBatchId}/download`,
+        originalFilename: detail.originalFilename,
+        fileType: detail.fileType,
+        fileSizeBytes: detail.fileSizeBytes,
+        fileSha256: detail.fileSha256
+      },
+      errorsUrl: `/api/imports/batches/${numericBatchId}/errors`
+    };
+  } finally {
+    db.close();
+  }
 }
 
 function listImportBatches(query = {}) {
@@ -491,6 +567,11 @@ function listImportBatches(query = {}) {
   const where = [];
   const params = {};
 
+  const importType = normalizeImportTypeFilter(query.importType || query.import_type);
+  if (importType) {
+    where.push('import_type = @importType');
+    params.importType = importType;
+  }
   if (query.status) {
     where.push('status = @status');
     params.status = query.status;
@@ -518,12 +599,17 @@ function listImportBatches(query = {}) {
          import_type AS importType,
          original_filename AS originalFilename,
          file_type AS fileType,
+         file_size_bytes AS fileSizeBytes,
+         file_sha256 AS fileSha256,
          status,
+         audit_phase AS auditPhase,
+         preview_audit_digest AS previewAuditDigest,
          total_rows AS totalRows,
          success_count AS successCount,
          failure_count AS failureCount,
          skipped_count AS skippedCount,
          duplicate_strategy AS duplicateStrategy,
+         CASE WHEN backup_json IS NULL OR backup_json = '' THEN 0 ELSE 1 END AS hasBackup,
          started_at AS startedAt,
          finished_at AS finishedAt,
          created_at AS createdAt,
@@ -590,6 +676,31 @@ function deleteImportBatch(batchId) {
   }
 }
 
+function normalizeIssueSeverityFilter(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (!['error', 'warning'].includes(normalized)) {
+    throw badRequest('severity 仅支持 error 或 warning。', { code: 'UNSUPPORTED_IMPORT_ERROR_SEVERITY_FILTER', severity: value });
+  }
+  return normalized;
+}
+
+function normalizeIssueStatusFilter(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (['skipped', 'skip', 'warning'].includes(normalized)) {
+    return 'warning';
+  }
+  if (['blocked', 'failed', 'error'].includes(normalized)) {
+    return 'error';
+  }
+  throw badRequest('status 仅支持 skipped/blocked 或 error/warning 等价筛选。', { code: 'UNSUPPORTED_IMPORT_ERROR_STATUS_FILTER', status: value });
+}
+
 function listImportErrors(batchId, query = {}) {
   const numericBatchId = parseBatchId(batchId);
 
@@ -601,7 +712,24 @@ function listImportErrors(batchId, query = {}) {
       throw notFound('导入批次不存在。', { batchId: numericBatchId });
     }
 
-    const total = db.prepare('SELECT COUNT(*) AS total FROM import_errors WHERE batch_id = ?').get(numericBatchId).total;
+    const where = ['batch_id = @batchId'];
+    const params = { batchId: numericBatchId };
+    const severity = normalizeIssueSeverityFilter(query.severity);
+    const statusSeverity = normalizeIssueStatusFilter(query.status);
+    if (severity && statusSeverity && severity !== statusSeverity) {
+      where.push('1 = 0');
+    } else if (severity || statusSeverity) {
+      where.push('severity = @severity');
+      params.severity = severity || statusSeverity;
+    }
+    const code = String(query.code || query.errorCode || query.error_code || '').trim();
+    if (code) {
+      where.push('error_code = @code');
+      params.code = code;
+    }
+    const whereSql = `WHERE ${where.join(' AND ')}`;
+
+    const total = db.prepare(`SELECT COUNT(*) AS total FROM import_errors ${whereSql}`).get(params).total;
     const rows = db.prepare(
       `SELECT
          id,
@@ -614,10 +742,10 @@ function listImportErrors(batchId, query = {}) {
          severity,
          created_at AS createdAt
        FROM import_errors
-       WHERE batch_id = @batchId
+       ${whereSql}
        ORDER BY row_number ASC, id ASC
        LIMIT @pageSize OFFSET @offset`
-    ).all({ batchId: numericBatchId, pageSize, offset });
+    ).all({ ...params, pageSize, offset });
 
     return { rows, pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } };
   } finally {
@@ -747,6 +875,8 @@ module.exports = {
   createImportBatchFromUpload,
   deleteImportBatch,
   getImportBatchFileDownload,
+  getImportBatchQueryDetail,
+  getImportTypeLabel,
   listEnergyRecords,
   listImportBatches,
   listImportErrors,

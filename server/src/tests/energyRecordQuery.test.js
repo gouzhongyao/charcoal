@@ -243,7 +243,7 @@ assert(productionServiceJs.includes('UNKNOWN_PRODUCTION_UNIT'), '月度产量导
 assert(productionServiceJs.includes('PRODUCTION_UNIT_NAME_MISMATCH'), 'unitName 应辅助校验编码匹配结果。');
 assert(productionServiceJs.includes('AMBIGUOUS_PRODUCTION_UNIT_NAME'), 'unitName 名称歧义应报错。');
 assert(productionServiceJs.includes('OUTPUT_UNIT_MISMATCH'), '单位不一致不得静默改单位，应有明确 warning/block。');
-assert(productionServiceJs.includes('persistsImportBatch: false'), '本轮月度产量导入若未复用 import_batches/import_errors，必须在响应中声明审计边界。');
+assert(productionServiceJs.includes('persistsImportBatch: true'), '月度产量 preview 应声明已持久化 import_batches/import_errors 审计批次。');
 assert(productionServiceJs.includes('carbonAccountingIncluded: false'), 'P2 首期不得纳入碳核算联动。');
 assert(!/photovoltaic-generation|self-use|carbon_emissions/i.test(productionRouteJs), 'P2 首期 production 路由不得实现发电、自发自用或碳核算联动。');
 assert(!/INSERT\s+INTO\s+carbon_emissions|UPDATE\s+carbon_emissions/i.test(productionServiceJs), 'P2 首期产能服务不得写入碳核算结果。');

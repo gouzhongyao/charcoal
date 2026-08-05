@@ -40,6 +40,7 @@ const state = {
   activeView: 'dashboard',
   lastApiState: 'unknown',
   deletingImportBatchId: null,
+  importBatchFilters: {},
   backupActionName: null,
   backupActionType: null,
   energyFilters: {},
@@ -54,6 +55,12 @@ const state = {
   ledgerMeterFilters: {},
   ledgerReadingFilters: {},
   ledgerGenerationFilters: {},
+  generationRecordImportPreview: null,
+  generationRecordImportPreviewLoading: false,
+  generationRecordImportPreviewError: null,
+  generationRecordImportExecuteLoading: false,
+  generationRecordImportExecuteResult: null,
+  generationRecordImportExecuteError: null,
   ledgerProductionUnitFilters: {},
   ledgerProductionOutputFilters: {},
   ledgerProductionIntensityFilters: {},
@@ -537,6 +544,7 @@ const TEMPLATE_FILE_NAMES = {
   'organization-units': '用能单元导入模板.xlsx',
   meters: '计量器具导入模板.xlsx',
   'meter-readings': '计量抄表导入模板.xlsx',
+  'generation-records': '发电自用记录导入模板.xlsx',
   'production-outputs': '月度产量导入模板.xlsx',
   'carbon-factors': '碳因子维护模板.xlsx',
   'prediction-history': '预测历史数据模板.xlsx'
@@ -568,10 +576,11 @@ function getFileNameFromContentDisposition(contentDisposition) {
   return fallbackMatch ? fallbackMatch[1].trim() : '';
 }
 
-async function downloadTemplate(templateType, fileName) {
+async function downloadTemplateFile(templateType, extension = 'xlsx', fileName) {
   let objectUrl = null;
+  const normalizedExtension = String(extension || 'xlsx').replace(/^\./, '') || 'xlsx';
   try {
-    const response = await fetch(buildApiUrl(`/templates/${encodeURIComponent(templateType)}.xlsx`));
+    const response = await fetch(buildApiUrl(`/templates/${encodeURIComponent(templateType)}.${normalizedExtension}`));
     if (!response.ok) {
       const errorText = await response.text().catch(() => '');
       throw new Error(`HTTP ${response.status}${errorText ? `：${errorText.slice(0, 120)}` : ''}`);
@@ -582,7 +591,8 @@ async function downloadTemplate(templateType, fileName) {
     }
 
     const headerFileName = getFileNameFromContentDisposition(response.headers.get('content-disposition'));
-    const downloadName = headerFileName || fileName || TEMPLATE_FILE_NAMES[templateType] || `${templateType}.xlsx`;
+    const defaultFileName = TEMPLATE_FILE_NAMES[templateType] || `${templateType}.xlsx`;
+    const downloadName = headerFileName || fileName || defaultFileName.replace(/\.xlsx$/i, `.${normalizedExtension}`);
     objectUrl = URL.createObjectURL(blob);
     const link = createElement('a', {
       href: objectUrl,
@@ -601,6 +611,14 @@ async function downloadTemplate(templateType, fileName) {
       window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
     }
   }
+}
+
+async function downloadTemplate(templateType, fileName) {
+  await downloadTemplateFile(templateType, 'xlsx', fileName);
+}
+
+async function downloadTemplateCsv(templateType, fileName) {
+  await downloadTemplateFile(templateType, 'csv', fileName);
 }
 
 function createTemplateDownloadButton(templateType, label, fileName) {
@@ -874,9 +892,10 @@ async function renderImports() {
   const root = getViewRoot();
   clearNode(root);
   root.append(renderLoading('正在读取导入契约与批次列表...'));
+  const importBatchQuery = toQuery({ ...state.importBatchFilters, page: 1, pageSize: 20 });
   const [contract, batches] = await Promise.all([
     safeApi('/imports/contract'),
-    safeApi('/imports/batches?page=1&pageSize=20')
+    safeApi(`/imports/batches${importBatchQuery}`)
   ]);
   clearNode(root);
 
@@ -942,9 +961,19 @@ async function renderImports() {
 }
 
 function formatImportType(importType) {
-  if (importType === 'meter_reading') return '抄表导入';
-  if (importType === 'energy_record' || !importType) return '能耗导入';
-  return importType;
+  const labels = {
+    energy_record: '能耗导入',
+    meter_reading: '抄表导入',
+    organization_unit: '组织/用能单元导入',
+    meter_device: '计量器具导入',
+    production_output: '月度产量导入',
+    generation_record: '发电记录导入'
+  };
+  return labels[importType] || labels.energy_record;
+}
+
+function isImportAuditBatchType(importType) {
+  return importType === 'production_output' || importType === 'generation_record';
 }
 
 function renderImportBatchActions(row) {
@@ -952,23 +981,65 @@ function renderImportBatchActions(row) {
   const filename = getImportDisplayFilename(row);
   const importType = row.importType || 'energy_record';
   const isMeterReadingBatch = importType === 'meter_reading';
+  const isAuditBatch = isImportAuditBatchType(importType);
+  const deleteDisabledReason = isMeterReadingBatch
+    ? '抄表导入批次需保留 source_batch_id 追溯链路，不能通过通用导入批次删除。'
+    : isAuditBatch
+      ? '月度产量/发电记录审计批次需保留原文件、错误明细和业务记录追溯，当前禁用通用删除。'
+      : undefined;
   return createElement('div', { className: 'table-actions' }, [
+    createElement('button', { type: 'button', className: 'btn btn-small', text: '查看详情', dataset: { action: 'load-import-batch-detail', batchId: row.id } }),
     createElement('button', { type: 'button', className: 'btn btn-small', text: '查看错误', dataset: { action: 'load-import-errors', batchId: row.id } }),
     createElement('button', { type: 'button', className: 'btn btn-small', text: '下载原文件', dataset: { action: 'download-import-file', batchId: row.id, filename } }),
     createElement('button', {
       type: 'button',
       className: 'btn btn-small btn-danger',
-      text: isMeterReadingBatch ? '禁止通用删除' : isDeleting ? '删除中...' : '删除',
-      title: isMeterReadingBatch ? '抄表导入批次需保留 source_batch_id 追溯链路，不能通过通用导入批次删除。' : undefined,
-      disabled: isDeleting || isMeterReadingBatch ? 'disabled' : undefined,
+      text: deleteDisabledReason ? '禁止通用删除' : isDeleting ? '删除中...' : '删除',
+      title: deleteDisabledReason,
+      disabled: isDeleting || Boolean(deleteDisabledReason) ? 'disabled' : undefined,
       dataset: { action: 'delete-import-batch', batchId: row.id, filename, importType }
     })
+  ]);
+}
+
+function renderImportBatchFilters() {
+  const importTypeOptions = [
+    { value: '', label: '全部批次类型' },
+    { value: 'energy_record', label: '能耗导入' },
+    { value: 'meter_reading', label: '抄表导入' },
+    { value: 'organization_unit', label: '组织/用能单元导入' },
+    { value: 'meter_device', label: '计量器具导入' },
+    { value: 'production_output', label: '月度产量导入' },
+    { value: 'generation_record', label: '发电记录导入' }
+  ];
+  const statusOptions = [
+    { value: '', label: '全部状态' },
+    { value: 'pending', label: 'pending' },
+    { value: 'processing', label: 'processing' },
+    { value: 'completed', label: 'completed' },
+    { value: 'completed_with_errors', label: 'completed_with_errors' },
+    { value: 'failed', label: 'failed' },
+    { value: 'cancelled', label: 'cancelled' }
+  ];
+  return createElement('form', { id: 'import-batches-filters', className: 'filter-row' }, [
+    createElement('label', { className: 'field compact' }, [
+      createElement('span', { text: '批次类型' }),
+      createElement('select', { name: 'importType' }, importTypeOptions.map((option) => createElement('option', { value: option.value, selected: state.importBatchFilters.importType === option.value ? 'selected' : undefined, text: option.label })))
+    ]),
+    createElement('label', { className: 'field compact' }, [
+      createElement('span', { text: '状态' }),
+      createElement('select', { name: 'status' }, statusOptions.map((option) => createElement('option', { value: option.value, selected: state.importBatchFilters.status === option.value ? 'selected' : undefined, text: option.label })))
+    ]),
+    createElement('button', { type: 'submit', className: 'btn btn-primary', text: '筛选批次' }),
+    createElement('button', { type: 'button', className: 'btn btn-ghost', text: '重置筛选', dataset: { action: 'reset-import-batches-filters' } })
   ]);
 }
 
 function renderImportBatchesCard(batches) {
   const rows = batches.ok ? batches.value.data : [];
   return renderCard('导入批次列表', [
+    renderImportBatchFilters(),
+    createElement('p', { className: 'muted', text: '批次列表支持能耗导入、抄表导入、组织/用能单元导入、计量器具导入、月度产量导入、发电记录导入；月度产量/发电记录批次仅提供追溯查看、错误明细和原文件下载，通用删除保持禁用。' }),
     batches.ok ? renderTable([
       { key: 'id', label: '批次' },
       { key: 'originalFilename', label: '文件名', render: (row) => createElement('span', { className: 'filename-text', text: formatText(getImportDisplayFilename(row)) }) },
@@ -981,8 +1052,11 @@ function renderImportBatchesCard(batches) {
       { key: 'createdAt', label: '创建时间' },
       { key: 'actions', label: '操作', render: (row) => renderImportBatchActions(row) }
     ], rows, '暂无导入批次。请先上传表格文件。') : renderMessage('error', '批次列表读取失败', batches.error.message),
+    createElement('div', { id: 'import-batch-detail-panel', className: 'sub-panel' }, [
+      renderEmpty('批次详情入口', '点击批次列表或领域导入面板中的“查看详情”后，将从 /imports/batches/:batchId 读取批次状态、审计上下文、执行结果、备份摘要、原文件和错误入口。')
+    ]),
     createElement('div', { id: 'import-errors-panel', className: 'sub-panel' }, [
-      renderEmpty('错误明细入口', '点击批次列表中的“查看错误”后，将从 /imports/batches/:batchId/errors 读取错误行。')
+      renderEmpty('错误明细入口', '点击“查看错误”后，将从 /imports/batches/:batchId/errors 读取错误/警告行，可用于核对 skipped warning 和 blocked error。')
     ])
   ]);
 }
@@ -1011,7 +1085,8 @@ async function refreshImportBatches(focusBatchId) {
   }
   clearNode(section);
   section.append(renderLoading('正在刷新导入批次列表...'));
-  const batches = await safeApi('/imports/batches?page=1&pageSize=20');
+  const query = toQuery({ ...state.importBatchFilters, page: 1, pageSize: 20 });
+  const batches = await safeApi(`/imports/batches${query}`);
   clearNode(section);
   section.append(renderImportBatchesCard(batches));
   if (focusBatchId) {
@@ -1213,17 +1288,30 @@ async function handleImportSubmit(event) {
   }
 }
 
+async function getDownloadFailureMessage(response) {
+  const fallback = response.status === 404
+    ? '导入批次原始文件不存在或已被移动。'
+    : response.status === 400
+      ? '导入批次原始文件路径无效，已被安全边界拦截。'
+      : `下载请求失败（HTTP ${response.status}）。`;
+  try {
+    const payload = await response.clone().json();
+    return payload?.error?.message || fallback;
+  } catch (error) {
+    return fallback;
+  }
+}
+
 async function downloadImportFile(batchId, filename) {
   let objectUrl = null;
   try {
     const response = await fetch(buildApiUrl(`/imports/batches/${encodeURIComponent(batchId)}/download`));
     if (!response.ok) {
-      const errorText = await response.text().catch(() => '');
-      throw new Error(`HTTP ${response.status}${errorText ? `：${errorText.slice(0, 120)}` : ''}`);
+      throw new Error(await getDownloadFailureMessage(response));
     }
     const blob = await response.blob();
     if (!blob || blob.size === 0) {
-      throw new Error('原始文件为空');
+      throw new Error('原始文件为空。');
     }
     const headerFileName = getFileNameFromContentDisposition(response.headers.get('content-disposition'));
     objectUrl = URL.createObjectURL(blob);
@@ -1237,7 +1325,7 @@ async function downloadImportFile(batchId, filename) {
     link.remove();
     showImportOperationResult('success', '历史文件下载已触发', `批次 ${batchId} 原始文件下载已触发。`);
   } catch (error) {
-    showImportOperationResult('error', '历史文件下载失败', `${error.message || error}。请确认后端已启动，且该批次原始文件仍在本地 uploads 目录。`);
+    showImportOperationResult('error', '历史文件下载失败', `${error.message || error} 请确认后端已启动，且该批次原始文件仍在本地 uploads 目录；页面不会展示服务端本地路径。`);
   } finally {
     if (objectUrl) {
       window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
@@ -1248,6 +1336,10 @@ async function downloadImportFile(batchId, filename) {
 async function deleteImportBatch(batchId, filename, importType = 'energy_record') {
   if (importType === 'meter_reading') {
     showImportOperationResult('error', '抄表批次禁止通用删除', '抄表导入批次需保留 meter_reading_records.source_batch_id 追溯链路，请走抄表批次作废/追溯策略；当前通用删除入口不会删除该批次。');
+    return;
+  }
+  if (isImportAuditBatchType(importType)) {
+    showImportOperationResult('error', '审计批次禁止通用删除', '月度产量/发电记录审计批次需保留原文件、错误明细和业务记录追溯；当前页面禁用通用删除，不会物理删除业务记录或审计批次。');
     return;
   }
   const confirmed = window.confirm(`确认删除导入批次 ${batchId}${filename ? `（${filename}）` : ''}？\n\n将删除该批次、错误明细、该批次导入的能耗记录，以及这些能耗记录关联的碳排放结果。上传原件不会物理删除；既有预测运行不会自动删除，如需反映最新历史数据请重新创建预测运行。`);
@@ -1276,8 +1368,95 @@ async function deleteImportBatch(batchId, filename, importType = 'energy_record'
   await refreshDashboardAndEnergyAfterImportChange();
 }
 
+function formatAuditObjectSummary(value) {
+  if (value === undefined || value === null || value === '') {
+    return '-';
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch (error) {
+    return String(value);
+  }
+}
+
+function getImportAuditPanel(selector, title, message) {
+  const existingPanel = document.querySelector(selector);
+  if (existingPanel) {
+    return existingPanel;
+  }
+  const root = getViewRoot();
+  if (!root) {
+    return null;
+  }
+  const fallbackPanel = createElement('div', {
+    id: selector.replace(/^#/, ''),
+    className: 'sub-panel import-audit-fallback-panel',
+    'aria-live': 'polite'
+  }, [
+    renderEmpty(title, message)
+  ]);
+  root.prepend(fallbackPanel);
+  return fallbackPanel;
+}
+
+async function loadImportBatchDetail(batchId) {
+  const panel = getImportAuditPanel(
+    '#import-batch-detail-panel',
+    '批次详情入口',
+    '当前页面未预置数据导入页详情容器，已在本页创建临时批次详情面板；正在读取 /imports/batches/:batchId。'
+  );
+  if (!panel) {
+    return;
+  }
+  clearNode(panel);
+  panel.append(renderLoading(`正在读取批次 ${batchId} 详情...`));
+  const response = await safeApi(`/imports/batches/${batchId}`);
+  clearNode(panel);
+  if (!response.ok) {
+    panel.append(renderMessage('error', '批次详情读取失败', formatApiError(response.error)));
+    return;
+  }
+  const detail = response.value.data || {};
+  const counts = detail.counts || {};
+  const download = detail.download || {};
+  panel.append(renderCard(`批次 ${formatText(detail.id, batchId)} 详情`, [
+    renderKeyValueList([
+      { label: '批次类型', value: detail.importTypeLabel || formatImportType(detail.importType) },
+      { label: '原文件', value: detail.displayFilename || detail.originalFilename || '-' },
+      { label: '状态', value: detail.status || '-' },
+      { label: '审计阶段', value: detail.auditPhase || '-' },
+      { label: '持久化状态', value: detail.id ? '已持久化，可追溯批次详情、错误明细和原文件。' : '未返回持久批次。' },
+      { label: '行数统计', value: `总行 ${formatNumber(counts.totalRows, 0)}，成功 ${formatNumber(counts.successCount, 0)}，失败 ${formatNumber(counts.failureCount, 0)}，跳过 ${formatNumber(counts.skippedCount, 0)}` },
+      { label: '原文件 sha256', value: download.fileSha256 || detail.fileSha256 || '-' },
+      { label: '原文件大小', value: download.fileSizeBytes || detail.fileSizeBytes || '-' },
+      { label: '错误摘要', value: detail.errorSummary || '-' },
+      { label: '备份信息', value: formatAuditObjectSummary(detail.backup) },
+      { label: '审计上下文', value: formatAuditObjectSummary(detail.auditContext) },
+      { label: '执行结果', value: formatAuditObjectSummary(detail.executeResult) }
+    ]),
+    createElement('div', { className: 'template-actions' }, [
+      createElement('button', { type: 'button', className: 'btn btn-small', text: '查看错误明细', dataset: { action: 'load-import-errors', batchId: detail.id || batchId } }),
+      createElement('button', { type: 'button', className: 'btn btn-small', text: '下载原文件', disabled: download.available === false ? 'disabled' : undefined, title: download.available === false ? '该批次没有可下载原文件。' : undefined, dataset: { action: 'download-import-file', batchId: detail.id || batchId, filename: detail.displayFilename || detail.originalFilename || '' } })
+    ]),
+    Array.isArray(detail.issueSummary) && detail.issueSummary.length > 0 ? renderTable([
+      { key: 'severity', label: '级别' },
+      { key: 'errorCode', label: '错误码' },
+      { key: 'count', label: '数量' },
+      { key: 'firstRowNumber', label: '首行' },
+      { key: 'sampleMessage', label: '示例说明' }
+    ], detail.issueSummary, '暂无错误摘要。') : renderEmpty('错误摘要', '该批次暂无错误/警告摘要。')
+  ]));
+}
+
 async function loadImportErrors(batchId) {
-  const panel = document.querySelector('#import-errors-panel');
+  const panel = getImportAuditPanel(
+    '#import-errors-panel',
+    '错误明细入口',
+    '当前页面未预置数据导入页错误容器，已在本页创建临时错误明细面板；正在读取 /imports/batches/:batchId/errors。'
+  );
   if (!panel) {
     return;
   }
@@ -2221,6 +2400,25 @@ function renderLedgerImportPanel(kind, result) {
   return createElement('div', { id: selector, className: 'inline-result', 'aria-live': 'polite' }, content);
 }
 
+function renderImportAuditBatchLinks(audit = {}, noun = '导入') {
+  const batchId = audit.batchId || audit.auditBatch?.id;
+  const auditBatch = audit.auditBatch || {};
+  if (!batchId) {
+    return renderMessage('warning', `${noun}批次未返回`, '本次响应未返回 batchId，无法从页面直接查看持久批次；请保留当前响应明细并检查后端返回。');
+  }
+  const persistentText = audit.persistsImportBatch === true || auditBatch.id
+    ? '已持久化，可通过批次详情、错误明细和原文件下载追溯。'
+    : '响应未明确 persistsImportBatch=true，请以批次详情接口为准。';
+  return createElement('div', { className: 'sub-panel' }, [
+    renderMessage('info', `${noun}审计批次`, `批次号 ${formatText(batchId)}；类型 ${formatImportType(auditBatch.importType)}；状态 ${formatText(auditBatch.status || audit.status)}；持久化状态：${persistentText}`),
+    createElement('div', { className: 'template-actions' }, [
+      createElement('button', { type: 'button', className: 'btn btn-small', text: '查看批次详情', dataset: { action: 'load-import-batch-detail', batchId } }),
+      createElement('button', { type: 'button', className: 'btn btn-small', text: '查看错误明细', dataset: { action: 'load-import-errors', batchId } }),
+      createElement('button', { type: 'button', className: 'btn btn-small', text: '下载原文件', dataset: { action: 'download-import-file', batchId, filename: auditBatch.originalFilename || audit.originalFilename || '' } })
+    ])
+  ]);
+}
+
 function renderProductionOutputImportAudit(audit = {}) {
   const summary = audit.summary || {};
   const items = Array.isArray(audit.items) ? audit.items : [];
@@ -2228,8 +2426,9 @@ function renderProductionOutputImportAudit(audit = {}) {
     renderMessage(
       audit.executed ? 'success' : 'info',
       audit.executed ? '月度产量导入已执行' : '月度产量导入预演结果',
-      `总行数 ${formatNumber(summary.totalRows, 0)}，可导入 ${formatNumber(summary.wouldImport, 0)}，已导入 ${formatNumber(audit.imported || summary.imported || 0, 0)}，跳过 ${formatNumber(summary.skipped || audit.skipped || 0, 0)}，阻断 ${formatNumber(summary.blocked || 0, 0)}，警告 ${formatNumber(summary.warnings || 0, 0)}，错误 ${formatNumber(summary.errors || 0, 0)}。${audit.backup?.backupName ? `备份：${audit.backup.backupName}。` : ''}`
+      `总行数 ${formatNumber(summary.totalRows, 0)}，可导入 ${formatNumber(summary.wouldImport, 0)}，已导入 ${formatNumber(audit.imported || summary.imported || 0, 0)}，跳过 ${formatNumber(summary.skipped || audit.skipped || 0, 0)}，阻断 ${formatNumber(summary.blocked || 0, 0)}，警告 ${formatNumber(summary.warnings || 0, 0)}，错误 ${formatNumber(summary.errors || 0, 0)}。批次号：${formatText(audit.batchId || audit.auditBatch?.id, '未返回')}；持久化状态：${audit.persistsImportBatch === true ? '已持久化' : '未确认'}。${audit.backup?.backupName ? `备份：${audit.backup.backupName}。` : ''}`
     ),
+    renderImportAuditBatchLinks(audit, '月度产量导入'),
     renderTable([
       { key: 'rowNumber', label: '行号' },
       { key: 'status', label: '状态', render: (row) => renderStatusPill(row.status || row.previewStatus) },
@@ -2247,7 +2446,7 @@ function renderProductionOutputImportPanel() {
   const executeResult = state.productionOutputImportExecuteResult;
   const canExecute = preview?.previewSignature && Number(preview?.summary?.wouldImport || 0) > 0 && Array.isArray(preview?.candidateRowIds) && preview.candidateRowIds.length > 0;
   const children = [
-    createElement('p', { className: 'muted', text: '月度产量导入采用 preview + signature + candidate rows + 自动备份 + 固定确认文本受控 execute。产能单元编码必填并优先匹配；名称仅辅助校验/展示；同产能单元同月份已有 active 产量时 skip warning，不覆盖、不作废旧记录。' }),
+    createElement('p', { className: 'muted', text: '月度产量导入采用 preview + signature + candidate rows + 自动备份 + 固定确认文本受控 execute。产能单元编码必填并优先匹配；名称仅辅助校验/展示；同产能单元同月份已有 active 产量时 skip warning，不覆盖、不作废旧记录；preview/execute 响应会展示可追溯批次号、批次详情、错误明细和原文件下载入口。' }),
     renderTemplateActions([{ type: 'production-outputs', label: '下载产量导入模板（Excel）' }]),
     createElement('form', { id: 'production-output-import-preview-form', className: 'form-card' }, [
       createElement('label', { className: 'field' }, [
@@ -2343,17 +2542,110 @@ function renderGenerationForm(units = [], editingRecord = null) {
 }
 
 function renderGenerationBoundaryCard(meta = {}) {
-  return renderCard('首期边界说明', [
+  return renderCard('发电自用边界说明', [
     renderMessage('info', '外购电参考口径', '外购电参考来自 active energy_records 中 electricity + 同用能单元 + 同月份汇总，仅供参考，不自动抵扣、不入账。'),
     renderKeyValueList([
       { label: '固定能源类型', value: 'photovoltaic / 光伏；标准单位 kWh。' },
-      { label: '不写 energy_records', value: meta.writesEnergyRecords === false ? '确认：不会自动写入或回填 energy_records。' : '接口未返回确认，需以后端实际逻辑为准。' },
-      { label: '不写 carbon_emissions', value: meta.writesCarbonEmissions === false ? '确认：不会自动写入 carbon_emissions。' : '接口未返回确认，需以后端实际逻辑为准。' },
-      { label: '不影响单位产品能耗', value: meta.affectsProductionIntensity === false ? '确认：不影响单位产品能耗统计。' : '接口未返回确认，需以后端实际逻辑为准。' },
-      { label: '首期不含导入/导出', value: meta.importExportIncluded === false ? '确认：页面不提供发电导入、导出或模板下载。' : '当前页面仍不提供导入/导出入口。' },
-      { label: '不含实时采集/外部网关', value: meta.realtimeCollectionIncluded === false ? '确认：不引入实时采集、自动同步或外部网关。' : '当前页面仅支持手工录入。' }
+      { label: '导入/导出目标表', value: '模板下载、当前筛选导出、上传 preview 和受控 execute 只维护 generation_records。' },
+      { label: '不写 energy_records', value: meta.writesEnergyRecords === false ? '确认：不会自动写入或回填 energy_records。' : '页面固定边界：导入/导出不写 energy_records。' },
+      { label: '不写 carbon_emissions', value: meta.writesCarbonEmissions === false ? '确认：不会自动写入 carbon_emissions。' : '页面固定边界：导入/导出不写 carbon_emissions。' },
+      { label: '不影响单位产品能耗', value: meta.affectsProductionIntensity === false ? '确认：不影响单位产品能耗统计。' : '页面固定边界：不影响单位产品能耗统计。' },
+      { label: '重复策略', value: '默认 skip：同用能单元、同月份、photovoltaic 已有 active 记录或同文件重复候选会跳过并显示 warning，不覆盖旧记录。' },
+      { label: '不含实时采集/外部网关', value: meta.realtimeCollectionIncluded === false ? '确认：不引入实时采集、自动同步或外部网关。' : '当前页面不引入实时采集、自动同步或外部网关。' }
     ])
   ]);
+}
+
+function renderGenerationImportIssueList(row = {}) {
+  const issues = [];
+  if (Array.isArray(row.errors)) issues.push(...row.errors);
+  if (Array.isArray(row.warnings)) issues.push(...row.warnings);
+  if (Array.isArray(row.reasons)) issues.push(...row.reasons);
+  if (issues.length === 0) {
+    return createElement('span', { text: row.reasonText || row.reason || row.reasonCodes || '-' });
+  }
+  return createElement('ul', { className: 'compact-list' }, issues.map((issue) => createElement('li', {
+    text: `${formatText(issue.severity, 'info')}：${formatText(issue.fieldName, 'row')}；原始值 ${formatText(issue.rawValue)}；${formatText(issue.message || issue.code)}`
+  })));
+}
+
+function renderGenerationRecordImportAudit(audit = {}) {
+  const summary = audit.summary || {};
+  const items = Array.isArray(audit.items) && audit.items.length > 0
+    ? audit.items
+    : (Array.isArray(audit.previewAudit?.items) ? audit.previewAudit.items : []);
+  return [
+    renderMessage(
+      audit.executed ? 'success' : 'info',
+      audit.executed ? '发电自用记录导入已执行' : '发电自用记录导入预演结果',
+      `总行数 ${formatNumber(summary.totalRows, 0)}，可导入 ${formatNumber(summary.wouldImport, 0)}，已导入 ${formatNumber(audit.imported || summary.imported || 0, 0)}，跳过 ${formatNumber(summary.skipped || audit.skipped || 0, 0)}，阻断 ${formatNumber(summary.blocked || audit.blocked || 0, 0)}，警告 ${formatNumber(summary.warnings || audit.warnings || 0, 0)}，错误 ${formatNumber(summary.errors || audit.errors || 0, 0)}。批次号：${formatText(audit.batchId || audit.auditBatch?.id, '未返回')}；持久化状态：${audit.persistsImportBatch === true ? '已持久化' : '未确认'}。${audit.backup?.backupName ? `备份：${audit.backup.backupName}。` : ''}导入/导出只维护 generation_records，不写 energy_records，不写 carbon_emissions，不影响单位产品能耗。`
+    ),
+    renderImportAuditBatchLinks(audit, '发电记录导入'),
+    Array.isArray(audit.notices) && audit.notices.length > 0
+      ? createElement('ul', { className: 'compact-list' }, audit.notices.map((notice) => createElement('li', { text: notice })))
+      : null,
+    renderTable([
+      { key: 'rowNumber', label: '行号' },
+      { key: 'status', label: '状态', render: (row) => renderStatusPill(row.status || row.previewStatus) },
+      { key: 'organizationUnitCode', label: '用能单元编码', render: (row) => createElement('span', { text: formatText(row.organizationUnitCode || row.values?.organizationUnitCode) }) },
+      { key: 'organizationUnitName', label: '用能单元名称', render: (row) => createElement('span', { text: formatText(row.organizationUnitName || row.values?.organizationUnitName) }) },
+      { key: 'normalizedMonth', label: '月份', render: (row) => createElement('span', { text: formatText(row.normalizedMonth || row.values?.normalizedMonth) }) },
+      { key: 'generationValueKwh', label: '发电量', render: (row) => createElement('span', { text: `${formatText(row.generationValueKwh ?? row.values?.generationValueKwh)} kWh` }) },
+      { key: 'selfUseValueKwh', label: '自发自用', render: (row) => createElement('span', { text: `${formatText(row.selfUseValueKwh ?? row.values?.selfUseValueKwh)} kWh` }) },
+      { key: 'gridExportValueKwh', label: '上网电量', render: (row) => createElement('span', { text: `${formatText(row.gridExportValueKwh ?? row.values?.gridExportValueKwh)} kWh` }) },
+      { key: 'reasonText', label: '错误/警告/说明', render: renderGenerationImportIssueList }
+    ], items, '暂无行级明细。')
+  ];
+}
+
+function renderGenerationRecordImportResultRegion(preview, executeResult) {
+  const content = [];
+  if (state.generationRecordImportPreviewLoading || state.generationRecordImportExecuteLoading) {
+    content.push(renderLoading(state.generationRecordImportExecuteLoading ? '正在受控导入发电自用记录...' : '正在预演发电自用记录导入...'));
+  }
+  if (state.generationRecordImportPreviewError) {
+    content.push(renderMessage('error', '发电自用记录导入预演失败', state.generationRecordImportPreviewError));
+  }
+  if (state.generationRecordImportExecuteError) {
+    content.push(renderMessage('error', '发电自用记录受控导入失败', state.generationRecordImportExecuteError));
+  }
+  if (executeResult) {
+    content.push(...renderGenerationRecordImportAudit(executeResult));
+  } else if (preview) {
+    content.push(...renderGenerationRecordImportAudit(preview));
+  } else {
+    content.push(renderMessage('info', '发电自用记录导入预演', '选择文件并运行预演后，这里会展示 summary、wouldImport/skipped/blocked、行级错误/警告原因；预演前不会写入 generation_records。'));
+  }
+  return createElement('div', { id: 'ledger-generation-import-result', className: 'inline-result', 'aria-live': 'polite' }, content);
+}
+
+function renderGenerationRecordImportPanel() {
+  const preview = state.generationRecordImportPreview;
+  const executeResult = state.generationRecordImportExecuteResult;
+  const canExecute = preview?.previewSignature && Number(preview?.summary?.wouldImport || 0) > 0 && Array.isArray(preview?.candidateRowIds) && preview.candidateRowIds.length > 0;
+  const children = [
+    createElement('p', { className: 'muted', text: '发电自用导入采用上传 preview + previewSignature + candidateRows + 自动备份 + 固定确认文本受控 execute；预演不写库，执行仅写 active generation_records。重复 active 记录和同文件重复候选默认 skip warning，不覆盖旧记录。' }),
+    createElement('p', { className: 'muted', text: '非联动边界：导入/导出只维护 generation_records，不写 energy_records，不写 carbon_emissions，不影响单位产品能耗；外购电参考只读，不抵扣不入账。当前支持从 preview/execute 响应进入持久批次追溯：查看批次详情、错误明细和下载原文件。' }),
+    createElement('div', { className: 'template-actions' }, [
+      createTemplateDownloadButton('generation-records', '下载发电记录导入模板（Excel）'),
+      createElement('button', { type: 'button', className: 'btn btn-ghost', text: '下载发电记录导入模板（CSV）', dataset: { action: 'download-template-csv', templateType: 'generation-records', fileName: '发电自用记录导入模板.csv' } })
+    ]),
+    createElement('form', { id: 'ledger-generation-import-preview-form', className: 'form-card' }, [
+      createElement('label', { className: 'field' }, [
+        createElement('span', { text: '导入发电自用记录文件（.xlsx / .xls / .csv）' }),
+        createElement('input', { type: 'file', name: 'file', accept: '.xlsx,.xls,.csv' })
+      ]),
+      createElement('div', { className: 'template-actions' }, [
+        createElement('button', { type: 'submit', className: 'btn btn-primary', text: state.generationRecordImportPreviewLoading ? '预演中...' : '上传并运行预演', disabled: state.generationRecordImportPreviewLoading || state.generationRecordImportExecuteLoading ? 'disabled' : undefined }),
+        createElement('button', { type: 'button', className: 'btn btn-ghost', text: '导出当前筛选（Excel）', disabled: state.generationRecordImportPreviewLoading || state.generationRecordImportExecuteLoading ? 'disabled' : undefined, dataset: { action: 'export-ledger-generation' } }),
+        createElement('button', { type: 'button', className: 'btn btn-ghost', text: '导出当前筛选（CSV）', disabled: state.generationRecordImportPreviewLoading || state.generationRecordImportExecuteLoading ? 'disabled' : undefined, dataset: { action: 'export-ledger-generation-csv' } }),
+        createElement('button', { type: 'button', className: 'btn btn-danger', text: state.generationRecordImportExecuteLoading ? '导入中...' : '受控执行导入', disabled: canExecute && !state.generationRecordImportPreviewLoading && !state.generationRecordImportExecuteLoading ? undefined : 'disabled', dataset: { action: 'execute-generation-record-import' } })
+      ]),
+      createElement('small', { className: 'muted', text: '受控执行固定确认文本：确认导入发电自用记录；请求体会携带 confirmText、previewSignature、expectedWouldImport、candidateRowIds、candidateRows、acknowledgeSkippedRisks=true、requireBackup=true。' }),
+      renderGenerationRecordImportResultRegion(preview, executeResult)
+    ])
+  ];
+  return renderCard('发电自用导入/导出', children);
 }
 
 function renderGenerationActions(row) {
@@ -2447,6 +2739,81 @@ async function voidGenerationRecord(id, name) {
     return;
   }
   state.ledgerTab = 'generation';
+  await renderLedger();
+}
+
+async function handleGenerationRecordImportPreviewSubmit(event) {
+  event.preventDefault();
+  const form = getSubmittedForm(event, 'ledger-generation-import-preview-form');
+  const file = form?.querySelector('input[type="file"][name="file"]')?.files?.[0];
+  state.generationRecordImportPreviewError = null;
+  state.generationRecordImportExecuteError = null;
+  state.generationRecordImportExecuteResult = null;
+  state.generationRecordImportPreview = null;
+  const validationMessage = validateLedgerImportFile(file, '发电自用记录');
+  if (validationMessage) {
+    state.generationRecordImportPreviewError = validationMessage;
+    state.ledgerTab = 'generation';
+    await renderLedger();
+    return;
+  }
+  const body = new FormData();
+  body.append('file', file);
+  state.generationRecordImportPreviewLoading = true;
+  state.ledgerTab = 'generation';
+  await renderLedger();
+  const response = await safeApi('/generation/records/import/preview', { method: 'POST', body });
+  state.generationRecordImportPreviewLoading = false;
+  if (!response.ok) {
+    state.generationRecordImportPreviewError = formatApiError(response.error);
+    await renderLedger();
+    return;
+  }
+  state.generationRecordImportPreview = response.value.data || {};
+  await renderLedger();
+}
+
+async function executeGenerationRecordImportFromPreview() {
+  const preview = state.generationRecordImportPreview;
+  const summary = preview?.summary || {};
+  const candidateRowIds = Array.isArray(preview?.candidateRowIds) ? preview.candidateRowIds : [];
+  if (!preview?.previewSignature || Number(summary.wouldImport || 0) <= 0 || candidateRowIds.length === 0) {
+    window.alert('请先运行发电自用记录导入预演，并确认存在 wouldImport 候选后再执行。');
+    return;
+  }
+  const confirmText = window.prompt(`受控导入会自动创建备份，并只写入最新 preview 中 wouldImport=true 的发电自用记录候选。\n\n冲突、重复、无效和阻断行会按 skip 风险处理，不覆盖、不作废旧 active 记录，不自动创建用能单元；导入只写 generation_records，不写 energy_records，不写 carbon_emissions，不影响单位产品能耗；外购电参考只读，不抵扣不入账。\n\n如确认执行，请输入固定确认文本：确认导入发电自用记录`);
+  if (confirmText !== '确认导入发电自用记录') {
+    window.alert('确认文本不匹配，已取消发电自用记录受控导入。');
+    return;
+  }
+  state.generationRecordImportExecuteLoading = true;
+  state.generationRecordImportExecuteError = null;
+  state.generationRecordImportExecuteResult = null;
+  state.ledgerTab = 'generation';
+  await renderLedger();
+  const response = await safeApi('/generation/records/import/execute', {
+    method: 'POST',
+    body: {
+      confirmText,
+      batchId: preview.batchId || preview.auditBatch?.id,
+      previewSignature: preview.previewSignature,
+      expectedWouldImport: Number(summary.wouldImport || 0),
+      candidateRowIds,
+      candidateRows: preview.candidateRows || [],
+      previewAudit: preview.previewAudit || { summary: preview.summary || {}, items: preview.items || [] },
+      previewAuditDigest: preview.previewAuditDigest,
+      acknowledgeSkippedRisks: true,
+      requireBackup: true
+    }
+  });
+  state.generationRecordImportExecuteLoading = false;
+  if (!response.ok) {
+    state.generationRecordImportExecuteError = formatApiError(response.error);
+    await renderLedger();
+    return;
+  }
+  state.generationRecordImportExecuteResult = response.value.data || {};
+  state.generationRecordImportPreview = null;
   await renderLedger();
 }
 
@@ -2615,7 +2982,8 @@ async function renderLedger(edit = {}) {
       unitsResponse.ok ? renderGenerationForm(units, editingGenerationRecord) : renderMessage('error', '用能单元读取失败', formatApiError(unitsResponse.error)),
       renderGenerationBoundaryCard(generationMeta)
     ]));
-    root.append(renderMessage('info', '发电自发自用首期口径', '本页仅支持 photovoltaic / 光伏发电记录页面录入、编辑、作废、查询和汇总；外购电参考来自能耗记录，仅供参考，不自动抵扣、不入账。'));
+    root.append(renderMessage('info', '发电自发自用导入/导出口径', '本页支持 photovoltaic / 光伏发电记录页面录入、编辑、作废、查询、汇总，以及模板下载、当前筛选导出、上传 preview 和固定确认文本受控 execute；导入/导出只维护 generation_records，不写 energy_records，不写 carbon_emissions，不影响单位产品能耗；外购电参考只读，不抵扣不入账。'));
+    root.append(renderGenerationRecordImportPanel());
     root.append(renderFilterRow('ledger-generation', [
       { name: 'organizationUnitId', label: '用能单元', type: 'select', value: state.ledgerGenerationFilters.organizationUnitId || '', options: getLedgerUnitOptions(units.filter((unit) => unit.status === 'active'), true, '全部用能单元') },
       { name: 'monthStart', label: '开始月份', type: 'month', value: state.ledgerGenerationFilters.monthStart || '' },
@@ -2957,6 +3325,7 @@ async function executeProductionOutputImport() {
     method: 'POST',
     body: {
       confirmText,
+      batchId: preview.batchId || preview.auditBatch?.id,
       previewSignature: preview.previewSignature,
       expectedWouldImport: Number(summary.wouldImport || 0),
       candidateRowIds,
@@ -3214,6 +3583,13 @@ async function exportLedgerReadings() {
 async function exportProductionOutputs() {
   const query = toQuery({ ...state.ledgerProductionOutputFilters, format: 'xlsx' });
   await downloadLedgerExport(`/production/outputs/export${query}`, '月度产量导出.xlsx', '月度产量导出已触发', '月度产量导出');
+}
+
+async function exportGenerationRecords(format = 'xlsx') {
+  const normalizedFormat = String(format || 'xlsx').toLowerCase() === 'csv' ? 'csv' : 'xlsx';
+  const query = toQuery({ ...state.ledgerGenerationFilters, format: normalizedFormat });
+  const fallbackFileName = normalizedFormat === 'csv' ? '发电自用记录导出.csv' : '发电自用记录导出.xlsx';
+  await downloadLedgerExport(`/generation/records/export${query}`, fallbackFileName, '发电自用记录导出已触发', '发电自用记录导出');
 }
 
 async function exportEnergyLedgerBackfillPreview() {
@@ -3597,12 +3973,24 @@ function bindEvents() {
       await downloadTemplate(actionButton.dataset.templateType, actionButton.dataset.fileName);
       actionButton.disabled = false;
       actionButton.textContent = originalText;
+    } else if (action === 'download-template-csv') {
+      const originalText = actionButton.textContent;
+      actionButton.disabled = true;
+      actionButton.textContent = '正在准备 CSV 模板...';
+      await downloadTemplateCsv(actionButton.dataset.templateType, actionButton.dataset.fileName);
+      actionButton.disabled = false;
+      actionButton.textContent = originalText;
+    } else if (action === 'load-import-batch-detail') {
+      await loadImportBatchDetail(actionButton.dataset.batchId);
     } else if (action === 'load-import-errors') {
       await loadImportErrors(actionButton.dataset.batchId);
     } else if (action === 'download-import-file') {
       await downloadImportFile(actionButton.dataset.batchId, actionButton.dataset.filename);
     } else if (action === 'delete-import-batch') {
       await deleteImportBatch(actionButton.dataset.batchId, actionButton.dataset.filename, actionButton.dataset.importType);
+    } else if (action === 'reset-import-batches-filters') {
+      state.importBatchFilters = {};
+      await refreshImportBatches();
     } else if (action === 'create-backup') {
       const originalText = actionButton.textContent;
       actionButton.disabled = true;
@@ -3660,8 +4048,14 @@ function bindEvents() {
       await exportLedgerMeters();
     } else if (action === 'export-ledger-readings') {
       await exportLedgerReadings();
+    } else if (action === 'export-ledger-generation') {
+      await exportGenerationRecords('xlsx');
+    } else if (action === 'export-ledger-generation-csv') {
+      await exportGenerationRecords('csv');
     } else if (action === 'export-production-outputs') {
       await exportProductionOutputs();
+    } else if (action === 'execute-generation-record-import') {
+      await executeGenerationRecordImportFromPreview();
     } else if (action === 'execute-production-output-import') {
       await executeProductionOutputImport();
     } else if (action === 'run-meter-reading-generation-preview') {
@@ -3701,6 +4095,10 @@ function bindEvents() {
       await renderLedger();
     } else if (action === 'reset-ledger-generation-filters') {
       state.ledgerGenerationFilters = {};
+      state.generationRecordImportPreview = null;
+      state.generationRecordImportPreviewError = null;
+      state.generationRecordImportExecuteError = null;
+      state.generationRecordImportExecuteResult = null;
       state.ledgerTab = 'generation';
       await renderLedger();
     } else if (action === 'reset-ledger-production-units-filters') {
@@ -3738,6 +4136,10 @@ function bindEvents() {
     try {
       if (form.id === 'import-form') {
         await handleImportSubmit(event);
+      } else if (form.id === 'import-batches-filters') {
+        event.preventDefault();
+        state.importBatchFilters = collectFormValues(form);
+        await refreshImportBatches();
       } else if (form.id === 'energy-filters') {
         event.preventDefault();
         state.energyFilters = collectFormValues(form);
@@ -3756,6 +4158,8 @@ function bindEvents() {
         await handleMeterReadingSubmit(event);
       } else if (form.id === 'ledger-generation-form') {
         await handleGenerationSubmit(event);
+      } else if (form.id === 'ledger-generation-import-preview-form') {
+        await handleGenerationRecordImportPreviewSubmit(event);
       } else if (form.id === 'ledger-production-unit-form') {
         await handleProductionUnitSubmit(event);
       } else if (form.id === 'ledger-production-output-form') {
@@ -3786,6 +4190,10 @@ function bindEvents() {
       } else if (form.id === 'ledger-generation-filters') {
         event.preventDefault();
         state.ledgerGenerationFilters = collectFormValues(form);
+        state.generationRecordImportPreview = null;
+        state.generationRecordImportPreviewError = null;
+        state.generationRecordImportExecuteError = null;
+        state.generationRecordImportExecuteResult = null;
         state.ledgerTab = 'generation';
         await renderLedger();
       } else if (form.id === 'ledger-production-units-filters') {
@@ -3819,6 +4227,7 @@ function bindEvents() {
         'ledger-unit-import-form': '#ledger-unit-import-result',
         'ledger-meter-import-form': '#ledger-meter-import-result',
         'ledger-reading-form': '#ledger-reading-result',
+        'ledger-generation-import-preview-form': '#ledger-generation-import-result',
         'ledger-production-unit-form': '#ledger-production-unit-result',
         'ledger-production-output-form': '#ledger-production-output-result',
         'ledger-reading-import-form': '#ledger-reading-import-result',

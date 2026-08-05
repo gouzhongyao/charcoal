@@ -1242,7 +1242,9 @@ try {
   const uploadPreview = createProductionOutputImportPreviewFromUpload({ path: productionImportCsvPath, originalname: 'production-outputs.csv', filename: 'production-outputs.csv', size: fs.statSync(productionImportCsvPath).size });
   assert.strictEqual(uploadPreview.dryRun, true);
   assert.strictEqual(uploadPreview.writesProductionOutputs, false);
-  assert.strictEqual(uploadPreview.persistsImportBatch, false);
+  assert.strictEqual(uploadPreview.persistsImportBatch, true);
+  assert(Number.isInteger(uploadPreview.batchId), '月度产量导入 preview 应返回持久审计 batchId。');
+  assert.strictEqual(uploadPreview.auditBatch && uploadPreview.auditBatch.importType, 'production_output');
   assert.strictEqual(uploadPreview.summary.wouldImport, 1, '有效行应为 wouldImport。');
   assert.strictEqual(uploadPreview.summary.skipped, 1, '已有 active 产量冲突应 skipped。');
   assert(uploadPreview.items.some((item) => item.status === 'skipped' && item.reasonCodes.includes('DUPLICATE_ACTIVE_PRODUCTION_OUTPUT_SKIPPED')), '冲突行应 skipped 并带 warning。');
@@ -1369,7 +1371,7 @@ assert(!/safeApi\(`?\/energy-records\/ledger-backfill\/(?!execute)[^`)]*\{\s*met
 assert(!/safeApi\(`?\/energy-records\/ledger-backfill[^`)]*\{\s*method:\s*['"](?:PUT|PATCH|DELETE)['"]/i.test(clientMainJs), '前端不得对 ledger-backfill 发起 PUT/PATCH/DELETE 写调用。');
 assert(schemaSql.includes('CREATE TABLE IF NOT EXISTS organization_units'), 'schema 应包含 organization_units 表。');
 assert(schemaSql.includes('CREATE TABLE IF NOT EXISTS meter_devices'), 'schema 应包含 meter_devices 表。');
-assert(schemaSql.includes("import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device'))"), 'import_batches 应支持 energy_record、meter_reading、organization_unit 和 meter_device 导入类型。');
+assert(/import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK \(import_type IN \('[^)]*energy_record[^)]*meter_reading[^)]*organization_unit[^)]*meter_device[^)]*production_output[^)]*generation_record[^)]*'\)\)/.test(schemaSql), 'import_batches 应支持 energy_record、meter_reading、organization_unit、meter_device、production_output 和 generation_record 导入类型。');
 assert(schemaSql.includes('CREATE TABLE IF NOT EXISTS meter_reading_records'), 'schema 应包含 meter_reading_records 表。');
 assert(schemaSql.includes('normalized_usage_value REAL NOT NULL'), 'meter_reading_records 应包含标准化用量。');
 assert(schemaSql.includes("record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void'))"), '抄表记录应支持 active/void 状态。');

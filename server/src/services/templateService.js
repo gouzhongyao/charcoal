@@ -1,4 +1,8 @@
 const XLSX = require('xlsx');
+const {
+  GENERATION_RECORD_IMPORT_HEADERS,
+  GENERATION_RECORD_IMPORT_TEMPLATE_ID
+} = require('./generationService');
 
 const UTF8_BOM = '﻿';
 
@@ -54,6 +58,23 @@ const TEMPLATE_DEFINITIONS = {
     rows: [
       ['PU-001', '一线产能单元', '2026-01', '1000', 't', 'upload', '编码优先；名称仅用于辅助校验/展示'],
       ['PU-002', '二线产能单元', '2026/02', '2500', '件', '', 'data_source 为空时默认 upload']
+    ]
+  },
+  [GENERATION_RECORD_IMPORT_TEMPLATE_ID]: {
+    type: GENERATION_RECORD_IMPORT_TEMPLATE_ID,
+    name: '发电自用记录导入模板',
+    baseFileName: '发电自用记录导入模板',
+    sheetName: '发电自用记录导入模板',
+    route: '/api/templates/generation-records.xlsx',
+    csvRoute: '/api/templates/generation-records.csv',
+    recommendedFormat: 'xlsx',
+    appliesTo: ['基础台账', '发电自用', '发电记录导入'],
+    contractRoute: 'POST /api/generation/records/import/preview -> POST /api/generation/records/import/execute',
+    description: '用于预演并受控导入发电自用记录；用能单元编码必填且必须匹配 active 用能单元，同用能单元同月份 photovoltaic 已有 active 发电记录或同文件重复候选时默认 skip warning，不覆盖、不作废旧记录；导入只写 generation_records，不写 energy_records、carbon_emissions 或单位产品能耗。',
+    headers: [...GENERATION_RECORD_IMPORT_HEADERS],
+    rows: [
+      ['OU-001', '一车间', '2026-01', '1200', '900', '300', 'upload', '编码优先；名称仅用于辅助校验/展示'],
+      ['OU-002', '二车间', '2026/02', '850', '700', '150', '', 'data_source 为空时默认 upload']
     ]
   },
   'organization-units': {

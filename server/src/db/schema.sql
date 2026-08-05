@@ -9,13 +9,19 @@ CREATE TABLE IF NOT EXISTS app_meta (
 
 CREATE TABLE IF NOT EXISTS import_batches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device')),
+  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_output', 'generation_record')),
   original_filename TEXT NOT NULL,
   stored_filename TEXT,
   file_type TEXT NOT NULL CHECK (file_type IN ('xlsx', 'xls', 'csv')),
   file_size_bytes INTEGER CHECK (file_size_bytes IS NULL OR file_size_bytes >= 0),
   file_sha256 TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'completed_with_errors', 'failed', 'cancelled')),
+  audit_phase TEXT CHECK (audit_phase IS NULL OR audit_phase IN ('preview', 'execute')),
+  preview_signature TEXT,
+  preview_audit_digest TEXT,
+  audit_context_json TEXT,
+  execute_result_json TEXT,
+  backup_json TEXT,
   total_rows INTEGER NOT NULL DEFAULT 0 CHECK (total_rows >= 0),
   success_count INTEGER NOT NULL DEFAULT 0 CHECK (success_count >= 0),
   failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
@@ -165,6 +171,8 @@ CREATE TABLE IF NOT EXISTS production_units (
 
 CREATE TABLE IF NOT EXISTS production_output_records (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
   production_unit_id INTEGER NOT NULL,
   normalized_month TEXT NOT NULL CHECK (
     normalized_month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
@@ -177,6 +185,7 @@ CREATE TABLE IF NOT EXISTS production_output_records (
   remark TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
   FOREIGN KEY (production_unit_id) REFERENCES production_units(id) ON DELETE RESTRICT
 );
 
@@ -215,6 +224,8 @@ CREATE TABLE IF NOT EXISTS energy_records (
 
 CREATE TABLE IF NOT EXISTS generation_records (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
   organization_unit_id INTEGER NOT NULL,
   energy_type_id INTEGER NOT NULL,
   normalized_month TEXT NOT NULL CHECK (
@@ -224,13 +235,14 @@ CREATE TABLE IF NOT EXISTS generation_records (
   generation_value_kwh REAL NOT NULL CHECK (generation_value_kwh >= 0),
   self_use_value_kwh REAL NOT NULL DEFAULT 0 CHECK (self_use_value_kwh >= 0),
   grid_export_value_kwh REAL NOT NULL DEFAULT 0 CHECK (grid_export_value_kwh >= 0),
-  data_source TEXT NOT NULL DEFAULT 'manual' CHECK (data_source IN ('manual', 'calculation')),
+  data_source TEXT NOT NULL DEFAULT 'manual' CHECK (data_source IN ('manual', 'upload', 'calculation')),
   record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
   remark TEXT,
   void_reason TEXT,
   voided_at TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
   FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE RESTRICT,
   FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
   CHECK (self_use_value_kwh + grid_export_value_kwh <= generation_value_kwh + 0.000001)
@@ -334,6 +346,7 @@ CREATE INDEX IF NOT EXISTS idx_production_units_org_status ON production_units(o
 CREATE INDEX IF NOT EXISTS idx_production_units_product_status ON production_units(product_name, status);
 CREATE INDEX IF NOT EXISTS idx_production_output_records_unit_month ON production_output_records(production_unit_id, normalized_month);
 CREATE INDEX IF NOT EXISTS idx_production_output_records_status_month ON production_output_records(record_status, normalized_month);
+CREATE INDEX IF NOT EXISTS idx_production_output_records_batch ON production_output_records(source_batch_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_production_output_records_active_unit_month ON production_output_records(production_unit_id, normalized_month) WHERE record_status = 'active';
 CREATE INDEX IF NOT EXISTS idx_energy_records_month_type ON energy_records(normalized_month, energy_type_id);
 CREATE INDEX IF NOT EXISTS idx_energy_records_batch ON energy_records(source_batch_id);
@@ -341,6 +354,7 @@ CREATE INDEX IF NOT EXISTS idx_energy_records_organization_unit ON energy_record
 CREATE INDEX IF NOT EXISTS idx_energy_records_meter_device ON energy_records(meter_device_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_energy_records_active_duplicate_key ON energy_records(duplicate_key) WHERE record_status = 'active';
 CREATE INDEX IF NOT EXISTS idx_generation_records_org_month ON generation_records(organization_unit_id, normalized_month);
+CREATE INDEX IF NOT EXISTS idx_generation_records_batch ON generation_records(source_batch_id);
 CREATE INDEX IF NOT EXISTS idx_generation_records_energy_status ON generation_records(energy_type_id, record_status);
 CREATE INDEX IF NOT EXISTS idx_generation_records_status_month ON generation_records(record_status, normalized_month);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_generation_records_active_org_month_energy ON generation_records(organization_unit_id, normalized_month, energy_type_id) WHERE record_status = 'active';
