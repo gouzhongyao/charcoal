@@ -2,7 +2,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const mainJs = fs.readFileSync(path.join(__dirname, '../../../client/src/main.js'), 'utf8');
+const mainJs = fs.readFileSync(path.join(__dirname, '../../../client/src/legacy-main.js'), 'utf8');
 const generationRouteJs = fs.readFileSync(path.join(__dirname, '../routes/generation.js'), 'utf8');
 const generationServiceJs = fs.readFileSync(path.join(__dirname, '../services/generationService.js'), 'utf8');
 
@@ -165,7 +165,7 @@ assert(generationExportSource.includes('`/generation/records/export${query}`'), 
 assert(generationRouteJs.includes("router.get('/contract'"), '后端应提供发电导入导出静态契约接口。');
 assert(generationRouteJs.includes("router.get('/records/export'"), '后端应提供发电当前筛选导出接口。');
 assert(generationRouteJs.includes("router.post('/records/import/preview'"), '后端应提供发电导入 preview 接口。');
-assert(generationRouteJs.includes("router.post('/records/import/execute', requireWritable('generation:records-import-execute')"), '后端应提供受控 execute 且挂写保护。');
+assert(generationRouteJs.includes("router.post('/records/import/execute', authenticate, requirePermission('ledger:generation:execute'), requireWritable('generation:records-import-execute')"), '后端应提供受控 execute 且挂写保护。');
 assert(generationServiceJs.includes("GENERATION_RECORD_IMPORT_TEMPLATE_ID = 'generation-records'"), '后端应定稿 generation-records 模板 id。');
 assert(generationServiceJs.includes("GENERATION_RECORD_IMPORT_CONFIRM_TEXT = '确认导入发电自用记录'"), '后端应定稿受控 execute 固定确认文本。');
 assert(generationServiceJs.includes('acknowledgeSkippedRisks'), '后端契约应包含跳过风险确认字段。');

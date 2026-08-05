@@ -150,11 +150,11 @@ assert(generationRouteSource.includes("router.get('/contract'"), '发电路由�
 assert(generationRouteSource.includes("router.get('/records/export'"), '发电路由应提供 /api/generation/records/export 当前筛选导出接口。');
 assert(generationRouteSource.includes("X-Export-Row-Count"), '发电导出路由应返回 X-Export-Row-Count 行数响应头。');
 assert(generationRouteSource.includes("Content-Disposition"), '发电导出路由应返回 Content-Disposition 下载响应头。');
-assert(generationRouteSource.includes("router.post('/records/import/preview', requireWritable('generation:records-import-preview')"), '发电路由应在上传文件落盘前对 preview 执行维护态写保护。');
+assert(generationRouteSource.includes("router.post('/records/import/preview', authenticate, requirePermission('ledger:generation:preview'), requireWritable('generation:records-import-preview')"), '发电路由应在上传文件落盘前对 preview 执行维护态写保护。');
 assert(generationRouteSource.includes('createGenerationRecordImportPreviewFromUpload'), '发电 preview 路由应调用上传解析预演服务。');
 assert(!generationRouteSource.includes('.then((preview) => {\n        cleanupUploadedImportFile(req.file);'), '发电 preview 成功后应保留本次上传文件供审计批次追溯，不再立即清理原文件。');
 assert(generationRouteSource.includes('cleanupUploadedImportFile(req.file);\n        next(error);'), '发电 preview 解析失败后仍应清理本次临时上传文件。');
-assert(generationRouteSource.includes("router.post('/records/import/execute', requireWritable('generation:records-import-execute')"), '发电路由应提供 /api/generation/records/import/execute 并挂维护态写保护。');
+assert(generationRouteSource.includes("router.post('/records/import/execute', authenticate, requirePermission('ledger:generation:execute'), requireWritable('generation:records-import-execute')"), '发电路由应提供 /api/generation/records/import/execute 并挂维护态写保护。');
 assert(generationRouteSource.includes('executeGenerationRecordImport'), '发电 execute 路由应调用受控导入服务。');
 
 console.log('generation import/export contract tests passed');

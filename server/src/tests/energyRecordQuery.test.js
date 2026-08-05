@@ -47,6 +47,7 @@ assert.deepStrictEqual(filters, {
   normalizedMonthEnd: '2026-12',
   energyTypeCode: 'electricity',
   organization: '总部',
+  keyword: undefined,
   site: 'A园区',
   department: '生产部',
   organizationUnitId: undefined,
@@ -70,6 +71,15 @@ assert.strictEqual(where.whereSql.includes('er.source_batch_id = @sourceBatchId'
 assert.strictEqual(where.whereSql.includes('electricity'), false);
 assert.strictEqual(where.params.energyTypeCode, 'electricity');
 assert.strictEqual(where.params.sourceBatchId, 12);
+
+const keywordFilters = normalizeEnergyRecordFilters({ search: '仪表_100%\\测试' });
+assert.strictEqual(keywordFilters.keyword, '仪表_100%\\测试');
+const keywordWhere = buildEnergyRecordWhere(keywordFilters);
+assert.strictEqual(keywordWhere.whereSql.includes('et.name LIKE @keyword'), true);
+assert.strictEqual(keywordWhere.whereSql.includes('md.meter_name LIKE @keyword'), true);
+assert.strictEqual(keywordWhere.whereSql.includes('er.remark LIKE @keyword'), true);
+assert.strictEqual(keywordWhere.whereSql.includes('仪表_100'), false);
+assert.strictEqual(keywordWhere.params.keyword, '%仪表\\_100\\%\\\\测试%');
 
 const ledgerFilters = normalizeEnergyRecordFilters({ organizationUnitId: '10', meterDeviceId: '20' });
 assert.strictEqual(ledgerFilters.organizationUnitId, 10);
@@ -113,7 +123,7 @@ const meterReadingsRouteJs = fs.readFileSync(path.join(__dirname, '..', 'routes'
 const productionServiceJs = fs.readFileSync(path.join(__dirname, '..', 'services', 'productionService.js'), 'utf8');
 const productionRouteJs = fs.readFileSync(path.join(__dirname, '..', 'routes', 'production.js'), 'utf8');
 const serverIndexJs = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
-const clientMainJs = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'client', 'src', 'main.js'), 'utf8');
+const clientMainJs = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'client', 'src', 'legacy-main.js'), 'utf8');
 assert(statisticsServiceJs.includes('LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id'), '能耗明细应左关联用能单元，未关联记录不能因此查询失败。');
 assert(statisticsServiceJs.includes('LEFT JOIN meter_devices md ON md.id = er.meter_device_id'), '能耗明细应左关联计量器具，未关联记录不能因此查询失败。');
 assert(statisticsServiceJs.includes('ou.unit_path AS organizationUnitPath'), '能耗明细应返回用能单元路径展示字段。');
@@ -130,6 +140,14 @@ assert.strictEqual(
   'function',
   '历史 energy_records 台账关联回填预演审计预案导出服务必须导出可调用函数。'
 );
+assert.strictEqual(
+  typeof require('../services/energyRecordStatisticsService').exportEnergyRecords,
+  'function',
+  '能耗明细导出服务必须导出可调用函数。'
+);
+assert(statisticsServiceJs.includes('ENERGY_RECORD_EXPORT_FIELDS'), '能耗明细导出应使用固定字段白名单。');
+assert(statisticsServiceJs.includes("fileName: `能耗明细-${date}.${format}`"), '能耗明细导出应使用中文文件名。');
+assert(statisticsServiceJs.includes('normalizeEnergyRecordExportFormat'), '能耗明细导出格式必须限制为 xlsx/csv。');
 assert(statisticsServiceJs.includes('writesEnergyRecords: false'), '历史台账关联预演必须明确不写入 energy_records。');
 assert(statisticsServiceJs.includes('previewOnly: true'), '历史台账关联预演必须明确仅为 preview。');
 assert(statisticsServiceJs.includes('preview-only / dry-run / no-write'), '导出文件必须包含醒目的 preview-only / dry-run / no-write 元信息。');
@@ -146,6 +164,10 @@ assert(statisticsServiceJs.includes('organization_unit_id IS NULL'), '执行更�
 assert(statisticsServiceJs.includes('meter_device_id IS NULL'), '执行更新必须包含 meter_device_id NULL 防覆盖条件。');
 assert(!/INSERT\s+INTO\s+energy_records/i.test(statisticsServiceJs), '能耗统计服务不得提供 INSERT energy_records 的回填路径。');
 assert(!/DELETE\s+FROM\s+energy_records/i.test(statisticsServiceJs), '能耗统计服务不得提供 DELETE energy_records 的回填路径。');
+assert(energyRecordsRouteJs.includes('router.use(authenticate)'), '能耗记录路由必须统一要求登录。');
+assert(energyRecordsRouteJs.includes("requireAnyPermission('energy:records:view', 'energy-records:view')"), '只读能耗记录接口必须兼容新旧查看权限键。');
+assert(energyRecordsRouteJs.includes("router.get('/export', requireEnergyRecordView"), '应提供受保护的能耗明细导出接口。');
+assert(energyRecordsRouteJs.includes("requirePermission('energy:records:ledger-backfill:execute')"), '台账回填执行必须校验专用执行权限。');
 assert(energyRecordsRouteJs.includes("router.get('/ledger-backfill/preview/export'"), '应提供明确命名的历史台账关联预演审计预案 GET 导出接口。');
 assert(energyRecordsRouteJs.includes("router.get('/ledger-backfill/preview'"), '应提供明确命名的历史台账关联预演接口。');
 assert(energyRecordsRouteJs.includes("router.post('/ledger-backfill/execute'"), '应提供受控执行历史台账回填 POST 接口。');

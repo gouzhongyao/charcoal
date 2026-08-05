@@ -1355,7 +1355,7 @@ execFileSync(process.execPath, ['-e', productionSmokeScript], { cwd: path.join(_
 
 const schemaSql = fs.readFileSync(path.join(__dirname, '..', 'db', 'schema.sql'), 'utf8');
 const importServiceJs = fs.readFileSync(path.join(__dirname, '..', 'services', 'importService.js'), 'utf8');
-const clientMainJs = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'client', 'src', 'main.js'), 'utf8');
+const clientMainJs = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'client', 'src', 'legacy-main.js'), 'utf8');
 assert(importServiceJs.includes('import_type AS importType'), '通用导入批次列表/详情查询应返回 importType。');
 assert(importServiceJs.includes('METER_READING_IMPORT_BATCH_DELETE_FORBIDDEN'), '通用批次删除应拒绝 meter_reading 批次。');
 assert(clientMainJs.includes("{ key: 'importType', label: '批次类型'"), '前端通用导入批次列表应展示批次类型。');
@@ -1389,5 +1389,112 @@ assert(schemaSql.includes('organization_unit_id INTEGER'), 'energy_records 应�
 assert(schemaSql.includes('meter_device_id INTEGER'), 'energy_records 应包含 meter_device_id。');
 assert(schemaSql.includes("unit_type IN ('enterprise', 'department', 'workshop', 'process', 'equipment')"), 'unit_type 应有白名单约束。');
 assert(schemaSql.includes("online_status IN ('online', 'offline', 'unknown')"), 'online_status 应有白名单约束。');
+
+const ledgerApiSecuritySmokeScript = String.raw`
+const assert = require('assert');
+const fs = require('fs');
+const http = require('http');
+const os = require('os');
+const path = require('path');
+
+(async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'charcoal-ledger-api-security-'));
+  let server;
+  try {
+    process.env.DATA_DIR = path.join(tmpDir, 'data');
+    process.env.SQLITE_PATH = path.join(process.env.DATA_DIR, 'ledger-api-security.sqlite');
+    process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
+    process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
+    process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
+    process.env.CHARCOAL_ALLOW_REGISTER = 'true';
+    const { initDatabase, openDatabase } = require(path.join(process.cwd(), 'server', 'src', 'db', 'database'));
+    const { createOrganizationUnit, createMeter } = require(path.join(process.cwd(), 'server', 'src', 'services', 'ledgerService'));
+    const { createMeterReading } = require(path.join(process.cwd(), 'server', 'src', 'services', 'meterReadingService'));
+    const { createGenerationRecord } = require(path.join(process.cwd(), 'server', 'src', 'services', 'generationService'));
+    const { createProductionOutput, createProductionUnit } = require(path.join(process.cwd(), 'server', 'src', 'services', 'productionService'));
+    const { register } = require(path.join(process.cwd(), 'server', 'src', 'services', 'authService'));
+    initDatabase();
+    const root = createOrganizationUnit({ unitCode: 'API-ROOT', unitName: 'API 安全总厂', unitType: 'enterprise' });
+    const db = openDatabase();
+    const electricity = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity' AND is_active = 1").get();
+    db.close();
+    const meter = createMeter({ meterCode: 'API-METER', meterName: 'API 安全电表', meterType: 'electricity', energyTypeId: electricity.id, organizationUnitId: root.id, multiplier: 1, allowManualReading: 1, status: 'active' });
+    createMeterReading({ meterDeviceId: meter.id, readingDate: '2026-08-31', previousValue: 10, currentValue: 20, unit: 'kWh' });
+    createGenerationRecord({ organizationUnitId: root.id, normalizedMonth: '2026-08', generationValueKwh: 100, selfUseValueKwh: 80, gridExportValueKwh: 20 });
+    const productionUnit = createProductionUnit({ unitCode: 'API-PU', unitName: 'API 产能单元', organizationUnitId: root.id, productName: 'API 产品', outputUnit: 't' });
+    createProductionOutput({ productionUnitId: productionUnit.id, normalizedMonth: '2026-08', outputValue: 10, outputUnit: 't' });
+    register({ username: 'ledgerordinary', password: 'Password123!' });
+    const { app } = require(path.join(process.cwd(), 'server', 'src', 'index'));
+    server = await new Promise((resolve) => { const instance = app.listen(0, '127.0.0.1', () => resolve(instance)); });
+    const request = (method, pathname, token) => new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port: server.address().port, method, path: pathname, headers: token ? { Authorization: 'Bearer ' + token } : {} }, (res) => {
+        const chunks = []; res.on('data', (chunk) => chunks.push(chunk)); res.on('end', () => {
+          const raw = Buffer.concat(chunks); const isJson = String(res.headers['content-type'] || '').includes('application/json');
+          resolve({ status: res.statusCode, headers: res.headers, body: isJson ? JSON.parse(raw.toString('utf8')) : raw });
+        });
+      });
+      req.on('error', reject); req.end();
+    });
+    const login = async (username, password) => {
+      const payload = JSON.stringify({ username, password });
+      return new Promise((resolve, reject) => {
+        const req = http.request({ host: '127.0.0.1', port: server.address().port, method: 'POST', path: '/api/login', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (res) => {
+          const chunks = []; res.on('data', (chunk) => chunks.push(chunk)); res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))));
+        });
+        req.on('error', reject); req.end(payload);
+      });
+    };
+    const adminToken = (await login('admin', 'AdminPassword123!')).data.token;
+    const ordinaryToken = (await login('ledgerordinary', 'Password123!')).data.token;
+    const viewEndpoints = [
+      '/api/organization/units?keyword=API-ROOT', '/api/organization/units/stats',
+      '/api/meters?keyword=API-METER', '/api/meters/stats',
+      '/api/meter-readings?keyword=API-METER', '/api/meter-readings/stats',
+      '/api/generation/records?keyword=API-ROOT', '/api/generation/stats', '/api/generation/statistics/monthly',
+      '/api/production/units?keyword=API-PU', '/api/production/outputs?keyword=API-PU', '/api/production/stats',
+      '/api/production/statistics/unit-energy-intensity?productionUnitId=' + productionUnit.id
+    ];
+    for (const endpoint of viewEndpoints) {
+      assert.strictEqual((await request('GET', endpoint)).status, 401, endpoint + ' must reject anonymous access');
+      assert.strictEqual((await request('GET', endpoint, ordinaryToken)).status, 403, endpoint + ' must reject ordinary users');
+      assert.strictEqual((await request('GET', endpoint, adminToken)).status, 200, endpoint + ' must allow super admin');
+    }
+    const meterKeyword = await request('GET', '/api/meters?keyword=' + encodeURIComponent("API-METER' OR 1=1 --"), adminToken);
+    assert.strictEqual(meterKeyword.status, 200);
+    assert.strictEqual(meterKeyword.body.data.length, 0, 'keyword must remain parameterized and not expand result sets');
+    const stats = await request('GET', '/api/meter-readings/stats', adminToken);
+    assert.strictEqual(stats.body.data.total, 1);
+    assert.strictEqual(stats.body.data.active, 1);
+    assert.strictEqual(stats.body.data.byMonthEnergyType[0].normalizedUnit, 'kWh');
+    const generationStats = await request('GET', '/api/generation/stats', adminToken);
+    assert.strictEqual(generationStats.body.data.active, 1);
+    assert.strictEqual(generationStats.body.data.monthly[0].generationValueKwh, 100);
+    const productionStats = await request('GET', '/api/production/stats', adminToken);
+    assert.strictEqual(productionStats.body.data.productionUnits.active, 1);
+    assert.strictEqual(productionStats.body.data.productionOutputs.active, 1);
+    const exports = ['/api/organization/units/export?format=csv', '/api/meters/export?format=csv', '/api/meter-readings/export?format=csv', '/api/generation/records/export?format=csv', '/api/production/outputs/export?format=csv'];
+    for (const endpoint of exports) {
+      assert.strictEqual((await request('GET', endpoint)).status, 401, endpoint + ' must reject anonymous downloads');
+      assert.strictEqual((await request('GET', endpoint, ordinaryToken)).status, 403, endpoint + ' must reject unauthorized downloads');
+      const exported = await request('GET', endpoint, adminToken);
+      assert.strictEqual(exported.status, 200);
+      assert(!exported.body.toString('utf8').includes(tmpDir), 'downloads must not expose local paths');
+    }
+    const guardedWrites = [
+      ['POST', '/api/generation/records/import/preview'], ['POST', '/api/generation/records/import/execute'],
+      ['POST', '/api/production/outputs/import/preview'], ['POST', '/api/production/outputs/import/execute'],
+      ['POST', '/api/meter-readings/energy-record-generation/execute'], ['DELETE', '/api/meter-readings/1']
+    ];
+    for (const [method, endpoint] of guardedWrites) {
+      assert.strictEqual((await request(method, endpoint)).status, 401, endpoint + ' must authenticate before write handling');
+      assert.strictEqual((await request(method, endpoint, ordinaryToken)).status, 403, endpoint + ' must enforce permission before write handling');
+    }
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+})().catch((error) => { console.error(error); process.exit(1); });
+`;
+execFileSync(process.execPath, ['-e', ledgerApiSecuritySmokeScript], { cwd: path.join(__dirname, '..', '..', '..'), stdio: 'pipe' });
 
 console.log('ledger validation tests passed');

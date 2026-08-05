@@ -4,7 +4,7 @@ const { openDatabase } = require('../db/database');
 const { badRequest, notFound } = require('../utils/errors');
 const { decodeUploadOriginalName } = require('../utils/filenameEncoding');
 
-const AUDIT_IMPORT_TYPES = Object.freeze(['production_output', 'generation_record']);
+const AUDIT_IMPORT_TYPES = Object.freeze(['production_unit', 'production_output', 'generation_record', 'energy_budget', 'carbon_factor', 'prediction_config']);
 const GENERIC_DELETE_FORBIDDEN_IMPORT_TYPES = Object.freeze([...AUDIT_IMPORT_TYPES, 'meter_reading']);
 const IMPORT_BATCH_STATUSES = Object.freeze(['pending', 'processing', 'completed', 'completed_with_errors', 'failed', 'cancelled']);
 const IMPORT_AUDIT_PHASES = Object.freeze(['preview', 'execute']);

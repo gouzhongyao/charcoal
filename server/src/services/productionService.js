@@ -48,6 +48,32 @@ const PRODUCTION_OUTPUT_IMPORT_ALIASES = Object.freeze({
   remark: ['remark', '备注', '说明', 'note']
 });
 
+const MAX_PRODUCTION_UNIT_EXPORT_ROWS = 5000;
+const PRODUCTION_UNIT_IMPORT_CONFIRM_TEXT = '确认导入产能单元';
+const PRODUCTION_UNIT_IMPORT_SIGNATURE_VERSION = 'production-unit-import-preview:v1';
+const PRODUCTION_UNIT_IMPORT_HMAC_ALGORITHM = 'sha256';
+const PRODUCTION_UNIT_IMPORT_SIGNATURE_PREFIX = 'hmac-sha256:v1';
+const DEFAULT_PRODUCTION_UNIT_IMPORT_HMAC_SECRET = 'charcoal-local-development-production-unit-import-hmac-secret';
+const PRODUCTION_UNIT_IMPORT_BACKUP_REASON = 'production-unit-import';
+const PRODUCTION_UNIT_EXPORT_FIELDS = Object.freeze([
+  { key: 'unitCode', header: 'unitCode' },
+  { key: 'unitName', header: 'unitName' },
+  { key: 'organizationUnitCode', header: 'organizationUnitCode' },
+  { key: 'productName', header: 'productName' },
+  { key: 'outputUnit', header: 'outputUnit' },
+  { key: 'remark', header: 'remark' },
+  { key: 'status', header: 'status' }
+]);
+const PRODUCTION_UNIT_IMPORT_ALIASES = Object.freeze({
+  unitCode: ['unitCode', 'unit_code', 'production_unit_code', '产能单元编码', '产线编码'],
+  unitName: ['unitName', 'unit_name', 'production_unit_name', '产能单元名称', '产线名称'],
+  organizationUnitCode: ['organizationUnitCode', 'organization_unit_code', 'organization_code', '所属用能单元编码', '用能单元编码', '组织单元编码'],
+  productName: ['productName', 'product_name', '产品名称', '产品'],
+  outputUnit: ['outputUnit', 'output_unit', '产量单位', '单位'],
+  remark: ['remark', '备注', '说明', 'note'],
+  status: ['status', '状态']
+});
+
 function getNow() {
   return new Date().toISOString();
 }
@@ -84,6 +110,44 @@ function getProductionOutputImportHmacSecret() {
     || normalizeText(process.env.CHARCOAL_HMAC_SECRET)
     || normalizeText(process.env.APP_SECRET)
     || DEFAULT_PRODUCTION_OUTPUT_IMPORT_HMAC_SECRET;
+}
+
+function getProductionUnitImportHmacSecret() {
+  return normalizeText(process.env.PRODUCTION_UNIT_IMPORT_HMAC_SECRET)
+    || normalizeText(process.env.CHARCOAL_HMAC_SECRET)
+    || normalizeText(process.env.APP_SECRET)
+    || DEFAULT_PRODUCTION_UNIT_IMPORT_HMAC_SECRET;
+}
+
+function buildProductionUnitImportSignaturePayload(preview) {
+  return {
+    version: PRODUCTION_UNIT_IMPORT_SIGNATURE_VERSION,
+    algorithm: `HMAC-${PRODUCTION_UNIT_IMPORT_HMAC_ALGORITHM}`,
+    dryRun: preview.dryRun === true,
+    previewOnly: preview.previewOnly === true,
+    writesProductionUnits: preview.writesProductionUnits === true,
+    persistsImportBatch: preview.persistsImportBatch === true,
+    confirmText: preview.confirmText,
+    backupReason: preview.backupReason,
+    summary: preview.summary,
+    candidateRowIds: preview.candidateRowIds,
+    candidateRows: preview.candidateRows
+  };
+}
+
+function hmacProductionUnitImportJson(value) {
+  return crypto
+    .createHmac(PRODUCTION_UNIT_IMPORT_HMAC_ALGORITHM, getProductionUnitImportHmacSecret())
+    .update(stableStringify(value))
+    .digest('hex');
+}
+
+function buildProductionUnitImportPreviewSignature(preview) {
+  return `${PRODUCTION_UNIT_IMPORT_SIGNATURE_PREFIX}:${hmacProductionUnitImportJson(buildProductionUnitImportSignaturePayload(preview))}`;
+}
+
+function verifyProductionUnitImportPreviewSignature(preview, previewSignature) {
+  return timingSafeEqualText(previewSignature, buildProductionUnitImportPreviewSignature(preview));
 }
 
 function buildProductionOutputImportSignaturePayload(preview) {
@@ -230,6 +294,8 @@ function getProductionUnitById(db, unitId, options = {}) {
   const row = db.prepare(
     `SELECT
        pu.id,
+       pu.source_batch_id AS sourceBatchId,
+       pu.source_row_number AS sourceRowNumber,
        pu.unit_code AS unitCode,
        pu.unit_name AS unitName,
        pu.organization_unit_id AS organizationUnitId,
@@ -281,6 +347,8 @@ function mapProductionUnitRow(row) {
   if (!row) return row;
   return {
     id: row.id,
+    sourceBatchId: row.sourceBatchId || null,
+    sourceRowNumber: row.sourceRowNumber || null,
     unitCode: row.unitCode,
     unitName: row.unitName,
     organizationUnitId: row.organizationUnitId,
@@ -461,6 +529,8 @@ function listProductionUnits(query = {}) {
     const rows = db.prepare(
       `SELECT
          pu.id,
+         pu.source_batch_id AS sourceBatchId,
+         pu.source_row_number AS sourceRowNumber,
          pu.unit_code AS unitCode,
          pu.unit_name AS unitName,
          pu.organization_unit_id AS organizationUnitId,
@@ -568,6 +638,11 @@ function buildProductionOutputWhere(query = {}) {
     where.push('por.record_status = @recordStatus');
     params.recordStatus = status;
   }
+  const keyword = normalizeText(query.keyword || query.search);
+  if (keyword) {
+    where.push('(pu.unit_code LIKE @keyword OR pu.unit_name LIKE @keyword OR pu.product_name LIKE @keyword OR ou.unit_path LIKE @keyword OR por.remark LIKE @keyword)');
+    params.keyword = `%${keyword}%`;
+  }
   const monthStart = normalizeOptionalMonth(firstDefined(query, ['monthStart', 'normalizedMonthStart', 'month_start']), 'monthStart');
   if (monthStart) {
     where.push('por.normalized_month >= @monthStart');
@@ -666,6 +741,81 @@ function exportProductionOutputs(query = {}) {
   }
 }
 
+function buildProductionUnitExportRows(rows = []) {
+  return rows.map((row) => PRODUCTION_UNIT_EXPORT_FIELDS.reduce((result, field) => {
+    result[field.header] = row[field.key] ?? '';
+    return result;
+  }, {}));
+}
+
+function selectProductionUnitExportRows(db, query = {}) {
+  const where = [];
+  const params = {};
+  const status = normalizeText(query.status);
+  if (status) {
+    assertWhitelist(status, 'status', PRODUCTION_UNIT_STATUSES);
+    where.push('pu.status = @status');
+    params.status = status;
+  }
+  const organizationUnitId = parsePositiveInteger(firstDefined(query, ['organizationUnitId', 'organization_unit_id']), 'organizationUnitId');
+  if (organizationUnitId) {
+    where.push('pu.organization_unit_id = @organizationUnitId');
+    params.organizationUnitId = organizationUnitId;
+  }
+  const keyword = normalizeText(query.keyword || query.search);
+  if (keyword) {
+    where.push('(pu.unit_code LIKE @keyword OR pu.unit_name LIKE @keyword OR pu.product_name LIKE @keyword OR ou.unit_code LIKE @keyword OR ou.unit_path LIKE @keyword)');
+    params.keyword = `%${keyword}%`;
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  return db.prepare(
+    `SELECT
+       pu.id,
+       pu.source_batch_id AS sourceBatchId,
+       pu.source_row_number AS sourceRowNumber,
+       pu.unit_code AS unitCode,
+       pu.unit_name AS unitName,
+       pu.organization_unit_id AS organizationUnitId,
+       ou.unit_code AS organizationUnitCode,
+       ou.unit_name AS organizationUnitName,
+       ou.unit_path AS organizationUnitPath,
+       pu.product_name AS productName,
+       pu.output_unit AS outputUnit,
+       pu.status,
+       pu.remark,
+       pu.created_at AS createdAt,
+       pu.updated_at AS updatedAt
+     FROM production_units pu
+     JOIN organization_units ou ON ou.id = pu.organization_unit_id
+     ${whereSql}
+     ORDER BY pu.status ASC, pu.unit_code ASC, pu.id ASC
+     LIMIT @limit`
+  ).all({ ...params, limit: MAX_PRODUCTION_UNIT_EXPORT_ROWS }).map(mapProductionUnitRow);
+}
+
+function exportProductionUnits(query = {}) {
+  const format = String(query.format || 'xlsx').toLowerCase() === 'csv' ? 'csv' : 'xlsx';
+  const db = openDatabase();
+  try {
+    const rows = selectProductionUnitExportRows(db, query);
+    const exportRows = buildProductionUnitExportRows(rows);
+    const headers = PRODUCTION_UNIT_EXPORT_FIELDS.map((field) => field.header);
+    const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const fileName = `产能单元导出-${date}.${format}`;
+    if (format === 'csv') {
+      const csvLines = [headers, ...exportRows.map((row) => headers.map((header) => row[header]))].map((row) => row.map(escapeCsvCell).join(','));
+      return { fileName, format, contentType: 'text/csv; charset=utf-8', body: Buffer.from(`${UTF8_BOM}${csvLines.join('\n')}\n`, 'utf8'), rowCount: rows.length, fields: headers };
+    }
+    const workbook = XLSX.utils.book_new();
+    const worksheet = XLSX.utils.json_to_sheet(exportRows, { header: headers });
+    worksheet['!cols'] = headers.map((header) => ({ wch: Math.min(Math.max(String(header).length + 8, 14), 32) }));
+    XLSX.utils.book_append_sheet(workbook, worksheet, '产能单元');
+    return { fileName, format, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' }), rowCount: rows.length, fields: headers };
+  } finally {
+    db.close();
+  }
+}
+
 function normalizeHeaderName(value) {
   return String(value || '').trim().replace(/[\s_\-\/\\:：()（）]/g, '').toLowerCase();
 }
@@ -743,6 +893,8 @@ function loadProductionOutputImportIndexes(db) {
     productionUnits: db.prepare(
       `SELECT
          pu.id,
+         pu.source_batch_id AS sourceBatchId,
+         pu.source_row_number AS sourceRowNumber,
          pu.unit_code AS unitCode,
          pu.unit_name AS unitName,
          pu.organization_unit_id AS organizationUnitId,
@@ -1263,6 +1415,445 @@ async function executeProductionOutputImport(body = {}) {
   }
 }
 
+function canonicalProductionUnitImportFieldName(header) {
+  const normalized = normalizeHeaderName(header);
+  for (const [field, aliases] of Object.entries(PRODUCTION_UNIT_IMPORT_ALIASES)) {
+    if (aliases.map(normalizeHeaderName).includes(normalized)) return field;
+  }
+  return null;
+}
+
+function mapProductionUnitImportFields(row = {}) {
+  const mapped = {};
+  const fieldMapping = {};
+  Object.entries(row || {}).forEach(([header, value]) => {
+    const field = canonicalProductionUnitImportFieldName(header);
+    if (!field || (Object.prototype.hasOwnProperty.call(mapped, field) && normalizeText(mapped[field]))) return;
+    mapped[field] = value;
+    fieldMapping[field] = header;
+  });
+  return { mapped, fieldMapping };
+}
+
+function createProductionUnitImportIssue(rowNumber, fieldName, rawValue, code, message, severity = 'error') {
+  return { rowNumber, fieldName, rawValue: rawValue === undefined || rawValue === null ? null : String(rawValue), code, message, severity };
+}
+
+function buildProductionUnitImportIndexes(input = {}) {
+  const organizationsByCode = new Map();
+  const productionUnitsByCode = new Map();
+  (input.organizationUnits || []).forEach((unit) => {
+    if (unit.unitCode) organizationsByCode.set(String(unit.unitCode), unit);
+  });
+  (input.productionUnits || []).forEach((unit) => {
+    if (unit.unitCode) productionUnitsByCode.set(String(unit.unitCode), unit);
+  });
+  return { organizationsByCode, productionUnitsByCode };
+}
+
+function loadProductionUnitImportIndexes(db) {
+  return buildProductionUnitImportIndexes({
+    organizationUnits: db.prepare(
+      `SELECT id, unit_code AS unitCode, unit_name AS unitName, unit_path AS unitPath, status
+       FROM organization_units`
+    ).all(),
+    productionUnits: db.prepare(
+      `SELECT id, unit_code AS unitCode, unit_name AS unitName, status
+       FROM production_units`
+    ).all()
+  });
+}
+
+function readRequiredProductionUnitImportText(mapped, fieldName, rowNumber, errors) {
+  const value = normalizeText(mapped[fieldName]);
+  if (!value) {
+    errors.push(createProductionUnitImportIssue(rowNumber, fieldName, mapped[fieldName], 'REQUIRED_FIELD_MISSING', `必填字段 ${fieldName} 为空或未映射。`));
+    return null;
+  }
+  return value;
+}
+
+function validateAndNormalizeProductionUnitImportRow(row, rowNumber, indexes, seenUnitCodes = new Set()) {
+  const { mapped, fieldMapping } = mapProductionUnitImportFields(row);
+  const errors = [];
+  const unitCode = readRequiredProductionUnitImportText(mapped, 'unitCode', rowNumber, errors);
+  const unitName = readRequiredProductionUnitImportText(mapped, 'unitName', rowNumber, errors);
+  const organizationUnitCode = readRequiredProductionUnitImportText(mapped, 'organizationUnitCode', rowNumber, errors);
+  const productName = readRequiredProductionUnitImportText(mapped, 'productName', rowNumber, errors);
+  const outputUnit = readRequiredProductionUnitImportText(mapped, 'outputUnit', rowNumber, errors);
+  const status = normalizeText(mapped.status) || 'active';
+  if (!PRODUCTION_UNIT_STATUSES.includes(status)) {
+    errors.push(createProductionUnitImportIssue(rowNumber, 'status', mapped.status, 'UNSUPPORTED_PRODUCTION_UNIT_STATUS', 'status 仅支持 active 或 inactive。'));
+  }
+  const organizationUnit = organizationUnitCode ? indexes.organizationsByCode.get(organizationUnitCode) || null : null;
+  if (organizationUnitCode && !organizationUnit) {
+    errors.push(createProductionUnitImportIssue(rowNumber, 'organizationUnitCode', organizationUnitCode, 'UNKNOWN_ORGANIZATION_UNIT', '未找到匹配用能单元；产能单元导入不自动创建或挂接用能单元。'));
+  } else if (organizationUnit && organizationUnit.status !== 'active') {
+    errors.push(createProductionUnitImportIssue(rowNumber, 'organizationUnitCode', organizationUnitCode, 'INACTIVE_ORGANIZATION_UNIT', '所属用能单元不是 active 状态，禁止导入产能单元。'));
+  }
+
+  const record = unitCode && unitName && organizationUnit && productName && outputUnit && PRODUCTION_UNIT_STATUSES.includes(status)
+    ? {
+      rowNumber,
+      unitCode,
+      unitName,
+      organizationUnitId: organizationUnit.id,
+      organizationUnitCode: organizationUnit.unitCode,
+      organizationUnitName: organizationUnit.unitName,
+      organizationUnitPath: organizationUnit.unitPath,
+      productName,
+      outputUnit,
+      remark: normalizeText(mapped.remark),
+      status
+    }
+    : null;
+  if (errors.length > 0) {
+    return { fieldMapping, mapped, record, status: 'blocked', wouldImport: false, reasons: errors };
+  }
+  const existingUnit = indexes.productionUnitsByCode.get(record.unitCode) || null;
+  if (existingUnit) {
+    return {
+      fieldMapping,
+      record,
+      status: 'skipped',
+      wouldImport: false,
+      existingProductionUnitId: existingUnit.id,
+      reasons: [createProductionUnitImportIssue(rowNumber, 'unitCode', record.unitCode, 'DUPLICATE_PRODUCTION_UNIT_CODE_SKIPPED', `产能单元编码已存在且状态为 ${existingUnit.status}，按 skip 策略跳过，不覆盖、不恢复既有台账。`, 'warning')]
+    };
+  }
+  if (seenUnitCodes.has(record.unitCode)) {
+    return {
+      fieldMapping,
+      record,
+      status: 'skipped',
+      wouldImport: false,
+      reasons: [createProductionUnitImportIssue(rowNumber, 'unitCode', record.unitCode, 'DUPLICATE_IMPORT_CANDIDATE_SKIPPED', '同一导入预演中已存在相同产能单元编码候选，后续重复行按 skip 策略跳过。', 'warning')]
+    };
+  }
+  seenUnitCodes.add(record.unitCode);
+  return {
+    fieldMapping,
+    record,
+    status: 'wouldImport',
+    wouldImport: true,
+    reasons: [createProductionUnitImportIssue(rowNumber, 'row', rowNumber, 'READY_TO_IMPORT', '满足校验且无重复编码冲突，可受控导入。', 'info')]
+  };
+}
+
+function summarizeProductionUnitImportItems(items = []) {
+  const summary = { totalRows: items.length, wouldImport: 0, skipped: 0, blocked: 0, warnings: 0, errors: 0 };
+  items.forEach((item) => {
+    if (Object.prototype.hasOwnProperty.call(summary, item.status)) summary[item.status] += 1;
+    (item.reasons || []).forEach((reason) => {
+      if (reason.severity === 'warning') summary.warnings += 1;
+      if (reason.severity === 'error') summary.errors += 1;
+    });
+  });
+  return summary;
+}
+
+function buildProductionUnitImportPreviewWithDb(db, rows = []) {
+  const indexes = loadProductionUnitImportIndexes(db);
+  const seenUnitCodes = new Set();
+  const fieldMapping = {};
+  const items = rows.map((row, index) => {
+    const rowNumber = Number(row.rowNumber || row.__rowNumber || index + 2);
+    const result = validateAndNormalizeProductionUnitImportRow(row, rowNumber, indexes, seenUnitCodes);
+    Object.assign(fieldMapping, result.fieldMapping || {});
+    const record = result.record || {};
+    const mapped = result.mapped || {};
+    const item = {
+      rowNumber,
+      rowId: rowNumber,
+      unitCode: record.unitCode || normalizeText(mapped.unitCode) || null,
+      unitName: record.unitName || normalizeText(mapped.unitName) || null,
+      organizationUnitCode: record.organizationUnitCode || normalizeText(mapped.organizationUnitCode) || null,
+      organizationUnitName: record.organizationUnitName || null,
+      organizationUnitPath: record.organizationUnitPath || null,
+      organizationUnitId: record.organizationUnitId || null,
+      productName: record.productName || normalizeText(mapped.productName) || null,
+      outputUnit: record.outputUnit || normalizeText(mapped.outputUnit) || null,
+      remark: record.remark || normalizeText(mapped.remark) || null,
+      productionUnitStatus: record.status || normalizeText(mapped.status) || 'active',
+      status: result.status,
+      wouldImport: result.wouldImport,
+      existingProductionUnitId: result.existingProductionUnitId || null,
+      reasons: result.reasons || []
+    };
+    item.reasonCodes = item.reasons.map((reason) => reason.code).join('|');
+    item.reasonText = item.reasons.map((reason) => reason.message).join('；');
+    return item;
+  });
+  const summary = summarizeProductionUnitImportItems(items);
+  const candidateRowIds = items.filter((item) => item.wouldImport).map((item) => item.rowNumber).sort((a, b) => a - b);
+  const candidateRows = items.map((item) => ({
+    rowNumber: item.rowNumber,
+    unitCode: item.unitCode,
+    unitName: item.unitName,
+    organizationUnitCode: item.organizationUnitCode,
+    productName: item.productName,
+    outputUnit: item.outputUnit,
+    remark: item.remark,
+    status: item.productionUnitStatus
+  }));
+  const preview = {
+    dryRun: true,
+    previewOnly: true,
+    writesProductionUnits: false,
+    persistsImportBatch: true,
+    confirmText: PRODUCTION_UNIT_IMPORT_CONFIRM_TEXT,
+    backupReason: PRODUCTION_UNIT_IMPORT_BACKUP_REASON,
+    fieldMapping,
+    summary,
+    candidateRowIds,
+    candidateRows,
+    items,
+    notices: [
+      '本轮产能单元导入 preview 不写入 production_units；原始文件元数据、批次状态和 error/warning 明细会持久化到 import_batches/import_errors。',
+      'execute 必须携带固定确认文本、previewSignature、expectedWouldImport、candidateRowIds、candidateRows、acknowledgeSkippedRisks=true、requireBackup=true。',
+      '所属用能单元必须已存在且为 active；既有或同文件重复产能单元编码按 skip 策略处理，不覆盖、不恢复、不自动创建或挂接。'
+    ]
+  };
+  preview.previewSignature = buildProductionUnitImportPreviewSignature(preview);
+  return preview;
+}
+
+function buildProductionUnitImportPreviewFromRows(rows = []) {
+  const db = openDatabase();
+  try {
+    return buildProductionUnitImportPreviewWithDb(db, rows);
+  } finally {
+    db.close();
+  }
+}
+
+function collectProductionUnitImportAuditIssues(preview = {}) {
+  return (preview.items || []).flatMap((item) => (item.reasons || [])
+    .filter((reason) => ['error', 'warning'].includes(reason.severity))
+    .map((reason) => ({ rowNumber: item.rowNumber, fieldName: reason.fieldName, rawValue: reason.rawValue, code: reason.code, message: reason.message, severity: reason.severity })));
+}
+
+function buildProductionUnitImportErrorSummary(summary = {}) {
+  const parts = [];
+  if (summary.blocked > 0) parts.push(`${summary.blocked} 行阻断`);
+  if (summary.skipped > 0) parts.push(`${summary.skipped} 行跳过`);
+  if (summary.warnings > 0) parts.push(`${summary.warnings} 条警告`);
+  if (summary.errors > 0) parts.push(`${summary.errors} 条错误`);
+  return parts.length ? `产能单元导入存在 ${parts.join('、')}。` : null;
+}
+
+function buildProductionUnitAuditBatchResponse(batch) {
+  if (!batch) return null;
+  return {
+    id: batch.id,
+    importType: batch.importType,
+    status: batch.status,
+    auditPhase: batch.auditPhase,
+    originalFilename: batch.originalFilename,
+    fileSha256: batch.fileSha256,
+    fileSizeBytes: batch.fileSizeBytes,
+    previewSignature: batch.previewSignature,
+    counts: batch.counts || { totalRows: batch.totalRows, successCount: batch.successCount, failureCount: batch.failureCount, skippedCount: batch.skippedCount },
+    issueCounts: batch.issueCounts,
+    hasBackup: Object.prototype.hasOwnProperty.call(batch, 'hasBackup') ? batch.hasBackup : Boolean(batch.backup),
+    createdAt: batch.createdAt,
+    updatedAt: batch.updatedAt,
+    completedAt: batch.completedAt
+  };
+}
+
+function attachProductionUnitAuditBatch(result, batch) {
+  if (!batch) return result;
+  return { ...result, persistsImportBatch: true, batchId: batch.id, auditBatch: buildProductionUnitAuditBatchResponse(batch) };
+}
+
+function createProductionUnitImportAuditBatch(preview, file) {
+  const auditBatch = createPreviewAuditBatch({
+    importType: 'production_unit',
+    originalFilename: file.originalname,
+    storedFilename: file.filename || null,
+    filePath: file.path,
+    fileType: String(file.originalname || '').split('.').pop().toLowerCase(),
+    fileSizeBytes: file.size,
+    duplicateStrategy: 'skip',
+    fieldMapping: preview.fieldMapping,
+    previewSignature: preview.previewSignature,
+    auditContext: { confirmText: preview.confirmText, backupReason: preview.backupReason, summary: preview.summary, candidateRowIds: preview.candidateRowIds, candidateRows: preview.candidateRows, notices: preview.notices },
+    statistics: { totalRows: preview.summary.totalRows, successCount: preview.summary.wouldImport, failureCount: preview.summary.blocked, skippedCount: preview.summary.skipped },
+    errorSummary: buildProductionUnitImportErrorSummary(preview.summary)
+  });
+  const withIssues = replaceImportAuditIssues(auditBatch.id, collectProductionUnitImportAuditIssues(preview));
+  return getImportAuditSummary(withIssues.id);
+}
+
+function createProductionUnitImportPreviewFromUpload(file) {
+  if (!file) throw badRequest('请使用 multipart/form-data 上传字段名为 file 的产能单元表格文件。', { code: 'IMPORT_FILE_REQUIRED', fieldName: 'file' });
+  assertSupportedImportFile(file.originalname);
+  const parsed = parseImportFile(file.path, file.originalname);
+  const preview = buildProductionUnitImportPreviewFromRows(parsed.rows || []);
+  return attachProductionUnitAuditBatch(preview, createProductionUnitImportAuditBatch(preview, file));
+}
+
+function normalizeProductionUnitCandidateRowIds(value) {
+  if (!Array.isArray(value)) throw badRequest('candidateRowIds 必须是数组。', { code: 'PRODUCTION_UNIT_IMPORT_CANDIDATE_ROW_IDS_REQUIRED' });
+  return value.map((id) => parsePositiveInteger(id, 'candidateRowIds', { required: true })).sort((a, b) => a - b);
+}
+
+function normalizeProductionUnitExpectedWouldImport(value) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    throw badRequest('expectedWouldImport 为必填非负整数。', { code: 'PRODUCTION_UNIT_IMPORT_EXPECTED_WOULD_IMPORT_REQUIRED' });
+  }
+  const normalized = Number(value);
+  if (!Number.isSafeInteger(normalized) || normalized < 0) {
+    throw badRequest('expectedWouldImport 必须是非负整数。', { code: 'PRODUCTION_UNIT_IMPORT_EXPECTED_WOULD_IMPORT_INVALID', rawValue: value });
+  }
+  return normalized;
+}
+
+function normalizeOptionalProductionUnitImportBatchId(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  return parsePositiveInteger(value, 'batchId', { required: true });
+}
+
+function findProductionUnitAuditBatchIdForExecute(previewSignature, requestedBatchId = null) {
+  if (requestedBatchId) {
+    const batch = getImportAuditBatchDetail(requestedBatchId, { includeIssues: false });
+    if (batch.importType !== 'production_unit') throw badRequest('batchId 不是产能单元导入审计批次。', { code: 'PRODUCTION_UNIT_IMPORT_AUDIT_BATCH_TYPE_MISMATCH', batchId: requestedBatchId, importType: batch.importType });
+    if (batch.previewSignature && !timingSafeEqualText(batch.previewSignature, previewSignature)) throw badRequest('batchId 与 previewSignature 不匹配，已拒绝执行产能单元导入。', { code: 'PRODUCTION_UNIT_IMPORT_AUDIT_BATCH_SIGNATURE_MISMATCH', batchId: requestedBatchId });
+    return requestedBatchId;
+  }
+  const db = openDatabase();
+  try {
+    const row = db.prepare("SELECT id FROM import_batches WHERE import_type = 'production_unit' AND preview_signature = ? ORDER BY id DESC LIMIT 1").get(previewSignature);
+    return row ? Number(row.id) : null;
+  } finally {
+    db.close();
+  }
+}
+
+function buildProductionUnitAuditFailureStatistics(batch) {
+  return batch ? { totalRows: Number(batch.totalRows || 0), successCount: 0, failureCount: Number(batch.failureCount || 0), skippedCount: Number(batch.skippedCount || 0) } : { totalRows: 0, successCount: 0, failureCount: 0, skippedCount: 0 };
+}
+
+function markProductionUnitImportAuditFailure(body = {}, error) {
+  try {
+    const requestedBatchId = normalizeOptionalProductionUnitImportBatchId(body.batchId);
+    const previewSignature = normalizeText(body.previewSignature);
+    const batchId = requestedBatchId || (previewSignature ? findProductionUnitAuditBatchIdForExecute(previewSignature) : null);
+    if (!batchId) return;
+    const batch = getImportAuditBatchDetail(batchId, { includeIssues: false });
+    if (batch.importType !== 'production_unit' || (batch.auditPhase === 'execute' && ['completed', 'completed_with_errors'].includes(batch.status))) return;
+    updateExecuteAuditResult(batchId, {
+      status: 'failed',
+      statistics: buildProductionUnitAuditFailureStatistics(batch),
+      executeResult: {
+        executed: false,
+        writesProductionUnits: false,
+        errorCode: error?.details?.code || error?.code || 'PRODUCTION_UNIT_IMPORT_EXECUTE_FAILED',
+        errorMessage: error?.message || '产能单元导入执行失败。',
+        previewSignatureProvided: Boolean(body.previewSignature),
+        expectedWouldImport: body.expectedWouldImport ?? null,
+        candidateRowIds: Array.isArray(body.candidateRowIds) ? body.candidateRowIds : null,
+        requireBackup: body.requireBackup === true,
+        acknowledgeSkippedRisks: body.acknowledgeSkippedRisks === true
+      },
+      backup: null,
+      errorSummary: error?.message || '产能单元导入执行失败。'
+    });
+  } catch (_) {
+    // 审计失败标记不能掩盖原始业务拒绝原因。
+  }
+}
+
+async function executeProductionUnitImportInternal(body = {}) {
+  const confirmText = normalizeText(body.confirmText);
+  if (confirmText !== PRODUCTION_UNIT_IMPORT_CONFIRM_TEXT) throw badRequest('确认文本不匹配，已拒绝导入产能单元。', { code: 'PRODUCTION_UNIT_IMPORT_CONFIRM_TEXT_MISMATCH', requiredConfirmText: PRODUCTION_UNIT_IMPORT_CONFIRM_TEXT });
+  if (body.acknowledgeSkippedRisks !== true) throw badRequest('必须确认已知晓冲突、重复、无效和阻断记录会被跳过。', { code: 'PRODUCTION_UNIT_IMPORT_SKIPPED_RISKS_ACK_REQUIRED' });
+  if (body.requireBackup !== true) throw badRequest('执行前必须要求自动备份，requireBackup 必须显式为 true。', { code: 'PRODUCTION_UNIT_IMPORT_BACKUP_REQUIRED' });
+  const previewSignature = normalizeText(body.previewSignature);
+  if (!previewSignature) throw badRequest('previewSignature 为必填项。', { code: 'PRODUCTION_UNIT_IMPORT_PREVIEW_SIGNATURE_REQUIRED' });
+  const expectedWouldImport = normalizeProductionUnitExpectedWouldImport(body.expectedWouldImport);
+  const candidateRowIds = normalizeProductionUnitCandidateRowIds(body.candidateRowIds);
+  if (!Array.isArray(body.candidateRows) || body.candidateRows.length === 0) throw badRequest('candidateRows 为必填数组，必须来自最新导入预演响应。', { code: 'PRODUCTION_UNIT_IMPORT_CANDIDATE_ROWS_REQUIRED' });
+  const requestedBatchId = normalizeOptionalProductionUnitImportBatchId(body.batchId);
+  const auditBatchId = findProductionUnitAuditBatchIdForExecute(previewSignature, requestedBatchId);
+  if (!auditBatchId) throw badRequest('未找到与 previewSignature 匹配的产能单元导入审计批次，已拒绝执行。', { code: 'PRODUCTION_UNIT_IMPORT_AUDIT_BATCH_REQUIRED' });
+  const previewDb = openDatabase();
+  let preview;
+  try {
+    preview = buildProductionUnitImportPreviewWithDb(previewDb, body.candidateRows);
+  } finally {
+    previewDb.close();
+  }
+  if (!verifyProductionUnitImportPreviewSignature(preview, previewSignature)) throw badRequest('当前 previewSignature 与执行前重新计算结果不一致，已拒绝执行。', { code: 'PRODUCTION_UNIT_IMPORT_PREVIEW_SIGNATURE_MISMATCH' });
+  if (preview.summary.wouldImport !== expectedWouldImport) throw badRequest('expectedWouldImport 与执行前重新计算结果不一致，已拒绝执行。', { code: 'PRODUCTION_UNIT_IMPORT_WOULD_IMPORT_MISMATCH', expected: preview.summary.wouldImport, actual: expectedWouldImport });
+  assertSameArray(preview.candidateRowIds, candidateRowIds, 'PRODUCTION_UNIT_IMPORT_CANDIDATE_ROW_IDS_MISMATCH', 'candidateRowIds 与执行前重新计算结果不一致，已拒绝执行。');
+
+  const backup = await createBackup({ reason: PRODUCTION_UNIT_IMPORT_BACKUP_REASON });
+  const writeDb = openDatabase();
+  try {
+    const transaction = writeDb.transaction(() => {
+      const latestPreview = buildProductionUnitImportPreviewWithDb(writeDb, body.candidateRows);
+      if (!verifyProductionUnitImportPreviewSignature(latestPreview, previewSignature)) throw badRequest('当前 previewSignature 与写入前重新计算结果不一致，已拒绝执行。', { code: 'PRODUCTION_UNIT_IMPORT_PREVIEW_SIGNATURE_MISMATCH' });
+      const insertUnit = writeDb.prepare(
+        `INSERT INTO production_units (
+           source_batch_id, source_row_number, unit_code, unit_name, organization_unit_id, product_name, output_unit, status, remark, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      const now = getNow();
+      const items = [];
+      let imported = 0;
+      latestPreview.items.forEach((item) => {
+        if (!item.wouldImport) {
+          items.push({ rowNumber: item.rowNumber, status: 'skipped', previewStatus: item.status, reasonCodes: item.reasonCodes, reason: item.reasonText, existingProductionUnitId: item.existingProductionUnitId || null });
+          return;
+        }
+        const insertResult = insertUnit.run(auditBatchId || null, auditBatchId ? item.rowNumber : null, item.unitCode, item.unitName, item.organizationUnitId, item.productName, item.outputUnit, item.productionUnitStatus, item.remark || null, now, now);
+        imported += 1;
+        items.push({ rowNumber: item.rowNumber, status: 'imported', productionUnitId: Number(insertResult.lastInsertRowid), unitCode: item.unitCode, organizationUnitId: item.organizationUnitId, sourceBatchId: auditBatchId || null, sourceRowNumber: auditBatchId ? item.rowNumber : null, reason: '已按受控导入写入产能单元。' });
+      });
+      const result = {
+        executed: true,
+        dryRun: false,
+        writesProductionUnits: true,
+        persistsImportBatch: Boolean(auditBatchId),
+        imported,
+        skipped: items.filter((item) => item.status === 'skipped').length,
+        previewSignature: latestPreview.previewSignature,
+        expectedWouldImport,
+        candidateRowIds: latestPreview.candidateRowIds,
+        backup,
+        summary: { ...latestPreview.summary, imported },
+        importedItems: items.filter((item) => item.status === 'imported'),
+        skippedItems: items.filter((item) => item.status === 'skipped'),
+        items,
+        note: '已按最新 preview 的 wouldImport 候选受控导入；冲突、重复、无效和阻断状态均跳过，不覆盖、不恢复既有产能单元。'
+      };
+      if (!auditBatchId) return result;
+      const auditBatch = updateExecuteAuditResult(auditBatchId, {
+        status: latestPreview.summary.blocked > 0 || latestPreview.summary.skipped > 0 ? 'completed_with_errors' : 'completed',
+        statistics: { totalRows: latestPreview.summary.totalRows, successCount: imported, failureCount: latestPreview.summary.blocked, skippedCount: latestPreview.summary.skipped },
+        executeResult: { executed: true, writesProductionUnits: true, imported, skipped: result.skipped, previewSignature: latestPreview.previewSignature, expectedWouldImport, candidateRowIds: latestPreview.candidateRowIds, importedItems: result.importedItems, skippedItems: result.skippedItems, summary: result.summary, note: result.note },
+        backup,
+        errorSummary: buildProductionUnitImportErrorSummary(latestPreview.summary)
+      }, { db: writeDb });
+      return attachProductionUnitAuditBatch(result, auditBatch);
+    });
+    return transaction();
+  } finally {
+    writeDb.close();
+  }
+}
+
+async function executeProductionUnitImport(body = {}) {
+  try {
+    return await executeProductionUnitImportInternal(body);
+  } catch (error) {
+    markProductionUnitImportAuditFailure(body, error);
+    throw error;
+  }
+}
+
 function createProductionOutput(input = {}) {
   const payload = normalizeProductionOutputPayload(input);
   const db = openDatabase();
@@ -1329,6 +1920,50 @@ function voidProductionOutput(outputId) {
       };
     });
     return transaction();
+  } finally {
+    db.close();
+  }
+}
+
+function getProductionStats(query = {}) {
+  const db = openDatabase();
+  try {
+    const unitWhere = [];
+    const unitParams = {};
+    const organizationUnitId = parsePositiveInteger(firstDefined(query, ['organizationUnitId', 'organization_unit_id']), 'organizationUnitId');
+    if (organizationUnitId) {
+      unitWhere.push('pu.organization_unit_id = @organizationUnitId');
+      unitParams.organizationUnitId = organizationUnitId;
+    }
+    const unitKeyword = normalizeText(query.unitKeyword || query.keyword || query.search);
+    if (unitKeyword) {
+      unitWhere.push('(pu.unit_code LIKE @unitKeyword OR pu.unit_name LIKE @unitKeyword OR pu.product_name LIKE @unitKeyword OR ou.unit_path LIKE @unitKeyword)');
+      unitParams.unitKeyword = `%${unitKeyword}%`;
+    }
+    const unitWhereSql = unitWhere.length ? `WHERE ${unitWhere.join(' AND ')}` : '';
+    const unitTotals = db.prepare(`SELECT COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN pu.status = 'active' THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN pu.status = 'inactive' THEN 1 ELSE 0 END), 0) AS inactive
+      FROM production_units pu JOIN organization_units ou ON ou.id = pu.organization_unit_id ${unitWhereSql}`).get(unitParams);
+    const outputQuery = { ...query, status: undefined, recordStatus: undefined, record_status: undefined };
+    const { whereSql, params } = buildProductionOutputWhere(outputQuery);
+    const outputTotals = db.prepare(`SELECT COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN por.record_status = 'active' THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN por.record_status = 'void' THEN 1 ELSE 0 END), 0) AS void
+      FROM production_output_records por JOIN production_units pu ON pu.id = por.production_unit_id
+      JOIN organization_units ou ON ou.id = pu.organization_unit_id ${whereSql}`).get(params);
+    const outputsByMonth = db.prepare(`SELECT por.normalized_month AS normalizedMonth, por.record_status AS recordStatus,
+      por.output_unit AS outputUnit, COUNT(*) AS recordCount, COALESCE(SUM(por.output_value), 0) AS outputValue
+      FROM production_output_records por JOIN production_units pu ON pu.id = por.production_unit_id
+      JOIN organization_units ou ON ou.id = pu.organization_unit_id ${whereSql}
+      GROUP BY por.normalized_month, por.record_status, por.output_unit
+      ORDER BY por.normalized_month DESC, por.record_status ASC, por.output_unit ASC`).all();
+    return {
+      productionUnits: { total: Number(unitTotals.total || 0), active: Number(unitTotals.active || 0), inactive: Number(unitTotals.inactive || 0) },
+      productionOutputs: { total: Number(outputTotals.total || 0), active: Number(outputTotals.active || 0), void: Number(outputTotals.void || 0), byMonth: outputsByMonth },
+      unitEnergyIntensity: null,
+      meta: { unitEnergyIntensityRoute: 'GET /api/production/statistics/unit-energy-intensity?productionUnitId=...', generationIncluded: false, selfUseIncluded: false, carbonAccountingIncluded: false }
+    };
   } finally {
     db.close();
   }
@@ -1543,6 +2178,10 @@ function getUnitEnergyIntensity(query = {}) {
 
 module.exports = {
   PRODUCTION_OUTPUT_EXPORT_FIELDS,
+  PRODUCTION_UNIT_EXPORT_FIELDS,
+  PRODUCTION_UNIT_IMPORT_BACKUP_REASON,
+  PRODUCTION_UNIT_IMPORT_CONFIRM_TEXT,
+  PRODUCTION_UNIT_IMPORT_ALIASES,
   PRODUCTION_OUTPUT_IMPORT_BACKUP_REASON,
   PRODUCTION_OUTPUT_IMPORT_CONFIRM_TEXT,
   PRODUCTION_OUTPUT_IMPORT_STATUSES,
@@ -1553,12 +2192,19 @@ module.exports = {
   buildProductionOutputExportRows,
   buildProductionOutputImportIndexes,
   buildProductionOutputImportPreviewFromRows,
+  buildProductionUnitExportRows,
+  buildProductionUnitImportIndexes,
+  buildProductionUnitImportPreviewFromRows,
   createProductionOutput,
   createProductionOutputImportPreviewFromUpload,
   createProductionUnit,
+  createProductionUnitImportPreviewFromUpload,
   deactivateProductionUnit,
   executeProductionOutputImport,
+  executeProductionUnitImport,
   exportProductionOutputs,
+  exportProductionUnits,
+  getProductionStats,
   getUnitEnergyIntensity,
   listProductionOutputs,
   listProductionUnits,

@@ -208,7 +208,7 @@ function buildExecuteBody(preview, overrides = {}) {
 
     const routeSource = fs.readFileSync(path.join(__dirname, '..', 'routes', 'generation.js'), 'utf8');
     assert(routeSource.includes("router.post('/records/import/preview'"), 'preview 路由应保留。');
-    assert(routeSource.includes("router.post('/records/import/execute', requireWritable('generation:records-import-execute')"), 'execute 路由应存在且挂维护态写保护。');
+    assert(routeSource.includes("router.post('/records/import/execute', authenticate, requirePermission('ledger:generation:execute'), requireWritable('generation:records-import-execute')"), 'execute 路由应存在且挂维护态写保护。');
     assert(routeSource.includes('executeGenerationRecordImport'), 'execute 路由应调用受控导入服务。');
 
     console.log('generation import execute tests passed');

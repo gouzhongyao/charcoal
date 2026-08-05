@@ -3,10 +3,39 @@ const {
   GENERATION_RECORD_IMPORT_HEADERS,
   GENERATION_RECORD_IMPORT_TEMPLATE_ID
 } = require('./generationService');
+const {
+  ENERGY_BUDGET_IMPORT_HEADERS,
+  ENERGY_BUDGET_IMPORT_TEMPLATE_ID
+} = require('./energyBudgetService');
+const {
+  CARBON_FACTOR_IMPORT_HEADERS,
+  CARBON_FACTOR_IMPORT_TEMPLATE_ID
+} = require('./carbonAccountingService');
+const {
+  PREDICTION_CONFIG_IMPORT_HEADERS,
+  PREDICTION_CONFIG_IMPORT_TEMPLATE_ID
+} = require('./predictionService');
 
 const UTF8_BOM = '﻿';
 
 const TEMPLATE_DEFINITIONS = {
+  [ENERGY_BUDGET_IMPORT_TEMPLATE_ID]: {
+    type: ENERGY_BUDGET_IMPORT_TEMPLATE_ID,
+    name: '用能预算导入模板',
+    baseFileName: '用能预算导入模板',
+    sheetName: '用能预算导入模板',
+    route: '/api/templates/energy-budgets.xlsx',
+    csvRoute: '/api/templates/energy-budgets.csv',
+    recommendedFormat: 'xlsx',
+    appliesTo: ['能耗管理', '用能预算'],
+    contractRoute: 'POST /api/energy-budgets/import/preview -> POST /api/energy-budgets/import/execute',
+    description: '用于预演并受控导入用能预算；periodMonth、energyTypeCode/能源类型、organizationScope、budgetValue、unit、remark、status 与后端契约一致。能源类型必须为 active；相同月份、能源类型和组织范围已存在或同文件重复时默认 skip warning，不覆盖、不物理删除既有预算。',
+    headers: [...ENERGY_BUDGET_IMPORT_HEADERS],
+    rows: [
+      ['2026-01', 'electricity', '整体', '12000', 'kWh', '全公司电力月度预算', 'active'],
+      ['2026/02', 'heat', '生产部', '8000', 'MJ', '组织范围可按实际业务文本填写', 'active']
+    ]
+  },
   'energy-records': {
     type: 'energy-records',
     name: '能耗数据导入模板',
@@ -41,6 +70,23 @@ const TEMPLATE_DEFINITIONS = {
     rows: [
       ['2026-02-28', 'E-001', '一车间电表', '12000', '12500', '1', '', 'kWh', '烟测集团/生产部', 'usage_value 为空时按表码差×倍率计算'],
       ['2026-02-28', '', '锅炉房热量表', '100', '110', '10', '', 'MJ', '烟测集团/锅炉房', 'meter_code 为空时用 用能单元 + meter_name 匹配']
+    ]
+  },
+  'production-units': {
+    type: 'production-units',
+    name: '产能单元导入模板',
+    baseFileName: '产能单元导入模板',
+    sheetName: '产能单元导入模板',
+    route: '/api/templates/production-units.xlsx',
+    csvRoute: '/api/templates/production-units.csv',
+    recommendedFormat: 'xlsx',
+    appliesTo: ['基础台账', '产能单元'],
+    contractRoute: 'POST /api/production/units/import/preview -> POST /api/production/units/import/execute',
+    description: '用于预演并受控导入产能单元；unitCode、unitName、organizationUnitCode、productName、outputUnit、remark、status 与后端契约一致。organizationUnitCode 必须匹配 active 用能单元；已有产能单元编码或同文件重复默认 skip warning，不覆盖、不恢复、不物理删除既有台账。',
+    headers: ['unitCode', 'unitName', 'organizationUnitCode', 'productName', 'outputUnit', 'remark', 'status'],
+    rows: [
+      ['PU-001', '一线产能单元', 'OU-001', '产品A', 't', '所属用能单元必须已存在且 active', 'active'],
+      ['PU-002', '二线产能单元', 'OU-002', '产品B', '件', '重复编码按 skip 处理，不覆盖既有单元', 'inactive']
     ]
   },
   'production-outputs': {
@@ -111,21 +157,37 @@ const TEMPLATE_DEFINITIONS = {
       ['H-001', '锅炉房热量表', 'heat', 'heat', 'OU-003', '生产部/锅炉房', 'offline', '', '10', '1', 'input', '锅炉房', 'active', 'online_status 仅作台账字段']
     ]
   },
-  'carbon-factors': {
-    type: 'carbon-factors',
-    name: '碳因子维护模板',
-    baseFileName: '碳因子维护模板',
+  [CARBON_FACTOR_IMPORT_TEMPLATE_ID]: {
+    type: CARBON_FACTOR_IMPORT_TEMPLATE_ID,
+    name: '碳因子导入模板',
+    baseFileName: '碳因子导入模板',
     sheetName: '碳因子模板',
     route: '/api/templates/carbon-factors.xlsx',
     csvRoute: '/api/templates/carbon-factors.csv',
     recommendedFormat: 'xlsx',
     appliesTo: ['碳核算', '碳因子维护'],
-    contractRoute: 'POST /api/carbon/factors',
-    description: '用于维护参考和字段整理；模板字段与后端 upsert 契约一致，当前碳因子页面按表单逐条保存，未提供碳因子批量上传接口。',
-    headers: ['能源类型编码', '地区', '年份', '单位', '因子值', '排放单位', '来源', '来源链接', '有效开始日期', '有效结束日期', '是否启用'],
+    contractRoute: 'POST /api/carbon/factors/import/preview -> POST /api/carbon/factors/import/execute',
+    description: '用于预演并受控导入碳因子；字段与碳因子导出、详情和维护契约一致。能源类型必须为 active；相同能源类型、地区、年份、单位和来源已存在或同文件重复时默认 skip warning，不覆盖、不物理删除既有因子，也不写入碳排放结果。',
+    headers: [...CARBON_FACTOR_IMPORT_HEADERS],
     rows: [
-      ['electricity', 'default', '2026', 'kWh', '0.5703', 'kgCO2e', '业务维护', 'https://example.com/electricity-factor', '2026-01-01', '2026-12-31', 'true'],
-      ['natural_gas', 'default', '2026', 'm3', '2.1622', 'kgCO2e', '业务维护', '', '2026-01-01', '', 'true']
+      ['electricity', 'default', '2026', 'kWh', '0.5703', 'kgCO2e', '业务维护', 'https://example.com/electricity-factor', '2026-01-01', '2026-12-31', 'active'],
+      ['natural_gas', 'default', '2026', 'm3', '2.1622', 'kgCO2e', '业务维护', '', '2026-01-01', '', 'active']
+    ]
+  },
+  [PREDICTION_CONFIG_IMPORT_TEMPLATE_ID]: {
+    type: PREDICTION_CONFIG_IMPORT_TEMPLATE_ID,
+    name: '预测配置草稿导入模板',
+    baseFileName: '预测配置草稿导入模板',
+    sheetName: '预测配置草稿',
+    route: '/api/templates/prediction-configs.xlsx',
+    csvRoute: '/api/templates/prediction-configs.csv',
+    recommendedFormat: 'xlsx',
+    appliesTo: ['预测管理', '预测配置草稿'],
+    contractRoute: 'POST /api/predictions/configs/import/preview -> POST /api/predictions/configs/import/execute',
+    description: '仅用于导入可编辑的 draft 预测配置；不会运行预测，不会写 prediction_results、energy_records 或 carbon_emissions。预测结果必须由后端基于已入库能耗数据生成。',
+    headers: [...PREDICTION_CONFIG_IMPORT_HEADERS],
+    rows: [
+      ['电力趋势预测草稿', '导入后可编辑，运行时由服务端读取已入库能耗', 'electricity', '生产部', 'A园区', '生产部', '', '2026-01', '2026-03', '2026-04', '2026-06', 'moving_average', '3', 'draft']
     ]
   },
   'prediction-history': {

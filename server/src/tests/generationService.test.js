@@ -86,11 +86,11 @@ try {
   assert(routeSql.includes("router.get('/records/export'"), '应提供发电记录当前筛选导出接口。');
   assert(routeSql.includes("X-Export-Row-Count"), '发电导出接口应返回 X-Export-Row-Count 行数响应头。');
   assert(routeSql.includes("Content-Disposition"), '发电导出接口应返回中文文件名 Content-Disposition 下载响应头。');
-  assert(routeSql.includes("router.post('/records/import/preview', requireWritable('generation:records-import-preview')"), '发电记录导入 preview 接口应在上传落盘前挂维护态写保护。');
+  assert(routeSql.includes("router.post('/records/import/preview', authenticate, requirePermission('ledger:generation:preview'), requireWritable('generation:records-import-preview')"), '发电记录导入 preview 接口应在上传落盘前挂维护态写保护。');
   assert(routeSql.includes('createGenerationRecordImportPreviewFromUpload'), '发电 preview 路由应调用上传解析预演服务。');
   assert(!routeSql.includes('.then((preview) => {\n        cleanupUploadedImportFile(req.file);'), '发电 preview 成功后应保留上传文件供审计批次追溯。');
   assert(routeSql.includes('cleanupUploadedImportFile(req.file);\n        next(error);'), '发电 preview 解析失败后仍应清理本次临时上传文件。');
-  assert(routeSql.includes("router.post('/records/import/execute', requireWritable('generation:records-import-execute')"), '应提供发电记录导入 execute 接口且挂维护态写保护。');
+  assert(routeSql.includes("router.post('/records/import/execute', authenticate, requirePermission('ledger:generation:execute'), requireWritable('generation:records-import-execute')"), '应提供发电记录导入 execute 接口且挂维护态写保护。');
   assert(routeSql.includes('executeGenerationRecordImport'), '发电 execute 路由应调用受控导入服务。');
   assert(!routeSql.includes("router.get('/records/export', requireWritable"), '发电导出接口是只读能力，不应挂 requireWritable。');
   assert(routeSql.includes("router.get('/records'"), '应提供发电记录列表接口。');

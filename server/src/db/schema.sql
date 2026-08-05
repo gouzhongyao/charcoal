@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS app_meta (
 
 CREATE TABLE IF NOT EXISTS import_batches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_output', 'generation_record')),
+  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_unit', 'production_output', 'generation_record', 'energy_budget', 'carbon_factor', 'prediction_config')),
   original_filename TEXT NOT NULL,
   stored_filename TEXT,
   file_type TEXT NOT NULL CHECK (file_type IN ('xlsx', 'xls', 'csv')),
@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS energy_types (
 
 CREATE TABLE IF NOT EXISTS carbon_factors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
   energy_type_id INTEGER NOT NULL,
   region TEXT NOT NULL DEFAULT 'default',
   factor_year INTEGER CHECK (factor_year IS NULL OR factor_year BETWEEN 1900 AND 2200),
@@ -82,6 +84,7 @@ CREATE TABLE IF NOT EXISTS carbon_factors (
   is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
   FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
   UNIQUE (energy_type_id, region, factor_year, unit, source)
 );
@@ -157,6 +160,8 @@ CREATE TABLE IF NOT EXISTS meter_reading_records (
 
 CREATE TABLE IF NOT EXISTS production_units (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
   unit_code TEXT NOT NULL UNIQUE,
   unit_name TEXT NOT NULL,
   organization_unit_id INTEGER NOT NULL,
@@ -166,6 +171,7 @@ CREATE TABLE IF NOT EXISTS production_units (
   remark TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
   FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE RESTRICT
 );
 
@@ -248,6 +254,27 @@ CREATE TABLE IF NOT EXISTS generation_records (
   CHECK (self_use_value_kwh + grid_export_value_kwh <= generation_value_kwh + 0.000001)
 );
 
+CREATE TABLE IF NOT EXISTS energy_budgets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  period_month TEXT NOT NULL CHECK (
+    period_month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
+    AND CAST(substr(period_month, 6, 2) AS INTEGER) BETWEEN 1 AND 12
+  ),
+  energy_type_id INTEGER NOT NULL,
+  organization_scope TEXT NOT NULL DEFAULT '整体',
+  budget_value REAL NOT NULL CHECK (budget_value >= 0),
+  unit TEXT NOT NULL,
+  remark TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+  UNIQUE (period_month, energy_type_id, organization_scope)
+);
+
 CREATE TABLE IF NOT EXISTS carbon_emissions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   energy_record_id INTEGER NOT NULL,
@@ -267,11 +294,36 @@ CREATE TABLE IF NOT EXISTS carbon_emissions (
   CHECK (status <> 'calculated' OR (carbon_factor_id IS NOT NULL AND factor_value IS NOT NULL AND emission_value IS NOT NULL))
 );
 
+CREATE TABLE IF NOT EXISTS prediction_configs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  name TEXT NOT NULL,
+  note TEXT,
+  energy_type_id INTEGER,
+  organization_scope TEXT,
+  site TEXT,
+  department TEXT,
+  source_batch_filter_id INTEGER,
+  train_start_month TEXT NOT NULL,
+  train_end_month TEXT NOT NULL,
+  predict_start_month TEXT NOT NULL,
+  predict_end_month TEXT NOT NULL,
+  algorithm TEXT NOT NULL CHECK (algorithm IN ('moving_average', 'linear_trend')),
+  window_size INTEGER CHECK (window_size IS NULL OR window_size BETWEEN 2 AND 12),
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'active', 'archived')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  archived_at TEXT,
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS prediction_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   algorithm TEXT NOT NULL CHECK (algorithm IN ('moving_average', 'linear_trend', 'year_over_year', 'manual_baseline')),
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled', 'archived')),
   target_energy_type_id INTEGER,
   train_start_month TEXT CHECK (
     train_start_month IS NULL
@@ -344,6 +396,7 @@ CREATE INDEX IF NOT EXISTS idx_meter_reading_records_energy_month ON meter_readi
 CREATE INDEX IF NOT EXISTS idx_meter_reading_records_status_month ON meter_reading_records(record_status, normalized_month);
 CREATE INDEX IF NOT EXISTS idx_production_units_org_status ON production_units(organization_unit_id, status);
 CREATE INDEX IF NOT EXISTS idx_production_units_product_status ON production_units(product_name, status);
+CREATE INDEX IF NOT EXISTS idx_production_units_batch ON production_units(source_batch_id);
 CREATE INDEX IF NOT EXISTS idx_production_output_records_unit_month ON production_output_records(production_unit_id, normalized_month);
 CREATE INDEX IF NOT EXISTS idx_production_output_records_status_month ON production_output_records(record_status, normalized_month);
 CREATE INDEX IF NOT EXISTS idx_production_output_records_batch ON production_output_records(source_batch_id);
@@ -358,9 +411,16 @@ CREATE INDEX IF NOT EXISTS idx_generation_records_batch ON generation_records(so
 CREATE INDEX IF NOT EXISTS idx_generation_records_energy_status ON generation_records(energy_type_id, record_status);
 CREATE INDEX IF NOT EXISTS idx_generation_records_status_month ON generation_records(record_status, normalized_month);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_generation_records_active_org_month_energy ON generation_records(organization_unit_id, normalized_month, energy_type_id) WHERE record_status = 'active';
+CREATE INDEX IF NOT EXISTS idx_energy_budgets_month_type_status ON energy_budgets(period_month, energy_type_id, status);
+CREATE INDEX IF NOT EXISTS idx_energy_budgets_scope_status ON energy_budgets(organization_scope, status);
+CREATE INDEX IF NOT EXISTS idx_energy_budgets_batch ON energy_budgets(source_batch_id);
 CREATE INDEX IF NOT EXISTS idx_carbon_factors_match ON carbon_factors(energy_type_id, region, factor_year, unit, is_active);
+CREATE INDEX IF NOT EXISTS idx_carbon_factors_batch ON carbon_factors(source_batch_id);
 CREATE INDEX IF NOT EXISTS idx_carbon_emissions_record ON carbon_emissions(energy_record_id, status);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_carbon_emissions_record_method ON carbon_emissions(energy_record_id, calculation_method) WHERE status <> 'superseded';
+CREATE INDEX IF NOT EXISTS idx_prediction_configs_status_updated ON prediction_configs(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prediction_configs_energy_month ON prediction_configs(energy_type_id, predict_start_month, predict_end_month);
+CREATE INDEX IF NOT EXISTS idx_prediction_configs_batch ON prediction_configs(source_batch_id);
 CREATE INDEX IF NOT EXISTS idx_prediction_runs_status_created ON prediction_runs(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_prediction_results_run_month ON prediction_results(prediction_run_id, target_month);
 
@@ -390,6 +450,112 @@ SET default_unit = 'MJ',
 WHERE code = 'heat'
   AND (default_unit <> 'MJ' OR standard_unit <> 'MJ');
 
+CREATE TABLE IF NOT EXISTS sys_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  display_name TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  is_builtin INTEGER NOT NULL DEFAULT 0 CHECK (is_builtin IN (0, 1)),
+  last_login_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS sys_roles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  role_code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  role_name TEXT NOT NULL,
+  description TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  is_builtin INTEGER NOT NULL DEFAULT 0 CHECK (is_builtin IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS sys_user_roles (
+  user_id INTEGER NOT NULL,
+  role_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (user_id, role_id),
+  FOREIGN KEY (user_id) REFERENCES sys_users(id) ON DELETE RESTRICT,
+  FOREIGN KEY (role_id) REFERENCES sys_roles(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS sys_menus (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id INTEGER,
+  menu_type TEXT NOT NULL DEFAULT 'menu' CHECK (menu_type IN ('directory', 'menu', 'button')),
+  menu_name TEXT NOT NULL,
+  route_path TEXT,
+  component TEXT,
+  permission_code TEXT UNIQUE,
+  icon TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  visible INTEGER NOT NULL DEFAULT 1 CHECK (visible IN (0, 1)),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  is_builtin INTEGER NOT NULL DEFAULT 0 CHECK (is_builtin IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (parent_id) REFERENCES sys_menus(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS sys_role_menus (
+  role_id INTEGER NOT NULL,
+  menu_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (role_id, menu_id),
+  FOREIGN KEY (role_id) REFERENCES sys_roles(id) ON DELETE RESTRICT,
+  FOREIGN KEY (menu_id) REFERENCES sys_menus(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS sys_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  created_ip TEXT,
+  user_agent TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  last_seen_at TEXT,
+  FOREIGN KEY (user_id) REFERENCES sys_users(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS sys_login_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT,
+  user_id INTEGER,
+  success INTEGER NOT NULL CHECK (success IN (0, 1)),
+  reason TEXT,
+  ip TEXT,
+  user_agent TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (user_id) REFERENCES sys_users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS sys_operation_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  operation TEXT NOT NULL,
+  target_type TEXT,
+  target_id TEXT,
+  detail_json TEXT,
+  ip TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (user_id) REFERENCES sys_users(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sys_users_status_username ON sys_users(status, username);
+CREATE INDEX IF NOT EXISTS idx_sys_roles_status_code ON sys_roles(status, role_code);
+CREATE INDEX IF NOT EXISTS idx_sys_user_roles_role ON sys_user_roles(role_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_sys_menus_parent_order ON sys_menus(parent_id, sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_sys_role_menus_menu ON sys_role_menus(menu_id, role_id);
+CREATE INDEX IF NOT EXISTS idx_sys_sessions_token_active ON sys_sessions(token_hash, expires_at, revoked_at);
+CREATE INDEX IF NOT EXISTS idx_sys_sessions_user_active ON sys_sessions(user_id, expires_at, revoked_at);
+CREATE INDEX IF NOT EXISTS idx_sys_login_logs_username_created ON sys_login_logs(username, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sys_operation_logs_user_created ON sys_operation_logs(user_id, created_at DESC);
+
 INSERT OR IGNORE INTO app_meta (key, value) VALUES
-  ('schema_stage', 'generation-basic'),
-  ('schema_version', '2026-08-03-generation-basic');
+  ('schema_stage', 'rbac-backend-core'),
+  ('schema_version', '2026-08-05-rbac-backend-core');

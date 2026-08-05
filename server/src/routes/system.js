@@ -1,10 +1,16 @@
 const express = require('express');
-const { getDatabaseInfo } = require('../db/database');
+const { authenticate } = require('../middleware/auth');
+const { requirePermission } = require('../middleware/permission');
 const { getApiContract } = require('../services/contractService');
 const { getMaintenanceState } = require('../services/maintenanceState');
 const { sendSuccess } = require('../utils/response');
 
 const router = express.Router();
+
+// 登录前 bootstrap 仅提供应用能力与维护态标识，不返回本地目录或数据库路径。
+function getPublicMaintenanceState() {
+  return { active: getMaintenanceState().active === true };
+}
 
 router.get('/health', (req, res) => {
   sendSuccess(res, {
@@ -18,25 +24,24 @@ router.get('/health', (req, res) => {
 router.get('/bootstrap', (req, res) => {
   sendSuccess(res, {
     appName: '本地轻量化能碳管理平台',
-    stack: ['local-frontend', 'node-express', 'sqlite-local-file'],
-    database: getDatabaseInfo(),
-    maintenance: getMaintenanceState(),
+    mode: 'local',
+    storage: 'local-file',
+    maintenance: getPublicMaintenanceState(),
     contractOnly: false,
     nextCapabilities: ['energy-statistics', 'dashboard-summary', 'carbon-accounting', 'prediction-runs', 'backup-restore']
   });
 });
 
-router.get('/meta', (req, res) => {
+router.get('/meta', authenticate, requirePermission('system:bootstrap:view'), (req, res) => {
   sendSuccess(res, {
     apiVersion: '0.1.0',
     architecture: 'local-lightweight',
-    database: getDatabaseInfo(),
-    maintenance: getMaintenanceState(),
+    maintenance: getPublicMaintenanceState(),
     contract: getApiContract()
   });
 });
 
-router.get('/', (req, res) => {
+router.get('/', authenticate, requirePermission('system:bootstrap:view'), (req, res) => {
   sendSuccess(res, {
     service: 'energy-carbon-platform-api',
     contractOnly: true,

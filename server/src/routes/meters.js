@@ -1,5 +1,7 @@
 const express = require('express');
 const { asyncHandler } = require('../middleware/errorHandler');
+const { authenticate } = require('../middleware/auth');
+const { requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { assertWritableAllowed } = require('../services/maintenanceState');
 const { normalizeUploadError, uploadImportFile } = require('../middleware/upload');
@@ -8,6 +10,7 @@ const {
   createMeterImportBatchFromUpload,
   deactivateMeter,
   exportMeters,
+  getMeterStats,
   listMeters,
   updateMeter
 } = require('../services/ledgerService');
@@ -20,7 +23,7 @@ function buildContentDisposition(fileName, fallbackName) {
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
-router.get('/export', asyncHandler(async (req, res) => {
+router.get('/export', authenticate, requirePermission('ledger:meters:export'), asyncHandler(async (req, res) => {
   const result = exportMeters(req.query);
   res.setHeader('Content-Type', result.contentType);
   res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `meters.${result.format}`));
@@ -29,7 +32,11 @@ router.get('/export', asyncHandler(async (req, res) => {
   res.status(200).send(result.body);
 }));
 
-router.post('/import', requireWritable('meters:import'), (req, res, next) => {
+router.get('/stats', authenticate, requirePermission('ledger:meters:view'), asyncHandler(async (req, res) => {
+  sendSuccess(res, getMeterStats());
+}));
+
+router.post('/import', authenticate, requirePermission('ledger:meters:import'), requireWritable('meters:import'), (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {
@@ -46,21 +53,21 @@ router.post('/import', requireWritable('meters:import'), (req, res, next) => {
   });
 });
 
-router.get('/', asyncHandler(async (req, res) => {
+router.get('/', authenticate, requirePermission('ledger:meters:view'), asyncHandler(async (req, res) => {
   const result = listMeters(req.query);
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination } });
 }));
 
-router.post('/', requireWritable('meters:create'), asyncHandler(async (req, res) => {
+router.post('/', authenticate, requirePermission('ledger:meters:create'), requireWritable('meters:create'), asyncHandler(async (req, res) => {
   const meter = createMeter(req.body || {});
   sendSuccess(res, meter, { statusCode: 201 });
 }));
 
-router.put('/:id', requireWritable('meters:update'), asyncHandler(async (req, res) => {
+router.put('/:id', authenticate, requirePermission('ledger:meters:update'), requireWritable('meters:update'), asyncHandler(async (req, res) => {
   sendSuccess(res, updateMeter(req.params.id, req.body || {}));
 }));
 
-router.delete('/:id', requireWritable('meters:deactivate'), asyncHandler(async (req, res) => {
+router.delete('/:id', authenticate, requirePermission('ledger:meters:deactivate'), requireWritable('meters:deactivate'), asyncHandler(async (req, res) => {
   sendSuccess(res, deactivateMeter(req.params.id));
 }));
 

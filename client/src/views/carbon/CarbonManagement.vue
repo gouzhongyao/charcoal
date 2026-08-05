@@ -1,0 +1,203 @@
+<template>
+  <ManagementPage title="碳核算">
+    <template #title-extra><HelpIcon label="查看碳核算管理说明" content="碳因子可新增、编辑和启停，但不提供物理删除。排放结果只能由服务端基于 active 能耗记录和匹配因子计算；缺失因子不估算排放。所有排放汇总按排放单位分列，页面不会跨单位相加。" /></template>
+
+    <PageState v-if="!canManageCarbon" description="当前账号没有碳因子或碳排放查看权限。请联系管理员授予 carbon:* 对应权限；前端仅控制可见性，服务端仍会再次鉴权。" />
+    <template v-else>
+      <section v-if="canFactorView" class="module-section">
+        <header class="module-heading"><div class="heading-with-help"><h2>碳因子管理</h2><HelpIcon label="查看碳因子维护说明" content="因子以能源类型、地区、年份、活动单位和来源为依据维护。停用只阻止后续匹配，不会删除或改写已有排放历史快照。" /></div></header>
+        <ManagementToolbar :loading="factorLoading" @search="applyFactorFilters" @reset="resetFactorFilters">
+          <el-form-item label="能源类型"><el-select v-model="factorDraftFilters.energyTypeCode" clearable placeholder="全部能源类型"><el-option v-for="item in energyTypes" :key="item.code" :label="`${item.name}（${item.code}）`" :value="item.code" /></el-select></el-form-item>
+          <el-form-item label="地区"><el-input v-model.trim="factorDraftFilters.region" clearable placeholder="如：default" /></el-form-item>
+          <el-form-item label="年份"><el-input v-model.trim="factorDraftFilters.factorYear" clearable inputmode="numeric" placeholder="如：2026" /></el-form-item>
+          <el-form-item label="状态"><el-select v-model="factorDraftFilters.status" clearable placeholder="全部状态"><el-option label="启用" value="active" /><el-option label="停用" value="inactive" /></el-select></el-form-item>
+          <el-form-item label="字符搜索"><el-input v-model.trim="factorDraftFilters.keyword" clearable placeholder="能源、地区、来源或单位" /></el-form-item>
+          <template #actions><el-button v-if="canFactorTemplate" :loading="factorTemplateLoading" @click="downloadFactorTemplate">下载模板</el-button><el-button v-if="canFactorImport" @click="openFactorImport">导入因子</el-button><el-button v-if="canFactorExport" :loading="factorExportLoading" @click="exportFactors">导出当前筛选</el-button><el-button v-if="canFactorCreate" type="primary" @click="openFactorCreate">新增因子</el-button></template>
+        </ManagementToolbar>
+        <el-alert v-if="energyTypesError" type="warning" :closable="false" show-icon :title="`能源类型字典读取失败：${energyTypesError}`" />
+        <el-alert v-if="factorError" type="error" :closable="false" show-icon :title="factorError" />
+        <section class="stat-grid" aria-label="当前筛选下的碳因子概览"><StatCard label="因子总数" :value="formatInteger(factorPagination.total)" note="当前筛选命中记录" /><StatCard label="启用因子" :value="formatInteger(activeFactorCount)" note="仅启用因子可参与后续计算" /><StatCard label="停用因子" :value="formatInteger(inactiveFactorCount)" note="停用保留历史追溯" /><StatCard label="已加载页数" :value="formatInteger(factors.length)" note="当前分页显示记录" /></section>
+        <article class="page-card"><header class="table-heading"><span>共 {{ formatInteger(factorPagination.total) }} 条</span><small>没有删除操作；启停由服务端保留历史边界。</small></header><PageState v-if="factorError && !factors.length" :error="factorError" @retry="loadFactors" /><PageState v-else-if="!factors.length && !factorLoading" description="暂无碳因子；可下载模板、导入或新增首条因子。" /><template v-else><el-table :data="factors" v-loading="factorLoading" stripe><el-table-column prop="energyTypeName" label="能源类型" min-width="130" /><el-table-column prop="region" label="地区" min-width="100" /><el-table-column prop="factorYear" label="年份" width="85" /><el-table-column prop="unit" label="活动单位" width="100" /><el-table-column label="因子值" min-width="145"><template #default="{ row }">{{ formatNumber(row.factorValue, 6) }} {{ row.factorUnit }}/{{ row.unit }}</template></el-table-column><el-table-column prop="source" label="来源" min-width="140" show-overflow-tooltip /><el-table-column label="状态" width="90"><template #default="{ row }"><StatusTag :status="row.status" /></template></el-table-column><el-table-column label="操作" width="145" fixed="right"><template #default="{ row }"><el-button v-if="canFactorUpdate" link type="primary" @click="openFactorEdit(row)">编辑</el-button><el-button v-if="canFactorStatus" link :type="row.status === 'active' ? 'warning' : 'success'" :loading="factorStatusLoadingId === row.id" @click="confirmFactorStatus(row)">{{ row.status === 'active' ? '停用' : '启用' }}</el-button></template></el-table-column></el-table><div class="pagination"><el-pagination v-model:current-page="factorPage" v-model:page-size="factorPageSize" layout="total, sizes, prev, pager, next" :page-sizes="[20, 50, 100]" :total="factorPagination.total || 0" @current-change="loadFactors" @size-change="changeFactorPageSize" /></div></template></article>
+      </section>
+      <PageState v-else description="当前账号没有 carbon:factors:view 权限，碳因子管理内容不可见。" />
+
+      <section v-if="canEmissionView" class="module-section">
+        <header class="module-heading"><div class="heading-with-help"><h2>碳排放结果</h2><HelpIcon label="查看排放结果边界" content="页面只读取、筛选、统计和导出服务端计算结果；不支持人工新建、编辑或删除排放。重新计算时服务端会标记旧结果为 superseded，默认列表不展示。" /></div></header>
+        <ManagementToolbar :loading="emissionLoading" @search="applyEmissionFilters" @reset="resetEmissionFilters">
+          <el-form-item label="开始月份"><el-date-picker v-model="emissionDraftFilters.normalizedMonthStart" type="month" value-format="YYYY-MM" placeholder="开始月份" /></el-form-item>
+          <el-form-item label="结束月份"><el-date-picker v-model="emissionDraftFilters.normalizedMonthEnd" type="month" value-format="YYYY-MM" placeholder="结束月份" /></el-form-item>
+          <el-form-item label="能源类型"><el-select v-model="emissionDraftFilters.energyTypeCode" clearable placeholder="全部能源类型"><el-option v-for="item in energyTypes" :key="item.code" :label="`${item.name}（${item.code}）`" :value="item.code" /></el-select></el-form-item>
+          <el-form-item label="组织"><el-input v-model.trim="emissionDraftFilters.organization" clearable placeholder="精确组织名称" /></el-form-item>
+          <el-form-item label="状态"><el-select v-model="emissionDraftFilters.status" clearable placeholder="全部有效状态"><el-option label="已计算" value="calculated" /><el-option label="因子缺失" value="factor_missing" /><el-option label="无效记录" value="invalid_record" /><el-option label="已替代" value="superseded" /></el-select></el-form-item>
+          <el-form-item label="字符搜索"><el-input v-model.trim="emissionDraftFilters.keyword" clearable placeholder="能源、组织、站点或部门" /></el-form-item>
+          <template #actions><el-button v-if="canEmissionExport" :loading="emissionExportLoading" @click="exportEmissions">导出当前筛选</el-button><el-button v-if="canEmissionCalculate" type="primary" @click="openCalculate">执行服务端计算</el-button></template>
+        </ManagementToolbar>
+        <el-alert v-if="emissionError" type="error" :closable="false" show-icon :title="emissionError" />
+        <section class="stat-grid" aria-label="当前筛选下的碳排放概览"><StatCard label="排放结果数" :value="formatInteger(emissionStats.totalRecords)" note="当前筛选命中记录" /><StatCard label="已计算 / 缺失" :value="`${formatInteger(emissionStats.calculatedCount)} / ${formatInteger(emissionStats.missingFactorCount)}`" note="缺失因子不估算排放" /><StatCard label="按排放单位总量" :value="totalsByEmissionUnitLabel(emissionStats.totalsByEmissionUnit)" note="按单位分列，禁止跨单位相加" /><StatCard label="无效 / 已替代" :value="`${formatInteger(emissionStats.invalidRecordCount)} / ${formatInteger(emissionStats.supersededCount)}`" note="统计来自服务端实际状态" /></section>
+        <article class="page-card missing-panel"><header class="table-heading"><div class="heading-with-help"><h3>缺失因子</h3><HelpIcon label="查看缺失因子说明" content="缺失提示来自 factor_missing 排放结果，仅作为维护因子的参考；页面不会依据活动值估算或写入排放量。" /></div><span>当前筛选结果</span></header><PageState v-if="missingError" :error="missingError" @retry="loadEmissions" /><PageState v-else-if="!missingFactors.length && !emissionLoading" description="当前筛选下没有缺失因子。" /><el-table v-else :data="missingFactors" size="small"><el-table-column prop="energyTypeName" label="能源类型" min-width="120" /><el-table-column prop="unit" label="活动单位" width="100" /><el-table-column prop="requestedRegion" label="请求地区" width="110" /><el-table-column prop="factorYear" label="因子年份" width="100" /><el-table-column prop="missingRecordCount" label="影响记录" width="100" /><el-table-column label="月份范围" min-width="140"><template #default="{ row }">{{ row.monthStart }} 至 {{ row.monthEnd }}</template></el-table-column></el-table></article>
+        <section class="chart-grid" aria-label="碳排放统计图表"><article v-for="chart in chartDefinitions" :key="chart.key" class="page-card chart-panel"><header class="chart-heading"><div class="heading-with-help"><h3>{{ chart.title }}</h3><HelpIcon :label="`查看${chart.title}口径`" :content="`${chart.title}只展示所选排放单位 ${selectedEmissionUnit || '（暂无单位）'} 的服务端统计；图例使用固定实体色，不以计算状态着色，并提供悬停提示与下方表格回退。`" /></div><el-select v-model="selectedEmissionUnit" size="small" class="unit-select" placeholder="选择排放单位"><el-option v-for="unit in emissionUnits" :key="unit" :label="unit" :value="unit" /></el-select></header><PageState v-if="statsError" :error="statsError" @retry="loadEmissions" /><PageState v-else-if="!chartRows(chart.key).length" description="当前筛选及排放单位下暂无统计数据" /><template v-else><div class="bar-legend" :aria-label="`${chart.title}图例`"><span v-for="row in chartRows(chart.key)" :key="chartEntityKey(chart.key, row)"><i :style="{ backgroundColor: carbonCategoryColor(chartEntityKey(chart.key, row)) }" />{{ chartLabel(chart.key, row) }}</span></div><div class="bar-chart" @mouseleave="chartTooltip = null"><button v-for="row in chartRows(chart.key)" :key="chartEntityKey(chart.key, row)" class="bar-row" type="button" :aria-label="chartTooltipLabel(chart.key, row)" @mouseenter="chartTooltip = { key: chart.key, id: chartEntityKey(chart.key, row) }" @focus="chartTooltip = { key: chart.key, id: chartEntityKey(chart.key, row) }"><span class="bar-name"><i :style="{ backgroundColor: carbonCategoryColor(chartEntityKey(chart.key, row)) }" />{{ chartLabel(chart.key, row) }}</span><span class="bar-track"><span class="bar-fill" :style="{ width: `${percentage(row.totalEmissionValue, chartMax(chart.key))}%`, backgroundColor: carbonCategoryColor(chartEntityKey(chart.key, row)) }" /></span><span class="bar-value">{{ formatNumber(row.totalEmissionValue, 4) }} {{ row.emissionUnit }}</span></button></div><p v-if="chartTooltip?.key === chart.key" class="chart-tooltip" role="status">{{ chartTooltipText(chart.key) }}</p><el-table :data="chartRows(chart.key)" size="small" class="chart-table"><el-table-column :label="chart.columnLabel" min-width="120"><template #default="{ row }">{{ chartLabel(chart.key, row) }}</template></el-table-column><el-table-column label="排放量" min-width="145"><template #default="{ row }">{{ formatNumber(row.totalEmissionValue, 4) }} {{ row.emissionUnit }}</template></el-table-column><el-table-column prop="emissionRecordCount" label="结果数" width="90" /><el-table-column prop="calculatedCount" label="已计算" width="90" /><el-table-column prop="missingFactorCount" label="缺失" width="80" /></el-table></template></article></section>
+        <article class="page-card"><header class="table-heading"><div class="heading-with-help"><h3>排放结果列表</h3><HelpIcon label="查看排放列表说明" content="列表仅展示服务端保存的核算结果，当前筛选也会传入统计、缺失因子查询和导出。没有人工编辑、删除或前端计算入口。" /></div><span>共 {{ formatInteger(emissionPagination.total) }} 条</span></header><PageState v-if="emissionError && !emissions.length" :error="emissionError" @retry="loadEmissions" /><PageState v-else-if="!emissions.length && !emissionLoading" description="暂无排放结果；维护因子后可执行服务端计算。" /><template v-else><el-table :data="emissions" v-loading="emissionLoading" stripe><el-table-column prop="normalizedMonth" label="月份" width="100" /><el-table-column prop="energyTypeName" label="能源类型" min-width="120" /><el-table-column prop="organization" label="组织" min-width="120" show-overflow-tooltip /><el-table-column label="活动值" min-width="130"><template #default="{ row }">{{ formatNumber(row.activityValue) }} {{ row.activityUnit }}</template></el-table-column><el-table-column label="因子值" min-width="130"><template #default="{ row }">{{ row.factorValue === null ? '—' : formatNumber(row.factorValue, 6) }}</template></el-table-column><el-table-column label="排放量" min-width="145"><template #default="{ row }">{{ row.emissionValue === null ? '—（缺失因子）' : `${formatNumber(row.emissionValue, 4)} ${row.emissionUnit}` }}</template></el-table-column><el-table-column label="状态" width="110"><template #default="{ row }"><el-tag size="small" effect="light" :type="emissionStatusType(row.status)">{{ emissionStatusLabel(row.status) }}</el-tag></template></el-table-column><el-table-column prop="calculatedAt" label="计算时间" min-width="165"><template #default="{ row }">{{ formatDateTime(row.calculatedAt) }}</template></el-table-column></el-table><div class="pagination"><el-pagination v-model:current-page="emissionPage" v-model:page-size="emissionPageSize" layout="total, sizes, prev, pager, next" :page-sizes="[20, 50, 100]" :total="emissionPagination.total || 0" @current-change="loadEmissions" @size-change="changeEmissionPageSize" /></div></template></article>
+      </section>
+      <PageState v-else description="当前账号没有 carbon:emissions:view 权限，排放结果及统计不可见。" />
+
+      <ManagementDrawer v-model="factorDrawerOpen" :title="factorEditingId ? '编辑碳因子' : '新增碳因子'" :loading="factorSaving" :confirm-disabled="factorFormBlocked" @save="saveFactor"><el-alert v-if="factorFormError" type="error" :closable="false" show-icon :title="factorFormError" class="drawer-alert" /><el-form ref="factorFormRef" :model="factorForm" :rules="factorRules" label-position="top"><el-form-item label="能源类型" prop="energyTypeCode"><HelpIcon label="查看能源类型说明" content="只能选择 active 能源类型；服务端会再次校验，停用能源类型不能维护因子。" /><el-select v-model="factorForm.energyTypeCode" class="drawer-control" placeholder="选择能源类型"><el-option v-for="item in activeEnergyTypes" :key="item.code" :label="`${item.name}（${item.code}）`" :value="item.code" /></el-select></el-form-item><el-form-item label="地区" prop="region"><HelpIcon label="查看地区说明" content="地区用于因子匹配，留空时服务端使用 default。" /><el-input v-model.trim="factorForm.region" maxlength="100" /></el-form-item><el-form-item label="因子年份"><HelpIcon label="查看因子年份说明" content="年份为空表示通用年份；匹配优先使用记录年份对应因子。" /><el-input v-model.trim="factorForm.factorYear" inputmode="numeric" placeholder="留空表示通用年份" /></el-form-item><el-form-item label="活动单位" prop="unit"><HelpIcon label="查看活动单位说明" content="活动单位必须与能耗标准化单位一致，例如 kWh、MJ 或 t。" /><el-input v-model.trim="factorForm.unit" maxlength="40" /></el-form-item><el-form-item label="因子值" prop="factorValue"><HelpIcon label="查看因子值说明" content="排放量由服务端以活动值乘因子值计算；页面不计算也不写入排放结果。" /><el-input-number v-model="factorForm.factorValue" :min="0.000001" :precision="6" class="drawer-control" /></el-form-item><el-form-item label="排放单位" prop="factorUnit"><el-input v-model.trim="factorForm.factorUnit" maxlength="40" placeholder="kgCO2e" /></el-form-item><el-form-item label="来源" prop="source"><el-input v-model.trim="factorForm.source" maxlength="255" /></el-form-item><el-form-item label="来源链接"><el-input v-model.trim="factorForm.sourceUrl" maxlength="1000" /></el-form-item><el-form-item label="有效开始日期"><el-date-picker v-model="factorForm.effectiveFrom" type="date" value-format="YYYY-MM-DD" class="drawer-control" /></el-form-item><el-form-item label="有效结束日期"><el-date-picker v-model="factorForm.effectiveTo" type="date" value-format="YYYY-MM-DD" class="drawer-control" /></el-form-item><el-form-item label="状态"><el-select v-model="factorForm.status"><el-option label="启用" value="active" /><el-option label="停用" value="inactive" /></el-select></el-form-item></el-form></ManagementDrawer>
+      <ManagementDrawer v-model="factorImportDrawerOpen" title="导入碳因子：上传预演" confirm-label="开始预演" :loading="factorPreviewLoading" :confirm-disabled="!factorImportFile" @save="previewFactorImport"><p class="drawer-notice">预演仅校验并保存导入审计，不写碳因子或排放。重复行按 skip 策略保留 warning，不覆盖现有因子。</p><el-upload :auto-upload="false" :limit="1" accept=".xlsx,.xls,.csv" :on-change="selectFactorImportFile" :on-remove="clearFactorImportFile"><el-button>选择碳因子表格</el-button><template #tip><div class="el-upload__tip">支持 .xlsx、.xls、.csv；可先下载模板核对字段。</div></template></el-upload><el-alert v-if="factorImportError" type="error" :closable="false" show-icon :title="factorImportError" class="drawer-alert" /><template v-if="factorImportPreview"><div class="preview-summary"><span>候选 {{ formatInteger(factorImportPreview.summary?.wouldImport) }}</span><span>跳过 {{ formatInteger(factorImportPreview.summary?.skipped) }}</span><span>阻断 {{ formatInteger(factorImportPreview.summary?.blocked) }}</span><span>warning {{ formatInteger(factorImportPreview.summary?.warnings) }}</span></div><el-table :data="factorImportPreview.items || []" size="small" max-height="240"><el-table-column prop="rowNumber" label="行" width="60" /><el-table-column prop="status" label="结果" width="95" /><el-table-column prop="energyTypeCode" label="能源" min-width="100" /><el-table-column prop="reasonText" label="行错误 / warning" min-width="220" show-overflow-tooltip /></el-table><el-button type="danger" class="execute-import-button" :disabled="!canExecuteFactorImport" @click="openFactorImportExecute">进入执行确认</el-button></template></ManagementDrawer>
+      <ManagementDrawer v-model="factorImportExecuteDrawerOpen" title="确认执行碳因子导入" confirm-label="确认导入" :loading="factorExecuteLoading" :confirm-disabled="factorImportConfirmText !== factorImportPreview?.confirmText || !canExecuteFactorImport" @save="executeFactorImport"><p class="drawer-notice">执行会以签名的当前预演候选写入碳因子并创建自动备份；不会覆盖、物理删除既有因子，也不会写入 carbon_emissions。</p><el-form label-position="top"><el-form-item :label="`请输入固定确认文本：${factorImportPreview?.confirmText || ''}`"><el-input v-model="factorImportConfirmText" /></el-form-item></el-form><el-alert v-if="factorExecuteError" type="error" :closable="false" show-icon :title="factorExecuteError" /></ManagementDrawer>
+      <ManagementDrawer v-model="calculateDrawerOpen" title="执行服务端碳排放计算" confirm-label="执行计算" :loading="calculateLoading" :confirm-disabled="!calculateForm.normalizedMonthStart && !calculateForm.normalizedMonthEnd" @save="calculateEmissions"><p class="drawer-notice">服务端只读取 active 能耗记录和 active 匹配因子；缺失因子会记录 factor_missing 而不是估算排放。重复计算由服务端保留 superseded 追溯。</p><el-form :model="calculateForm" label-position="top"><el-form-item label="开始月份"><el-date-picker v-model="calculateForm.normalizedMonthStart" type="month" value-format="YYYY-MM" class="drawer-control" /></el-form-item><el-form-item label="结束月份"><el-date-picker v-model="calculateForm.normalizedMonthEnd" type="month" value-format="YYYY-MM" class="drawer-control" /></el-form-item><el-form-item label="核算地区"><el-input v-model.trim="calculateForm.region" placeholder="default" /></el-form-item><el-form-item label="本次最多记录数"><el-input-number v-model="calculateForm.limit" :min="1" :max="5000" class="drawer-control" /></el-form-item></el-form><el-alert v-if="calculateError" type="error" :closable="false" show-icon :title="calculateError" /></ManagementDrawer>
+    </template>
+  </ManagementPage>
+</template>
+
+<script setup>
+import { computed, onMounted, ref } from 'vue';
+import { ElMessage, ElMessageBox } from 'element-plus';
+import ManagementPage from '@/components/ManagementPage.vue';
+import ManagementToolbar from '@/components/ManagementToolbar.vue';
+import ManagementDrawer from '@/components/ManagementDrawer.vue';
+import HelpIcon from '@/components/HelpIcon.vue';
+import PageState from '@/components/PageState.vue';
+import StatCard from '@/components/StatCard.vue';
+import StatusTag from '@/components/StatusTag.vue';
+import { getEnergyTypes } from '@/api/energy';
+import { calculateCarbonEmissions, createCarbonFactor, downloadCarbonFactorTemplate, executeCarbonFactorImport, exportCarbonEmissions, exportCarbonFactors, getCarbonEmissionStats, getCarbonEmissions, getCarbonFactor, getCarbonFactors, getMissingCarbonFactors, previewCarbonFactorImport, updateCarbonFactor, updateCarbonFactorStatus } from '@/api/carbon';
+import { buildCarbonEmissionFilters, buildCarbonFactorFilters, buildCarbonFactorImportExecutePayload, carbonCategoryColor, limitChartCategories, nextCarbonFactorStatus, numberValue, rowsForEmissionUnit, totalsByEmissionUnitLabel } from '@/utils/carbonManagement';
+import { hasPermi } from '@/utils/permission';
+
+/** 返回空白碳因子筛选条件。 */
+const emptyFactorFilters = () => ({ energyTypeCode: '', region: '', factorYear: '', status: '', keyword: '' });
+/** 返回空白排放筛选条件。 */
+const emptyEmissionFilters = () => ({ normalizedMonthStart: '', normalizedMonthEnd: '', energyTypeCode: '', organization: '', status: '', calculationMethod: '', includeSuperseded: false, keyword: '' });
+/** 返回新增碳因子的默认表单。 */
+const emptyFactorForm = () => ({ energyTypeCode: '', region: 'default', factorYear: '', unit: '', factorValue: undefined, factorUnit: 'kgCO2e', source: '', sourceUrl: '', effectiveFrom: '', effectiveTo: '', status: 'active' });
+/** 返回服务端计算的默认参数。 */
+const emptyCalculateForm = () => ({ normalizedMonthStart: '', normalizedMonthEnd: '', region: 'default', limit: 500 });
+/** 捕获请求错误，以真实服务端消息展示在对应区域。 */
+const safe = async (task) => { try { return { ok: true, value: await task() }; } catch (error) { return { ok: false, error }; } };
+/** 从错误对象提取用户可理解的服务端反馈。 */
+const requestError = (result) => result?.error?.message || '接口请求失败。';
+/** 三个统计图的固定定义。 */
+const chartDefinitions = Object.freeze([{ key: 'month', title: '月度排放趋势', columnLabel: '月份' }, { key: 'energy', title: '能源类型排放', columnLabel: '能源类型' }, { key: 'organization', title: '组织排放', columnLabel: '组织' }]);
+
+// 权限仅用于界面可见性，所有实际操作仍由服务端 carbon:* 权限校验。
+const canFactorView = computed(() => hasPermi('carbon:factors:view'));
+const canFactorCreate = computed(() => hasPermi('carbon:factors:create'));
+const canFactorUpdate = computed(() => hasPermi('carbon:factors:update'));
+const canFactorStatus = computed(() => hasPermi('carbon:factors:status'));
+const canFactorExport = computed(() => hasPermi('carbon:factors:export'));
+const canFactorTemplate = computed(() => hasPermi('carbon:factor:template'));
+const canFactorImport = computed(() => hasPermi('carbon:factor:import'));
+const canEmissionView = computed(() => hasPermi('carbon:emissions:view'));
+const canEmissionCalculate = computed(() => hasPermi('carbon:emissions:calculate'));
+const canEmissionExport = computed(() => hasPermi('carbon:emissions:export'));
+const canManageCarbon = computed(() => hasPermi(['carbon:factors:view', 'carbon:emissions:view']));
+
+// 因子列表及抽屉状态。
+const energyTypes = ref([]); const energyTypesError = ref('');
+const factorDraftFilters = ref(emptyFactorFilters()); const factorAppliedFilters = ref(emptyFactorFilters());
+const factorPage = ref(1); const factorPageSize = ref(20); const factorPagination = ref({ total: 0 }); const factors = ref([]); const factorLoading = ref(false); const factorError = ref(''); const factorExportLoading = ref(false); const factorTemplateLoading = ref(false); const factorStatusLoadingId = ref(null);
+const factorDrawerOpen = ref(false); const factorEditingId = ref(null); const factorForm = ref(emptyFactorForm()); const factorFormRef = ref(); const factorSaving = ref(false); const factorFormError = ref('');
+const factorImportDrawerOpen = ref(false); const factorImportExecuteDrawerOpen = ref(false); const factorImportFile = ref(null); const factorImportPreview = ref(null); const factorPreviewLoading = ref(false); const factorExecuteLoading = ref(false); const factorImportError = ref(''); const factorExecuteError = ref(''); const factorImportConfirmText = ref('');
+const factorRules = { energyTypeCode: [{ required: true, message: '请选择能源类型。', trigger: 'change' }], unit: [{ required: true, message: '请填写活动单位。', trigger: 'blur' }], factorValue: [{ required: true, type: 'number', message: '请填写大于 0 的因子值。', trigger: 'change' }], source: [{ required: true, message: '请填写因子来源。', trigger: 'blur' }] };
+
+// 排放列表、统计和服务端计算抽屉状态。
+const emissionDraftFilters = ref(emptyEmissionFilters()); const emissionAppliedFilters = ref(emptyEmissionFilters());
+const emissionPage = ref(1); const emissionPageSize = ref(20); const emissionPagination = ref({ total: 0 }); const emissions = ref([]); const emissionStats = ref({ totalsByEmissionUnit: [], byMonth: [], byEnergyType: [], byOrganization: [] }); const missingFactors = ref([]); const emissionLoading = ref(false); const emissionError = ref(''); const statsError = ref(''); const missingError = ref(''); const emissionExportLoading = ref(false); const selectedEmissionUnit = ref(''); const chartTooltip = ref(null);
+const calculateDrawerOpen = ref(false); const calculateForm = ref(emptyCalculateForm()); const calculateLoading = ref(false); const calculateError = ref('');
+
+/** 只允许在因子表单中选择启用的能源类型。 */
+const activeEnergyTypes = computed(() => energyTypes.value.filter((item) => Number(item.isActive) === 1 || item.isActive === true));
+/** 当前页中的启用因子数量。 */
+const activeFactorCount = computed(() => factors.value.filter((row) => row.status === 'active').length);
+/** 当前页中的停用因子数量。 */
+const inactiveFactorCount = computed(() => factors.value.filter((row) => row.status === 'inactive').length);
+/** 服务端返回的排放单位列表，用于统计分面。 */
+const emissionUnits = computed(() => [...new Set((emissionStats.value.totalsByEmissionUnit || []).map((row) => row.emissionUnit).filter(Boolean))]);
+/** 因子抽屉不能在字典为空或保存中提交。 */
+const factorFormBlocked = computed(() => factorSaving.value || !activeEnergyTypes.value.length);
+/** 必须保留所有服务器签名候选和受控确认，才可进入导入执行。 */
+const canExecuteFactorImport = computed(() => Boolean(factorImportPreview.value?.batchId && factorImportPreview.value?.previewSignature && numberValue(factorImportPreview.value?.summary?.wouldImport) > 0 && Array.isArray(factorImportPreview.value?.candidateRows) && factorImportPreview.value.candidateRows.length === numberValue(factorImportPreview.value.summary?.wouldImport)));
+
+/** 格式化数值，保留业务所需的小数。 */
+function formatNumber(value, digits = 2) { return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: digits }).format(numberValue(value)); }
+/** 格式化整数。 */
+function formatInteger(value) { return formatNumber(value, 0); }
+/** 格式化 API 日期时间。 */
+function formatDateTime(value) { return value ? String(value).replace('T', ' ').replace(/\.\d+Z$/, '') : '—'; }
+/** 计算同单位柱状图的安全百分比。 */
+function percentage(value, maximum) { return Math.max(2, Math.min(100, (numberValue(value) / maximum) * 100)); }
+/** 返回选定单位下指定统计维度的真实服务端统计行。 */
+function chartRows(key) { const source = key === 'month' ? emissionStats.value.byMonth : key === 'energy' ? emissionStats.value.byEnergyType : emissionStats.value.byOrganization; const unitRows = rowsForEmissionUnit(source || [], selectedEmissionUnit.value); return key === 'month' ? [...unitRows].sort((left, right) => String(left.normalizedMonth).localeCompare(String(right.normalizedMonth))) : limitChartCategories(unitRows, key === 'energy' ? 'energyTypeCode' : 'organization'); }
+/** 返回统计图行的可读分类名。 */
+function chartLabel(key, row) { return key === 'month' ? row.normalizedMonth : key === 'energy' ? (row.energyTypeName || row.energyTypeCode) : row.organization; }
+/** 返回分类色的稳定实体键。 */
+function chartEntityKey(key, row) { return `${key}:${key === 'energy' ? row.energyTypeCode : chartLabel(key, row)}`; }
+/** 返回单个统计图的同单位最大值。 */
+function chartMax(key) { return Math.max(...chartRows(key).map((row) => numberValue(row.totalEmissionValue)), 1); }
+/** 返回图表悬停和键盘聚焦时的完整提示。 */
+function chartTooltipLabel(key, row) { return `${chartLabel(key, row)}：${formatNumber(row.totalEmissionValue, 4)} ${row.emissionUnit}；结果 ${formatInteger(row.emissionRecordCount)} 条，已计算 ${formatInteger(row.calculatedCount)} 条，缺失因子 ${formatInteger(row.missingFactorCount)} 条。`; }
+/** 返回当前悬停统计行的提示文本。 */
+function chartTooltipText(key) { const row = chartRows(key).find((item) => chartEntityKey(key, item) === chartTooltip.value?.id); return row ? chartTooltipLabel(key, row) : ''; }
+/** 返回排放状态标签文本。 */
+function emissionStatusLabel(status) { return ({ calculated: '已计算', factor_missing: '因子缺失', invalid_record: '无效记录', superseded: '已替代' })[status] || status || '未知'; }
+/** 返回排放状态标签类型；此颜色不用于任何统计系列。 */
+function emissionStatusType(status) { return ({ calculated: 'success', factor_missing: 'warning', invalid_record: 'danger', superseded: 'info' })[status] || 'info'; }
+
+/** 加载能源字典，供筛选和因子表单共用。 */
+async function loadEnergyTypes() { const result = await safe(getEnergyTypes); if (result.ok) { energyTypes.value = result.value.data || []; energyTypesError.value = ''; } else energyTypesError.value = requestError(result); }
+/** 加载当前已应用筛选的碳因子列表。 */
+async function loadFactors() { if (!canFactorView.value) return; factorLoading.value = true; const result = await safe(() => getCarbonFactors(buildCarbonFactorFilters(factorAppliedFilters.value, { page: factorPage.value, pageSize: factorPageSize.value }))); factorLoading.value = false; if (result.ok) { factors.value = result.value.data || []; factorPagination.value = result.value.meta?.pagination || {}; factorError.value = ''; } else { factors.value = []; factorError.value = requestError(result); } }
+/** 并行读取排放列表、统计和缺失因子，且分别显示真实错误。 */
+async function loadEmissions() { if (!canEmissionView.value) return; emissionLoading.value = true; const filters = buildCarbonEmissionFilters(emissionAppliedFilters.value, { page: emissionPage.value, pageSize: emissionPageSize.value }); const [listResult, statsResult, missingResult] = await Promise.all([safe(() => getCarbonEmissions(filters)), safe(() => getCarbonEmissionStats(filters)), safe(() => getMissingCarbonFactors(filters))]); emissionLoading.value = false; if (listResult.ok) { emissions.value = listResult.value.data || []; emissionPagination.value = listResult.value.meta?.pagination || {}; emissionError.value = ''; } else { emissions.value = []; emissionError.value = requestError(listResult); } if (statsResult.ok) { emissionStats.value = statsResult.value.data || { totalsByEmissionUnit: [], byMonth: [], byEnergyType: [], byOrganization: [] }; statsError.value = ''; if (!emissionUnits.value.includes(selectedEmissionUnit.value)) selectedEmissionUnit.value = emissionUnits.value[0] || ''; } else { emissionStats.value = { totalsByEmissionUnit: [], byMonth: [], byEnergyType: [], byOrganization: [] }; statsError.value = requestError(statsResult); } if (missingResult.ok) { missingFactors.value = missingResult.value.data || []; missingError.value = ''; } else { missingFactors.value = []; missingError.value = requestError(missingResult); } }
+/** 应用因子筛选并重置分页。 */
+function applyFactorFilters() { factorAppliedFilters.value = { ...factorDraftFilters.value }; factorPage.value = 1; loadFactors(); }
+/** 清空因子筛选并重新查询。 */
+function resetFactorFilters() { factorDraftFilters.value = emptyFactorFilters(); factorAppliedFilters.value = emptyFactorFilters(); factorPage.value = 1; loadFactors(); }
+/** 因子分页大小变化时回到第一页。 */
+function changeFactorPageSize() { factorPage.value = 1; loadFactors(); }
+/** 应用排放筛选并重置分页。 */
+function applyEmissionFilters() { emissionAppliedFilters.value = { ...emissionDraftFilters.value }; emissionPage.value = 1; loadEmissions(); }
+/** 清空排放筛选并重新查询。 */
+function resetEmissionFilters() { emissionDraftFilters.value = emptyEmissionFilters(); emissionAppliedFilters.value = emptyEmissionFilters(); emissionPage.value = 1; loadEmissions(); }
+/** 排放分页大小变化时回到第一页。 */
+function changeEmissionPageSize() { emissionPage.value = 1; loadEmissions(); }
+
+/** 打开新增碳因子抽屉。 */
+function openFactorCreate() { factorEditingId.value = null; factorForm.value = emptyFactorForm(); factorFormError.value = ''; factorDrawerOpen.value = true; }
+/** 获取服务端详情后打开编辑碳因子抽屉。 */
+async function openFactorEdit(row) { factorFormError.value = ''; const result = await safe(() => getCarbonFactor(row.id)); if (!result.ok) { ElMessage.error(`读取碳因子详情失败：${requestError(result)}`); return; } const factor = result.value.data || {}; factorEditingId.value = factor.id; factorForm.value = { energyTypeCode: factor.energyTypeCode || '', region: factor.region || 'default', factorYear: factor.factorYear ?? '', unit: factor.unit || '', factorValue: numberValue(factor.factorValue), factorUnit: factor.factorUnit || 'kgCO2e', source: factor.source || '', sourceUrl: factor.sourceUrl || '', effectiveFrom: factor.effectiveFrom || '', effectiveTo: factor.effectiveTo || '', status: factor.status || 'active' }; factorDrawerOpen.value = true; }
+/** 保存新增或编辑的碳因子，计算结果不会在前端写入。 */
+async function saveFactor() { if (factorFormBlocked.value) return; const valid = await factorFormRef.value?.validate().catch(() => false); if (!valid) return; factorSaving.value = true; factorFormError.value = ''; const payload = { ...factorForm.value, factorYear: factorForm.value.factorYear || null }; const result = await safe(() => factorEditingId.value ? updateCarbonFactor(factorEditingId.value, payload) : createCarbonFactor(payload)); factorSaving.value = false; if (!result.ok) { factorFormError.value = requestError(result); return; } factorDrawerOpen.value = false; ElMessage.success(factorEditingId.value ? '碳因子已更新。' : '碳因子已新增。'); await loadFactors(); }
+/** 二次确认后通过服务端启停碳因子，明确不是物理删除。 */
+async function confirmFactorStatus(row) { const status = nextCarbonFactorStatus(row.status); const action = status === 'inactive' ? '停用' : '启用'; try { await ElMessageBox.confirm(`${action}“${row.energyTypeName || row.energyTypeCode} / ${row.region} / ${row.factorYear || '通用年份'}”碳因子？${status === 'inactive' ? '停用不是物理删除，已有排放历史及因子快照会保留。' : '启用后可重新参与后续服务端匹配。'}`, `确认${action}`, { type: status === 'inactive' ? 'warning' : 'info', confirmButtonText: `确认${action}`, cancelButtonText: '取消' }); } catch { return; } factorStatusLoadingId.value = row.id; const result = await safe(() => updateCarbonFactorStatus(row.id, status)); factorStatusLoadingId.value = null; if (!result.ok) { ElMessage.error(`碳因子${action}失败：${requestError(result)}`); return; } ElMessage.success(`碳因子已${action}。`); await loadFactors(); }
+/** 下载受后端权限保护的碳因子模板。 */
+async function downloadFactorTemplate() { factorTemplateLoading.value = true; const result = await safe(() => downloadCarbonFactorTemplate()); factorTemplateLoading.value = false; if (!result.ok) ElMessage.error(`碳因子模板下载失败：${requestError(result)}`); }
+/** 导出当前已应用因子筛选，而非草稿筛选。 */
+async function exportFactors() { factorExportLoading.value = true; const result = await safe(() => exportCarbonFactors(buildCarbonFactorFilters(factorAppliedFilters.value))); factorExportLoading.value = false; if (!result.ok) ElMessage.error(`碳因子导出失败：${requestError(result)}`); }
+
+/** 初始化碳因子导入预演抽屉。 */
+function openFactorImport() { factorImportDrawerOpen.value = true; factorImportFile.value = null; factorImportPreview.value = null; factorImportError.value = ''; factorExecuteError.value = ''; factorImportConfirmText.value = ''; }
+/** 记录选择的可信本地上传文件。 */
+function selectFactorImportFile(file) { factorImportFile.value = file.raw || null; factorImportPreview.value = null; factorImportError.value = ''; }
+/** 清除上传文件和旧预演，避免误用候选。 */
+function clearFactorImportFile() { factorImportFile.value = null; factorImportPreview.value = null; }
+/** 上传文件至服务端创建只读预演。 */
+async function previewFactorImport() { if (!factorImportFile.value) return; factorPreviewLoading.value = true; factorImportError.value = ''; const result = await safe(() => previewCarbonFactorImport(factorImportFile.value)); factorPreviewLoading.value = false; if (!result.ok) { factorImportPreview.value = null; factorImportError.value = `碳因子导入预演失败：${requestError(result)}`; return; } factorImportPreview.value = result.value.data || {}; ElMessage.success('碳因子导入预演已完成，请核对候选、跳过和阻断行。'); }
+/** 打开带固定确认文本的导入执行抽屉。 */
+function openFactorImportExecute() { factorExecuteError.value = ''; factorImportConfirmText.value = ''; factorImportExecuteDrawerOpen.value = true; }
+/** 仅原样提交服务器签名的预演候选载荷。 */
+async function executeFactorImport() { if (!canExecuteFactorImport.value || factorImportConfirmText.value !== factorImportPreview.value?.confirmText) return; factorExecuteLoading.value = true; factorExecuteError.value = ''; const payload = { ...buildCarbonFactorImportExecutePayload(factorImportPreview.value), confirmText: factorImportConfirmText.value }; const result = await safe(() => executeCarbonFactorImport(payload)); factorExecuteLoading.value = false; if (!result.ok) { factorExecuteError.value = `碳因子导入执行失败：${requestError(result)}`; return; } factorImportExecuteDrawerOpen.value = false; factorImportDrawerOpen.value = false; factorImportPreview.value = null; ElMessage.success(`碳因子导入完成：成功 ${formatInteger(result.value.data?.imported)} 条，跳过 ${formatInteger(result.value.data?.skipped)} 条。`); await loadFactors(); }
+
+/** 导出当前已应用的排放筛选结果。 */
+async function exportEmissions() { emissionExportLoading.value = true; const result = await safe(() => exportCarbonEmissions(buildCarbonEmissionFilters(emissionAppliedFilters.value))); emissionExportLoading.value = false; if (!result.ok) ElMessage.error(`碳排放结果导出失败：${requestError(result)}`); }
+/** 打开服务端计算参数抽屉，并从当前月份筛选带入默认值。 */
+function openCalculate() { calculateForm.value = { ...emptyCalculateForm(), normalizedMonthStart: emissionAppliedFilters.value.normalizedMonthStart, normalizedMonthEnd: emissionAppliedFilters.value.normalizedMonthEnd }; calculateError.value = ''; calculateDrawerOpen.value = true; }
+/** 触发服务端计算后刷新只读排放结果、统计和缺失因子。 */
+async function calculateEmissions() { if (!calculateForm.value.normalizedMonthStart && !calculateForm.value.normalizedMonthEnd) return; calculateLoading.value = true; calculateError.value = ''; const result = await safe(() => calculateCarbonEmissions({ ...calculateForm.value })); calculateLoading.value = false; if (!result.ok) { calculateError.value = `碳排放计算失败：${requestError(result)}`; return; } calculateDrawerOpen.value = false; ElMessage.success(`服务端计算完成：已处理 ${formatInteger(result.value.data?.totalRecords)} 条，已计算 ${formatInteger(result.value.data?.calculatedCount)} 条，缺失因子 ${formatInteger(result.value.data?.missingFactorCount)} 条。`); await loadEmissions(); }
+
+/** 页面加载时只请求当前账号有权查看的资源。 */
+onMounted(async () => { if (!canManageCarbon.value) return; await loadEnergyTypes(); await Promise.all([loadFactors(), loadEmissions()]); });
+</script>
+
+<style scoped>
+.module-section{display:grid;gap:14px}.module-heading{display:flex;align-items:center;justify-content:space-between}.module-heading h2,.chart-heading h3{margin:0;color:#123b79;font-size:17px}.heading-with-help{display:flex;align-items:center}.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.table-heading,.chart-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.table-heading small,.table-heading span,.chart-heading span{color:#7385a2;font-size:12px}.pagination{display:flex;justify-content:flex-end;margin-top:16px}.missing-panel{overflow-x:auto}.chart-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.chart-panel{min-width:0}.unit-select{width:132px}.bar-legend{display:flex;flex-wrap:wrap;gap:8px 12px;margin-bottom:10px;color:#516170;font-size:12px}.bar-legend span{display:inline-flex;align-items:center;gap:5px}.bar-legend i,.bar-name i{width:10px;height:10px;flex:0 0 10px;border:1px solid rgba(11,11,11,.1);border-radius:2px}.bar-chart{display:grid;gap:8px}.bar-row{display:grid;grid-template-columns:minmax(72px,.8fr) minmax(110px,1.8fr) minmax(96px,.8fr);align-items:center;gap:8px;width:100%;padding:5px 0;color:#183153;text-align:left;background:transparent;border:0;border-radius:6px}.bar-row:hover{background:#f7fbff}.bar-row:focus-visible{outline:2px solid #1769e0;outline-offset:2px}.bar-name{display:flex;align-items:center;gap:6px;min-width:0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bar-track{height:14px;padding-right:2px;background:#e7f1ff;border-radius:999px}.bar-fill{display:block;height:14px;border-right:2px solid #fcfcfb;border-radius:0 999px 999px 0}.bar-value{color:#516170;font-size:12px;text-align:right;white-space:nowrap}.chart-tooltip{margin:8px 0;padding:8px 10px;color:#183153;background:#edf5ff;border:1px solid #c9dcf5;border-radius:8px;font-size:12px;line-height:1.5}.chart-table{width:100%;margin-top:10px}.drawer-alert{margin-bottom:12px}.drawer-notice{margin:0 0 16px;color:#516170;line-height:1.7}.drawer-control{width:100%}.preview-summary{display:flex;flex-wrap:wrap;gap:14px;margin:16px 0;color:#516170;font-size:13px}.execute-import-button{margin-top:14px}@media (max-width:1240px){.chart-grid{grid-template-columns:1fr}.chart-panel{overflow-x:auto}}@media (max-width:900px){.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media (max-width:640px){.stat-grid{grid-template-columns:1fr}.chart-heading{align-items:flex-start;flex-direction:column}.bar-row{grid-template-columns:1fr}.bar-value{text-align:left}}
+</style>

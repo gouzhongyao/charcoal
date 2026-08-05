@@ -1,0 +1,1 @@
+<template><LedgerManagement kind="readings" /></template><script setup>import LedgerManagement from './LedgerManagement.vue';</script>

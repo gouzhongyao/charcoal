@@ -1,6 +1,17 @@
+const crypto = require('crypto');
+const XLSX = require('xlsx');
 const { openDatabase } = require('../db/database');
 const { badRequest, notFound } = require('../utils/errors');
+const backupService = require('./backupService');
 const { buildPaginationMeta, normalizePagination } = require('./energyRecordQuery');
+const { assertSupportedImportFile, parseImportFile } = require('./import/parser');
+const {
+  createPreviewAuditBatch,
+  getImportAuditBatchDetail,
+  getImportAuditSummary,
+  replaceImportAuditIssues,
+  updateExecuteAuditResult
+} = require('./importAuditService');
 const {
   PREDICTION_RESULT_SORT_COLUMNS,
   PREDICTION_SORT_COLUMNS,
@@ -20,583 +31,214 @@ const {
 
 const RUN_PAGE_SIZE_MAX = 200;
 const RESULT_PAGE_SIZE_MAX = 500;
+const CONFIG_PAGE_SIZE_MAX = 200;
+const MAX_PREDICTION_EXPORT_ROWS = 5000;
+const PREDICTION_CONFIG_STATUSES = Object.freeze(['draft', 'active', 'archived']);
+const PREDICTION_CONFIG_IMPORT_TYPE = 'prediction_config';
+const PREDICTION_CONFIG_IMPORT_TEMPLATE_ID = 'prediction-configs';
+const PREDICTION_CONFIG_IMPORT_CONFIRM_TEXT = '确认导入预测配置草稿';
+const PREDICTION_CONFIG_IMPORT_HEADERS = Object.freeze(['name', 'note', 'energyTypeCode', 'organizationScope', 'site', 'department', 'sourceBatchId', 'trainStartMonth', 'trainEndMonth', 'predictStartMonth', 'predictEndMonth', 'algorithm', 'windowSize', 'status']);
+const PREDICTION_CONFIG_IMPORT_ALIASES = Object.freeze({
+  name: ['name', '名称', '配置名称'], note: ['note', 'remark', '备注', '说明'],
+  energyTypeCode: ['energyTypeCode', 'energy_type_code', '能源类型', '能源类型编码'],
+  organizationScope: ['organizationScope', 'organization', '组织范围', '组织'],
+  site: ['site', '厂区', '站点'], department: ['department', '部门'],
+  sourceBatchId: ['sourceBatchId', 'source_batch_id', '能耗批次ID', '历史批次ID'],
+  trainStartMonth: ['trainStartMonth', 'train_start_month', '训练开始月份'],
+  trainEndMonth: ['trainEndMonth', 'train_end_month', '训练结束月份'],
+  predictStartMonth: ['predictStartMonth', 'predict_start_month', '目标开始月份', '预测开始月份'],
+  predictEndMonth: ['predictEndMonth', 'predict_end_month', '目标结束月份', '预测结束月份'],
+  algorithm: ['algorithm', '算法'], windowSize: ['windowSize', 'window_size', '窗口大小'], status: ['status', '状态']
+});
+const PREDICTION_CONFIG_EXPORT_FIELDS = Object.freeze(PREDICTION_CONFIG_IMPORT_HEADERS.map((key) => ({ key, header: key })));
+const PREDICTION_RESULT_EXPORT_FIELDS = Object.freeze([
+  { key: 'predictionRunId', header: 'predictionRunId' }, { key: 'predictionRunName', header: 'predictionRunName' },
+  { key: 'algorithm', header: 'algorithm' }, { key: 'runStatus', header: 'runStatus' },
+  { key: 'energyTypeCode', header: 'energyTypeCode' }, { key: 'targetMonth', header: 'targetMonth' },
+  { key: 'predictedValue', header: 'predictedValue' }, { key: 'predictedUnit', header: 'predictedUnit' },
+  { key: 'confidenceLow', header: 'confidenceLow' }, { key: 'confidenceHigh', header: 'confidenceHigh' }, { key: 'methodNote', header: 'methodNote' }
+]);
 
-function nullableText(value) {
-  return normalizeText(value) || null;
-}
+function nullableText(value) { return normalizeText(value) || null; }
+function escapeLike(value) { return String(value).replace(/[\\%_]/g, '\\$&'); }
+function stableStringify(value) { if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`; if (value && typeof value === 'object') return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`; return JSON.stringify(value); }
+function timingSafeEqualText(actual, expected) { const left = Buffer.from(String(actual || ''), 'utf8'); const right = Buffer.from(String(expected || ''), 'utf8'); return left.length === right.length && crypto.timingSafeEqual(left, right); }
 
+/** 规范化实际预测服务支持的历史数据筛选条件。 */
 function normalizeTrainingFilters(payload = {}) {
   return {
-    energyTypeCode: normalizeText(payload.energyTypeCode),
-    organization: normalizeText(payload.organization),
+    energyTypeCode: normalizeText(payload.energyTypeCode || payload.energy_type_code),
+    organization: normalizeText(payload.organization || payload.organizationScope || payload.organization_scope),
     site: normalizeText(payload.site || payload.location),
     department: normalizeText(payload.department),
-    sourceBatchId: normalizePositiveInteger(payload.sourceBatchId, 'sourceBatchId')
+    sourceBatchId: normalizePositiveInteger(payload.sourceBatchId || payload.source_batch_id, 'sourceBatchId')
   };
 }
 
+/** 规范化运行输入，禁止调用方提供或覆写预测结果。 */
 function normalizePredictionPayload(payload = {}) {
   const algorithm = normalizePredictionAlgorithm(payload.algorithm);
   const trainStartMonth = normalizeMonth(payload.trainStartMonth || payload.train_start_month, 'trainStartMonth');
   const trainEndMonth = normalizeMonth(payload.trainEndMonth || payload.train_end_month, 'trainEndMonth');
   const predictStartMonth = normalizeMonth(payload.predictStartMonth || payload.predict_start_month, 'predictStartMonth');
   const predictEndMonth = normalizeMonth(payload.predictEndMonth || payload.predict_end_month, 'predictEndMonth');
-
-  const requiredMonthFields = [
-    ['trainStartMonth', trainStartMonth],
-    ['trainEndMonth', trainEndMonth],
-    ['predictStartMonth', predictStartMonth],
-    ['predictEndMonth', predictEndMonth]
-  ];
-  const missingFields = requiredMonthFields.filter(([, value]) => !value).map(([fieldName]) => fieldName);
-  if (missingFields.length > 0) {
-    throw badRequest('创建预测运行必须提供训练月份和预测月份范围。', {
-      code: 'REQUIRED_PREDICTION_MONTH_RANGE',
-      missingFields
-    });
-  }
-
-  const { trainMonths, predictionMonths } = validatePredictionRange({
-    trainStartMonth,
-    trainEndMonth,
-    predictStartMonth,
-    predictEndMonth
-  });
-  const windowSize = algorithm === 'moving_average'
-    ? (normalizePositiveInteger(payload.windowSize, 'windowSize', { min: 2, max: 12 }) || 3)
-    : undefined;
+  const missingFields = [['trainStartMonth', trainStartMonth], ['trainEndMonth', trainEndMonth], ['predictStartMonth', predictStartMonth], ['predictEndMonth', predictEndMonth]].filter(([, value]) => !value).map(([key]) => key);
+  if (missingFields.length) throw badRequest('创建预测运行必须提供训练月份和预测月份范围。', { code: 'REQUIRED_PREDICTION_MONTH_RANGE', missingFields });
+  const { trainMonths, predictionMonths } = validatePredictionRange({ trainStartMonth, trainEndMonth, predictStartMonth, predictEndMonth });
+  const windowSize = algorithm === 'moving_average' ? (normalizePositiveInteger(payload.windowSize || payload.window_size, 'windowSize', { min: 2, max: 12 }) || 3) : undefined;
   const filters = normalizeTrainingFilters(payload);
-  const requiredHistoryMonths = algorithm === 'moving_average'
-    ? resolveMovingAverageRequiredHistoryMonths(windowSize)
-    : 3;
-  const name = normalizeText(payload.name) || `轻量预测 ${filters.energyTypeCode || '全部能源'} ${predictStartMonth}~${predictEndMonth}`;
-
-  return {
-    name,
-    algorithm,
-    trainStartMonth,
-    trainEndMonth,
-    predictStartMonth,
-    predictEndMonth,
-    trainMonths,
-    predictionMonths,
-    windowSize,
-    filters,
-    requiredHistoryMonths
-  };
+  const requiredHistoryMonths = algorithm === 'moving_average' ? resolveMovingAverageRequiredHistoryMonths(windowSize) : 3;
+  return { name: normalizeText(payload.name) || `轻量预测 ${filters.energyTypeCode || '全部能源'} ${predictStartMonth}~${predictEndMonth}`, note: nullableText(payload.note || payload.remark), algorithm, trainStartMonth, trainEndMonth, predictStartMonth, predictEndMonth, trainMonths, predictionMonths, windowSize, filters, requiredHistoryMonths };
 }
 
 function resolveEnergyTypeId(db, energyTypeCode) {
-  if (!energyTypeCode) {
-    return null;
-  }
-  const energyType = db.prepare(
-    `SELECT id, code, name, standard_unit AS standardUnit, is_active AS isActive
-     FROM energy_types
-     WHERE code = @energyTypeCode`
-  ).get({ energyTypeCode });
-  if (!energyType) {
-    throw badRequest('未找到 energyTypeCode 对应的能源类型。', {
-      code: 'UNKNOWN_ENERGY_TYPE',
-      energyTypeCode
-    });
-  }
-  if (energyType.isActive !== 1) {
-    throw badRequest('能源类型已停用，不能创建预测运行。', {
-      code: 'INACTIVE_ENERGY_TYPE',
-      energyTypeCode
-    });
-  }
+  if (!energyTypeCode) return null;
+  const energyType = db.prepare('SELECT id, is_active AS isActive FROM energy_types WHERE code = ?').get(energyTypeCode);
+  if (!energyType) throw badRequest('未找到 energyTypeCode 对应的能源类型。', { code: 'UNKNOWN_ENERGY_TYPE', energyTypeCode });
+  if (Number(energyType.isActive) !== 1) throw badRequest('能源类型已停用，不能创建预测配置或运行。', { code: 'INACTIVE_ENERGY_TYPE', energyTypeCode });
   return energyType.id;
 }
 
 function buildHistoryWhere(normalizedPayload) {
   const where = ["er.record_status = 'active'", 'er.normalized_month >= @trainStartMonth', 'er.normalized_month <= @trainEndMonth'];
-  const params = {
-    trainStartMonth: normalizedPayload.trainStartMonth,
-    trainEndMonth: normalizedPayload.trainEndMonth
-  };
+  const params = { trainStartMonth: normalizedPayload.trainStartMonth, trainEndMonth: normalizedPayload.trainEndMonth };
   const filters = normalizedPayload.filters;
-
-  if (filters.energyTypeCode) {
-    where.push('et.code = @energyTypeCode');
-    params.energyTypeCode = filters.energyTypeCode;
-  }
-  if (filters.organization) {
-    where.push('er.organization = @organization');
-    params.organization = filters.organization;
-  }
-  if (filters.site) {
-    where.push('er.site = @site');
-    params.site = filters.site;
-  }
-  if (filters.department) {
-    where.push('er.department = @department');
-    params.department = filters.department;
-  }
-  if (filters.sourceBatchId) {
-    where.push('er.source_batch_id = @sourceBatchId');
-    params.sourceBatchId = filters.sourceBatchId;
-  }
-
-  return {
-    whereSql: `WHERE ${where.join(' AND ')}`,
-    params
-  };
+  if (filters.energyTypeCode) { where.push('et.code = @energyTypeCode'); params.energyTypeCode = filters.energyTypeCode; }
+  if (filters.organization) { where.push('er.organization = @organization'); params.organization = filters.organization; }
+  if (filters.site) { where.push('er.site = @site'); params.site = filters.site; }
+  if (filters.department) { where.push('er.department = @department'); params.department = filters.department; }
+  if (filters.sourceBatchId) { where.push('er.source_batch_id = @sourceBatchId'); params.sourceBatchId = filters.sourceBatchId; }
+  return { whereSql: `WHERE ${where.join(' AND ')}`, params };
 }
 
-function loadHistoricalGroups(db, normalizedPayload) {
-  const { whereSql, params } = buildHistoryWhere(normalizedPayload);
-  const rows = db.prepare(
-    `SELECT
-       er.energy_type_id AS energyTypeId,
-       et.code AS energyTypeCode,
-       et.name AS energyTypeName,
-       er.normalized_unit AS unit,
-       er.normalized_month AS month,
-       COALESCE(SUM(er.normalized_value), 0) AS value,
-       COUNT(er.id) AS recordCount
-     FROM energy_records er
-     JOIN energy_types et ON et.id = er.energy_type_id
-     ${whereSql}
-     GROUP BY er.energy_type_id, et.code, et.name, er.normalized_unit, er.normalized_month
-     ORDER BY et.display_order ASC, et.code ASC, er.normalized_unit ASC, er.normalized_month ASC`
-  ).all(params);
-
-  const groupMap = new Map();
-  rows.forEach((row) => {
-    const key = `${row.energyTypeId}:${row.unit}`;
-    if (!groupMap.has(key)) {
-      groupMap.set(key, {
-        energyTypeId: row.energyTypeId,
-        energyTypeCode: row.energyTypeCode,
-        energyTypeName: row.energyTypeName,
-        unit: row.unit,
-        points: []
-      });
-    }
-    groupMap.get(key).points.push({
-      month: row.month,
-      value: Number(row.value || 0),
-      recordCount: row.recordCount
-    });
-  });
-
-  return Array.from(groupMap.values());
+function loadHistoricalGroups(db, payload) {
+  const { whereSql, params } = buildHistoryWhere(payload);
+  const rows = db.prepare(`SELECT er.energy_type_id AS energyTypeId, et.code AS energyTypeCode, et.name AS energyTypeName, er.normalized_unit AS unit, er.normalized_month AS month, COALESCE(SUM(er.normalized_value), 0) AS value, COUNT(er.id) AS recordCount FROM energy_records er JOIN energy_types et ON et.id = er.energy_type_id ${whereSql} GROUP BY er.energy_type_id, et.code, et.name, er.normalized_unit, er.normalized_month ORDER BY et.display_order, et.code, er.normalized_unit, er.normalized_month`).all(params);
+  const groups = new Map();
+  rows.forEach((row) => { const key = `${row.energyTypeId}:${row.unit}`; if (!groups.has(key)) groups.set(key, { ...row, points: [] }); groups.get(key).points.push({ month: row.month, value: Number(row.value || 0), recordCount: row.recordCount }); });
+  return [...groups.values()];
 }
 
-function serializeRunParameters(normalizedPayload, warnings = []) {
-  return JSON.stringify({
-    algorithm: normalizedPayload.algorithm,
-    windowSize: normalizedPayload.windowSize || null,
-    filters: normalizedPayload.filters,
-    trainMonths: normalizedPayload.trainMonths,
-    predictionMonths: normalizedPayload.predictionMonths,
-    requiredHistoryMonths: normalizedPayload.requiredHistoryMonths,
-    warnings
-  });
+function serializeRunParameters(payload, warnings = [], configSnapshot = null) {
+  return JSON.stringify({ algorithm: payload.algorithm, windowSize: payload.windowSize || null, filters: payload.filters, trainMonths: payload.trainMonths, predictionMonths: payload.predictionMonths, requiredHistoryMonths: payload.requiredHistoryMonths, configSnapshot, warnings });
 }
 
-function createRunRow(db, normalizedPayload, targetEnergyTypeId) {
-  const result = db.prepare(
-    `INSERT INTO prediction_runs (
-       name, algorithm, status, target_energy_type_id,
-       train_start_month, train_end_month, predict_start_month, predict_end_month,
-       parameters_json, note
-     ) VALUES (
-       @name, @algorithm, 'running', @targetEnergyTypeId,
-       @trainStartMonth, @trainEndMonth, @predictStartMonth, @predictEndMonth,
-       @parametersJson, @note
-     )`
-  ).run({
-    name: normalizedPayload.name,
-    algorithm: normalizedPayload.algorithm,
-    targetEnergyTypeId,
-    trainStartMonth: normalizedPayload.trainStartMonth,
-    trainEndMonth: normalizedPayload.trainEndMonth,
-    predictStartMonth: normalizedPayload.predictStartMonth,
-    predictEndMonth: normalizedPayload.predictEndMonth,
-    parametersJson: serializeRunParameters(normalizedPayload),
-    note: '轻量预测运行已创建，计算结果仅作本地趋势参考。'
-  });
-  return result.lastInsertRowid;
+function createRunRow(db, payload, targetEnergyTypeId, configSnapshot = null) {
+  return db.prepare(`INSERT INTO prediction_runs (name, algorithm, status, target_energy_type_id, train_start_month, train_end_month, predict_start_month, predict_end_month, parameters_json, note) VALUES (@name, @algorithm, 'running', @targetEnergyTypeId, @trainStartMonth, @trainEndMonth, @predictStartMonth, @predictEndMonth, @parametersJson, @note)`).run({ name: payload.name, algorithm: payload.algorithm, targetEnergyTypeId, trainStartMonth: payload.trainStartMonth, trainEndMonth: payload.trainEndMonth, predictStartMonth: payload.predictStartMonth, predictEndMonth: payload.predictEndMonth, parametersJson: serializeRunParameters(payload, [], configSnapshot), note: payload.note || '轻量预测运行已创建，计算结果仅作本地趋势参考。' }).lastInsertRowid;
 }
 
 function updateRunStatus(db, runId, status, note, parametersJson) {
-  db.prepare(
-    `UPDATE prediction_runs
-     SET status = @status,
-         completed_at = CASE WHEN @status IN ('completed', 'failed') THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE completed_at END,
-         parameters_json = @parametersJson,
-         note = @note
-     WHERE id = @runId`
-  ).run({ runId, status, note, parametersJson });
+  db.prepare(`UPDATE prediction_runs SET status = @status, completed_at = CASE WHEN @status IN ('completed', 'failed', 'cancelled') THEN COALESCE(completed_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) ELSE completed_at END, parameters_json = @parametersJson, note = @note WHERE id = @runId`).run({ runId, status, note, parametersJson });
+}
+function saveForecastResults(db, runId, group, rows) {
+  const insert = db.prepare('INSERT INTO prediction_results (prediction_run_id, energy_type_id, target_month, predicted_value, predicted_unit, confidence_low, confidence_high, method_note) VALUES (@runId, @energyTypeId, @targetMonth, @predictedValue, @predictedUnit, @confidenceLow, @confidenceHigh, @methodNote)');
+  rows.forEach((row) => insert.run({ runId, energyTypeId: group.energyTypeId, targetMonth: row.targetMonth, predictedValue: row.predictedValue, predictedUnit: group.unit, confidenceLow: row.confidenceLow, confidenceHigh: row.confidenceHigh, methodNote: `${row.methodNote} 能源类型=${group.energyTypeCode}，单位=${group.unit}。` }));
 }
 
-function saveForecastResults(db, runId, group, forecastRows) {
-  const insert = db.prepare(
-    `INSERT INTO prediction_results (
-       prediction_run_id, energy_type_id, target_month, predicted_value, predicted_unit,
-       confidence_low, confidence_high, method_note
-     ) VALUES (
-       @runId, @energyTypeId, @targetMonth, @predictedValue, @predictedUnit,
-       @confidenceLow, @confidenceHigh, @methodNote
-     )`
-  );
-
-  forecastRows.forEach((row) => {
-    insert.run({
-      runId,
-      energyTypeId: group.energyTypeId,
-      targetMonth: row.targetMonth,
-      predictedValue: row.predictedValue,
-      predictedUnit: group.unit,
-      confidenceLow: row.confidenceLow,
-      confidenceHigh: row.confidenceHigh,
-      methodNote: `${row.methodNote} 能源类型=${group.energyTypeCode}，单位=${group.unit}。`
-    });
+/** 仅由后端基于已入库的 active energy_records 生成结果。 */
+function runNormalizedPrediction(db, payload, configSnapshot = null) {
+  const targetEnergyTypeId = resolveEnergyTypeId(db, payload.filters.energyTypeCode);
+  const runId = createRunRow(db, payload, targetEnergyTypeId, configSnapshot);
+  const warnings = []; const skippedGroups = []; const createdGroups = [];
+  loadHistoricalGroups(db, payload).forEach((group) => {
+    const sufficiency = summarizeHistorySufficiency(group.points, payload.trainMonths, { minHistoryMonths: payload.requiredHistoryMonths });
+    const label = `${group.energyTypeCode}/${group.unit}`;
+    if (!sufficiency.sufficient) { skippedGroups.push({ group: label, ...sufficiency }); warnings.push(`${label} ${sufficiency.warnings.join('；')}`); return; }
+    detectHistoryWarnings(group.points).forEach((warning) => warnings.push(`${label} ${warning}`));
+    const forecasts = buildForecast(group.points, payload.predictionMonths, { algorithm: payload.algorithm, windowSize: payload.windowSize });
+    saveForecastResults(db, runId, group, forecasts);
+    createdGroups.push({ group: label, energyTypeId: group.energyTypeId, energyTypeCode: group.energyTypeCode, unit: group.unit, sampleMonths: sufficiency.sampleMonths, resultCount: forecasts.length, warnings: sufficiency.warnings });
   });
+  if (!createdGroups.length) {
+    const note = loadHistoricalGroups(db, payload).length === 0 ? '未找到符合筛选条件的历史能耗记录，预测运行失败，未写入预测结果。' : `历史样本月份不足，预测运行失败，未写入预测结果。${warnings.join('；')}`;
+    const finalWarnings = warnings.length ? warnings : [note];
+    updateRunStatus(db, runId, 'failed', note, serializeRunParameters(payload, finalWarnings, configSnapshot));
+    return { run: getPredictionRunById(db, runId), summary: { status: 'failed', resultCount: 0, skippedGroups, warnings: finalWarnings } };
+  }
+  const note = [`预测完成：生成 ${createdGroups.reduce((sum, item) => sum + item.resultCount, 0)} 条结果。`, '算法为本地轻量趋势/移动平均，不代表高精度 AI 或机器学习预测。', warnings.length ? `提示：${warnings.join('；')}` : null].filter(Boolean).join(' ');
+  updateRunStatus(db, runId, 'completed', note, serializeRunParameters(payload, warnings, configSnapshot));
+  return { run: getPredictionRunById(db, runId), summary: { status: 'completed', resultCount: createdGroups.reduce((sum, item) => sum + item.resultCount, 0), groups: createdGroups, skippedGroups, warnings } };
 }
 
 function createPredictionRun(payload = {}) {
-  const normalizedPayload = normalizePredictionPayload(payload);
-  const db = openDatabase();
-  try {
-    const transaction = db.transaction(() => {
-      const targetEnergyTypeId = resolveEnergyTypeId(db, normalizedPayload.filters.energyTypeCode);
-      const runId = createRunRow(db, normalizedPayload, targetEnergyTypeId);
-      const historicalGroups = loadHistoricalGroups(db, normalizedPayload);
-      const createdResults = [];
-      const skippedGroups = [];
-      const warnings = [];
-
-      historicalGroups.forEach((group) => {
-        const sufficiency = summarizeHistorySufficiency(group.points, normalizedPayload.trainMonths, {
-          minHistoryMonths: normalizedPayload.requiredHistoryMonths
-        });
-        const groupLabel = `${group.energyTypeCode}/${group.unit}`;
-        if (!sufficiency.sufficient) {
-          skippedGroups.push({ group: groupLabel, ...sufficiency });
-          warnings.push(`${groupLabel} ${sufficiency.warnings.join('；')}`);
-          return;
-        }
-
-        detectHistoryWarnings(group.points).forEach((warning) => warnings.push(`${groupLabel} ${warning}`));
-        const forecastRows = buildForecast(group.points, normalizedPayload.predictionMonths, {
-          algorithm: normalizedPayload.algorithm,
-          windowSize: normalizedPayload.windowSize
-        });
-        saveForecastResults(db, runId, group, forecastRows);
-        createdResults.push({
-          group: groupLabel,
-          energyTypeId: group.energyTypeId,
-          energyTypeCode: group.energyTypeCode,
-          unit: group.unit,
-          sampleMonths: sufficiency.sampleMonths,
-          resultCount: forecastRows.length,
-          warnings: sufficiency.warnings
-        });
-      });
-
-      if (createdResults.length === 0) {
-        const failureNote = historicalGroups.length === 0
-          ? '未找到符合筛选条件的历史能耗记录，预测运行失败，未写入预测结果。'
-          : `历史样本月份不足，预测运行失败，未写入预测结果。${warnings.join('；')}`;
-        const finalWarnings = warnings.length > 0 ? warnings : [failureNote];
-        updateRunStatus(db, runId, 'failed', failureNote, serializeRunParameters(normalizedPayload, finalWarnings));
-        return {
-          run: getPredictionRunById(db, runId),
-          summary: {
-            status: 'failed',
-            resultCount: 0,
-            skippedGroups,
-            warnings: finalWarnings
-          }
-        };
-      }
-
-      const note = [
-        `预测完成：生成 ${createdResults.reduce((sum, group) => sum + group.resultCount, 0)} 条结果。`,
-        '算法为本地轻量趋势/移动平均，不代表高精度 AI 或机器学习预测。',
-        warnings.length > 0 ? `提示：${warnings.join('；')}` : null
-      ].filter(Boolean).join(' ');
-      updateRunStatus(db, runId, 'completed', note, serializeRunParameters(normalizedPayload, warnings));
-
-      return {
-        run: getPredictionRunById(db, runId),
-        summary: {
-          status: 'completed',
-          resultCount: createdResults.reduce((sum, group) => sum + group.resultCount, 0),
-          groups: createdResults,
-          skippedGroups,
-          warnings
-        }
-      };
-    });
-
-    return transaction();
-  } finally {
-    db.close();
-  }
+  const normalized = normalizePredictionPayload(payload); const db = openDatabase();
+  try { return db.transaction(() => runNormalizedPrediction(db, normalized))(); } finally { db.close(); }
 }
 
-function mapRunRow(row) {
-  if (!row) {
-    return null;
-  }
-  let parameters = null;
-  try {
-    parameters = row.parametersJson ? JSON.parse(row.parametersJson) : null;
-  } catch (error) {
-    parameters = { parseError: 'parameters_json 不是有效 JSON', raw: row.parametersJson };
-  }
-  return { ...row, parameters };
-}
-
+function mapRunRow(row) { if (!row) return null; let parameters = null; try { parameters = row.parametersJson ? JSON.parse(row.parametersJson) : null; } catch (_) { parameters = { parseError: 'parameters_json 不是有效 JSON' }; } return { ...row, parameters }; }
 function getPredictionRunById(db, runId) {
-  const row = db.prepare(
-    `SELECT
-       pr.id,
-       pr.name,
-       pr.algorithm,
-       pr.status,
-       pr.target_energy_type_id AS targetEnergyTypeId,
-       et.code AS energyTypeCode,
-       et.name AS energyTypeName,
-       pr.train_start_month AS trainStartMonth,
-       pr.train_end_month AS trainEndMonth,
-       pr.predict_start_month AS predictStartMonth,
-       pr.predict_end_month AS predictEndMonth,
-       pr.parameters_json AS parametersJson,
-       pr.created_at AS createdAt,
-       pr.completed_at AS completedAt,
-       pr.note,
-       COUNT(pres.id) AS resultCount
-     FROM prediction_runs pr
-     LEFT JOIN energy_types et ON et.id = pr.target_energy_type_id
-     LEFT JOIN prediction_results pres ON pres.prediction_run_id = pr.id
-     WHERE pr.id = @runId
-     GROUP BY pr.id`
-  ).get({ runId });
-  return mapRunRow(row);
+  return mapRunRow(db.prepare(`SELECT pr.id, pr.name, pr.algorithm, pr.status, pr.target_energy_type_id AS targetEnergyTypeId, et.code AS energyTypeCode, et.name AS energyTypeName, pr.train_start_month AS trainStartMonth, pr.train_end_month AS trainEndMonth, pr.predict_start_month AS predictStartMonth, pr.predict_end_month AS predictEndMonth, pr.parameters_json AS parametersJson, pr.created_at AS createdAt, pr.completed_at AS completedAt, pr.note, COUNT(pres.id) AS resultCount FROM prediction_runs pr LEFT JOIN energy_types et ON et.id = pr.target_energy_type_id LEFT JOIN prediction_results pres ON pres.prediction_run_id = pr.id WHERE pr.id = @runId GROUP BY pr.id`).get({ runId }));
 }
+function getPredictionRun(runIdRaw) { const runId = normalizePositiveInteger(runIdRaw, 'runId'); const db = openDatabase(); try { const run = getPredictionRunById(db, runId); if (!run) throw notFound('预测运行不存在。', { runId }); const results = selectPredictionResultRows(db, { runId }, { limit: MAX_PREDICTION_EXPORT_ROWS }); return { ...run, results }; } finally { db.close(); } }
 
-function getPredictionRun(runIdRaw) {
-  const runId = normalizePositiveInteger(runIdRaw, 'runId');
-  const db = openDatabase();
-  try {
-    const run = getPredictionRunById(db, runId);
-    if (!run) {
-      throw notFound('预测运行不存在。', { runId });
-    }
-    const results = db.prepare(
-      `SELECT
-         pres.id,
-         pres.prediction_run_id AS predictionRunId,
-         pres.energy_type_id AS energyTypeId,
-         et.code AS energyTypeCode,
-         et.name AS energyTypeName,
-         pres.target_month AS targetMonth,
-         pres.predicted_value AS predictedValue,
-         pres.predicted_unit AS predictedUnit,
-         pres.confidence_low AS confidenceLow,
-         pres.confidence_high AS confidenceHigh,
-         pres.method_note AS methodNote,
-         pres.created_at AS createdAt
-       FROM prediction_results pres
-       LEFT JOIN energy_types et ON et.id = pres.energy_type_id
-       WHERE pres.prediction_run_id = @runId
-       ORDER BY pres.target_month ASC, et.display_order ASC, et.code ASC, pres.id ASC`
-    ).all({ runId });
-    return { ...run, results };
-  } finally {
-    db.close();
-  }
+function normalizeRunListFilters(query = {}) { const algorithm = normalizeText(query.algorithm); if (algorithm) normalizePredictionAlgorithm(algorithm); return { algorithm, status: normalizePredictionStatus(query.status), energyTypeCode: normalizeText(query.energyTypeCode), targetMonth: normalizeText(query.targetMonth || query.predictStartMonth), keyword: normalizeText(query.keyword || query.search), createdAtStart: nullableText(query.createdAtStart), createdAtEnd: nullableText(query.createdAtEnd) }; }
+function buildRunListWhere(filters = {}) { const where = []; const params = {}; if (filters.algorithm) { where.push('pr.algorithm = @algorithm'); params.algorithm = filters.algorithm; } if (filters.status) { where.push('pr.status = @status'); params.status = filters.status; } if (filters.energyTypeCode) { where.push('et.code = @energyTypeCode'); params.energyTypeCode = filters.energyTypeCode; } if (filters.targetMonth) { where.push('pr.predict_start_month <= @targetMonth AND pr.predict_end_month >= @targetMonth'); params.targetMonth = filters.targetMonth; } if (filters.keyword) { where.push("(pr.name LIKE @keyword ESCAPE '\\' OR pr.note LIKE @keyword ESCAPE '\\' OR et.code LIKE @keyword ESCAPE '\\' OR et.name LIKE @keyword ESCAPE '\\')"); params.keyword = `%${escapeLike(filters.keyword)}%`; } if (filters.createdAtStart) { where.push('pr.created_at >= @createdAtStart'); params.createdAtStart = filters.createdAtStart; } if (filters.createdAtEnd) { where.push('pr.created_at <= @createdAtEnd'); params.createdAtEnd = filters.createdAtEnd; } return { whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '', params }; }
+function listPredictionRuns(query = {}) { const { page, pageSize, offset } = normalizePagination(query, { defaultPageSize: 20, maxPageSize: RUN_PAGE_SIZE_MAX }); const sort = normalizeSort(query, PREDICTION_SORT_COLUMNS, { sortBy: 'createdAt', sortOrder: 'desc' }); const { whereSql, params } = buildRunListWhere(normalizeRunListFilters(query)); const db = openDatabase(); try { const total = db.prepare(`SELECT COUNT(*) AS total FROM prediction_runs pr LEFT JOIN energy_types et ON et.id = pr.target_energy_type_id ${whereSql}`).get(params).total; const rows = db.prepare(`SELECT pr.id, pr.name, pr.algorithm, pr.status, pr.target_energy_type_id AS targetEnergyTypeId, et.code AS energyTypeCode, et.name AS energyTypeName, pr.train_start_month AS trainStartMonth, pr.train_end_month AS trainEndMonth, pr.predict_start_month AS predictStartMonth, pr.predict_end_month AS predictEndMonth, pr.parameters_json AS parametersJson, pr.created_at AS createdAt, pr.completed_at AS completedAt, pr.note, COUNT(pres.id) AS resultCount FROM prediction_runs pr LEFT JOIN energy_types et ON et.id = pr.target_energy_type_id LEFT JOIN prediction_results pres ON pres.prediction_run_id = pr.id ${whereSql} GROUP BY pr.id ORDER BY ${sort.orderSql}, pr.id DESC LIMIT @pageSize OFFSET @offset`).all({ ...params, pageSize, offset }).map(mapRunRow); return { rows, pagination: buildPaginationMeta(page, pageSize, total), sort: { sortBy: sort.sortBy, sortOrder: sort.sortOrder } }; } finally { db.close(); } }
+
+function normalizeResultFilters(query = {}) { const runId = normalizePositiveInteger(query.runId || query.predictionRunId, 'runId'); const start = normalizeMonth(query.targetMonthStart || query.monthStart || query.startMonth, 'targetMonthStart'); const end = normalizeMonth(query.targetMonthEnd || query.monthEnd || query.endMonth, 'targetMonthEnd'); if (start && end) generateMonthSequence(start, end); return { runId, energyTypeCode: normalizeText(query.energyTypeCode), targetMonthStart: start, targetMonthEnd: end, keyword: normalizeText(query.keyword || query.search), runStatus: normalizePredictionStatus(query.runStatus) }; }
+function buildResultWhere(filters = {}) { const where = []; const params = {}; if (filters.runId) { where.push('pres.prediction_run_id = @runId'); params.runId = filters.runId; } if (filters.energyTypeCode) { where.push('et.code = @energyTypeCode'); params.energyTypeCode = filters.energyTypeCode; } if (filters.targetMonthStart) { where.push('pres.target_month >= @targetMonthStart'); params.targetMonthStart = filters.targetMonthStart; } if (filters.targetMonthEnd) { where.push('pres.target_month <= @targetMonthEnd'); params.targetMonthEnd = filters.targetMonthEnd; } if (filters.runStatus) { where.push('pr.status = @runStatus'); params.runStatus = filters.runStatus; } if (filters.keyword) { where.push("(pr.name LIKE @keyword ESCAPE '\\' OR et.code LIKE @keyword ESCAPE '\\' OR et.name LIKE @keyword ESCAPE '\\' OR pres.method_note LIKE @keyword ESCAPE '\\')"); params.keyword = `%${escapeLike(filters.keyword)}%`; } return { whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '', params }; }
+function selectPredictionResultRows(db, query = {}, options = {}) { const sort = normalizeSort(query, PREDICTION_RESULT_SORT_COLUMNS, { sortBy: 'targetMonth', sortOrder: 'asc' }); const { whereSql, params } = buildResultWhere(normalizeResultFilters(query)); return db.prepare(`SELECT pres.id, pres.prediction_run_id AS predictionRunId, pr.name AS predictionRunName, pr.algorithm, pr.status AS runStatus, pres.energy_type_id AS energyTypeId, et.code AS energyTypeCode, et.name AS energyTypeName, pres.target_month AS targetMonth, pres.predicted_value AS predictedValue, pres.predicted_unit AS predictedUnit, pres.confidence_low AS confidenceLow, pres.confidence_high AS confidenceHigh, pres.method_note AS methodNote, pres.created_at AS createdAt FROM prediction_results pres LEFT JOIN energy_types et ON et.id = pres.energy_type_id JOIN prediction_runs pr ON pr.id = pres.prediction_run_id ${whereSql} ORDER BY ${sort.orderSql}, et.display_order, et.code, pres.id LIMIT @limit OFFSET @offset`).all({ ...params, limit: options.limit || MAX_PREDICTION_EXPORT_ROWS, offset: options.offset || 0 }); }
+function listPredictionResults(query = {}) { const { page, pageSize, offset } = normalizePagination(query, { defaultPageSize: 50, maxPageSize: RESULT_PAGE_SIZE_MAX }); const sort = normalizeSort(query, PREDICTION_RESULT_SORT_COLUMNS, { sortBy: 'targetMonth', sortOrder: 'asc' }); const { whereSql, params } = buildResultWhere(normalizeResultFilters(query)); const db = openDatabase(); try { const total = db.prepare(`SELECT COUNT(*) AS total FROM prediction_results pres LEFT JOIN energy_types et ON et.id = pres.energy_type_id JOIN prediction_runs pr ON pr.id = pres.prediction_run_id ${whereSql}`).get(params).total; return { rows: selectPredictionResultRows(db, query, { limit: pageSize, offset }), pagination: buildPaginationMeta(page, pageSize, total), sort: { sortBy: sort.sortBy, sortOrder: sort.sortOrder } }; } finally { db.close(); } }
+
+function normalizeConfigStatus(value, fallback = 'draft') { const status = normalizeText(value) || fallback; if (!PREDICTION_CONFIG_STATUSES.includes(status)) throw badRequest('预测配置状态仅支持 draft、active 或 archived。', { code: 'INVALID_PREDICTION_CONFIG_STATUS', status, allowedStatuses: PREDICTION_CONFIG_STATUSES }); return status; }
+function normalizeConfigPayload(input = {}, options = {}) { const existing = options.existing || {}; const merged = { ...existing, ...input, organization: input.organizationScope ?? input.organization ?? existing.organizationScope, sourceBatchId: input.sourceBatchId ?? existing.sourceBatchId }; const normalized = normalizePredictionPayload(merged); const status = normalizeConfigStatus(input.status, existing.status || 'draft'); if (status === 'archived' && !options.allowArchived) throw badRequest('请通过状态接口归档预测配置。', { code: 'PREDICTION_CONFIG_ARCHIVE_ROUTE_REQUIRED' }); if (normalized.name.length > 200 || (normalized.note && normalized.note.length > 1000)) throw badRequest('预测配置名称或备注长度超出限制。', { code: 'PREDICTION_CONFIG_TEXT_TOO_LONG' }); return { ...normalized, status }; }
+function mapConfigRow(row) { return row ? { ...row, windowSize: row.windowSize === null ? null : Number(row.windowSize), sourceBatchId: row.sourceBatchId === null ? null : Number(row.sourceBatchId) } : null; }
+function getPredictionConfigById(db, configId, options = {}) { const row = db.prepare(`SELECT pc.id, pc.source_batch_id AS sourceBatchId, pc.source_row_number AS sourceRowNumber, pc.name, pc.note, pc.energy_type_id AS energyTypeId, et.code AS energyTypeCode, et.name AS energyTypeName, pc.organization_scope AS organizationScope, pc.site, pc.department, pc.source_batch_filter_id AS sourceBatchFilterId, pc.train_start_month AS trainStartMonth, pc.train_end_month AS trainEndMonth, pc.predict_start_month AS predictStartMonth, pc.predict_end_month AS predictEndMonth, pc.algorithm, pc.window_size AS windowSize, pc.status, pc.created_at AS createdAt, pc.updated_at AS updatedAt, pc.archived_at AS archivedAt FROM prediction_configs pc LEFT JOIN energy_types et ON et.id = pc.energy_type_id WHERE pc.id = ?`).get(configId); if (!row && !options.optional) throw notFound('预测配置草稿不存在。', { configId }); return mapConfigRow(row); }
+function getPredictionConfig(configIdRaw) { const configId = normalizePositiveInteger(configIdRaw, 'configId'); const db = openDatabase(); try { return getPredictionConfigById(db, configId); } finally { db.close(); } }
+function configFields(payload, energyTypeId) { return { name: payload.name, note: payload.note, energyTypeId, organizationScope: payload.filters.organization || null, site: payload.filters.site || null, department: payload.filters.department || null, sourceBatchFilterId: payload.filters.sourceBatchId || null, trainStartMonth: payload.trainStartMonth, trainEndMonth: payload.trainEndMonth, predictStartMonth: payload.predictStartMonth, predictEndMonth: payload.predictEndMonth, algorithm: payload.algorithm, windowSize: payload.windowSize || null, status: payload.status }; }
+function createPredictionConfig(input = {}) { const payload = normalizeConfigPayload(input); const db = openDatabase(); try { return db.transaction(() => { const fields = configFields(payload, resolveEnergyTypeId(db, payload.filters.energyTypeCode)); const inserted = db.prepare(`INSERT INTO prediction_configs (name, note, energy_type_id, organization_scope, site, department, source_batch_filter_id, train_start_month, train_end_month, predict_start_month, predict_end_month, algorithm, window_size, status) VALUES (@name, @note, @energyTypeId, @organizationScope, @site, @department, @sourceBatchFilterId, @trainStartMonth, @trainEndMonth, @predictStartMonth, @predictEndMonth, @algorithm, @windowSize, @status)`).run(fields); return getPredictionConfigById(db, inserted.lastInsertRowid); })(); } finally { db.close(); } }
+function updatePredictionConfig(configIdRaw, input = {}) { const configId = normalizePositiveInteger(configIdRaw, 'configId'); const db = openDatabase(); try { return db.transaction(() => { const existing = getPredictionConfigById(db, configId); if (existing.status === 'archived') throw badRequest('已归档预测配置不可编辑；请复制为新草稿。', { code: 'PREDICTION_CONFIG_ARCHIVED' }); const payload = normalizeConfigPayload(input, { existing }); const fields = configFields(payload, resolveEnergyTypeId(db, payload.filters.energyTypeCode)); db.prepare(`UPDATE prediction_configs SET name=@name, note=@note, energy_type_id=@energyTypeId, organization_scope=@organizationScope, site=@site, department=@department, source_batch_filter_id=@sourceBatchFilterId, train_start_month=@trainStartMonth, train_end_month=@trainEndMonth, predict_start_month=@predictStartMonth, predict_end_month=@predictEndMonth, algorithm=@algorithm, window_size=@windowSize, status=@status, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=@configId`).run({ ...fields, configId }); return getPredictionConfigById(db, configId); })(); } finally { db.close(); } }
+function setPredictionConfigStatus(configIdRaw, input = {}) { const configId = normalizePositiveInteger(configIdRaw, 'configId'); const status = normalizeConfigStatus(typeof input === 'string' ? input : input.status); const db = openDatabase(); try { return db.transaction(() => { getPredictionConfigById(db, configId); db.prepare(`UPDATE prediction_configs SET status=?, archived_at=CASE WHEN ?='archived' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE NULL END, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(status, status, configId); return getPredictionConfigById(db, configId); })(); } finally { db.close(); } }
+function copyPredictionConfig(configIdRaw) { const configId = normalizePositiveInteger(configIdRaw, 'configId'); const db = openDatabase(); try { return db.transaction(() => { const source = getPredictionConfigById(db, configId); const inserted = db.prepare(`INSERT INTO prediction_configs (name,note,energy_type_id,organization_scope,site,department,source_batch_filter_id,train_start_month,train_end_month,predict_start_month,predict_end_month,algorithm,window_size,status) SELECT name || '（副本）',note,energy_type_id,organization_scope,site,department,source_batch_filter_id,train_start_month,train_end_month,predict_start_month,predict_end_month,algorithm,window_size,'draft' FROM prediction_configs WHERE id=?`).run(source.id); return getPredictionConfigById(db, inserted.lastInsertRowid); })(); } finally { db.close(); } }
+function buildConfigWhere(query = {}) { const where = []; const params = {}; const status = query.status ? normalizeConfigStatus(query.status) : null; const energyTypeCode = normalizeText(query.energyTypeCode); const algorithm = normalizeText(query.algorithm); const keyword = normalizeText(query.keyword || query.search); if (status) { where.push('pc.status=@status'); params.status = status; } if (energyTypeCode) { where.push('et.code=@energyTypeCode'); params.energyTypeCode = energyTypeCode; } if (algorithm) { normalizePredictionAlgorithm(algorithm); where.push('pc.algorithm=@algorithm'); params.algorithm = algorithm; } if (keyword) { where.push("(pc.name LIKE @keyword ESCAPE '\\' OR pc.note LIKE @keyword ESCAPE '\\' OR pc.organization_scope LIKE @keyword ESCAPE '\\' OR pc.site LIKE @keyword ESCAPE '\\' OR pc.department LIKE @keyword ESCAPE '\\' OR et.code LIKE @keyword ESCAPE '\\')"); params.keyword = `%${escapeLike(keyword)}%`; } return { whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '', params }; }
+function selectConfigRows(db, query = {}, options = {}) { const { whereSql, params } = buildConfigWhere(query); return db.prepare(`SELECT pc.id,pc.source_batch_id AS sourceBatchId,pc.source_row_number AS sourceRowNumber,pc.name,pc.note,pc.energy_type_id AS energyTypeId,et.code AS energyTypeCode,et.name AS energyTypeName,pc.organization_scope AS organizationScope,pc.site,pc.department,pc.source_batch_filter_id AS sourceBatchFilterId,pc.train_start_month AS trainStartMonth,pc.train_end_month AS trainEndMonth,pc.predict_start_month AS predictStartMonth,pc.predict_end_month AS predictEndMonth,pc.algorithm,pc.window_size AS windowSize,pc.status,pc.created_at AS createdAt,pc.updated_at AS updatedAt,pc.archived_at AS archivedAt FROM prediction_configs pc LEFT JOIN energy_types et ON et.id=pc.energy_type_id ${whereSql} ORDER BY pc.updated_at DESC,pc.id DESC LIMIT @limit OFFSET @offset`).all({ ...params, limit: options.limit || MAX_PREDICTION_EXPORT_ROWS, offset: options.offset || 0 }).map(mapConfigRow); }
+function listPredictionConfigs(query = {}) { const { page, pageSize, offset } = normalizePagination(query, { defaultPageSize: 20, maxPageSize: CONFIG_PAGE_SIZE_MAX }); const db = openDatabase(); try { const { whereSql, params } = buildConfigWhere(query); const total = db.prepare(`SELECT COUNT(*) AS total FROM prediction_configs pc LEFT JOIN energy_types et ON et.id=pc.energy_type_id ${whereSql}`).get(params).total; return { rows: selectConfigRows(db, query, { limit: pageSize, offset }), pagination: buildPaginationMeta(page, pageSize, total) }; } finally { db.close(); } }
+function createRunFromConfig(configIdRaw) { const configId = normalizePositiveInteger(configIdRaw, 'configId'); const db = openDatabase(); try { return db.transaction(() => { const config = getPredictionConfigById(db, configId); if (config.status === 'archived') throw badRequest('已归档预测配置不可运行；请复制为新草稿。', { code: 'PREDICTION_CONFIG_ARCHIVED' }); const payload = normalizePredictionPayload(config); const snapshot = { configId: config.id, config: { name: config.name, note: config.note, energyTypeCode: config.energyTypeCode, organizationScope: config.organizationScope, site: config.site, department: config.department, sourceBatchId: config.sourceBatchFilterId, trainStartMonth: config.trainStartMonth, trainEndMonth: config.trainEndMonth, predictStartMonth: config.predictStartMonth, predictEndMonth: config.predictEndMonth, algorithm: config.algorithm, windowSize: config.windowSize } }; return runNormalizedPrediction(db, payload, snapshot); })(); } finally { db.close(); } }
+function cancelOrArchivePredictionRun(runIdRaw, input = {}) { const runId = normalizePositiveInteger(runIdRaw, 'runId'); const requested = normalizeText(input.status || input.action); if (!['cancelled', 'archived'].includes(requested)) throw badRequest('status 仅支持 cancelled 或 archived。', { code: 'INVALID_PREDICTION_RUN_TRANSITION' }); const db = openDatabase(); try { return db.transaction(() => { const run = getPredictionRunById(db, runId); if (!run) throw notFound('预测运行不存在。', { runId }); if (requested === 'cancelled' && !['pending', 'running'].includes(run.status)) throw badRequest('仅 pending/running 预测运行可取消；已完成、失败或已归档记录和结果不可篡改。', { code: 'PREDICTION_RUN_CANCEL_NOT_ALLOWED', status: run.status }); if (requested === 'archived' && !['completed', 'failed', 'cancelled', 'archived'].includes(run.status)) throw badRequest('仅终态预测运行可归档，运行中的任务请先取消。', { code: 'PREDICTION_RUN_ARCHIVE_NOT_ALLOWED', status: run.status }); db.prepare(`UPDATE prediction_runs SET status=?, completed_at=CASE WHEN ?='cancelled' THEN COALESCE(completed_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')) ELSE completed_at END, note=COALESCE(note || ' ', '') || ? WHERE id=?`).run(requested, requested, requested === 'archived' ? ' 已归档；预测结果保持只读。' : ' 已取消；未删除或改写预测结果。', runId); return getPredictionRunById(db, runId); })(); } finally { db.close(); } }
+function buildPredictionStats(query = {}) { const db = openDatabase(); try { const { whereSql, params } = buildRunListWhere(normalizeRunListFilters(query)); const summary = db.prepare(`SELECT COUNT(DISTINCT pr.id) AS totalRuns, COUNT(DISTINCT CASE WHEN pr.status='completed' THEN pr.id END) AS completedCount, COUNT(DISTINCT CASE WHEN pr.status='failed' THEN pr.id END) AS failedCount, COUNT(DISTINCT CASE WHEN pr.status='cancelled' THEN pr.id END) AS cancelledCount, COUNT(DISTINCT CASE WHEN pr.status='archived' THEN pr.id END) AS archivedCount, COUNT(pres.id) AS resultCount FROM prediction_runs pr LEFT JOIN energy_types et ON et.id=pr.target_energy_type_id LEFT JOIN prediction_results pres ON pres.prediction_run_id=pr.id ${whereSql}`).get(params); const aggregate = (columns, groupBy) => db.prepare(`SELECT ${columns}, COUNT(*) AS runCount, COUNT(pres.id) AS resultCount FROM prediction_runs pr LEFT JOIN energy_types et ON et.id=pr.target_energy_type_id LEFT JOIN prediction_results pres ON pres.prediction_run_id=pr.id ${whereSql} GROUP BY ${groupBy} ORDER BY runCount DESC`).all(params); return { totalRuns: Number(summary.totalRuns || 0), completedCount: Number(summary.completedCount || 0), failedCount: Number(summary.failedCount || 0), cancelledCount: Number(summary.cancelledCount || 0), archivedCount: Number(summary.archivedCount || 0), resultCount: Number(summary.resultCount || 0), byStatus: aggregate('pr.status AS status', 'pr.status'), byAlgorithm: aggregate('pr.algorithm AS algorithm', 'pr.algorithm'), byEnergyType: aggregate('COALESCE(et.code, \'全部能源\') AS energyTypeCode', 'COALESCE(et.code, \'全部能源\')'), byTargetMonth: aggregate("pr.predict_start_month || '~' || pr.predict_end_month AS targetMonthRange", 'pr.predict_start_month,pr.predict_end_month'), meta: { filtersApplied: { ...query }, aggregationPolicy: '统计仅聚合当前筛选命中的真实预测运行及其实际 prediction_results；失败或样本不足运行不伪造结果。', noDataFabricated: true } }; } finally { db.close(); } }
+function renderExport(rows, fields, sheetName, prefix, requestedFormat) { const format = String(requestedFormat || 'xlsx').toLowerCase(); if (!['xlsx', 'csv'].includes(format)) throw badRequest('format 仅支持 xlsx 或 csv。', { code: 'UNSUPPORTED_EXPORT_FORMAT', format }); const headers = fields.map((field) => field.header); const values = rows.map((row) => fields.reduce((result, field) => ({ ...result, [field.header]: row[field.key] ?? '' }), {})); const fileName = `${prefix}-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.${format}`; if (format === 'csv') { const csv = `﻿${[headers, ...values.map((row) => headers.map((key) => row[key]))].map((row) => row.map((item) => `"${String(item).replace(/"/g, '""')}"`).join(',')).join('\n')}\n`; return { fileName, format, contentType: 'text/csv; charset=utf-8', body: Buffer.from(csv, 'utf8'), rowCount: rows.length, fields: headers }; } const workbook = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(values, { header: headers }), sheetName); return { fileName, format, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' }), rowCount: rows.length, fields: headers }; }
+function exportPredictionConfigs(query = {}) { const db = openDatabase(); try { return renderExport(selectConfigRows(db, query), PREDICTION_CONFIG_EXPORT_FIELDS, '预测配置草稿', '预测配置草稿导出', query.format); } finally { db.close(); } }
+function exportPredictionResults(query = {}) { const db = openDatabase(); try { return renderExport(selectPredictionResultRows(db, query), PREDICTION_RESULT_EXPORT_FIELDS, '预测结果', '预测结果导出', query.format); } finally { db.close(); } }
+
+function normalizeHeader(value) { return String(value || '').trim().replace(/[\s_\-/:：()（）]/g, '').toLowerCase(); }
+function mapImportFields(row = {}) { const mapped = {}; const fieldMapping = {}; Object.entries(row).forEach(([header, value]) => { const field = Object.entries(PREDICTION_CONFIG_IMPORT_ALIASES).find(([, aliases]) => aliases.map(normalizeHeader).includes(normalizeHeader(header)))?.[0]; if (field && (mapped[field] === undefined || !normalizeText(mapped[field]))) { mapped[field] = value; fieldMapping[field] = header; } }); return { mapped, fieldMapping }; }
+function candidateId(row) { return `prediction-config:${row.rowNumber}:${row.name}`; }
+function normalizeImportCandidate(row = {}) { const payload = normalizeConfigPayload({ ...row, status: 'draft' }); return { candidateRowId: normalizeText(row.candidateRowId), rowNumber: Number(row.rowNumber), ...configFields(payload, Number(row.energyTypeId || 0) || null), energyTypeCode: payload.filters.energyTypeCode }; }
+function importSecret() { const configured = normalizeText(process.env.PREDICTION_CONFIG_IMPORT_HMAC_SECRET) || normalizeText(process.env.CHARCOAL_HMAC_SECRET) || normalizeText(process.env.APP_SECRET); if (configured) return configured; const db = openDatabase(); try { let saved = db.prepare("SELECT value FROM app_meta WHERE key='prediction_config_import_hmac_secret'").get(); if (!saved) { db.prepare("INSERT INTO app_meta (key,value) VALUES ('prediction_config_import_hmac_secret',?)").run(crypto.randomBytes(32).toString('hex')); saved = db.prepare("SELECT value FROM app_meta WHERE key='prediction_config_import_hmac_secret'").get(); } return saved.value; } finally { db.close(); } }
+function previewSignature(rows) { return `hmac-sha256:v1:${crypto.createHmac('sha256', importSecret()).update(stableStringify({ operation: 'prediction-config-import', rows })).digest('hex')}`; }
+function buildPredictionConfigImportPreviewWithDb(db, rows = []) {
+  const types = new Map(db.prepare('SELECT id,code,name,is_active AS isActive FROM energy_types').all().map((row) => [row.code, row]));
+  const existingNames = new Set(db.prepare('SELECT name FROM prediction_configs').all().map((row) => row.name));
+  const seenNames = new Set(); const items = []; const fieldMapping = {};
+  rows.forEach((row, index) => {
+    const rowNumber = Number(row.rowNumber || row.__rowNumber || index + 2);
+    const { mapped: baseMapped, fieldMapping: mapping } = mapImportFields(row);
+    const mapped = { ...baseMapped, sourceBatchId: baseMapped.sourceBatchId ?? row.sourceBatchFilterId ?? row.sourceBatchId };
+    Object.assign(fieldMapping, mapping); const reasons = []; let candidate = null; let status = 'blocked';
+    try {
+      const energyTypeCode = normalizeText(mapped.energyTypeCode); const energy = energyTypeCode ? types.get(energyTypeCode) : null;
+      if (energyTypeCode && !energy) throw badRequest('未找到匹配能源类型。', { code: 'UNKNOWN_ENERGY_TYPE' });
+      if (energy && Number(energy.isActive) !== 1) throw badRequest('能源类型已停用。', { code: 'INACTIVE_ENERGY_TYPE' });
+      const payload = normalizeConfigPayload({ ...mapped, status: 'draft' });
+      candidate = { candidateRowId: candidateId({ rowNumber, name: payload.name }), rowNumber, ...configFields(payload, energy?.id || null), energyTypeCode: payload.filters.energyTypeCode };
+      if (existingNames.has(candidate.name) || seenNames.has(candidate.name)) {
+        reasons.push({ rowNumber, fieldName: 'name', rawValue: candidate.name, code: 'DUPLICATE_PREDICTION_CONFIG_SKIPPED', message: '已存在或同文件重复的预测配置名称按 skip 策略跳过，不覆盖既有草稿。', severity: 'warning' });
+        status = 'skipped'; candidate = null;
+      } else { seenNames.add(payload.name); status = 'wouldImport'; }
+    } catch (error) { reasons.push({ rowNumber, fieldName: null, rawValue: JSON.stringify(mapped), code: error.details?.code || 'INVALID_PREDICTION_CONFIG', message: error.message, severity: 'error' }); }
+    const item = { rowNumber, status, wouldImport: status === 'wouldImport', name: candidate?.name || normalizeText(mapped.name), reasons, errors: reasons.filter((reason) => reason.severity === 'error'), warnings: reasons.filter((reason) => reason.severity === 'warning'), reasonCodes: reasons.map((reason) => reason.code).join('|'), reasonText: reasons.map((reason) => reason.message).join('；'), candidate };
+    items.push(item);
+  });
+  const candidateRows = items.filter((item) => item.wouldImport).map((item) => item.candidate);
+  const summary = { totalRows: items.length, wouldImport: candidateRows.length, skipped: items.filter((item) => item.status === 'skipped').length, blocked: items.filter((item) => item.status === 'blocked').length, warnings: items.reduce((sum, item) => sum + item.warnings.length, 0), errors: items.reduce((sum, item) => sum + item.errors.length, 0) };
+  const preview = { dryRun: true, previewOnly: true, writesPredictionConfigs: false, writesPredictionRuns: false, writesPredictionResults: false, persistsImportBatch: true, duplicateStrategy: 'skip', confirmText: PREDICTION_CONFIG_IMPORT_CONFIRM_TEXT, backupReason: 'prediction-config-import', fieldMapping, summary, candidateRowIds: candidateRows.map((row) => row.rowNumber), candidateRows, items, notices: ['配置导入只生成可编辑 draft 预测配置，不运行预测，不写 prediction_runs 或 prediction_results，也不写 energy_records/carbon_emissions。', '预测结果只能由后端依据已入库 active energy_records 运行生成。'] };
+  preview.previewSignature = previewSignature(candidateRows); preview.previewAuditDigest = `hmac-sha256:v1:audit:${crypto.createHash('sha256').update(stableStringify({ summary, items: items.map((item) => ({ rowNumber: item.rowNumber, status: item.status, reasonCodes: item.reasonCodes })) })).digest('hex')}`;
+  return preview;
 }
+function buildPredictionConfigImportPreviewFromRows(rows = []) { const db = openDatabase(); try { return buildPredictionConfigImportPreviewWithDb(db, rows); } finally { db.close(); } }
+function createPredictionConfigImportPreviewFromUpload(file) { if (!file) throw badRequest('请使用 multipart/form-data 上传字段名为 file 的预测配置表格文件。', { code: 'IMPORT_FILE_REQUIRED', fieldName: 'file' }); assertSupportedImportFile(file.originalname); const parsed = parseImportFile(file.path, file.originalname); const preview = buildPredictionConfigImportPreviewFromRows(parsed.rows || []); const audit = createPreviewAuditBatch({ importType: PREDICTION_CONFIG_IMPORT_TYPE, originalFilename: file.originalname, storedFilename: file.filename || null, filePath: file.path, fileType: String(file.originalname).split('.').pop().toLowerCase(), fileSizeBytes: file.size, duplicateStrategy: 'skip', fieldMapping: preview.fieldMapping, previewSignature: preview.previewSignature, previewAuditDigest: preview.previewAuditDigest, auditContext: { summary: preview.summary, candidateRows: preview.candidateRows, candidateRowIds: preview.candidateRowIds, confirmText: preview.confirmText, notices: preview.notices }, statistics: { totalRows: preview.summary.totalRows, successCount: preview.summary.wouldImport, failureCount: preview.summary.blocked, skippedCount: preview.summary.skipped } }); replaceImportAuditIssues(audit.id, preview.items.flatMap((item) => item.reasons)); return { ...preview, batchId: audit.id, auditBatch: getImportAuditSummary(audit.id) }; }
+async function executePredictionConfigImport(body = {}) { const fail = (message, code) => { throw badRequest(message, { code }); }; if (normalizeText(body.confirmText) !== PREDICTION_CONFIG_IMPORT_CONFIRM_TEXT) fail('确认文本不匹配，已拒绝导入预测配置草稿。', 'PREDICTION_CONFIG_IMPORT_CONFIRM_TEXT_MISMATCH'); if (body.acknowledgeSkippedRisks !== true) fail('必须确认无效或重复记录将被跳过。', 'PREDICTION_CONFIG_IMPORT_SKIPPED_RISKS_ACK_REQUIRED'); if (body.requireBackup !== true) fail('执行前必须要求自动备份。', 'PREDICTION_CONFIG_IMPORT_BACKUP_REQUIRED'); if (!Array.isArray(body.candidateRows) || !body.candidateRows.length || !Array.isArray(body.candidateRowIds)) fail('candidateRows 和 candidateRowIds 必须来自 preview。', 'PREDICTION_CONFIG_IMPORT_CANDIDATES_REQUIRED'); const db = openDatabase(); let latest; try { latest = buildPredictionConfigImportPreviewWithDb(db, body.candidateRows); } finally { db.close(); } if (!timingSafeEqualText(body.previewSignature, latest.previewSignature)) fail('当前 previewSignature 与重新计算结果不一致，请重新 preview。', 'PREDICTION_CONFIG_IMPORT_PREVIEW_SIGNATURE_MISMATCH'); if (stableStringify(body.candidateRowIds.map(Number)) !== stableStringify(latest.candidateRowIds)) fail('候选行与最新预演不一致，请重新 preview。', 'PREDICTION_CONFIG_IMPORT_CANDIDATES_MISMATCH'); const batchId = normalizePositiveInteger(body.batchId, 'batchId'); const batch = getImportAuditBatchDetail(batchId, { includeIssues: false }); if (batch.importType !== PREDICTION_CONFIG_IMPORT_TYPE || !timingSafeEqualText(batch.previewSignature, body.previewSignature)) fail('batchId 与预测配置 previewSignature 不匹配。', 'PREDICTION_CONFIG_IMPORT_AUDIT_BATCH_MISMATCH'); const backup = await backupService.createBackup({ reason: 'prediction-config-import' }); const writeDb = openDatabase(); try { return writeDb.transaction(() => { const current = buildPredictionConfigImportPreviewWithDb(writeDb, body.candidateRows); if (!timingSafeEqualText(body.previewSignature, current.previewSignature)) fail('写入前预演已失效，请重新 preview。', 'PREDICTION_CONFIG_IMPORT_EXPIRED_PREVIEW'); const insert = writeDb.prepare(`INSERT INTO prediction_configs (source_batch_id,source_row_number,name,note,energy_type_id,organization_scope,site,department,source_batch_filter_id,train_start_month,train_end_month,predict_start_month,predict_end_month,algorithm,window_size,status) VALUES (@batchId,@sourceRowNumber,@name,@note,@energyTypeId,@organizationScope,@site,@department,@sourceBatchFilterId,@trainStartMonth,@trainEndMonth,@predictStartMonth,@predictEndMonth,@algorithm,@windowSize,'draft')`); const created = current.candidateRows.map((row) => { const id = insert.run({ ...row, batchId, sourceRowNumber: row.rowNumber }).lastInsertRowid; return getPredictionConfigById(writeDb, id); }); const result = { executed: true, dryRun: false, imported: created.length, skipped: Number(batch.skippedCount || 0), blocked: Number(batch.failureCount || 0), writesPredictionConfigs: true, writesPredictionRuns: false, writesPredictionResults: false, writesEnergyRecords: false, writesCarbonEmissions: false, importedRecords: created, backup: { backupName: backup.backupName, reason: backup.reason, method: backup.method, sizeBytes: backup.sizeBytes, createdAt: backup.createdAt, sha256: backup.sha256 }, note: '仅导入 draft 预测配置；未运行预测且未写入结果。' }; updateExecuteAuditResult(batchId, { status: batch.failureCount || batch.skippedCount ? 'completed_with_errors' : 'completed', statistics: { totalRows: batch.totalRows, successCount: created.length, failureCount: batch.failureCount, skippedCount: batch.skippedCount }, executeResult: result, backup: result.backup }, { db: writeDb }); return { ...result, batchId, auditBatch: getImportAuditSummary(batchId, { db: writeDb }) }; })(); } finally { writeDb.close(); } }
 
-function normalizeRunListFilters(query = {}) {
-  const algorithm = normalizeText(query.algorithm);
-  const status = normalizePredictionStatus(query.status);
-  const energyTypeCode = normalizeText(query.energyTypeCode);
-  const createdAtStart = nullableText(query.createdAtStart);
-  const createdAtEnd = nullableText(query.createdAtEnd);
-  if (algorithm) {
-    normalizePredictionAlgorithm(algorithm);
-  }
-  return { algorithm, status, energyTypeCode, createdAtStart, createdAtEnd };
-}
+function getPredictionManagementContract() { return { status: 'unified-management-api-ready', configTable: 'prediction_configs', runTable: 'prediction_runs', resultTable: 'prediction_results', configStatuses: PREDICTION_CONFIG_STATUSES, runStatuses: ['pending', 'running', 'completed', 'failed', 'cancelled', 'archived'], implementedAlgorithms: ['moving_average', 'linear_trend'], routes: { configList: 'GET /api/predictions/configs', configDetail: 'GET /api/predictions/configs/:configId', configCreate: 'POST /api/predictions/configs', configUpdate: 'PUT /api/predictions/configs/:configId', configStatus: 'PATCH /api/predictions/configs/:configId/status', configCopy: 'POST /api/predictions/configs/:configId/copy', configRun: 'POST /api/predictions/configs/:configId/runs', configExport: 'GET /api/predictions/configs/export?format=xlsx|csv', configImportPreview: 'POST /api/predictions/configs/import/preview', configImportExecute: 'POST /api/predictions/configs/import/execute', configTemplate: 'GET /api/templates/prediction-configs.xlsx|csv', runList: 'GET /api/predictions/runs', runDetail: 'GET /api/predictions/runs/:runId', runStatus: 'PATCH /api/predictions/runs/:runId/status', runStats: 'GET /api/predictions/runs/stats', resultList: 'GET /api/predictions/results', resultExport: 'GET /api/predictions/results/export?format=xlsx|csv' }, permissions: { config: ['prediction:config:view', 'prediction:config:create', 'prediction:config:update', 'prediction:config:status', 'prediction:config:import', 'prediction:config:export', 'prediction:config:template'], run: ['prediction:run:create', 'prediction:run:view', 'prediction:run:cancel', 'prediction:run:export'], result: ['prediction:result:view', 'prediction:result:export'] }, import: { template: { type: PREDICTION_CONFIG_IMPORT_TEMPLATE_ID, headers: PREDICTION_CONFIG_IMPORT_HEADERS, aliases: PREDICTION_CONFIG_IMPORT_ALIASES }, confirmText: PREDICTION_CONFIG_IMPORT_CONFIRM_TEXT, previewWrites: '仅统一 import_batches/import_errors 审计；不写 prediction_configs、prediction_runs、prediction_results、energy_records 或 carbon_emissions。', executeWrites: '仅写 prediction_configs 且强制状态为 draft；不触发预测运行或写预测结果。' }, resultPolicy: '预测结果不可手工导入、新增、编辑或删除；只能由服务端基于 active energy_records 在创建运行时生成。样本不足时运行 failed，prediction_results 保持为空。' }; }
 
-function buildRunListWhere(filters = {}) {
-  const where = [];
-  const params = {};
-  if (filters.algorithm) {
-    where.push('pr.algorithm = @algorithm');
-    params.algorithm = filters.algorithm;
-  }
-  if (filters.status) {
-    where.push('pr.status = @status');
-    params.status = filters.status;
-  }
-  if (filters.energyTypeCode) {
-    where.push('et.code = @energyTypeCode');
-    params.energyTypeCode = filters.energyTypeCode;
-  }
-  if (filters.createdAtStart) {
-    where.push('pr.created_at >= @createdAtStart');
-    params.createdAtStart = filters.createdAtStart;
-  }
-  if (filters.createdAtEnd) {
-    where.push('pr.created_at <= @createdAtEnd');
-    params.createdAtEnd = filters.createdAtEnd;
-  }
-  return {
-    whereSql: where.length > 0 ? `WHERE ${where.join(' AND ')}` : '',
-    params
-  };
-}
-
-function listPredictionRuns(query = {}) {
-  const { page, pageSize, offset } = normalizePagination(query, { defaultPageSize: 20, maxPageSize: RUN_PAGE_SIZE_MAX });
-  const sort = normalizeSort(query, PREDICTION_SORT_COLUMNS, { sortBy: 'createdAt', sortOrder: 'desc' });
-  const filters = normalizeRunListFilters(query);
-  const { whereSql, params } = buildRunListWhere(filters);
-  const db = openDatabase();
-  try {
-    const total = db.prepare(
-      `SELECT COUNT(*) AS total
-       FROM prediction_runs pr
-       LEFT JOIN energy_types et ON et.id = pr.target_energy_type_id
-       ${whereSql}`
-    ).get(params).total;
-    const rows = db.prepare(
-      `SELECT
-         pr.id,
-         pr.name,
-         pr.algorithm,
-         pr.status,
-         pr.target_energy_type_id AS targetEnergyTypeId,
-         et.code AS energyTypeCode,
-         et.name AS energyTypeName,
-         pr.train_start_month AS trainStartMonth,
-         pr.train_end_month AS trainEndMonth,
-         pr.predict_start_month AS predictStartMonth,
-         pr.predict_end_month AS predictEndMonth,
-         pr.parameters_json AS parametersJson,
-         pr.created_at AS createdAt,
-         pr.completed_at AS completedAt,
-         pr.note,
-         COUNT(pres.id) AS resultCount
-       FROM prediction_runs pr
-       LEFT JOIN energy_types et ON et.id = pr.target_energy_type_id
-       LEFT JOIN prediction_results pres ON pres.prediction_run_id = pr.id
-       ${whereSql}
-       GROUP BY pr.id
-       ORDER BY ${sort.orderSql}, pr.id DESC
-       LIMIT @pageSize OFFSET @offset`
-    ).all({ ...params, pageSize, offset }).map(mapRunRow);
-
-    return {
-      rows,
-      pagination: buildPaginationMeta(page, pageSize, total),
-      sort: { sortBy: sort.sortBy, sortOrder: sort.sortOrder }
-    };
-  } finally {
-    db.close();
-  }
-}
-
-function normalizeResultFilters(query = {}) {
-  const runId = normalizePositiveInteger(query.runId || query.predictionRunId, 'runId');
-  const energyTypeCode = normalizeText(query.energyTypeCode);
-  const targetMonthStart = normalizeMonth(query.targetMonthStart || query.monthStart || query.startMonth, 'targetMonthStart');
-  const targetMonthEnd = normalizeMonth(query.targetMonthEnd || query.monthEnd || query.endMonth, 'targetMonthEnd');
-  if (targetMonthStart && targetMonthEnd) {
-    generateMonthSequence(targetMonthStart, targetMonthEnd);
-  }
-  return { runId, energyTypeCode, targetMonthStart, targetMonthEnd };
-}
-
-function buildResultWhere(filters = {}) {
-  const where = [];
-  const params = {};
-  if (filters.runId) {
-    where.push('pres.prediction_run_id = @runId');
-    params.runId = filters.runId;
-  }
-  if (filters.energyTypeCode) {
-    where.push('et.code = @energyTypeCode');
-    params.energyTypeCode = filters.energyTypeCode;
-  }
-  if (filters.targetMonthStart) {
-    where.push('pres.target_month >= @targetMonthStart');
-    params.targetMonthStart = filters.targetMonthStart;
-  }
-  if (filters.targetMonthEnd) {
-    where.push('pres.target_month <= @targetMonthEnd');
-    params.targetMonthEnd = filters.targetMonthEnd;
-  }
-  return {
-    whereSql: where.length > 0 ? `WHERE ${where.join(' AND ')}` : '',
-    params
-  };
-}
-
-function listPredictionResults(query = {}) {
-  const { page, pageSize, offset } = normalizePagination(query, { defaultPageSize: 50, maxPageSize: RESULT_PAGE_SIZE_MAX });
-  const sort = normalizeSort(query, PREDICTION_RESULT_SORT_COLUMNS, { sortBy: 'targetMonth', sortOrder: 'asc' });
-  const filters = normalizeResultFilters(query);
-  const { whereSql, params } = buildResultWhere(filters);
-  const db = openDatabase();
-  try {
-    const total = db.prepare(
-      `SELECT COUNT(*) AS total
-       FROM prediction_results pres
-       LEFT JOIN energy_types et ON et.id = pres.energy_type_id
-       JOIN prediction_runs pr ON pr.id = pres.prediction_run_id
-       ${whereSql}`
-    ).get(params).total;
-    const rows = db.prepare(
-      `SELECT
-         pres.id,
-         pres.prediction_run_id AS predictionRunId,
-         pr.name AS predictionRunName,
-         pr.algorithm,
-         pr.status AS runStatus,
-         pres.energy_type_id AS energyTypeId,
-         et.code AS energyTypeCode,
-         et.name AS energyTypeName,
-         pres.target_month AS targetMonth,
-         pres.predicted_value AS predictedValue,
-         pres.predicted_unit AS predictedUnit,
-         pres.confidence_low AS confidenceLow,
-         pres.confidence_high AS confidenceHigh,
-         pres.method_note AS methodNote,
-         pres.created_at AS createdAt
-       FROM prediction_results pres
-       LEFT JOIN energy_types et ON et.id = pres.energy_type_id
-       JOIN prediction_runs pr ON pr.id = pres.prediction_run_id
-       ${whereSql}
-       ORDER BY ${sort.orderSql}, et.display_order ASC, et.code ASC, pres.id ASC
-       LIMIT @pageSize OFFSET @offset`
-    ).all({ ...params, pageSize, offset });
-
-    return {
-      rows,
-      pagination: buildPaginationMeta(page, pageSize, total),
-      sort: { sortBy: sort.sortBy, sortOrder: sort.sortOrder }
-    };
-  } finally {
-    db.close();
-  }
-}
-
-module.exports = {
-  createPredictionRun,
-  getPredictionRun,
-  listPredictionResults,
-  listPredictionRuns,
-  normalizePredictionPayload,
-  buildHistoryWhere,
-  buildRunListWhere,
-  buildResultWhere
-};
+module.exports = { PREDICTION_CONFIG_EXPORT_FIELDS, PREDICTION_CONFIG_IMPORT_ALIASES, PREDICTION_CONFIG_IMPORT_CONFIRM_TEXT, PREDICTION_CONFIG_IMPORT_HEADERS, PREDICTION_CONFIG_IMPORT_TEMPLATE_ID, PREDICTION_CONFIG_STATUSES, PREDICTION_RESULT_EXPORT_FIELDS, buildConfigWhere, buildHistoryWhere, buildPredictionConfigImportPreviewFromRows, buildPredictionStats, buildResultWhere, buildRunListWhere, cancelOrArchivePredictionRun, copyPredictionConfig, createPredictionConfig, createPredictionConfigImportPreviewFromUpload, createPredictionRun, createRunFromConfig, executePredictionConfigImport, exportPredictionConfigs, exportPredictionResults, getPredictionConfig, getPredictionManagementContract, getPredictionRun, listPredictionConfigs, listPredictionResults, listPredictionRuns, normalizeConfigPayload, normalizePredictionPayload, setPredictionConfigStatus, updatePredictionConfig };

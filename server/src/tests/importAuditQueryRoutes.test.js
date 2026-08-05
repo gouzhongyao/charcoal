@@ -9,13 +9,23 @@ process.env.DATA_DIR = path.join(tmpDir, 'data');
 process.env.SQLITE_PATH = path.join(process.env.DATA_DIR, 'import-audit-query-routes.sqlite');
 process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
 process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
+process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
 const { app } = require('../index');
 const { getDatabaseInfo, initDatabase, openDatabase, uploadsDir } = require('../db/database');
+const { login } = require('../services/authService');
+
+let accessToken = null;
 
 function requestJson(port, method, requestPath) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ hostname: '127.0.0.1', port, path: requestPath, method }, (res) => {
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port,
+      path: requestPath,
+      method,
+      headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {}
+    }, (res) => {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
@@ -132,6 +142,7 @@ function insertIssue(db, batchId, input) {
   let server;
   try {
     initDatabase();
+    accessToken = login({ username: 'admin', password: process.env.CHARCOAL_ADMIN_PASSWORD }).token;
     assert.strictEqual(getDatabaseInfo().databasePath, process.env.SQLITE_PATH, '查询/下载路由测试必须使用隔离 SQLite 文件。');
     fs.mkdirSync(uploadsDir, { recursive: true });
     fs.writeFileSync(path.join(uploadsDir, 'production-query.csv'), 'unit_code,normalized_month\nPU-001,2026-01\n', 'utf8');

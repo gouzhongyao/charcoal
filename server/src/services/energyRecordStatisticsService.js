@@ -32,6 +32,40 @@ function withEnergyRecordFilter(query, callback) {
   return callback({ filters, whereSql, params });
 }
 
+const ENERGY_RECORD_EXPORT_FIELDS = Object.freeze([
+  { key: 'id', header: '能耗记录ID' },
+  { key: 'sourceBatchId', header: '来源批次ID' },
+  { key: 'sourceRowNumber', header: '来源行号' },
+  { key: 'normalizedMonth', header: '月份' },
+  { key: 'energyTypeCode', header: '能源类型编码' },
+  { key: 'energyTypeName', header: '能源类型名称' },
+  { key: 'originalValue', header: '原始值' },
+  { key: 'originalUnit', header: '原始单位' },
+  { key: 'normalizedValue', header: '标准化值' },
+  { key: 'normalizedUnit', header: '标准化单位' },
+  { key: 'organization', header: '组织' },
+  { key: 'site', header: '地点' },
+  { key: 'department', header: '部门' },
+  { key: 'productionLine', header: '产线' },
+  { key: 'meterCode', header: '原始仪表编码' },
+  { key: 'ledgerMeterCode', header: '关联仪表编码' },
+  { key: 'meterDeviceName', header: '关联仪表名称' },
+  { key: 'organizationUnitCode', header: '关联用能单元编码' },
+  { key: 'organizationUnitName', header: '关联用能单元名称' },
+  { key: 'organizationUnitPath', header: '关联用能单元路径' },
+  { key: 'businessDimension', header: '业务维度' },
+  { key: 'remark', header: '备注' },
+  { key: 'createdAt', header: '创建时间' }
+]);
+
+function normalizeEnergyRecordExportFormat(value) {
+  const format = String(value || 'xlsx').trim().toLowerCase();
+  if (!['xlsx', 'csv'].includes(format)) {
+    throw badRequest('format 仅支持 xlsx 或 csv。', { code: 'UNSUPPORTED_ENERGY_RECORD_EXPORT_FORMAT', format });
+  }
+  return format;
+}
+
 function listEnergyRecords(query = {}) {
   const { page, pageSize, offset } = normalizePagination(query, { defaultPageSize: 20, maxPageSize: MAX_PAGE_SIZE });
   const sort = normalizeDetailSort(query);
@@ -43,6 +77,8 @@ function listEnergyRecords(query = {}) {
         `SELECT COUNT(*) AS total
          FROM energy_records er
          JOIN energy_types et ON et.id = er.energy_type_id
+         LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id
+         LEFT JOIN meter_devices md ON md.id = er.meter_device_id
          ${whereSql}`
       ).get(params).total;
       const rows = db.prepare(
@@ -100,6 +136,88 @@ function listEnergyRecords(query = {}) {
   });
 }
 
+function buildEnergyRecordExportRows(rows = []) {
+  return rows.map((row) => {
+    const output = {};
+    ENERGY_RECORD_EXPORT_FIELDS.forEach((field) => {
+      output[field.header] = row[field.key] ?? '';
+    });
+    return output;
+  });
+}
+
+function renderEnergyRecordCsv(rows = []) {
+  const headers = ENERGY_RECORD_EXPORT_FIELDS.map((field) => field.header);
+  const lines = [headers, ...rows.map((row) => ENERGY_RECORD_EXPORT_FIELDS.map((field) => row[field.key] ?? ''))];
+  return Buffer.from(`${UTF8_BOM}${lines.map((line) => line.map(escapeCsvCell).join(',')).join('\n')}\n`, 'utf8');
+}
+
+function renderEnergyRecordXlsx(rows = []) {
+  const headers = ENERGY_RECORD_EXPORT_FIELDS.map((field) => field.header);
+  const worksheet = XLSX.utils.json_to_sheet(buildEnergyRecordExportRows(rows), { header: headers });
+  worksheet['!cols'] = headers.map((header) => ({ wch: Math.min(Math.max(String(header).length + 8, 14), 36) }));
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, '能耗明细');
+  return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+}
+
+function exportEnergyRecords(query = {}) {
+  const format = normalizeEnergyRecordExportFormat(query.format);
+  const sort = normalizeDetailSort(query);
+  return withEnergyRecordFilter(query, ({ whereSql, params }) => {
+    const db = openDatabase();
+    try {
+      const rows = db.prepare(
+        `SELECT
+           er.id,
+           er.source_batch_id AS sourceBatchId,
+           er.source_row_number AS sourceRowNumber,
+           et.code AS energyTypeCode,
+           et.name AS energyTypeName,
+           er.normalized_month AS normalizedMonth,
+           er.original_unit AS originalUnit,
+           er.original_value AS originalValue,
+           er.normalized_unit AS normalizedUnit,
+           er.normalized_value AS normalizedValue,
+           ou.unit_code AS organizationUnitCode,
+           ou.unit_name AS organizationUnitName,
+           ou.unit_path AS organizationUnitPath,
+           md.meter_code AS ledgerMeterCode,
+           md.meter_name AS meterDeviceName,
+           er.organization,
+           er.site,
+           er.department,
+           er.production_line AS productionLine,
+           er.meter_code AS meterCode,
+           er.business_dimension AS businessDimension,
+           er.remark,
+           er.created_at AS createdAt
+         FROM energy_records er
+         JOIN energy_types et ON et.id = er.energy_type_id
+         LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id
+         LEFT JOIN meter_devices md ON md.id = er.meter_device_id
+         ${whereSql}
+         ORDER BY ${sort.orderSql}`
+      ).all(params);
+      const generatedAt = new Date().toISOString();
+      const date = generatedAt.slice(0, 10).replace(/-/g, '');
+      const body = format === 'csv' ? renderEnergyRecordCsv(rows) : renderEnergyRecordXlsx(rows);
+      return {
+        fileName: `能耗明细-${date}.${format}`,
+        format,
+        contentType: format === 'csv'
+          ? 'text/csv; charset=utf-8'
+          : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        body,
+        rowCount: rows.length,
+        fields: ENERGY_RECORD_EXPORT_FIELDS.map((field) => field.header)
+      };
+    } finally {
+      db.close();
+    }
+  });
+}
+
 function getEnergyRecordSummary(query = {}) {
   return withEnergyRecordFilter(query, ({ whereSql, params }) => {
     const db = openDatabase();
@@ -117,6 +235,8 @@ function getEnergyRecordSummary(query = {}) {
            MAX(er.normalized_month) AS monthEnd
          FROM energy_records er
          JOIN energy_types et ON et.id = er.energy_type_id
+         LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id
+         LEFT JOIN meter_devices md ON md.id = er.meter_device_id
          ${whereSql}`
       ).get(params);
 
@@ -154,6 +274,8 @@ function getMonthlyTrend(query = {}) {
            COALESCE(AVG(er.normalized_value), 0) AS averageNormalizedValue
          FROM energy_records er
          JOIN energy_types et ON et.id = er.energy_type_id
+         LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id
+         LEFT JOIN meter_devices md ON md.id = er.meter_device_id
          ${whereSql}
          GROUP BY er.normalized_month, et.code, et.name, er.normalized_unit
          ORDER BY er.normalized_month ASC, et.display_order ASC, et.code ASC
@@ -185,6 +307,8 @@ function getEnergyTypeBreakdown(query = {}) {
            MAX(er.normalized_month) AS monthEnd
          FROM energy_records er
          JOIN energy_types et ON et.id = er.energy_type_id
+         LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id
+         LEFT JOIN meter_devices md ON md.id = er.meter_device_id
          ${whereSql}
          GROUP BY et.code, et.name, et.category, er.normalized_unit, et.display_order
          ORDER BY totalNormalizedValue DESC, et.display_order ASC, et.code ASC
@@ -214,6 +338,8 @@ function getDimensionBreakdown(query = {}) {
            MAX(er.normalized_month) AS monthEnd
          FROM energy_records er
          JOIN energy_types et ON et.id = er.energy_type_id
+         LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id
+         LEFT JOIN meter_devices md ON md.id = er.meter_device_id
          ${whereSql}
          GROUP BY dimensionValue
          ORDER BY totalNormalizedValue DESC, recordCount DESC, dimensionValue ASC
@@ -531,6 +657,8 @@ function getEnergyRecordLedgerBackfillPreview(query = {}) {
            er.normalized_month AS normalizedMonth
          FROM energy_records er
          JOIN energy_types et ON et.id = er.energy_type_id
+         LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id
+         LEFT JOIN meter_devices md ON md.id = er.meter_device_id
          ${whereSql}
          ORDER BY er.id ASC`
       ).all(params);
@@ -872,6 +1000,7 @@ function getDashboardSummary() {
 
 module.exports = {
   executeEnergyRecordLedgerBackfill,
+  exportEnergyRecords,
   exportEnergyRecordLedgerBackfillPreview,
   getDashboardSummary,
   getDimensionBreakdown,

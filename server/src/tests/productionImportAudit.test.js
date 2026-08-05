@@ -10,6 +10,7 @@ process.env.SQLITE_PATH = path.join(process.env.DATA_DIR, 'production-import-aud
 process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
 process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 process.env.PRODUCTION_OUTPUT_IMPORT_HMAC_SECRET = 'test-production-output-import-audit-secret';
+process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
 const { getDatabaseInfo, initDatabase, openDatabase } = require('../db/database');
 const { createOrganizationUnit } = require('../services/ledgerService');

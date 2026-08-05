@@ -2,7 +2,7 @@ const { badRequest } = require('../utils/errors');
 
 const MONTH_PATTERN = /^(\d{4})-(0[1-9]|1[0-2])$/;
 const SUPPORTED_PREDICTION_ALGORITHMS = Object.freeze(['moving_average', 'linear_trend']);
-const PREDICTION_RUN_STATUSES = Object.freeze(['pending', 'running', 'completed', 'failed']);
+const PREDICTION_RUN_STATUSES = Object.freeze(['pending', 'running', 'completed', 'failed', 'cancelled', 'archived']);
 const PREDICTION_SORT_COLUMNS = Object.freeze({
   createdAt: 'pr.created_at',
   completedAt: 'pr.completed_at',

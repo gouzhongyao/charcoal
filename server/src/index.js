@@ -16,6 +16,11 @@ const meterRoutes = require('./routes/meters');
 const meterReadingRoutes = require('./routes/meterReadings');
 const productionRoutes = require('./routes/production');
 const generationRoutes = require('./routes/generation');
+const energyBudgetRoutes = require('./routes/energyBudgets');
+const authRoutes = require('./routes/auth');
+const userRoutes = require('./routes/users');
+const roleRoutes = require('./routes/roles');
+const menuRoutes = require('./routes/menus');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
 
 const app = express();
@@ -95,6 +100,14 @@ app.use('/api/meters', meterRoutes);
 app.use('/api/meter-readings', meterReadingRoutes);
 app.use('/api/production', productionRoutes);
 app.use('/api/generation', generationRoutes);
+app.use('/api/energy-budgets', energyBudgetRoutes);
+app.use('/api', authRoutes);
+app.use('/api/system/users', userRoutes);
+app.use('/api/system/roles', roleRoutes);
+app.use('/api/system/menus', menuRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/roles', roleRoutes);
+app.use('/api/menus', menuRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

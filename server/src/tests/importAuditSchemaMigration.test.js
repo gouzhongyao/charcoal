@@ -9,6 +9,7 @@ process.env.DATA_DIR = path.join(tmpDir, 'data');
 process.env.SQLITE_PATH = path.join(process.env.DATA_DIR, 'import-audit-schema.sqlite');
 process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
 process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
+process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
 const {
   buildImportBatchesImportTypeMigrationSql,
@@ -44,10 +45,13 @@ try {
     ['audit_phase', 'preview_signature', 'preview_audit_digest', 'audit_context_json', 'execute_result_json', 'backup_json'].forEach((columnName) => {
       assert(getTableColumns(newDb, 'import_batches').includes(columnName), `新库 import_batches 缺少 ${columnName}。`);
     });
+    assert(getTableColumns(newDb, 'production_units').includes('source_batch_id'), '新库 production_units 应包含 source_batch_id。');
+    assert(getTableColumns(newDb, 'production_units').includes('source_row_number'), '新库 production_units 应包含 source_row_number。');
     assert(getTableColumns(newDb, 'production_output_records').includes('source_batch_id'), '新库 production_output_records 应包含 source_batch_id。');
     assert(getTableColumns(newDb, 'production_output_records').includes('source_row_number'), '新库 production_output_records 应包含 source_row_number。');
     assert(getTableColumns(newDb, 'generation_records').includes('source_batch_id'), '新库 generation_records 应包含 source_batch_id。');
     assert(getTableColumns(newDb, 'generation_records').includes('source_row_number'), '新库 generation_records 应包含 source_row_number。');
+    assert(getIndexNames(newDb, 'production_units').includes('idx_production_units_batch'), '新库应创建 production unit source batch 索引。');
     assert(getIndexNames(newDb, 'production_output_records').includes('idx_production_output_records_batch'), '新库应创建 production source batch 索引。');
     assert(getIndexNames(newDb, 'generation_records').includes('idx_generation_records_batch'), '新库应创建 generation source batch 索引。');
 
@@ -130,8 +134,24 @@ try {
     legacyDb.prepare("INSERT INTO import_errors (batch_id, row_number, field_name, raw_value, error_code, error_reason, severity) VALUES (1, 2, 'energyType', '煤', 'LEGACY_ERROR_RETAINED', '旧批次错误明细应在 import_batches 重建后保留。', 'warning')").run();
     legacyDb.exec('DROP TABLE IF EXISTS production_output_records');
     legacyDb.exec('DROP TABLE IF EXISTS generation_records');
+    legacyDb.exec('DROP TABLE IF EXISTS production_units');
+    legacyDb.exec(`CREATE TABLE production_units (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      unit_code TEXT NOT NULL UNIQUE,
+      unit_name TEXT NOT NULL,
+      organization_unit_id INTEGER NOT NULL,
+      product_name TEXT NOT NULL,
+      output_unit TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+      remark TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE RESTRICT
+    );
+    CREATE INDEX idx_production_units_org_status ON production_units(organization_unit_id, status);
+    CREATE INDEX idx_production_units_product_status ON production_units(product_name, status);`);
     legacyOrganizationUnitId = legacyDb.prepare("INSERT INTO organization_units (unit_code, unit_name, unit_path, unit_type, status, created_at, updated_at) VALUES ('AUD-OU-LEGACY', '审计旧库单元', '审计旧库单元', 'enterprise', 'active', datetime('now'), datetime('now'))").run().lastInsertRowid;
-    legacyProductionUnitId = legacyDb.prepare("INSERT INTO production_units (unit_code, unit_name, organization_unit_id, product_name, output_unit, status, created_at, updated_at) VALUES ('AUD-PU-LEGACY', '审计旧库产能单元', ?, '产品B', '件', 'active', datetime('now'), datetime('now'))").run(legacyOrganizationUnitId).lastInsertRowid;
+    legacyProductionUnitId = legacyDb.prepare("INSERT INTO production_units (unit_code, unit_name, organization_unit_id, product_name, output_unit, status, remark, created_at, updated_at) VALUES ('AUD-PU-LEGACY', '审计旧库产能单元', ?, '产品B', '件', 'active', '旧产能单元保留', datetime('now'), datetime('now'))").run(legacyOrganizationUnitId).lastInsertRowid;
     legacyPhotovoltaicId = legacyDb.prepare("SELECT id FROM energy_types WHERE code = 'photovoltaic'").get().id;
     legacyDb.exec(`CREATE TABLE production_output_records (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -192,11 +212,15 @@ try {
     assert.strictEqual(retainedLegacyError.severity, 'warning');
     const productionBatchId = upgradedDb.prepare("INSERT INTO import_batches (import_type, original_filename, file_type, status, audit_phase, total_rows, success_count, failure_count, skipped_count) VALUES ('production_output', 'legacy-production.csv', 'csv', 'completed', 'execute', 1, 1, 0, 0)").run().lastInsertRowid;
     const generationBatchId = upgradedDb.prepare("INSERT INTO import_batches (import_type, original_filename, file_type, status, audit_phase, total_rows, success_count, failure_count, skipped_count) VALUES ('generation_record', 'legacy-generation.csv', 'csv', 'completed', 'execute', 1, 1, 0, 0)").run().lastInsertRowid;
+    assert(getTableColumns(upgradedDb, 'production_units').includes('source_batch_id'), '旧 production_units 应补充 source_batch_id。');
+    assert(getTableColumns(upgradedDb, 'production_units').includes('source_row_number'), '旧 production_units 应补充 source_row_number。');
+    assert.strictEqual(upgradedDb.prepare("SELECT COUNT(*) AS total FROM production_units WHERE remark = '旧产能单元保留' AND source_batch_id IS NULL AND source_row_number IS NULL").get().total, 1, '旧 production_units 数据应保留且 source 默认 NULL。');
     assert.strictEqual(upgradedDb.prepare("SELECT COUNT(*) AS total FROM production_output_records WHERE remark = '旧产量保留' AND source_batch_id IS NULL AND source_row_number IS NULL").get().total, 1, '旧 production_output_records 应保留且 source 默认 NULL。');
     assert.strictEqual(upgradedDb.prepare("SELECT COUNT(*) AS total FROM generation_records WHERE remark = '旧发电保留' AND source_batch_id IS NULL AND source_row_number IS NULL").get().total, 1, '旧 generation_records 应保留且 source 默认 NULL。');
     upgradedDb.prepare("INSERT INTO production_output_records (source_batch_id, source_row_number, production_unit_id, normalized_month, output_value, output_unit, data_source, record_status, created_at, updated_at) VALUES (?, 8, ?, '2026-05', 6, '件', 'upload', 'active', datetime('now'), datetime('now'))").run(productionBatchId, legacyProductionUnitId);
     upgradedDb.prepare("INSERT INTO generation_records (source_batch_id, source_row_number, organization_unit_id, energy_type_id, normalized_month, generation_value_kwh, self_use_value_kwh, grid_export_value_kwh, data_source, record_status, created_at, updated_at) VALUES (?, 9, ?, ?, '2026-05', 70, 50, 20, 'upload', 'active', datetime('now'), datetime('now'))").run(generationBatchId, legacyOrganizationUnitId, legacyPhotovoltaicId);
     assert(getIndexNames(upgradedDb, 'import_batches').includes('idx_import_batches_type_status_created'), '重建 import_batches 后应保留 type/status 索引。');
+    assert(getIndexNames(upgradedDb, 'production_units').includes('idx_production_units_batch'), '旧库升级后应在补列后创建 production unit source batch 索引。');
     assert(getIndexNames(upgradedDb, 'production_output_records').includes('idx_production_output_records_batch'), '旧库升级后应创建 production source batch 索引。');
     assert(getIndexNames(upgradedDb, 'generation_records').includes('idx_generation_records_batch'), '旧库升级后应创建 generation source batch 索引。');
     assert.deepStrictEqual(upgradedDb.prepare('PRAGMA foreign_key_check').all(), [], '隔离库升级后 foreign_key_check 应通过。');

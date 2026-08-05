@@ -1559,6 +1559,56 @@ function selectMeterRowsForExport(db, query = {}) {
   ).all({ ...params, limit: MAX_LEDGER_EXPORT_ROWS });
 }
 
+function getOrganizationUnitStats() {
+  const db = openDatabase();
+  try {
+    const totals = db.prepare(`SELECT
+      COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END), 0) AS inactive
+      FROM organization_units`).get();
+    const byType = db.prepare(`SELECT unit_type AS unitType, COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END), 0) AS inactive
+      FROM organization_units GROUP BY unit_type ORDER BY unit_type ASC`).all();
+    const byPathDepth = db.prepare(`SELECT
+      CASE WHEN unit_path IS NULL OR unit_path = '' THEN 0 ELSE LENGTH(unit_path) - LENGTH(REPLACE(unit_path, '/', '')) + 1 END AS pathDepth,
+      COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END), 0) AS inactive
+      FROM organization_units GROUP BY pathDepth ORDER BY pathDepth ASC`).all();
+    return { total: Number(totals.total || 0), active: Number(totals.active || 0), inactive: Number(totals.inactive || 0), byType, byPathDepth };
+  } finally {
+    db.close();
+  }
+}
+
+function getMeterStats() {
+  const db = openDatabase();
+  try {
+    const totals = db.prepare(`SELECT
+      COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END), 0) AS inactive
+      FROM meter_devices`).get();
+    const byEnergyType = db.prepare(`SELECT et.code AS energyTypeCode, et.name AS energyTypeName,
+      COUNT(md.id) AS total,
+      COALESCE(SUM(CASE WHEN md.status = 'active' THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN md.status = 'inactive' THEN 1 ELSE 0 END), 0) AS inactive
+      FROM meter_devices md JOIN energy_types et ON et.id = md.energy_type_id
+      GROUP BY et.id, et.code, et.name ORDER BY et.display_order ASC, et.code ASC`).all();
+    const byOrganizationUnit = db.prepare(`SELECT ou.id AS organizationUnitId, ou.unit_code AS organizationUnitCode,
+      ou.unit_name AS organizationUnitName, ou.unit_path AS organizationUnitPath, COUNT(md.id) AS total,
+      COALESCE(SUM(CASE WHEN md.status = 'active' THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN md.status = 'inactive' THEN 1 ELSE 0 END), 0) AS inactive
+      FROM meter_devices md JOIN organization_units ou ON ou.id = md.organization_unit_id
+      GROUP BY ou.id, ou.unit_code, ou.unit_name, ou.unit_path ORDER BY ou.unit_path ASC`).all();
+    return { total: Number(totals.total || 0), active: Number(totals.active || 0), inactive: Number(totals.inactive || 0), byEnergyType, byOrganizationUnit };
+  } finally {
+    db.close();
+  }
+}
+
 function exportOrganizationUnits(query = {}) {
   const format = String(query.format || 'xlsx').toLowerCase() === 'csv' ? 'csv' : 'xlsx';
   const db = openDatabase();
@@ -1608,6 +1658,8 @@ module.exports = {
   exportMeters,
   exportOrganizationUnits,
   findLedgerAssociationsForImportRecord,
+  getMeterStats,
+  getOrganizationUnitStats,
   listMeters,
   listOrganizationUnits,
   loadActiveLedgerIndexes,

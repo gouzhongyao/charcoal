@@ -465,6 +465,11 @@ function buildGenerationWhere(query = {}, db = null) {
     where.push('gr.record_status = @recordStatus');
     params.recordStatus = status;
   }
+  const keyword = normalizeText(query.keyword || query.search);
+  if (keyword) {
+    where.push('(ou.unit_code LIKE @keyword OR ou.unit_name LIKE @keyword OR ou.unit_path LIKE @keyword OR gr.remark LIKE @keyword)');
+    params.keyword = `%${keyword}%`;
+  }
   const monthStart = normalizeOptionalMonth(firstDefined(query, ['monthStart', 'normalizedMonthStart', 'month_start']), 'monthStart');
   if (monthStart) {
     where.push('gr.normalized_month >= @monthStart');
@@ -1804,6 +1809,37 @@ function getMonthlyGenerationStatistics(query = {}) {
   }
 }
 
+function getGenerationStats(query = {}) {
+  const db = openDatabase();
+  try {
+    const scopedQuery = { ...query, status: undefined, recordStatus: undefined, record_status: undefined };
+    const { whereSql, params } = buildGenerationWhere(scopedQuery, db);
+    const totals = db.prepare(`SELECT COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN gr.record_status = 'active' THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN gr.record_status = 'void' THEN 1 ELSE 0 END), 0) AS void
+      FROM generation_records gr JOIN organization_units ou ON ou.id = gr.organization_unit_id
+      JOIN energy_types et ON et.id = gr.energy_type_id ${whereSql}`).get(params);
+    const activeWhereSql = `${whereSql}${whereSql ? ' AND' : 'WHERE'} gr.record_status = 'active'`;
+    const monthly = db.prepare(`SELECT gr.normalized_month AS normalizedMonth,
+      COUNT(*) AS recordCount, COALESCE(SUM(gr.generation_value_kwh), 0) AS generationValueKwh,
+      COALESCE(SUM(gr.self_use_value_kwh), 0) AS selfUseValueKwh,
+      COALESCE(SUM(gr.grid_export_value_kwh), 0) AS gridExportValueKwh
+      FROM generation_records gr JOIN organization_units ou ON ou.id = gr.organization_unit_id
+      JOIN energy_types et ON et.id = gr.energy_type_id ${activeWhereSql}
+      GROUP BY gr.normalized_month ORDER BY gr.normalized_month DESC`).all(params).map((row) => ({
+      ...row,
+      generationValueKwh: Number(row.generationValueKwh || 0),
+      selfUseValueKwh: Number(row.selfUseValueKwh || 0),
+      gridExportValueKwh: Number(row.gridExportValueKwh || 0),
+      selfUseRate: Number(row.generationValueKwh || 0) > 0 ? Number(row.selfUseValueKwh || 0) / Number(row.generationValueKwh || 0) : null,
+      gridExportRate: Number(row.generationValueKwh || 0) > 0 ? Number(row.gridExportValueKwh || 0) / Number(row.generationValueKwh || 0) : null
+    }));
+    return { total: Number(totals.total || 0), active: Number(totals.active || 0), void: Number(totals.void || 0), monthly, meta: buildGenerationMeta() };
+  } finally {
+    db.close();
+  }
+}
+
 function buildGenerationMeta(extra = {}) {
   return {
     referenceOnly: true,
@@ -1955,6 +1991,7 @@ module.exports = {
   exportGenerationRecords,
   getGenerationImportExportContract,
   getGenerationRecordImportHmacSecret,
+  getGenerationStats,
   getMonthlyGenerationStatistics,
   listGenerationRecords,
   normalizeGenerationPayload,

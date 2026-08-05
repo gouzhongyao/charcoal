@@ -121,6 +121,7 @@ function normalizeEnergyRecordFilters(query = {}) {
     normalizedMonthEnd,
     energyTypeCode: normalizeText(query.energyTypeCode),
     organization: normalizeText(query.organization),
+    keyword: normalizeText(firstDefined(query, ['keyword', 'search'])),
     site: normalizeText(query.site),
     department: normalizeText(query.department),
     organizationUnitId: normalizePositiveInteger(firstDefined(query, ['organizationUnitId', 'organization_unit_id', 'orgId']), 'organizationUnitId'),
@@ -148,6 +149,26 @@ function buildEnergyRecordWhere(filters = {}) {
   if (filters.organization) {
     where.push('er.organization = @organization');
     params.organization = filters.organization;
+  }
+  if (filters.keyword) {
+    where.push(`(
+      et.code LIKE @keyword ESCAPE '\\'
+      OR et.name LIKE @keyword ESCAPE '\\'
+      OR er.organization LIKE @keyword ESCAPE '\\'
+      OR er.site LIKE @keyword ESCAPE '\\'
+      OR er.department LIKE @keyword ESCAPE '\\'
+      OR er.production_line LIKE @keyword ESCAPE '\\'
+      OR er.meter_code LIKE @keyword ESCAPE '\\'
+      OR er.business_dimension LIKE @keyword ESCAPE '\\'
+      OR er.remark LIKE @keyword ESCAPE '\\'
+      OR ou.unit_code LIKE @keyword ESCAPE '\\'
+      OR ou.unit_name LIKE @keyword ESCAPE '\\'
+      OR ou.unit_path LIKE @keyword ESCAPE '\\'
+      OR md.meter_code LIKE @keyword ESCAPE '\\'
+      OR md.meter_name LIKE @keyword ESCAPE '\\'
+      OR md.install_location LIKE @keyword ESCAPE '\\'
+    )`);
+    params.keyword = `%${filters.keyword.replace(/[\\%_]/g, '\\$&')}%`;
   }
   if (filters.site) {
     where.push('er.site = @site');

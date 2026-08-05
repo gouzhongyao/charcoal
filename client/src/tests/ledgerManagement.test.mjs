@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { blankForm, buildControlledExecutePayload, buildLedgerFilters, canExecutePreview, chartRows, nextLedgerStatus } from '../utils/ledgerManagement.js';
+assert.deepEqual(buildLedgerFilters({ keyword: '仪表', status: '', monthStart: '2026-01' }, { page: 2, pageSize: 20 }), { keyword: '仪表', monthStart: '2026-01', page: 2, pageSize: 20 });
+assert.equal(nextLedgerStatus('active'), 'inactive'); assert.equal(nextLedgerStatus('active', true), 'void');
+assert.deepEqual(chartRows([{ unitType: 'department', total: '3' }], 'unitType', 'total'), [{ label: 'department', value: 3, color: '#2a78d6' }]);
+const preview = { batchId: 9, confirmText: '确认导入发电自用记录', previewSignature: 'sig', summary: { wouldImport: 1 }, candidateRowIds: [2], candidateRows: [{ rowNumber: 2 }] };
+assert.equal(canExecutePreview(preview), true); assert.deepEqual(buildControlledExecutePayload(preview, 'generation').candidateRowIds, [2]);
+const productionUnitPreview = { batchId: 11, confirmText: '确认导入产能单元', previewSignature: 'unit-sig', summary: { wouldImport: 2 }, candidateRowIds: [2, 4], candidateRows: [{ rowNumber: 2, unitCode: 'PU-001' }, { rowNumber: 4, unitCode: 'PU-002' }] };
+assert.equal(canExecutePreview(productionUnitPreview), true); assert.deepEqual(buildControlledExecutePayload(productionUnitPreview, 'production').candidateRows.map((row) => row.unitCode), ['PU-001', 'PU-002']);
+const generation = { confirmText: '确认由抄表生成能耗记录', previewSignature: 'sig', summary: { wouldGenerate: 2 }, candidateReadingIds: [3, 5], filters: { monthStart: '2026-01' } };
+assert.equal(canExecutePreview(generation, 'reading-generation'), true); assert.deepEqual(buildControlledExecutePayload(generation, 'reading-generation').candidateReadingIds, [3, 5]);
+assert.equal(blankForm('productionOutputs').recordStatus, 'active');
+const ledgerApiSource = readFileSync(new URL('../api/ledger.js', import.meta.url), 'utf8');
+['/production/units/import/preview', '/production/units/import/execute', '/production/units/export', "template('production-units', '产能单元')"].forEach((contract) => assert.ok(ledgerApiSource.includes(contract), `missing production-unit API contract: ${contract}`));
+console.log('ledger management logic tests passed');

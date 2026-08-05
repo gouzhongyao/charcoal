@@ -403,6 +403,11 @@ function buildReadingWhere(query = {}) {
     where.push('et.code = @energyTypeCode');
     params.energyTypeCode = energyTypeCode;
   }
+  const keyword = normalizeText(query.keyword || query.search);
+  if (keyword) {
+    where.push('(md.meter_code LIKE @keyword OR md.meter_name LIKE @keyword OR ou.unit_path LIKE @keyword OR et.code LIKE @keyword OR et.name LIKE @keyword OR mrr.remark LIKE @keyword)');
+    params.keyword = `%${keyword}%`;
+  }
   const status = normalizeText(query.status || query.recordStatus);
   if (status) {
     assertWhitelist(status, 'status', READING_STATUSES);
@@ -1312,6 +1317,31 @@ async function executeMeterReadingEnergyRecordGeneration(body = {}) {
   }
 }
 
+function getMeterReadingStats(query = {}) {
+  const db = openDatabase();
+  try {
+    const { whereSql, params } = buildReadingWhere(query);
+    const fromSql = `FROM meter_reading_records mrr
+      JOIN meter_devices md ON md.id = mrr.meter_device_id
+      JOIN energy_types et ON et.id = mrr.energy_type_id
+      LEFT JOIN organization_units ou ON ou.id = mrr.organization_unit_id`;
+    const totals = db.prepare(`SELECT COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN mrr.record_status = 'active' THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN mrr.record_status = 'void' THEN 1 ELSE 0 END), 0) AS void
+      ${fromSql} ${whereSql}`).get(params);
+    const byMonthEnergyType = db.prepare(`SELECT mrr.normalized_month AS normalizedMonth,
+      et.code AS energyTypeCode, et.name AS energyTypeName, mrr.normalized_unit AS normalizedUnit,
+      mrr.record_status AS recordStatus, COUNT(*) AS recordCount,
+      COALESCE(SUM(mrr.normalized_usage_value), 0) AS normalizedUsageValue
+      ${fromSql} ${whereSql}
+      GROUP BY mrr.normalized_month, et.code, et.name, mrr.normalized_unit, mrr.record_status
+      ORDER BY mrr.normalized_month DESC, et.code ASC, mrr.normalized_unit ASC, mrr.record_status ASC`).all();
+    return { total: Number(totals.total || 0), active: Number(totals.active || 0), void: Number(totals.void || 0), byMonthEnergyType };
+  } finally {
+    db.close();
+  }
+}
+
 module.exports = {
   EXPORT_FIELDS,
   METER_READING_GENERATION_BACKUP_REASON,
@@ -1330,6 +1360,7 @@ module.exports = {
   exportMeterReadingEnergyRecordGenerationPreview,
   exportMeterReadings,
   getMeterReadingEnergyRecordGenerationPreview,
+  getMeterReadingStats,
   listMeterReadings,
   mapMeterReadingImportFields,
   normalizeReadingDate,

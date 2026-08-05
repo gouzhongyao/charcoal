@@ -1,5 +1,8 @@
 const { getImportParseLimits } = require('./import/parser');
 const { getGenerationImportExportContract } = require('./generationService');
+const { getEnergyBudgetContract } = require('./energyBudgetService');
+const { getCarbonManagementContract } = require('./carbonAccountingService');
+const { getPredictionManagementContract } = require('./predictionService');
 
 const importRequiredFields = [
   { key: 'period', internalKey: 'month', label: '月份', normalizedTo: 'YYYY-MM', required: true, examples: ['2026-01', '2026/01', '2026.01', '2026-01-01 00:00:00', 'Excel 日期单元格'] },
@@ -136,35 +139,7 @@ function getEnergyRecordContract() {
 }
 
 function getCarbonContract() {
-  return {
-    status: 'implemented-basic',
-    factorTable: 'carbon_factors',
-    emissionTable: 'carbon_emissions',
-    factorFields: ['energyTypeCode', 'region', 'factorYear', 'unit', 'factorValue', 'factorUnit', 'source', 'sourceUrl', 'effectiveFrom', 'effectiveTo', 'isActive'],
-    factorRoutes: {
-      list: 'GET /api/carbon/factors',
-      upsert: 'POST /api/carbon/factors 或 POST /api/carbon/factors/upsert',
-      toggleStatus: 'PATCH /api/carbon/factors/:factorId/status'
-    },
-    matchingKeys: ['energyTypeCode', 'normalizedUnit', 'region', 'factorYear', 'isActive'],
-    matchingPriority: ['指定 region + 记录年份', 'default region + 记录年份', '指定 region + 通用年份', 'default region + 通用年份'],
-    calculationBasis: 'energy_records.normalized_value * carbon_factors.factor_value',
-    emissionRoutes: {
-      calculate: 'POST /api/carbon/emissions/calculate',
-      list: 'GET /api/carbon/emissions',
-      statistics: 'GET /api/carbon/emissions/statistics?groupBy=month|energyType|organization|site',
-      missingFactors: 'GET /api/carbon/emissions/missing-factors'
-    },
-    recalculationPolicy: '同一 energyRecordId + calculationMethod 重新计算前会将旧结果标记为 superseded，默认查询不返回 superseded，避免重复 active 结果。',
-    missingFactorPolicy: '缺少匹配因子时写入 factor_missing 状态，emissionValue 保持 null，不伪造排放结果。',
-    templates: {
-      list: 'GET /api/templates',
-      recommendedFormat: 'xlsx',
-      carbonFactors: 'GET /api/templates/carbon-factors.xlsx',
-      csvCompatibility: 'GET /api/templates/carbon-factors.csv',
-      note: '当前碳因子模板用于维护参考和字段整理，默认下载 Excel .xlsx，CSV 仅保留兼容；字段使用能源类型编码、有效开始日期、有效结束日期和 true/false 是否启用；页面按表单逐条保存，未提供碳因子批量上传接口。'
-    }
-  };
+  return getCarbonManagementContract();
 }
 
 function getBackupContract() {
@@ -190,32 +165,7 @@ function getBackupContract() {
 }
 
 function getPredictionContract() {
-  return {
-    status: 'implemented-basic',
-    runTable: 'prediction_runs',
-    resultTable: 'prediction_results',
-    implementedAlgorithms: ['moving_average', 'linear_trend'],
-    reservedAlgorithms: ['year_over_year', 'manual_baseline'],
-    runStatuses: ['pending', 'running', 'completed', 'failed'],
-    routes: {
-      createRun: 'POST /api/predictions/runs',
-      listRuns: 'GET /api/predictions/runs',
-      getRunDetail: 'GET /api/predictions/runs/:runId',
-      listRunResults: 'GET /api/predictions/runs/:runId/results',
-      listResults: 'GET /api/predictions/results'
-    },
-    createFields: ['name', 'algorithm', 'energyTypeCode', 'trainStartMonth', 'trainEndMonth', 'predictStartMonth', 'predictEndMonth', 'organization', 'site', 'department', 'sourceBatchId', 'windowSize'],
-    historyPolicy: '至少需要 3 个历史样本月份；移动平均可通过 windowSize 设置 2-12 个月窗口，样本不足时预测运行标记 failed 且不写入预测结果。',
-    warningPolicy: '预测说明会写入 parameters_json、note 和 method_note；结果仅作本地轻量趋势参考，不应表述为高精度 AI/机器学习预测。',
-    templates: {
-      list: 'GET /api/templates',
-      recommendedFormat: 'xlsx',
-      predictionHistory: 'GET /api/templates/prediction-history.xlsx',
-      reusableTemplateType: 'energy-records',
-      csvCompatibility: 'GET /api/templates/prediction-history.csv',
-      note: '预测历史数据沿用能耗记录导入结构，可复用能耗数据导入模板或下载预测历史数据模板；前端默认下载 Excel .xlsx。'
-    }
-  };
+  return getPredictionManagementContract();
 }
 
 function getApiContract() {
@@ -240,6 +190,7 @@ function getApiContract() {
       meters: 'GET/POST/PUT/DELETE /api/meters 计量器具 CRUD；POST /api/meters/import 导入；GET /api/meters/export?format=xlsx|csv 导出当前筛选结果；DELETE 返回停用结果；在线状态和网关 ID 仅为台账字段',
       meterReadings: 'GET/POST/PUT/DELETE /api/meter-readings；POST /api/meter-readings/import 导入抄表；GET /api/meter-readings/export 导出当前筛选结果；抄表不自动进入 energy_records',
       generation: 'GET/POST/PUT/DELETE /api/generation/records；GET /api/generation/contract 查看发电自用导入导出契约；GET /api/generation/records/export 导出当前筛选结果；POST /api/generation/records/import/preview 预演不写库；POST /api/generation/records/import/execute 受控导入只写 generation_records',
+      energyBudgets: 'GET/POST/PUT/PATCH /api/energy-budgets；GET /api/energy-budgets/execution-comparison 按 active 预算与 active energy_records.normalized_value 做月度执行对比，并返回默认 80/100 阈值预警字段与汇总；GET /api/energy-budgets/contract 查看用能预算 P2 最小预警契约',
       energyRecords: 'GET /api/energy-records 查询已导入 active 能耗记录，兼容 organization/site/department 文本筛选并支持 organizationUnitId/meterDeviceId；GET /api/energy-records/contract 查看契约',
       energyStatistics: 'GET /api/energy-records/statistics/summary、monthly-trend、energy-type-breakdown、dimension-breakdown 查询基础统计聚合',
       dashboardSummary: 'GET /api/dashboard/summary 查询仅基于能耗记录、导入批次和错误数量的工作台摘要',
@@ -257,6 +208,7 @@ module.exports = {
   getApiContract,
   getBackupContract,
   getCarbonContract,
+  getEnergyBudgetContract,
   getEnergyRecordContract,
   getGenerationContract,
   getImportContract,

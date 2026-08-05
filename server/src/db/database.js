@@ -95,8 +95,35 @@ CREATE TABLE IF NOT EXISTS meter_reading_records (
   CHECK (current_value >= previous_value)
 );`;
 
+const ENERGY_BUDGETS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS energy_budgets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  period_month TEXT NOT NULL CHECK (
+    period_month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
+    AND CAST(substr(period_month, 6, 2) AS INTEGER) BETWEEN 1 AND 12
+  ),
+  energy_type_id INTEGER NOT NULL,
+  organization_scope TEXT NOT NULL DEFAULT '整体',
+  budget_value REAL NOT NULL CHECK (budget_value >= 0),
+  unit TEXT NOT NULL,
+  remark TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+  UNIQUE (period_month, energy_type_id, organization_scope)
+);
+
+CREATE INDEX IF NOT EXISTS idx_energy_budgets_month_type_status ON energy_budgets(period_month, energy_type_id, status);
+CREATE INDEX IF NOT EXISTS idx_energy_budgets_scope_status ON energy_budgets(organization_scope, status);
+CREATE INDEX IF NOT EXISTS idx_energy_budgets_batch ON energy_budgets(source_batch_id);`;
+
 const PRODUCTION_TABLES_SQL = `CREATE TABLE IF NOT EXISTS production_units (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
   unit_code TEXT NOT NULL UNIQUE,
   unit_name TEXT NOT NULL,
   organization_unit_id INTEGER NOT NULL,
@@ -106,6 +133,7 @@ const PRODUCTION_TABLES_SQL = `CREATE TABLE IF NOT EXISTS production_units (
   remark TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
   FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE RESTRICT
 );
 
@@ -131,6 +159,7 @@ CREATE TABLE IF NOT EXISTS production_output_records (
 
 CREATE INDEX IF NOT EXISTS idx_production_units_org_status ON production_units(organization_unit_id, status);
 CREATE INDEX IF NOT EXISTS idx_production_units_product_status ON production_units(product_name, status);
+CREATE INDEX IF NOT EXISTS idx_production_units_batch ON production_units(source_batch_id);
 CREATE INDEX IF NOT EXISTS idx_production_output_records_unit_month ON production_output_records(production_unit_id, normalized_month);
 CREATE INDEX IF NOT EXISTS idx_production_output_records_status_month ON production_output_records(record_status, normalized_month);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_production_output_records_active_unit_month ON production_output_records(production_unit_id, normalized_month) WHERE record_status = 'active';`;
@@ -205,9 +234,54 @@ SELECT
 FROM generation_records`;
 }
 
+const PREDICTION_CONFIGS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS prediction_configs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  name TEXT NOT NULL,
+  note TEXT,
+  energy_type_id INTEGER,
+  organization_scope TEXT,
+  site TEXT,
+  department TEXT,
+  source_batch_filter_id INTEGER,
+  train_start_month TEXT NOT NULL,
+  train_end_month TEXT NOT NULL,
+  predict_start_month TEXT NOT NULL,
+  predict_end_month TEXT NOT NULL,
+  algorithm TEXT NOT NULL CHECK (algorithm IN ('moving_average', 'linear_trend')),
+  window_size INTEGER CHECK (window_size IS NULL OR window_size BETWEEN 2 AND 12),
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'active', 'archived')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  archived_at TEXT,
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prediction_configs_status_updated ON prediction_configs(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prediction_configs_energy_month ON prediction_configs(energy_type_id, predict_start_month, predict_end_month);
+CREATE INDEX IF NOT EXISTS idx_prediction_configs_batch ON prediction_configs(source_batch_id);`;
+
+const PREDICTION_RUNS_TABLE_WITH_MANAGEMENT_STATUSES_SQL = `CREATE TABLE prediction_runs__migration_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  algorithm TEXT NOT NULL CHECK (algorithm IN ('moving_average', 'linear_trend', 'year_over_year', 'manual_baseline')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled', 'archived')),
+  target_energy_type_id INTEGER,
+  train_start_month TEXT,
+  train_end_month TEXT,
+  predict_start_month TEXT,
+  predict_end_month TEXT,
+  parameters_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  completed_at TEXT,
+  note TEXT,
+  FOREIGN KEY (target_energy_type_id) REFERENCES energy_types(id) ON DELETE SET NULL
+);`;
+
 const IMPORT_BATCHES_TABLE_WITH_LEDGER_TYPES_SQL = `CREATE TABLE import_batches__migration_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_output', 'generation_record')),
+  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_unit', 'production_output', 'generation_record', 'energy_budget', 'carbon_factor', 'prediction_config')),
   original_filename TEXT NOT NULL,
   stored_filename TEXT,
   file_type TEXT NOT NULL CHECK (file_type IN ('xlsx', 'xls', 'csv')),
@@ -359,7 +433,7 @@ function importBatchesImportTypeCheckAllowsLedgerTypes(createTableSql) {
 
 function importBatchesImportTypeCheckAllowsAuditTypes(createTableSql) {
   const sql = createTableSql || '';
-  return /import_type\s+TEXT[\s\S]*CHECK\s*\([\s\S]*import_type\s+IN\s*\([\s\S]*'organization_unit'[\s\S]*'meter_device'[\s\S]*'production_output'[\s\S]*'generation_record'/i.test(sql);
+  return /import_type\s+TEXT[\s\S]*CHECK\s*\([\s\S]*import_type\s+IN\s*\([\s\S]*'organization_unit'[\s\S]*'meter_device'[\s\S]*'production_unit'[\s\S]*'production_output'[\s\S]*'generation_record'[\s\S]*'energy_budget'[\s\S]*'carbon_factor'[\s\S]*'prediction_config'/i.test(sql);
 }
 
 function importBatchesHasAuditColumns(columns) {
@@ -375,6 +449,14 @@ function importBatchesHasAuditColumns(columns) {
 
 function generationRecordsDataSourceCheckAllowsUpload(createTableSql) {
   return /data_source\s+TEXT[\s\S]*CHECK\s*\([\s\S]*data_source\s+IN\s*\([\s\S]*'upload'/i.test(createTableSql || '');
+}
+
+function importBatchesImportTypeCheckAllowsPredictionConfig(createTableSql) {
+  return /import_type\s+TEXT[\s\S]*CHECK\s*\([\s\S]*'prediction_config'/i.test(createTableSql || '');
+}
+
+function predictionRunsStatusCheckAllowsManagementStatuses(createTableSql) {
+  return /status\s+TEXT[\s\S]*CHECK\s*\([\s\S]*'cancelled'[\s\S]*'archived'/i.test(createTableSql || '');
 }
 
 function buildImportBatchesImportTypeMigrationSql() {
@@ -511,6 +593,34 @@ function migrateGenerationRecordsDataSourceCheck(db) {
   return true;
 }
 
+function ensurePredictionConfigsTable(db) {
+  const existed = Boolean(getTableCreateSql(db, 'prediction_configs'));
+  db.exec(PREDICTION_CONFIGS_TABLE_SQL);
+  return !existed;
+}
+
+function migratePredictionRunsStatusCheck(db) {
+  const createTableSql = getTableCreateSql(db, 'prediction_runs');
+  if (!createTableSql || predictionRunsStatusCheckAllowsManagementStatuses(createTableSql)) return false;
+  const wasForeignKeysEnabled = db.pragma('foreign_keys', { simple: true }) === 1;
+  db.pragma('foreign_keys = OFF');
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec('DROP TABLE IF EXISTS prediction_runs__migration_new');
+      db.exec(PREDICTION_RUNS_TABLE_WITH_MANAGEMENT_STATUSES_SQL);
+      db.exec(`INSERT INTO prediction_runs__migration_new (id, name, algorithm, status, target_energy_type_id, train_start_month, train_end_month, predict_start_month, predict_end_month, parameters_json, created_at, completed_at, note)
+        SELECT id, name, algorithm, CASE WHEN status IN ('pending', 'running', 'completed', 'failed', 'cancelled', 'archived') THEN status ELSE 'failed' END, target_energy_type_id, train_start_month, train_end_month, predict_start_month, predict_end_month, parameters_json, created_at, completed_at, note FROM prediction_runs`);
+      db.exec('DROP TABLE prediction_runs');
+      db.exec('ALTER TABLE prediction_runs__migration_new RENAME TO prediction_runs');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_prediction_runs_status_created ON prediction_runs(status, created_at DESC)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_prediction_results_run_month ON prediction_results(prediction_run_id, target_month)');
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  } finally { if (wasForeignKeysEnabled) db.pragma('foreign_keys = ON'); }
+  return true;
+}
+
 function getTableColumns(db, tableName) {
   return db.prepare(`PRAGMA table_info(${tableName})`).all().map((column) => column.name);
 }
@@ -536,7 +646,7 @@ function migrateEnergyRecordLedgerColumns(db) {
     db,
     'import_batches',
     'import_type',
-    "import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_output', 'generation_record'))"
+    "import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_output', 'generation_record', 'energy_budget', 'carbon_factor'))"
   );
   const addedOrganizationUnit = addColumnIfMissing(
     db,
@@ -553,8 +663,52 @@ function migrateEnergyRecordLedgerColumns(db) {
   return addedImportType || addedOrganizationUnit || addedMeterDevice;
 }
 
+function ensureEnergyBudgetsTable(db) {
+  const beforeSql = getTableCreateSql(db, 'energy_budgets');
+  db.exec(ENERGY_BUDGETS_TABLE_SQL);
+  return !beforeSql;
+}
+
+function migrateEnergyBudgetImportSourceColumns(db) {
+  if (!getTableCreateSql(db, 'energy_budgets')) {
+    return false;
+  }
+  let changed = false;
+  changed = addColumnIfMissing(
+    db,
+    'energy_budgets',
+    'source_batch_id',
+    'source_batch_id INTEGER REFERENCES import_batches(id) ON DELETE SET NULL'
+  ) || changed;
+  changed = addColumnIfMissing(
+    db,
+    'energy_budgets',
+    'source_row_number',
+    'source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1)'
+  ) || changed;
+  db.exec('CREATE INDEX IF NOT EXISTS idx_energy_budgets_batch ON energy_budgets(source_batch_id)');
+  return changed;
+}
+
 function migrateImportAuditSourceColumns(db) {
   let changed = false;
+
+  if (getTableCreateSql(db, 'production_units')) {
+    // 旧库只可空补充产能单元导入来源，不重建台账或改变停用语义。
+    changed = addColumnIfMissing(
+      db,
+      'production_units',
+      'source_batch_id',
+      'source_batch_id INTEGER REFERENCES import_batches(id) ON DELETE SET NULL'
+    ) || changed;
+    changed = addColumnIfMissing(
+      db,
+      'production_units',
+      'source_row_number',
+      'source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1)'
+    ) || changed;
+    db.exec('CREATE INDEX IF NOT EXISTS idx_production_units_batch ON production_units(source_batch_id)');
+  }
 
   if (getTableCreateSql(db, 'production_output_records')) {
     // 旧库用可空补列而非重建业务表，保留既有唯一索引与写入语义；新库 schema 仍声明完整 FK/CHECK。
@@ -590,7 +744,172 @@ function migrateImportAuditSourceColumns(db) {
     db.exec('CREATE INDEX IF NOT EXISTS idx_generation_records_batch ON generation_records(source_batch_id)');
   }
 
+  if (getTableCreateSql(db, 'carbon_factors')) {
+    // 碳因子历史数据保留；仅补充导入来源追溯列，不重建或删除既有因子/排放结果。
+    changed = addColumnIfMissing(
+      db,
+      'carbon_factors',
+      'source_batch_id',
+      'source_batch_id INTEGER REFERENCES import_batches(id) ON DELETE SET NULL'
+    ) || changed;
+    changed = addColumnIfMissing(
+      db,
+      'carbon_factors',
+      'source_row_number',
+      'source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1)'
+    ) || changed;
+    db.exec('CREATE INDEX IF NOT EXISTS idx_carbon_factors_batch ON carbon_factors(source_batch_id)');
+  }
+
   return changed;
+}
+
+// 每项最后一个值是父菜单 route_path；仅超管获得全部种子，普通 user 保持个人中心最小权限。
+const RBAC_MENU_SEEDS = [
+  ['directory', '系统管理', '/system', null, null, 'Setting', 100, null],
+  ['menu', '用户管理', '/system/users', 'system/users/index', 'system:user:view', 'User', 110, '/system'],
+  ['menu', '角色管理', '/system/roles', 'system/roles/index', 'system:role:view', 'Avatar', 120, '/system'],
+  ['menu', '菜单管理', '/system/menus', 'system/menus/index', 'system:menu:view', 'Menu', 130, '/system'],
+  ['menu', '备份恢复', '/system/backups', 'system/backups/index', 'system:backup:view', 'FolderOpened', 140, '/system'],
+  ['menu', '个人中心', '/profile', 'profile/index', 'system:profile:update', 'UserFilled', 10, null],
+  ['menu', '工作台', '/dashboard', 'dashboard/index', 'dashboard:view', 'DataBoard', 20, null],
+  ['menu', '数据导入', '/imports', 'imports/index', 'imports:view', 'UploadFilled', 30, null],
+  ['directory', '能耗管理', '/energy', null, null, 'TrendCharts', 40, null],
+  ['menu', '能耗统计', '/energy/statistics', 'energy/statistics/index', 'energy:statistics:view', 'Histogram', 41, '/energy'],
+  ['menu', '用能预算', '/energy/budgets', 'energy/budgets/index', 'energy:budget:view', 'Wallet', 42, '/energy'],
+  ['directory', '基础台账', '/ledger', null, null, 'Collection', 50, null],
+  ['menu', '组织管理', '/ledger/organization', 'ledger/organization/index', 'ledger:organization:view', 'OfficeBuilding', 51, '/ledger'],
+  ['menu', '计量器具', '/ledger/meters', 'ledger/meters/index', 'ledger:meter:view', 'Monitor', 52, '/ledger'],
+  ['menu', '计量抄表', '/ledger/meter-readings', 'ledger/meter-readings/index', 'ledger:meter-reading:view', 'DocumentChecked', 53, '/ledger'],
+  ['menu', '生产单元', '/ledger/production-units', 'ledger/production-units/index', 'ledger:production-unit:view', 'Box', 54, '/ledger'],
+  ['menu', '月度产量', '/ledger/production-output', 'ledger/production-output/index', 'ledger:production-output:view', 'Tickets', 55, '/ledger'],
+  ['menu', '发电自用', '/ledger/generation', 'ledger/generation/index', 'ledger:generation:view', 'Lightning', 56, '/ledger'],
+  ['button', '产能单元模板下载', null, null, 'ledger:production:template', null, 541, '/ledger/production-units'],
+  ['button', '产能单元导入', null, null, 'ledger:production:import', null, 542, '/ledger/production-units'],
+  ['button', '产能单元导出', null, null, 'ledger:production:export', null, 543, '/ledger/production-units'],
+  ['menu', '碳核算', '/carbon', 'carbon/index', 'carbon:view', 'WindPower', 60, null],
+  ['menu', '预测管理', '/predictions', 'predictions/index', 'prediction:view', 'DataAnalysis', 70, null],
+  ['button', '预测配置查看', null, null, 'prediction:config:view', null, 701, '/predictions'],
+  ['button', '预测配置新增', null, null, 'prediction:config:create', null, 702, '/predictions'],
+  ['button', '预测配置编辑', null, null, 'prediction:config:update', null, 703, '/predictions'],
+  ['button', '预测配置状态', null, null, 'prediction:config:status', null, 704, '/predictions'],
+  ['button', '预测配置导入', null, null, 'prediction:config:import', null, 705, '/predictions'],
+  ['button', '预测配置导出', null, null, 'prediction:config:export', null, 706, '/predictions'],
+  ['button', '预测配置模板', null, null, 'prediction:config:template', null, 707, '/predictions'],
+  ['button', '预测运行创建', null, null, 'prediction:run:create', null, 708, '/predictions'],
+  ['button', '预测运行查看', null, null, 'prediction:run:view', null, 709, '/predictions'],
+  ['button', '预测运行取消归档', null, null, 'prediction:run:cancel', null, 710, '/predictions'],
+  ['button', '预测运行导出', null, null, 'prediction:run:export', null, 711, '/predictions'],
+  ['button', '预测结果查看', null, null, 'prediction:result:view', null, 712, '/predictions'],
+  ['button', '预测结果导出', null, null, 'prediction:result:export', null, 713, '/predictions'],
+  ['button', '用户新增', null, null, 'system:user:create', null, 111, '/system/users'],
+  ['button', '用户编辑', null, null, 'system:user:update', null, 112, '/system/users'],
+  ['button', '用户启停', null, null, 'system:user:status', null, 113, '/system/users'],
+  ['button', '用户分配角色', null, null, 'system:user:assign-role', null, 114, '/system/users'],
+  ['button', '用户删除', null, null, 'system:user:delete', null, 115, '/system/users'],
+  ['button', '用户重置密码', null, null, 'system:user:reset-password', null, 116, '/system/users'],
+  ['button', '角色新增', null, null, 'system:role:create', null, 121, '/system/roles'],
+  ['button', '角色编辑', null, null, 'system:role:update', null, 122, '/system/roles'],
+  ['button', '角色启停', null, null, 'system:role:status', null, 123, '/system/roles'],
+  ['button', '角色分配菜单', null, null, 'system:role:assign-menu', null, 124, '/system/roles'],
+  ['button', '角色删除', null, null, 'system:role:delete', null, 125, '/system/roles'],
+  ['button', '菜单新增', null, null, 'system:menu:create', null, 131, '/system/menus'],
+  ['button', '菜单编辑', null, null, 'system:menu:update', null, 132, '/system/menus'],
+  ['button', '菜单启停', null, null, 'system:menu:status', null, 133, '/system/menus'],
+  ['button', '菜单删除', null, null, 'system:menu:delete', null, 134, '/system/menus'],
+  ['button', '修改密码', null, null, 'system:profile:change-password', null, 11, '/profile']
+];
+
+function migrateLegacyImportMenuPermission(db, timestamp = new Date().toISOString()) {
+  const legacyMenu = db.prepare("SELECT id FROM sys_menus WHERE permission_code = 'import:view'").get();
+  if (!legacyMenu) return false;
+
+  const canonicalMenu = db.prepare("SELECT id FROM sys_menus WHERE permission_code = 'imports:view'").get();
+  if (!canonicalMenu) {
+    db.prepare("UPDATE sys_menus SET permission_code = 'imports:view', updated_at = ? WHERE id = ?")
+      .run(timestamp, legacyMenu.id);
+    return true;
+  }
+
+  // 极少数人工配置过新版菜单的旧库：将旧授权合并到新版菜单后移除旧键，避免遗留双权限口径。
+  db.prepare(`INSERT OR IGNORE INTO sys_role_menus (role_id, menu_id, created_at)
+    SELECT role_id, ?, created_at FROM sys_role_menus WHERE menu_id = ?`)
+    .run(canonicalMenu.id, legacyMenu.id);
+  db.prepare('UPDATE sys_menus SET parent_id = ? WHERE parent_id = ?').run(canonicalMenu.id, legacyMenu.id);
+  db.prepare('DELETE FROM sys_role_menus WHERE menu_id = ?').run(legacyMenu.id);
+  db.prepare('DELETE FROM sys_menus WHERE id = ?').run(legacyMenu.id);
+  return true;
+}
+
+function ensureRbacSeedData(db) {
+  const bcrypt = require('bcryptjs');
+  const now = new Date().toISOString();
+  const transaction = db.transaction(() => {
+    migrateLegacyImportMenuPermission(db, now);
+    db.prepare(`INSERT OR IGNORE INTO sys_roles (role_code, role_name, description, status, is_builtin, created_at, updated_at)
+      VALUES (?, ?, ?, 'active', 1, ?, ?)`)
+      .run('super_admin', '系统管理员', '系统内置管理员角色。', now, now);
+    db.prepare(`INSERT OR IGNORE INTO sys_roles (role_code, role_name, description, status, is_builtin, created_at, updated_at)
+      VALUES (?, ?, ?, 'active', 1, ?, ?)`)
+      .run('user', '普通用户', '注册用户的最低权限角色。', now, now);
+
+    const systemMenu = db.prepare('SELECT id FROM sys_menus WHERE permission_code IS NULL AND route_path = ?').get('/system');
+    let systemMenuId = systemMenu && systemMenu.id;
+    if (!systemMenuId) {
+      systemMenuId = db.prepare(`INSERT INTO sys_menus (menu_type, menu_name, route_path, icon, sort_order, visible, status, is_builtin, created_at, updated_at)
+        VALUES ('directory', '系统管理', '/system', 'Setting', 100, 1, 'active', 1, ?, ?)`)
+        .run(now, now).lastInsertRowid;
+    }
+    const insertMenu = db.prepare(`INSERT OR IGNORE INTO sys_menus
+      (parent_id, menu_type, menu_name, route_path, component, permission_code, icon, sort_order, visible, status, is_builtin, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 1, ?, ?)`);
+    const menuIdByRoute = new Map(db.prepare('SELECT id, route_path AS routePath FROM sys_menus WHERE route_path IS NOT NULL').all()
+      .map((menu) => [menu.routePath, menu.id]));
+    menuIdByRoute.set('/system', systemMenuId);
+    RBAC_MENU_SEEDS.slice(1).forEach(([menuType, menuName, routePath, component, permissionCode, icon, sortOrder, parentRoutePath]) => {
+      const parentId = parentRoutePath ? menuIdByRoute.get(parentRoutePath) : null;
+      if (parentRoutePath && !parentId) {
+        throw new Error(`RBAC 菜单种子缺少父菜单：${parentRoutePath}`);
+      }
+      insertMenu.run(parentId || null, menuType, menuName, routePath, component, permissionCode, icon, sortOrder, now, now);
+      if (routePath) {
+        const menu = db.prepare('SELECT id FROM sys_menus WHERE route_path = ?').get(routePath);
+        menuIdByRoute.set(routePath, menu.id);
+      }
+    });
+
+    const adminRole = db.prepare("SELECT id FROM sys_roles WHERE role_code = 'super_admin'").get();
+    const userRole = db.prepare("SELECT id FROM sys_roles WHERE role_code = 'user'").get();
+    const allMenus = db.prepare('SELECT id FROM sys_menus WHERE status = \'active\'').all();
+    const profileMenus = db.prepare("SELECT id FROM sys_menus WHERE permission_code IN ('system:profile:update', 'system:profile:change-password')").all();
+    const grant = db.prepare('INSERT OR IGNORE INTO sys_role_menus (role_id, menu_id, created_at) VALUES (?, ?, ?)');
+    allMenus.forEach((menu) => grant.run(adminRole.id, menu.id, now));
+    profileMenus.forEach((menu) => grant.run(userRole.id, menu.id, now));
+
+    let admin = db.prepare("SELECT id, status FROM sys_users WHERE username = 'admin'").get();
+    if (!admin || admin.status !== 'active') {
+      const configuredPassword = String(process.env.CHARCOAL_ADMIN_PASSWORD || '');
+      if (!configuredPassword) {
+        throw new Error('缺少 CHARCOAL_ADMIN_PASSWORD：首次初始化或恢复停用管理员时必须配置管理员密码，服务不会创建默认高权限密码。');
+      }
+      if (configuredPassword.length < 8) {
+        throw new Error('CHARCOAL_ADMIN_PASSWORD 至少需要 8 个字符。');
+      }
+      const passwordHash = bcrypt.hashSync(configuredPassword, 12);
+      if (admin) {
+        db.prepare("UPDATE sys_users SET password_hash = ?, status = 'active', is_builtin = 1, updated_at = ? WHERE id = ?")
+          .run(passwordHash, now, admin.id);
+      } else {
+        const result = db.prepare(`INSERT INTO sys_users
+          (username, display_name, password_hash, status, is_builtin, created_at, updated_at)
+          VALUES ('admin', '系统管理员', ?, 'active', 1, ?, ?)`)
+          .run(passwordHash, now, now);
+        admin = { id: result.lastInsertRowid };
+      }
+    }
+    db.prepare('INSERT OR IGNORE INTO sys_user_roles (user_id, role_id, created_at) VALUES (?, ?, ?)').run(admin.id, adminRole.id, now);
+  });
+  transaction();
 }
 
 function initDatabase() {
@@ -598,19 +917,24 @@ function initDatabase() {
   try {
     const schema = fs.readFileSync(schemaPath, 'utf8');
     migrateCarbonEmissionsStatusCheck(db);
+    migrateImportAuditSourceColumns(db);
     migrateEnergyRecordLedgerColumns(db);
     migrateImportBatchesImportTypeCheck(db);
     migrateGenerationRecordsDataSourceCheck(db);
-    migrateImportAuditSourceColumns(db);
+    migrateEnergyBudgetImportSourceColumns(db);
+    ensureEnergyBudgetsTable(db);
+    migratePredictionRunsStatusCheck(db);
+    ensurePredictionConfigsTable(db);
     db.exec('DROP INDEX IF EXISTS ux_carbon_emissions_record_method');
     db.exec(schema);
+    ensureRbacSeedData(db);
     db.prepare(
       `INSERT INTO app_meta (key, value, updated_at)
        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
        ON CONFLICT(key) DO UPDATE SET
          value = excluded.value,
          updated_at = excluded.updated_at`
-    ).run('schema_stage', 'generation-basic');
+    ).run('schema_stage', 'rbac-backend-core');
   } finally {
     db.close();
   }
@@ -641,6 +965,9 @@ module.exports = {
   buildImportBatchesImportTypeMigrationSql,
   carbonEmissionsStatusCheckAllowsSuperseded,
   ensureLocalDataDirectories,
+  ensureEnergyBudgetsTable,
+  ensurePredictionConfigsTable,
+  ensureRbacSeedData,
   generationRecordsDataSourceCheckAllowsUpload,
   getDatabaseInfo,
   getTableColumns,
@@ -650,8 +977,11 @@ module.exports = {
   initDatabase,
   migrateCarbonEmissionsStatusCheck,
   migrateEnergyRecordLedgerColumns,
+  migrateEnergyBudgetImportSourceColumns,
   migrateGenerationRecordsDataSourceCheck,
   migrateImportAuditSourceColumns,
+  migratePredictionRunsStatusCheck,
   migrateImportBatchesImportTypeCheck,
+  migrateLegacyImportMenuPermission,
   openDatabase
 };

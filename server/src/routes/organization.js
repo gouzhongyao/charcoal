@@ -1,5 +1,7 @@
 const express = require('express');
 const { asyncHandler } = require('../middleware/errorHandler');
+const { authenticate } = require('../middleware/auth');
+const { requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { assertWritableAllowed } = require('../services/maintenanceState');
 const { normalizeUploadError, uploadImportFile } = require('../middleware/upload');
@@ -8,6 +10,7 @@ const {
   createOrganizationUnitImportBatchFromUpload,
   deactivateOrganizationUnit,
   exportOrganizationUnits,
+  getOrganizationUnitStats,
   listOrganizationUnits,
   updateOrganizationUnit
 } = require('../services/ledgerService');
@@ -20,7 +23,7 @@ function buildContentDisposition(fileName, fallbackName) {
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
-router.get('/units/export', asyncHandler(async (req, res) => {
+router.get('/units/export', authenticate, requirePermission('ledger:units:export'), asyncHandler(async (req, res) => {
   const result = exportOrganizationUnits(req.query);
   res.setHeader('Content-Type', result.contentType);
   res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `organization-units.${result.format}`));
@@ -29,7 +32,11 @@ router.get('/units/export', asyncHandler(async (req, res) => {
   res.status(200).send(result.body);
 }));
 
-router.post('/units/import', requireWritable('organization:import-units'), (req, res, next) => {
+router.get('/units/stats', authenticate, requirePermission('ledger:units:view'), asyncHandler(async (req, res) => {
+  sendSuccess(res, getOrganizationUnitStats());
+}));
+
+router.post('/units/import', authenticate, requirePermission('ledger:units:import'), requireWritable('organization:import-units'), (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {
@@ -46,21 +53,21 @@ router.post('/units/import', requireWritable('organization:import-units'), (req,
   });
 });
 
-router.get('/units', asyncHandler(async (req, res) => {
+router.get('/units', authenticate, requirePermission('ledger:units:view'), asyncHandler(async (req, res) => {
   const result = listOrganizationUnits(req.query);
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination } });
 }));
 
-router.post('/units', requireWritable('organization:create-unit'), asyncHandler(async (req, res) => {
+router.post('/units', authenticate, requirePermission('ledger:units:create'), requireWritable('organization:create-unit'), asyncHandler(async (req, res) => {
   const unit = createOrganizationUnit(req.body || {});
   sendSuccess(res, unit, { statusCode: 201 });
 }));
 
-router.put('/units/:id', requireWritable('organization:update-unit'), asyncHandler(async (req, res) => {
+router.put('/units/:id', authenticate, requirePermission('ledger:units:update'), requireWritable('organization:update-unit'), asyncHandler(async (req, res) => {
   sendSuccess(res, updateOrganizationUnit(req.params.id, req.body || {}));
 }));
 
-router.delete('/units/:id', requireWritable('organization:deactivate-unit'), asyncHandler(async (req, res) => {
+router.delete('/units/:id', authenticate, requirePermission('ledger:units:deactivate'), requireWritable('organization:deactivate-unit'), asyncHandler(async (req, res) => {
   sendSuccess(res, deactivateOrganizationUnit(req.params.id));
 }));
 
