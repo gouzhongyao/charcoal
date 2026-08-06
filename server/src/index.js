@@ -22,6 +22,7 @@ const userRoutes = require('./routes/users');
 const roleRoutes = require('./routes/roles');
 const menuRoutes = require('./routes/menus');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
+const { AppError } = require('./utils/errors');
 
 const app = express();
 const port = Number(process.env.PORT || 3002);
@@ -79,7 +80,7 @@ app.use(cors({
       callback(null, true);
       return;
     }
-    callback(new Error('CORS origin is not allowed'));
+    callback(new AppError('CORS_ORIGIN_FORBIDDEN', '当前请求来源未被允许访问 API。', { statusCode: 403 }));
   },
   exposedHeaders: ['Content-Disposition', 'Content-Length', 'X-Recommended-Format', 'X-Backup-Name']
 }));

@@ -20,10 +20,11 @@ export function chartRows(rows = [], labelKey, valueKey, limit = 8) {
   return rows.slice(0, limit).map((row, index) => ({ label: String(row?.[labelKey] || '未标注'), value: numberValue(row?.[valueKey]), color: LEDGER_COLORS[index] }));
 }
 export function nextLedgerStatus(currentStatus, isRecord = false) { return isRecord ? 'void' : (currentStatus === 'active' ? 'inactive' : 'active'); }
+/** 判断预演结果是否满足受控执行条件；空状态或路由切换期间一律不可执行。 */
 export function canExecutePreview(preview = {}, kind = 'import') {
   return kind === 'reading-generation'
-    ? Boolean(preview.previewSignature && numberValue(preview.summary?.wouldGenerate) > 0 && preview.candidateReadingIds?.length)
-    : Boolean(preview.previewSignature && numberValue(preview.summary?.wouldImport) > 0 && preview.candidateRowIds?.length && preview.candidateRows?.length);
+    ? Boolean(preview?.previewSignature && numberValue(preview.summary?.wouldGenerate) > 0 && preview.candidateReadingIds?.length)
+    : Boolean(preview?.previewSignature && numberValue(preview.summary?.wouldImport) > 0 && preview.candidateRowIds?.length && preview.candidateRows?.length);
 }
 export function blankForm(kind) {
   const forms = {

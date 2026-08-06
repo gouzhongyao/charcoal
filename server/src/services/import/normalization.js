@@ -2,14 +2,14 @@ const crypto = require('crypto');
 
 const FIELD_ALIASES = {
   month: ['月份', '月度', '统计月份', '账期', '日期', '时间', 'month', 'period', 'date', 'billingmonth', 'statmonth'],
-  energyType: ['能源类型', '能源种类', '能源编码', '能源名称', '能源', '名称', '类型', 'energytype', 'energy_type', 'energyname', 'energy_name', 'energy', 'fueltype', 'fuel', 'type', 'name'],
+  energyType: ['能源类型', '能源类型编码', '能源类型名称', '能源种类', '能源编码', '能源名称', '能源', '名称', '类型', 'energytype', 'energy_type', 'energyname', 'energy_name', 'energy', 'fueltype', 'fuel', 'type', 'name'],
   value: ['用量', '能耗值', '消耗量', '消费量', '数值', '数据值', 'value', 'usage', 'amount', 'consumption', 'quantity'],
   unit: ['单位', '计量单位', 'unit', 'uom'],
   organization: ['组织', '组织/公司', '公司', '企业', '机构', '用能单元', '组织单元', '部门/车间', 'organization', 'organisation', 'organizationunit', 'organization_unit', 'company', 'org'],
   site: ['地点', '位置', '场所', '站点', '厂区', '厂站', 'location', 'site', 'place'],
   department: ['部门', '车间', '工序', '科室', 'department', 'dept', 'workshop', 'process'],
   productionLine: ['产线', '生产线', 'line', 'productionline', 'production_line'],
-  meterCode: ['设备', '设备名称', '表计', '表计名称', '表计编号', '仪表', '仪表名称', '仪表编号', '计量点', 'meter', 'metername', 'meter_name', 'metercode', 'meter_code', 'equipment', 'equipmentname', 'device'],
+  meterCode: ['设备', '设备名称', '表计', '表计名称', '表计编号', '仪表', '仪表名称', '仪表编号', '仪表编码', '计量器具编码', '计量点', 'meter', 'metername', 'meter_name', 'metercode', 'meter_code', 'equipment', 'equipmentname', 'device'],
   dataTime: ['数据时间', '采集时间', '记录时间', '发生时间', 'data_time', 'datatime', 'record_time', 'recordtime', 'timestamp'],
   businessDimension: ['业务维度', '维度', '业务', 'businessdimension', 'business_dimension', 'dimension'],
   remark: ['备注', '说明', 'note', 'remark', 'comments', 'comment']

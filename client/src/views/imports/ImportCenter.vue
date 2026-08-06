@@ -38,7 +38,7 @@ import ManagementPage from '@/components/ManagementPage.vue';
 import HelpIcon from '@/components/HelpIcon.vue';
 import PageState from '@/components/PageState.vue';
 import { createImportBatch, deleteImportBatch, downloadImportBatchFile, downloadImportTemplate, getImportBatchDetail, getImportBatchErrors, getImportBatches, getImportContract } from '@/api/imports';
-import { buildImportBatchFilters, canUseGenericImportBatchDelete, compactFieldMapping } from '@/utils/specialModules';
+import { buildImportBatchFilters, canUseGenericImportBatchDelete, compactFieldMapping, IMPORT_BATCH_TYPE_OPTIONS } from '@/utils/specialModules';
 import { hasPermi } from '@/utils/permission';
 
 // 导入契约、批次和详情状态。
@@ -49,7 +49,7 @@ const detailOpen = ref(false); const detail = ref(null); const detailLoading = r
 const safe = async (task) => { try { return { ok: true, value: await task() }; } catch (error) { return { ok: false, error }; } };
 const errorText = (result) => result?.error?.message || '接口请求失败。';
 const canView = computed(() => hasPermi('imports:view')); const canCreate = computed(() => hasPermi('imports:create')); const canDelete = computed(() => hasPermi('imports:delete')); const canDownload = computed(() => hasPermi('imports:download')); const canTemplate = computed(() => hasPermi('imports:view'));
-const supportedFileTypes = computed(() => contract.value.supportedFileTypes || []); const maxUploadFileSize = computed(() => contract.value.maxUploadFileSize || ''); const batchStatuses = computed(() => contract.value.batchStatuses || []); const importTypes = computed(() => [{ value: 'energy_record', label: '能耗数据导入' }, { value: 'meter_reading', label: '计量抄表导入' }, { value: 'production_output', label: '月度产量导入' }, { value: 'generation_record', label: '发电记录导入' }]); const mappingFields = computed(() => [...(contract.value.requiredFields || []), ...(contract.value.optionalFields || [])]);
+const supportedFileTypes = computed(() => contract.value.supportedFileTypes || []); const maxUploadFileSize = computed(() => contract.value.maxUploadFileSize || ''); const batchStatuses = computed(() => contract.value.batchStatuses || []); const importTypes = IMPORT_BATCH_TYPE_OPTIONS; const mappingFields = computed(() => [...(contract.value.requiredFields || []), ...(contract.value.optionalFields || [])]);
 
 /** 格式化导入计数。 */
 function number(value) { const input = Number(value); return Number.isFinite(input) ? new Intl.NumberFormat('zh-CN').format(input) : '0'; }

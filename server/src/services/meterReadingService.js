@@ -34,9 +34,9 @@ const METER_READING_GENERATION_EXPORT_FIELDS = Object.freeze([
   { key: 'wouldGenerate', header: '是否可生成' },
   { key: 'reasonCodes', header: '原因编码' },
   { key: 'reasons', header: '原因说明' },
-  { key: 'existingGeneratedEnergyRecordId', header: '已有 generated_energy_record_id' },
-  { key: 'conflictEnergyRecordId', header: '冲突 energy_record_id' },
-  { key: 'duplicateKey', header: '拟生成 duplicate_key' }
+  { key: 'existingGeneratedEnergyRecordId', header: '已有生成能耗记录ID' },
+  { key: 'conflictEnergyRecordId', header: '冲突能耗记录ID' },
+  { key: 'duplicateKey', header: '拟生成重复键' }
 ]);
 const EXPORT_FIELDS = Object.freeze([
   { key: 'meterCode', header: '仪表编码' },
@@ -1128,11 +1128,34 @@ function getMeterReadingEnergyRecordGenerationPreview(query = {}) {
   }
 }
 
+// 将内部筛选对象转换为审计文件中的中文展示文本，API JSON 字段保持不变。
+function formatGenerationExportFilters(filters = {}) {
+  const labels = {
+    organizationUnitId: '用能单元ID',
+    meterId: '计量器具ID',
+    energyTypeCode: '能源类型编码',
+    monthStart: '开始月份',
+    monthEnd: '结束月份',
+    status: '记录状态'
+  };
+  const entries = Object.entries(filters).map(([key, value]) => `${labels[key] || '其他筛选条件'}=${value}`);
+  return entries.length ? entries.join('；') : '无筛选条件';
+}
+
+// 清理审计文件说明中的内部表名与字段名，仅影响文件展示层。
+function formatGenerationExportReason(value) {
+  return String(value || '')
+    .replaceAll('generated_energy_record_id', '已生成能耗记录标识')
+    .replaceAll('active energy_records', '启用状态能耗记录')
+    .replaceAll('energy_records', '能耗记录')
+    .replaceAll('wouldGenerate', '可生成');
+}
+
 function buildGenerationExportRows(items = []) {
   return items.map((item) => {
     const output = {};
     METER_READING_GENERATION_EXPORT_FIELDS.forEach((field) => {
-      if (field.key === 'reasons') output[field.header] = item.reasonText || '';
+      if (field.key === 'reasons') output[field.header] = formatGenerationExportReason(item.reasonText);
       else output[field.header] = item[field.key] ?? '';
     });
     return output;
@@ -1145,22 +1168,22 @@ function exportMeterReadingEnergyRecordGenerationPreview(query = {}) {
   const headers = METER_READING_GENERATION_EXPORT_FIELDS.map((field) => field.header);
   const exportRows = buildGenerationExportRows(preview.items);
   const metaRows = [
-    ['预案类型', '抄表生成 energy_records 预演/审计预案'],
-    ['preview-only / dry-run / controlled-generate', 'true'],
-    ['writesEnergyRecords', 'false'],
-    ['carbonAccountingDeferred', 'true'],
-    ['fixedConfirmText', METER_READING_GENERATION_CONFIRM_TEXT],
-    ['backupReason', METER_READING_GENERATION_BACKUP_REASON],
-    ['previewSignature', preview.previewSignature],
-    ['wouldGenerate', preview.summary.wouldGenerate],
-    ['conflictSkipped', preview.summary.conflict],
-    ['filters', stableStringify(preview.filters)]
+    ['预案类型', '抄表生成能耗记录预演审计预案'],
+    ['执行性质', '仅预演、不写入，确认后受控生成'],
+    ['是否写入能耗记录', '否'],
+    ['碳核算是否后置', '是'],
+    ['固定确认文本', METER_READING_GENERATION_CONFIRM_TEXT],
+    ['备份原因', '抄表生成能耗记录'],
+    ['预演签名', preview.previewSignature],
+    ['可生成数量', preview.summary.wouldGenerate],
+    ['冲突跳过数量', preview.summary.conflict],
+    ['筛选条件', formatGenerationExportFilters(preview.filters)]
   ];
   const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
   const fileName = `抄表生成能耗记录预演审计预案-${date}.${format}`;
   if (format === 'csv') {
     const lines = [
-      ['抄表生成 energy_records 预演/审计预案'],
+      ['抄表生成能耗记录预演审计预案'],
       ...metaRows,
       [],
       headers,
@@ -1169,7 +1192,7 @@ function exportMeterReadingEnergyRecordGenerationPreview(query = {}) {
     return { fileName, format, contentType: 'text/csv; charset=utf-8', body: Buffer.from(`${UTF8_BOM}${lines.join('\n')}\n`, 'utf8'), rowCount: preview.items.length, fields: headers, previewSignature: preview.previewSignature };
   }
   const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(metaRows), '预案元信息');
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([['字段', '值'], ...metaRows]), '预案元信息');
   const detailSheet = XLSX.utils.json_to_sheet(exportRows, { header: headers });
   detailSheet['!cols'] = headers.map((header) => ({ wch: Math.min(Math.max(String(header).length + 8, 12), 32) }));
   XLSX.utils.book_append_sheet(workbook, detailSheet, '预演明细');
@@ -1359,6 +1382,7 @@ module.exports = {
   executeMeterReadingEnergyRecordGeneration,
   exportMeterReadingEnergyRecordGenerationPreview,
   exportMeterReadings,
+  formatGenerationExportFilters,
   getMeterReadingEnergyRecordGenerationPreview,
   getMeterReadingStats,
   listMeterReadings,

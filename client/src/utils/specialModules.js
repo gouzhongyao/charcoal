@@ -1,3 +1,13 @@
+// 导入批次筛选值与服务端 importService 的支持类型保持一一对应，value 用于 query、label 仅用于展示。
+export const IMPORT_BATCH_TYPE_OPTIONS = Object.freeze([
+  Object.freeze({ value: 'energy_record', label: '能耗数据导入' }),
+  Object.freeze({ value: 'meter_reading', label: '计量抄表导入' }),
+  Object.freeze({ value: 'organization_unit', label: '组织/用能单元导入' }),
+  Object.freeze({ value: 'meter_device', label: '计量器具导入' }),
+  Object.freeze({ value: 'production_output', label: '月度产量导入' }),
+  Object.freeze({ value: 'generation_record', label: '发电记录导入' })
+]);
+
 /** 将导入筛选转换为服务端允许的批次查询参数。 */
 export function buildImportBatchFilters(filters = {}, pagination = {}) {
   return Object.fromEntries(Object.entries({

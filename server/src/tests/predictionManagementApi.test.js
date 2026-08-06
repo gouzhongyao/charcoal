@@ -28,6 +28,22 @@ function request(server, method, pathname, body, token) {
   });
 }
 
+function grantViewRole(username, permissionCode) {
+  const db = openDatabase();
+  try {
+    const now = new Date().toISOString();
+    const user = db.prepare('SELECT id FROM sys_users WHERE username = ?').get(username);
+    const roleId = db.prepare(`INSERT INTO sys_roles (role_code, role_name, status, created_at, updated_at)
+      VALUES (?, ?, 'active', ?, ?)`).run(`${username}-${permissionCode.replaceAll(':', '-')}`, `${username} 查看角色`, now, now).lastInsertRowid;
+    const menu = db.prepare('SELECT id FROM sys_menus WHERE permission_code = ?').get(permissionCode);
+    assert(menu, `缺少 ${permissionCode} 菜单权限种子`);
+    db.prepare('INSERT INTO sys_role_menus (role_id, menu_id, created_at) VALUES (?, ?, ?)').run(roleId, menu.id, now);
+    db.prepare('INSERT INTO sys_user_roles (user_id, role_id, created_at) VALUES (?, ?, ?)').run(user.id, roleId, now);
+  } finally {
+    db.close();
+  }
+}
+
 function multipart(server, pathname, filename, content, token) {
   return new Promise((resolve, reject) => {
     const boundary = `----prediction-${Date.now()}`;
@@ -42,17 +58,42 @@ function multipart(server, pathname, filename, content, token) {
   try {
     initDatabase();
     register({ username: 'prediction-reader', password: 'Password123!' });
+    register({ username: 'prediction-config-reader', password: 'Password123!' });
+    register({ username: 'prediction-run-reader', password: 'Password123!' });
+    register({ username: 'prediction-result-reader', password: 'Password123!' });
+    grantViewRole('prediction-config-reader', 'prediction:config:view');
+    grantViewRole('prediction-run-reader', 'prediction:run:view');
+    grantViewRole('prediction-result-reader', 'prediction:result:view');
     const { app } = require('../index');
     server = await new Promise((resolve) => { const instance = app.listen(0, '127.0.0.1', () => resolve(instance)); });
     const adminToken = (await request(server, 'POST', '/api/login', { username: 'admin', password: 'AdminPassword123!' })).body.data.token;
     const readerToken = (await request(server, 'POST', '/api/login', { username: 'prediction-reader', password: 'Password123!' })).body.data.token;
+    const configToken = (await request(server, 'POST', '/api/login', { username: 'prediction-config-reader', password: 'Password123!' })).body.data.token;
+    const runToken = (await request(server, 'POST', '/api/login', { username: 'prediction-run-reader', password: 'Password123!' })).body.data.token;
+    const resultToken = (await request(server, 'POST', '/api/login', { username: 'prediction-result-reader', password: 'Password123!' })).body.data.token;
 
     assert.strictEqual((await request(server, 'GET', '/api/predictions/configs')).status, 401);
     assert.strictEqual((await request(server, 'GET', '/api/predictions/configs', undefined, readerToken)).status, 403);
+    assert.strictEqual((await request(server, 'GET', '/api/predictions/configs', undefined, configToken)).status, 200, '仅配置查看角色必须能读取配置列表。');
+    for (const pathname of ['/api/predictions/runs', '/api/predictions/runs/stats', '/api/predictions/results']) {
+      assert.strictEqual((await request(server, 'GET', pathname, undefined, configToken)).status, 403, `仅配置查看角色不得读取 ${pathname}。`);
+    }
+    assert.strictEqual((await request(server, 'GET', '/api/predictions/configs', undefined, runToken)).status, 403, '仅运行查看角色不得读取配置列表。');
+    assert.strictEqual((await request(server, 'GET', '/api/predictions/runs', undefined, runToken)).status, 200, '仅运行查看角色必须能读取运行列表。');
+    assert.strictEqual((await request(server, 'GET', '/api/predictions/runs/stats', undefined, runToken)).status, 200, '仅运行查看角色必须能读取运行统计。');
+    assert.strictEqual((await request(server, 'GET', '/api/predictions/results', undefined, runToken)).status, 403, '仅运行查看角色不得读取预测结果。');
+    assert.strictEqual((await request(server, 'GET', '/api/predictions/configs', undefined, resultToken)).status, 403, '仅结果查看角色不得读取配置列表。');
+    assert.strictEqual((await request(server, 'GET', '/api/predictions/runs', undefined, resultToken)).status, 403, '仅结果查看角色不得读取运行列表。');
+    assert.strictEqual((await request(server, 'GET', '/api/predictions/results', undefined, resultToken)).status, 200, '仅结果查看角色必须能读取预测结果。');
+    for (const token of [configToken, runToken, resultToken]) {
+      assert.strictEqual((await request(server, 'GET', '/api/predictions/contract', undefined, token)).status, 200, '任一预测查看角色必须能读取通用契约。');
+    }
     assert.strictEqual((await request(server, 'GET', '/api/predictions/configs', undefined, adminToken)).status, 200);
     assert.strictEqual((await request(server, 'GET', '/api/templates/prediction-configs.csv')).status, 401);
     assert.strictEqual((await request(server, 'GET', '/api/templates/prediction-configs.csv', undefined, readerToken)).status, 403);
-    assert.strictEqual((await request(server, 'GET', '/api/templates/prediction-configs.csv', undefined, adminToken)).status, 200);
+    const predictionTemplate = await request(server, 'GET', '/api/templates/prediction-configs.csv', undefined, adminToken);
+    assert.strictEqual(predictionTemplate.status, 200);
+    assert(predictionTemplate.body.toString('utf8').startsWith('﻿"配置名称","备注","能源类型编码","组织范围","厂区","部门","能耗批次ID","训练开始月份","训练结束月份","预测开始月份","预测结束月份","算法","窗口大小","状态"'), '预测配置模板必须输出中文表头。');
 
     const db = openDatabase();
     try {
@@ -66,12 +107,21 @@ function multipart(server, pathname, filename, content, token) {
     assert.strictEqual(created.status, 201);
     const configId = created.body.data.id;
     assert.strictEqual(created.body.data.status, 'draft');
+    assert.strictEqual((await request(server, 'GET', `/api/predictions/configs/${configId}`, undefined, configToken)).status, 200, '仅配置查看角色必须能读取配置详情。');
+    assert.strictEqual((await request(server, 'GET', `/api/predictions/configs/${configId}`, undefined, runToken)).status, 403, '仅运行查看角色不得读取配置详情。');
+    assert.strictEqual((await request(server, 'GET', `/api/predictions/configs/${configId}`, undefined, resultToken)).status, 403, '仅结果查看角色不得读取配置详情。');
     assert.strictEqual((await request(server, 'GET', '/api/predictions/configs?keyword=%E5%85%B3%E9%94%AE%E5%AD%97', undefined, adminToken)).body.meta.pagination.total, 1);
     const run = await request(server, 'POST', `/api/predictions/configs/${configId}/runs`, {}, adminToken);
     assert.strictEqual(run.status, 201);
     assert.strictEqual(run.body.data.run.status, 'completed');
     const runId = run.body.data.run.id;
     assert.strictEqual(run.body.data.summary.resultCount, 2);
+    assert.strictEqual((await request(server, 'GET', `/api/predictions/runs/${runId}`, undefined, runToken)).status, 200, '仅运行查看角色必须能读取运行详情。');
+    assert.strictEqual((await request(server, 'GET', `/api/predictions/runs/${runId}`, undefined, resultToken)).status, 403, '仅结果查看角色不得读取运行详情。');
+    assert.strictEqual((await request(server, 'GET', `/api/predictions/runs/${runId}/results`, undefined, resultToken)).status, 200, '仅结果查看角色必须能读取运行结果。');
+    for (const token of [configToken, runToken]) {
+      assert.strictEqual((await request(server, 'GET', `/api/predictions/runs/${runId}/results`, undefined, token)).status, 403, '非结果查看角色不得读取运行结果。');
+    }
     assert.strictEqual(run.body.data.run.parameters.configSnapshot.configId, configId, '运行必须保存配置快照。');
     const unchanged = await request(server, 'PUT', `/api/predictions/configs/${configId}`, { ...payload, name: '已编辑草稿' }, adminToken);
     assert.strictEqual(unchanged.status, 200);
@@ -81,11 +131,19 @@ function multipart(server, pathname, filename, content, token) {
     assert.strictEqual(stats.body.data.completedCount, 1);
     const exported = await request(server, 'GET', `/api/predictions/results/export?format=csv&runId=${runId}`, undefined, adminToken);
     assert.strictEqual(exported.status, 200);
-    assert(exported.body.toString('utf8').includes('predictedValue'));
+    assert(exported.body.toString('utf8').startsWith('﻿"预测运行ID","预测运行名称","算法","运行状态","能源类型编码","预测月份","预测值","预测单位","置信区间下限","置信区间上限","方法说明"'), '预测结果导出必须输出中文表头。');
+    const configExport = await request(server, 'GET', '/api/predictions/configs/export?format=csv', undefined, adminToken);
+    assert.strictEqual(configExport.status, 200);
+    assert(configExport.body.toString('utf8').startsWith('﻿"配置名称","备注","能源类型编码","组织范围"'), '预测配置导出必须输出中文表头。');
     assert.strictEqual((await request(server, 'PATCH', `/api/predictions/runs/${runId}/status`, { status: 'cancelled' }, adminToken)).status, 400, '已完成运行不允许取消或改写结果。');
     assert.strictEqual((await request(server, 'PATCH', `/api/predictions/runs/${runId}/status`, { status: 'archived' }, adminToken)).status, 200);
 
-    const csv = 'name,note,energyTypeCode,organizationScope,trainStartMonth,trainEndMonth,predictStartMonth,predictEndMonth,algorithm,windowSize,status\n导入预测草稿,不能直接产生结果,electricity,预测组织,2026-01,2026-03,2026-04,2026-05,moving_average,3,active\n导入预测草稿,同文件重复应跳过,electricity,预测组织,2026-01,2026-03,2026-04,2026-05,moving_average,3,active\n';
+    const englishCsv = 'name,note,energyTypeCode,organizationScope,trainStartMonth,trainEndMonth,predictStartMonth,predictEndMonth,algorithm,windowSize,status\n英文表头兼容草稿,兼容性预演,electricity,预测组织,2026-01,2026-03,2026-04,2026-05,moving_average,3,draft\n';
+    const englishPreviewResponse = await multipart(server, '/api/predictions/configs/import/preview', 'prediction-configs-english.csv', englishCsv, adminToken);
+    assert.strictEqual(englishPreviewResponse.status, 200);
+    assert.strictEqual(englishPreviewResponse.body.data.summary.wouldImport, 1, '预测配置导入必须继续兼容旧英文表头。');
+
+    const csv = '配置名称,备注,能源类型编码,组织范围,训练开始月份,训练结束月份,预测开始月份,预测结束月份,算法,窗口大小,状态\n导入预测草稿,不能直接产生结果,electricity,预测组织,2026-01,2026-03,2026-04,2026-05,moving_average,3,active\n导入预测草稿,同文件重复应跳过,electricity,预测组织,2026-01,2026-03,2026-04,2026-05,moving_average,3,active\n';
     const previewResponse = await multipart(server, '/api/predictions/configs/import/preview', 'prediction-configs.csv', csv, adminToken);
     assert.strictEqual(previewResponse.status, 200);
     const preview = previewResponse.body.data;

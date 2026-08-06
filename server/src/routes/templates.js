@@ -8,7 +8,7 @@ const { requirePermission } = require('../middleware/permission');
 const router = express.Router();
 
 function buildContentDisposition(fileName, fallbackName) {
-  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || 'template.xlsx';
+  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || '00000000.xlsx';
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
@@ -63,7 +63,7 @@ router.get('/energy-budgets.xlsx', authenticate, requirePermission('energy:budge
   const result = getTemplateXlsx('energy-budgets');
   if (!result) { templateNotFound(req, next); return; }
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, 'energy-budgets.xlsx'));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, '00000000.xlsx'));
   res.setHeader('Content-Length', String(result.buffer.length));
   res.setHeader('X-Template-Type', result.template.type);
   res.setHeader('X-Recommended-Format', 'xlsx');
@@ -74,7 +74,7 @@ router.get('/energy-budgets.csv', authenticate, requirePermission('energy:budget
   const result = getTemplateCsv('energy-budgets');
   if (!result) { templateNotFound(req, next); return; }
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, 'energy-budgets.csv'));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, '00000000.csv'));
   res.setHeader('Content-Length', String(Buffer.byteLength(result.csv, 'utf8')));
   res.setHeader('X-Template-Type', result.template.type);
   res.setHeader('X-Recommended-Format', 'xlsx');
@@ -93,7 +93,7 @@ router.get('/:templateType.xlsx', (req, res, next) => {
   }
 
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `${result.template.type}.xlsx`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, '00000000.xlsx'));
   res.setHeader('Content-Length', String(result.buffer.length));
   res.setHeader('X-Template-Type', result.template.type);
   res.setHeader('X-Recommended-Format', 'xlsx');
@@ -108,7 +108,7 @@ router.get('/:templateType.csv', (req, res, next) => {
   }
 
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `${result.template.type}.csv`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, '00000000.csv'));
   res.setHeader('Content-Length', String(Buffer.byteLength(result.csv, 'utf8')));
   res.setHeader('X-Template-Type', result.template.type);
   res.setHeader('X-Recommended-Format', 'xlsx');

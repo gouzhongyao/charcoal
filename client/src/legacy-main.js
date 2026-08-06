@@ -598,7 +598,7 @@ async function downloadTemplateFile(templateType, extension = 'xlsx', fileName) 
     }
 
     const headerFileName = getFileNameFromContentDisposition(response.headers.get('content-disposition'));
-    const defaultFileName = TEMPLATE_FILE_NAMES[templateType] || `${templateType}.xlsx`;
+    const defaultFileName = TEMPLATE_FILE_NAMES[templateType] || '导入模板.xlsx';
     const downloadName = headerFileName || fileName || defaultFileName.replace(/\.xlsx$/i, `.${normalizedExtension}`);
     objectUrl = URL.createObjectURL(blob);
     const link = createElement('a', {
@@ -636,7 +636,7 @@ function createTemplateDownloadButton(templateType, label, fileName) {
     dataset: {
       action: 'download-template',
       templateType,
-      fileName: fileName || TEMPLATE_FILE_NAMES[templateType] || `${templateType}.xlsx`
+      fileName: fileName || TEMPLATE_FILE_NAMES[templateType] || '导入模板.xlsx'
     }
   });
 }
@@ -4611,7 +4611,7 @@ async function exportGenerationRecords(format = 'xlsx') {
 
 async function exportEnergyLedgerBackfillPreview() {
   const query = toQuery({ ...state.energyFilters, format: 'xlsx', detailLimit: 500 });
-  await downloadLedgerExport(`/energy-records/ledger-backfill/preview/export${query}`, 'energy-records-台账回填预演审计预案.xlsx', '台账回填预演审计预案下载已触发', '台账回填预演审计预案下载');
+  await downloadLedgerExport(`/energy-records/ledger-backfill/preview/export${query}`, '历史能耗台账回填预演审计预案.xlsx', '台账回填预演审计预案下载已触发', '台账回填预演审计预案下载');
 }
 
 async function executeEnergyLedgerBackfill() {

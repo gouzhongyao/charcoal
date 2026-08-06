@@ -2,6 +2,7 @@ const assert = require('assert');
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+process.env.CHARCOAL_ADMIN_PASSWORD = process.env.CHARCOAL_ADMIN_PASSWORD || 'AdminPassword123!';
 const {
   buildEnergyRecordLedgerBackfillPreview,
   buildLedgerBackfillPreviewIndexes,
@@ -62,6 +63,7 @@ const {
   calculateUsageValue,
   executeMeterReadingEnergyRecordGeneration,
   exportMeterReadingEnergyRecordGenerationPreview,
+  formatGenerationExportFilters,
   getMeterReadingEnergyRecordGenerationPreview,
   mapMeterReadingImportFields,
   normalizeReadingDate,
@@ -69,6 +71,13 @@ const {
   validateAndNormalizeMeterReadingImportRow,
   voidMeterReading
 } = require('../services/meterReadingService');
+
+assert.strictEqual(
+  formatGenerationExportFilters({ organizationUnitId: 1, unexpectedInternalKey: 'hidden-value' }),
+  '用能单元ID=1；其他筛选条件=hidden-value',
+  '抄表生成预演的未知筛选键必须使用中文兜底标签，不得原样暴露内部英文 key。'
+);
+assert(!formatGenerationExportFilters({ unexpectedInternalKey: 'hidden-value' }).includes('unexpectedInternalKey'));
 
 assert.strictEqual(buildUnitPath(null, '企业A'), '企业A');
 assert.strictEqual(buildUnitPath('企业A/一车间', '热处理'), '企业A/一车间/热处理');
@@ -343,7 +352,7 @@ assert.strictEqual(productionOutputTemplate.contractRoute, 'POST /api/production
 ['产能单元编码', '产能单元名称', '月份', '产量值', '产量单位', '数据来源', '备注'].forEach((header) => {
   assert(productionOutputTemplate.headers.includes(header), `production-outputs 模板应包含 ${header}。`);
 });
-assert(getTemplateCsv('organization-units').csv.includes('unit_code'), '用能单元模板应支持 CSV 下载。');
+assert(getTemplateCsv('organization-units').csv.includes('用能单元编码'), '用能单元模板应支持中文表头 CSV 下载。');
 assert(getTemplateCsv('production-outputs').csv.includes('产量值'), '月度产量模板应支持 CSV 下载。');
 assert(getTemplateXlsx('meters').buffer.length > 0, '计量器具模板应支持 xlsx 下载。');
 assert(getTemplateXlsx('production-outputs').buffer.length > 0, '月度产量模板应支持 xlsx 下载。');
@@ -595,16 +604,25 @@ try {
   const previewExportCsv = exportEnergyRecordLedgerBackfillPreview({ format: 'csv', organization: 'UT-1', detailLimit: '50' });
   assert.strictEqual(previewExportCsv.format, 'csv');
   assert.strictEqual(previewExportCsv.contentType, 'text/csv; charset=utf-8');
+  assert.deepStrictEqual(previewExportCsv.fields, [
+    '能耗记录ID', '月份', '能源类型编码', '能源类型名称', '原始组织', '原始地点', '原始部门', '原始仪表字段',
+    '预演状态', '是否可作为回填候选', '原因编码', '原因说明', '原用能单元ID', '原计量器具ID', '候选用能单元ID',
+    '候选用能单元编码', '候选用能单元名称', '候选用能单元路径', '候选计量器具ID', '候选计量器具编码', '候选计量器具名称',
+    '候选计量器具能源类型', '候选计量器具所属用能单元ID', '候选计量器具所属用能单元编码', '候选计量器具所属用能单元名称',
+    '候选计量器具所属用能单元路径', '只读审计说明'
+  ], '台账回填预演导出字段必须完整使用中文标题且顺序稳定。');
   assert.strictEqual(previewExportCsv.rowCount, 4);
   const previewCsv = previewExportCsv.body.toString('utf8');
-  assert(previewCsv.includes('历史 energy_records 台账回填预演/审计预案'), 'CSV 导出应包含审计预案标题。');
-  assert(previewCsv.includes('preview-only / dry-run / no-write'), 'CSV 导出应包含只读 dry-run 元信息。');
-  assert(previewCsv.includes('writesEnergyRecords'), 'CSV 导出应包含 writesEnergyRecords 元信息。');
-  assert(previewCsv.includes('false'), 'CSV 导出应明确 writesEnergyRecords=false。');
+  assert(previewCsv.startsWith('﻿"历史能耗记录台账回填预演审计预案（仅预演、不写入）"'), 'CSV 导出应使用全中文审计预案标题。');
+  ['是否仅预演', '是否只读预览', '是否写入能耗记录', '只读说明', '操作类型', '数据范围', '筛选条件', '可回填数量'].forEach((label) => {
+    assert(previewCsv.includes(label), 'CSV 导出应包含中文元信息标签：' + label + '。');
+  });
+  ['energy_records', 'preview-only', 'dryRun', 'writesEnergyRecords', 'filters', 'wouldUpdate', 'normalizedMonthStart', 'organizationUnitId', 'meterDeviceId', 'sourceBatchId'].forEach((technicalLabel) => {
+    assert(!previewCsv.includes(technicalLabel), 'CSV 文件展示层不得暴露技术标签：' + technicalLabel + '。');
+  });
   assert(previewCsv.includes('能耗记录ID'), 'CSV 导出应包含能耗记录 ID 字段。');
-  assert(previewCsv.includes('候选 organization_unit_id'), 'CSV 导出应包含候选 organization_unit_id 字段。');
-  assert(previewCsv.includes('候选 meter_device_id'), 'CSV 导出应包含候选 meter_device_id 字段。');
-  assert(previewCsv.includes('wouldUpdate'), 'CSV 导出应包含 wouldUpdate 状态。');
+  assert(previewCsv.includes('候选用能单元ID'), 'CSV 导出应包含中文候选用能单元 ID 字段。');
+  assert(previewCsv.includes('候选计量器具ID'), 'CSV 导出应包含中文候选计量器具 ID 字段。');
   assert(previewCsv.includes('MT-1'), 'CSV 导出应包含候选计量器具编码。');
 
   const previewExportXlsx = exportEnergyRecordLedgerBackfillPreview({ format: 'xlsx', organization: 'UT-1', detailLimit: '50' });
@@ -615,6 +633,11 @@ try {
   const workbook = XLSX.read(previewExportXlsx.body, { type: 'buffer' });
   assert(workbook.SheetNames.includes('预案元信息'), 'xlsx 导出应包含预案元信息工作表。');
   assert(workbook.SheetNames.includes('预演明细'), 'xlsx 导出应包含预演明细工作表。');
+  const metaSheet = XLSX.utils.sheet_to_json(workbook.Sheets['预案元信息']);
+  assert(metaSheet.length > 0 && Object.prototype.hasOwnProperty.call(metaSheet[0], '字段') && Object.prototype.hasOwnProperty.call(metaSheet[0], '值'), 'xlsx 预案元信息表头必须使用中文。');
+  const metaLabels = metaSheet.map((row) => row['字段']);
+  assert(metaLabels.includes('是否写入能耗记录') && metaLabels.includes('筛选条件'), 'xlsx 元信息标签必须使用中文展示名称。');
+  assert(!metaLabels.some((label) => ['dryRun', 'previewOnly', 'writesEnergyRecords', 'filters'].includes(label)), 'xlsx 元信息不得暴露内部技术字段名。');
   const detailSheet = XLSX.utils.sheet_to_json(workbook.Sheets['预演明细']);
   assert.strictEqual(detailSheet.length, 4);
   assert(detailSheet.some((row) => row['候选计量器具编码'] === 'MT-1'), 'xlsx 导出明细应包含安全候选计量器具。');
@@ -857,16 +880,28 @@ try {
 
   const exportCsv = exportMeterReadingEnergyRecordGenerationPreview({ format: 'csv', detailLimit: '50' });
   assert.strictEqual(exportCsv.format, 'csv');
+  assert.deepStrictEqual(exportCsv.fields, [
+    '抄表记录ID', '仪表编码', '仪表名称', '用能单元', '能源类型编码', '能源类型名称', '抄表日期', '月份', '原始用量',
+    '原始单位', '标准化用量', '标准单位', '预演状态', '是否可生成', '原因编码', '原因说明', '已有生成能耗记录ID',
+    '冲突能耗记录ID', '拟生成重复键'
+  ], '抄表生成预演导出字段必须完整使用中文标题且顺序稳定。');
   const csvText = exportCsv.body.toString('utf8');
-  assert(csvText.includes('抄表生成 energy_records 预演/审计预案'));
-  assert(csvText.includes('preview-only / dry-run / controlled-generate'));
-  assert(csvText.includes('fixedConfirmText'));
+  assert(csvText.startsWith('﻿"抄表生成能耗记录预演审计预案"'), '抄表生成 CSV 必须使用全中文标题。');
+  ['执行性质', '是否写入能耗记录', '碳核算是否后置', '固定确认文本', '预演签名', '筛选条件'].forEach((label) => {
+    assert(csvText.includes(label), '抄表生成 CSV 应包含中文元信息标签：' + label + '。');
+  });
+  ['energy_records', 'preview-only', 'dry-run', 'writesEnergyRecords', 'fixedConfirmText', 'filters'].forEach((technicalLabel) => {
+    assert(!csvText.includes(technicalLabel), '抄表生成 CSV 展示层不得暴露技术标签：' + technicalLabel + '。');
+  });
   assert(csvText.includes('确认由抄表生成能耗记录'));
-  assert(csvText.includes('拟生成 duplicate_key'));
+  assert(csvText.includes('拟生成重复键'), '抄表生成预演导出必须使用中文重复键标题。');
   const exportXlsx = exportMeterReadingEnergyRecordGenerationPreview({ format: 'xlsx', detailLimit: '50' });
   const workbook = XLSX.read(exportXlsx.body, { type: 'buffer' });
   assert(workbook.SheetNames.includes('预案元信息'));
   assert(workbook.SheetNames.includes('预演明细'));
+  const generationMetaRows = XLSX.utils.sheet_to_json(workbook.Sheets['预案元信息']);
+  assert(generationMetaRows.some((row) => row['字段'] === '是否写入能耗记录' && row['值'] === '否'), '抄表生成 xlsx 应使用中文元信息标签和值。');
+  assert(!generationMetaRows.some((row) => ['writesEnergyRecords', 'filters', 'fixedConfirmText'].includes(row['字段'])), '抄表生成 xlsx 不得暴露内部技术字段名。');
 
   await assert.rejects(
     () => executeMeterReadingEnergyRecordGeneration({ confirmText: '错误确认文本', previewSignature: preview.previewSignature, expectedWouldGenerate: preview.summary.wouldGenerate, candidateReadingIds: preview.candidateReadingIds, filters: preview.filters, acknowledgeSkippedRisks: true, requireBackup: true }),

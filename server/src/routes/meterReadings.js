@@ -1,7 +1,7 @@
 const express = require('express');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticate } = require('../middleware/auth');
-const { requirePermission } = require('../middleware/permission');
+const { requireAnyPermission, requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { assertWritableAllowed } = require('../services/maintenanceState');
 const { normalizeUploadError, uploadImportFile } = require('../middleware/upload');
@@ -21,33 +21,34 @@ const {
 const { sendSuccess } = require('../utils/response');
 
 const router = express.Router();
+const requireMeterReadingView = requireAnyPermission('ledger:readings:view', 'ledger:meter-reading:view');
 
 function buildContentDisposition(fileName, fallbackName) {
-  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || 'meter-readings.xlsx';
+  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || '00000000.xlsx';
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
-router.get('/contract', authenticate, requirePermission('ledger:readings:view'), (req, res) => {
+router.get('/contract', authenticate, requireMeterReadingView, (req, res) => {
   sendSuccess(res, getMeterReadingContract(), { meta: { contractOnly: false } });
 });
 
 router.get('/export', authenticate, requirePermission('ledger:readings:export'), asyncHandler(async (req, res) => {
   const result = exportMeterReadings(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `meter-readings.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);
 }));
 
-router.get('/stats', authenticate, requirePermission('ledger:readings:view'), asyncHandler(async (req, res) => {
+router.get('/stats', authenticate, requireMeterReadingView, asyncHandler(async (req, res) => {
   sendSuccess(res, getMeterReadingStats(req.query));
 }));
 
 router.get('/energy-record-generation/preview/export', authenticate, requirePermission('ledger:readings:preview'), asyncHandler(async (req, res) => {
   const result = exportMeterReadingEnergyRecordGenerationPreview(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `meter-reading-energy-record-generation-preview.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Dry-Run', 'true');
   res.setHeader('X-Preview-Only', 'true');
@@ -84,7 +85,7 @@ router.post('/import', authenticate, requirePermission('ledger:readings:import')
   });
 });
 
-router.get('/', authenticate, requirePermission('ledger:readings:view'), asyncHandler(async (req, res) => {
+router.get('/', authenticate, requireMeterReadingView, asyncHandler(async (req, res) => {
   const result = listMeterReadings(req.query);
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination } });
 }));

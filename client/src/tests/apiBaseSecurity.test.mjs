@@ -1,10 +1,24 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { loadConfigFromFile } from 'vite';
+// API Base 模块：保持公网地址不可信及 Bearer Token 不外发的既有安全契约。
 const sourcePath = path.resolve('client/src/utils/apiBase.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
 const { applyTrustedAuthorization, isTrustedApiBase, normalizeApiBase } = await import(moduleUrl);
+
+// Vite 代理模块：验证开发地址与转发 Origin 使用同一固定本地来源。
+const viteConfigPath = path.resolve('client/vite.config.js');
+const loadedViteConfig = await loadConfigFromFile({ command: 'serve', mode: 'test' }, viteConfigPath);
+assert(loadedViteConfig, 'Vite 配置应可正常加载。');
+const viteServer = loadedViteConfig.config.server;
+const apiProxy = viteServer.proxy['/api'];
+assert.equal(viteServer.host, '127.0.0.1');
+assert.equal(viteServer.port, 7777);
+assert.equal(apiProxy.target, 'http://127.0.0.1:3002');
+assert.equal(apiProxy.changeOrigin, true);
+assert.equal(apiProxy.headers.Origin, `http://${viteServer.host}:${viteServer.port}`);
 
 for (const value of [
   'https://example.com/api',

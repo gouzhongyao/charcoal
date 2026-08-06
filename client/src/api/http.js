@@ -31,7 +31,7 @@ export function filenameFromDisposition(value = '') {
   if (encoded) { try { return decodeURIComponent(encoded); } catch { return encoded; } }
   return value.match(/filename="?([^";]+)"?/i)?.[1] || '';
 }
-export async function download(config, fallbackName = 'download') {
+export async function download(config, fallbackName = '下载文件') {
   const response = await http({ ...config, responseType: 'blob' });
   const fileName = filenameFromDisposition(response.headers['content-disposition']) || fallbackName;
   const url = URL.createObjectURL(response.data); const link = document.createElement('a');

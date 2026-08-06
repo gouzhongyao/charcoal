@@ -28,7 +28,7 @@ export const deleteImportBatch = (batchId) => request({ method: 'delete', url: `
 
 /** 使用响应头中的文件名下载受控目录中的批次原件。 */
 export function downloadImportBatchFile(batchId) {
-  return download({ url: `/imports/batches/${encodeURIComponent(batchId)}/download` }, `import-batch-${batchId}`);
+  return download({ url: `/imports/batches/${encodeURIComponent(batchId)}/download` }, `导入批次原文件-${batchId}`);
 }
 
 /** 下载服务端生成的模板，不在浏览器端构造模板文件。 */

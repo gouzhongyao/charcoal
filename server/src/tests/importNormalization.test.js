@@ -31,8 +31,12 @@ assert.strictEqual(canonicalFieldName('月份'), 'month');
 assert.strictEqual(canonicalFieldName('period'), 'month');
 assert.strictEqual(canonicalFieldName('energy_type'), 'energyType');
 assert.strictEqual(canonicalFieldName('energy_name'), 'energyType');
+assert.strictEqual(canonicalFieldName('能源类型编码'), 'energyType');
+assert.strictEqual(canonicalFieldName('能源类型名称'), 'energyType');
 assert.strictEqual(canonicalFieldName('organization_unit'), 'organization');
 assert.strictEqual(canonicalFieldName('meter_name'), 'meterCode');
+assert.strictEqual(canonicalFieldName('仪表编码'), 'meterCode');
+assert.strictEqual(canonicalFieldName('计量器具编码'), 'meterCode');
 assert.strictEqual(canonicalFieldName('data_time'), 'dataTime');
 assert.strictEqual(canonicalFieldName('设备名称'), 'meterCode');
 
@@ -41,6 +45,13 @@ assert.deepStrictEqual(mapRowFields({ 月份: '2026/1', 能源类型: '电力', 
   energyType: '电力',
   value: '1,234.5',
   unit: '度'
+});
+assert.deepStrictEqual(mapRowFields({ 月份: '2026-02', 能源类型编码: 'electricity', 用量: '88', 单位: 'kWh', 仪表编码: 'E-001' }).mapped, {
+  month: '2026-02',
+  energyType: 'electricity',
+  value: '88',
+  unit: 'kWh',
+  meterCode: 'E-001'
 });
 
 assert.strictEqual(normalizeMonth('2026/1'), '2026-01');

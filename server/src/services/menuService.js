@@ -29,5 +29,19 @@ function createMenu(input = {}) { const db = openDatabase(); try { const payload
 function updateMenu(menuId, input = {}) { const db = openDatabase(); try { const existing = getMenuDb(db, id(menuId)); const payload = normalizePayload(input, existing); assertParent(db, existing.id, payload.parentId); db.prepare(`UPDATE sys_menus SET parent_id = ?, menu_type = ?, menu_name = ?, route_path = ?, component = ?, permission_code = ?, icon = ?, sort_order = ?, visible = ?, status = ?, updated_at = ? WHERE id = ?`).run(payload.parentId, payload.menuType, payload.menuName, payload.routePath, payload.component, payload.permissionCode, payload.icon, payload.sortOrder, payload.visible, payload.status, now(), existing.id); return getMenuDb(db, existing.id); } catch (error) { if (/UNIQUE constraint failed: sys_menus.permission_code/.test(error.message)) throw badRequest('权限编码已存在。', { code: 'DUPLICATE_PERMISSION_CODE' }); throw error; } finally { db.close(); } }
 function setMenuStatus(menuId, status) { return updateMenu(menuId, { status }); }
 function deleteMenu(menuId) { const menu = id(menuId); const db = openDatabase(); try { const existing = getMenuDb(db, menu); if (existing.isBuiltin) throw badRequest('内置菜单不可删除。', { code: 'BUILTIN_MENU_PROTECTED' }); const childCount = db.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE parent_id = ?').get(menu).total; const roleCount = db.prepare('SELECT COUNT(*) AS total FROM sys_role_menus WHERE menu_id = ?').get(menu).total; if (childCount || roleCount) throw badRequest('菜单仍有关联子菜单或角色授权，不能物理删除；请停用。', { code: 'MENU_HAS_ASSOCIATIONS', childCount, roleCount }); db.prepare('DELETE FROM sys_menus WHERE id = ?').run(menu); } finally { db.close(); } }
-function getUserMenus(userId) { const db = openDatabase(); try { const rows = db.prepare(`SELECT DISTINCT m.id, m.parent_id AS parentId, m.menu_type AS menuType, m.menu_name AS menuName, m.route_path AS routePath, m.component, m.permission_code AS permissionCode, m.icon, m.sort_order AS sortOrder, m.visible, m.status, m.is_builtin AS isBuiltin, m.created_at AS createdAt, m.updated_at AS updatedAt FROM sys_menus m JOIN sys_role_menus rm ON rm.menu_id = m.id JOIN sys_user_roles ur ON ur.role_id = rm.role_id JOIN sys_roles r ON r.id = ur.role_id WHERE ur.user_id = ? AND m.status = 'active' AND m.visible = 1 AND r.status = 'active' ORDER BY COALESCE(m.parent_id, 0), m.sort_order, m.id`).all(userId).map(map); return buildTree(rows.filter((row) => row.menuType !== 'button')); } finally { db.close(); } }
+// 对历史人工重复配置按菜单 ID 与路由去重，避免重复目录或同一路由页面下发到前端。
+function dedupeVisibleMenuRows(rows = []) {
+  const menuIds = new Set();
+  const routePaths = new Set();
+  return rows.filter((row) => {
+    const menuId = Number(row?.id);
+    const routePath = text(row?.routePath);
+    if (!Number.isSafeInteger(menuId) || menuId < 1 || menuIds.has(menuId)) return false;
+    if (routePath && routePaths.has(routePath)) return false;
+    menuIds.add(menuId);
+    if (routePath) routePaths.add(routePath);
+    return true;
+  });
+}
+function getUserMenus(userId) { const db = openDatabase(); try { const rows = db.prepare(`SELECT DISTINCT m.id, m.parent_id AS parentId, m.menu_type AS menuType, m.menu_name AS menuName, m.route_path AS routePath, m.component, m.permission_code AS permissionCode, m.icon, m.sort_order AS sortOrder, m.visible, m.status, m.is_builtin AS isBuiltin, m.created_at AS createdAt, m.updated_at AS updatedAt FROM sys_menus m JOIN sys_role_menus rm ON rm.menu_id = m.id JOIN sys_user_roles ur ON ur.role_id = rm.role_id JOIN sys_roles r ON r.id = ur.role_id WHERE ur.user_id = ? AND m.status = 'active' AND m.visible = 1 AND r.status = 'active' ORDER BY COALESCE(m.parent_id, 0), m.sort_order, m.id`).all(userId).map(map); return buildTree(dedupeVisibleMenuRows(rows.filter((row) => row.menuType !== 'button'))); } finally { db.close(); } }
 module.exports = { createMenu, deleteMenu, getMenu: (menuId) => { const db = openDatabase(); try { return getMenuDb(db, id(menuId)); } finally { db.close(); } }, getUserMenus, listMenus, setMenuStatus, updateMenu };

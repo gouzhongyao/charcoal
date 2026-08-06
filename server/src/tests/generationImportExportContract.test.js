@@ -56,10 +56,13 @@ assert.strictEqual(template.route, '/api/templates/generation-records.xlsx');
 assert.strictEqual(template.csvRoute, '/api/templates/generation-records.csv');
 assert.strictEqual(template.contractRoute, 'POST /api/generation/records/import/preview -> POST /api/generation/records/import/execute');
 assert.deepStrictEqual(template.headers, expectedImportHeaders);
-assert(template.description.includes('只写 generation_records'), '模板说明应明确只写 generation_records。');
-assert(template.description.includes('不写 energy_records'), '模板说明应明确不写 energy_records。');
-assert(template.description.includes('carbon_emissions'), '模板说明应明确不写 carbon_emissions。');
-assert(template.description.includes('skip warning'), '模板说明应明确重复默认 skip warning。');
+assert(template.description.includes('只写发电自用记录'), '模板说明应以中文业务名称明确写入范围。');
+assert(template.description.includes('不写能耗记录'), '模板说明应以中文业务名称明确不写能耗记录。');
+assert(template.description.includes('碳排放结果'), '模板说明应以中文业务名称明确不写碳排放结果。');
+assert(template.description.includes('默认跳过并记录告警'), '模板说明应以中文业务描述明确重复处理方式。');
+['generation_records', 'energy_records', 'carbon_emissions', 'skip warning'].forEach((internalTerm) => {
+  assert(!template.description.includes(internalTerm), `用户可见模板说明不得暴露内部技术名 ${internalTerm}。`);
+});
 assert(listTemplates().some((item) => item.type === 'generation-records' && item.headers.join('|') === expectedImportHeaders.join('|')));
 assert(getTemplateCsv('generation-records').csv.includes('用能单元编码'), '发电模板应支持 CSV 下载。');
 assert(getTemplateCsv('generation-records').csv.startsWith('﻿'), '发电 CSV 模板应带 UTF-8 BOM。');

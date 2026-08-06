@@ -42,6 +42,22 @@ function request(server, method, pathname, body, token) {
   });
 }
 
+function grantViewRole(username, permissionCode) {
+  const db = openDatabase();
+  try {
+    const now = new Date().toISOString();
+    const user = db.prepare('SELECT id FROM sys_users WHERE username = ?').get(username);
+    const roleId = db.prepare(`INSERT INTO sys_roles (role_code, role_name, status, created_at, updated_at)
+      VALUES (?, ?, 'active', ?, ?)`).run(`${username}-${permissionCode.replaceAll(':', '-')}`, `${username} 查看角色`, now, now).lastInsertRowid;
+    const menu = db.prepare('SELECT id FROM sys_menus WHERE permission_code = ?').get(permissionCode);
+    assert(menu, `缺少 ${permissionCode} 菜单权限种子`);
+    db.prepare('INSERT INTO sys_role_menus (role_id, menu_id, created_at) VALUES (?, ?, ?)').run(roleId, menu.id, now);
+    db.prepare('INSERT INTO sys_user_roles (user_id, role_id, created_at) VALUES (?, ?, ?)').run(user.id, roleId, now);
+  } finally {
+    db.close();
+  }
+}
+
 function multipart(server, pathname, filename, content, token) {
   return new Promise((resolve, reject) => {
     const boundary = `----carbon-factor-${Date.now()}`;
@@ -71,6 +87,10 @@ function multipart(server, pathname, filename, content, token) {
   try {
     initDatabase();
     register({ username: 'carbon-reader', password: 'Password123!' });
+    register({ username: 'carbon-factor-reader', password: 'Password123!' });
+    register({ username: 'carbon-emission-reader', password: 'Password123!' });
+    grantViewRole('carbon-factor-reader', 'carbon:factors:view');
+    grantViewRole('carbon-emission-reader', 'carbon:emissions:view');
     const { app } = require('../index');
     server = await new Promise((resolve) => {
       const instance = app.listen(0, '127.0.0.1', () => resolve(instance));
@@ -80,22 +100,44 @@ function multipart(server, pathname, filename, content, token) {
     const readerLogin = await request(server, 'POST', '/api/login', { username: 'carbon-reader', password: 'Password123!' });
     const adminToken = adminLogin.body.data.token;
     const readerToken = readerLogin.body.data.token;
+    const factorToken = (await request(server, 'POST', '/api/login', { username: 'carbon-factor-reader', password: 'Password123!' })).body.data.token;
+    const emissionToken = (await request(server, 'POST', '/api/login', { username: 'carbon-emission-reader', password: 'Password123!' })).body.data.token;
 
     assert.strictEqual((await request(server, 'GET', '/api/carbon/factors')).status, 401, '碳因子列表必须拒绝匿名访问。');
     assert.strictEqual((await request(server, 'GET', '/api/carbon/factors', undefined, readerToken)).status, 403, '无因子权限用户必须被服务端拒绝。');
+    assert.strictEqual((await request(server, 'GET', '/api/carbon/factors', undefined, factorToken)).status, 200, '仅因子查看角色必须能读取因子列表。');
+    assert.strictEqual((await request(server, 'GET', '/api/carbon/emissions', undefined, factorToken)).status, 403, '仅因子查看角色不得读取排放列表。');
+    for (const pathname of ['/api/carbon/emissions/stats', '/api/carbon/emissions/statistics', '/api/carbon/emissions/missing-factors']) {
+      assert.strictEqual((await request(server, 'GET', pathname, undefined, factorToken)).status, 403, `仅因子查看角色不得读取 ${pathname}。`);
+    }
+    assert.strictEqual((await request(server, 'GET', '/api/carbon/factors', undefined, emissionToken)).status, 403, '仅排放查看角色不得读取因子列表。');
+    for (const pathname of ['/api/carbon/emissions', '/api/carbon/emissions/stats', '/api/carbon/emissions/statistics', '/api/carbon/emissions/missing-factors']) {
+      assert.strictEqual((await request(server, 'GET', pathname, undefined, emissionToken)).status, 200, `仅排放查看角色必须能读取 ${pathname}。`);
+    }
+    const factorContractResponse = await request(server, 'GET', '/api/carbon/contract', undefined, factorToken);
+    assert.strictEqual(factorContractResponse.status, 200, '任一碳查看角色必须能读取通用契约。');
+    // 内部契约字段与用户可见模板标题必须分别保持稳定。
+    const expectedFactorFields = ['energyTypeCode', 'region', 'factorYear', 'unit', 'factorValue', 'factorUnit', 'source', 'sourceUrl', 'effectiveFrom', 'effectiveTo', 'status'];
+    const expectedFactorHeaders = ['能源类型编码', '地区', '因子年份', '活动数据单位', '因子值', '排放单位', '因子来源', '来源链接', '有效开始日期', '有效结束日期', '状态'];
+    assert.deepStrictEqual(factorContractResponse.body.data.factorFields, expectedFactorFields, '碳因子内部 API 契约字段必须保持英文 JSON key，不得被中文模板标题替换。');
+    assert.deepStrictEqual(factorContractResponse.body.data.factors.export.fields.map((field) => field.key), expectedFactorFields, '碳因子导出契约 key 必须保持内部 JSON 字段。');
+    assert.deepStrictEqual(factorContractResponse.body.data.factors.template.headers, expectedFactorHeaders, '碳因子模板契约必须单独使用中文用户标题。');
+    assert.strictEqual((await request(server, 'GET', '/api/carbon/contract', undefined, emissionToken)).status, 200, '任一碳查看角色必须能读取通用契约。');
     assert.strictEqual((await request(server, 'GET', '/api/carbon/factors', undefined, adminToken)).status, 200, '超级管理员必须绕过细粒度碳权限。');
     assert.strictEqual((await request(server, 'GET', '/api/templates/carbon-factors.csv')).status, 401, '碳因子模板必须拒绝匿名下载。');
     assert.strictEqual((await request(server, 'GET', '/api/templates/carbon-factors.csv', undefined, readerToken)).status, 403, '碳因子模板必须拒绝无权限用户。');
     const template = await request(server, 'GET', '/api/templates/carbon-factors.csv', undefined, adminToken);
     assert.strictEqual(template.status, 200);
     assert.strictEqual(template.headers['x-template-type'], 'carbon-factors');
-    assert(template.body.toString('utf8').includes('energyTypeCode'), '碳因子模板必须使用统一字段头。');
+    assert(template.body.toString('utf8').startsWith('﻿"能源类型编码","地区","因子年份","活动数据单位","因子值","排放单位","因子来源","来源链接","有效开始日期","有效结束日期","状态"'), '碳因子模板必须使用中文字段头。');
 
     const created = await request(server, 'POST', '/api/carbon/factors', {
       energyTypeCode: 'electricity', region: 'default', factorYear: 2028, unit: 'kWh', factorValue: 0.5, factorUnit: 'kgCO2e', source: 'API 测试因子', status: 'active'
     }, adminToken);
     assert.strictEqual(created.status, 201);
     const factorId = created.body.data.id;
+    assert.strictEqual((await request(server, 'GET', `/api/carbon/factors/${factorId}`, undefined, factorToken)).status, 200, '仅因子查看角色必须能读取因子详情。');
+    assert.strictEqual((await request(server, 'GET', `/api/carbon/factors/${factorId}`, undefined, emissionToken)).status, 403, '仅排放查看角色不得读取因子详情。');
     assert.strictEqual((await request(server, 'GET', `/api/carbon/factors/${factorId}`, undefined, adminToken)).body.data.status, 'active');
 
     const db = openDatabase();
@@ -141,7 +183,12 @@ function multipart(server, pathname, filename, content, token) {
       assert.strictEqual(historical.status, 'calculated');
     } finally { historyDb.close(); }
 
-    const csv = 'energyTypeCode,region,factorYear,unit,factorValue,factorUnit,source,sourceUrl,effectiveFrom,effectiveTo,status\nheat,default,2028,MJ,0.1,kgCO2e,导入测试来源,,, ,active\nheat,default,2028,MJ,0.2,kgCO2e,导入测试来源,,,,active\n';
+    const englishCsv = 'energyTypeCode,region,factorYear,unit,factorValue,factorUnit,source,sourceUrl,effectiveFrom,effectiveTo,status\ncoal,default,2028,t,0.3,kgCO2e,英文表头兼容来源,,,,active\n';
+    const englishPreviewResponse = await multipart(server, '/api/carbon/factors/import/preview', 'carbon-factors-english.csv', englishCsv, adminToken);
+    assert.strictEqual(englishPreviewResponse.status, 200);
+    assert.strictEqual(englishPreviewResponse.body.data.summary.wouldImport, 1, '碳因子导入必须继续兼容旧英文表头。');
+
+    const csv = '能源类型编码,地区,因子年份,活动数据单位,因子值,排放单位,因子来源,来源链接,有效开始日期,有效结束日期,状态\nheat,default,2028,MJ,0.1,kgCO2e,导入测试来源,,, ,active\nheat,default,2028,MJ,0.2,kgCO2e,导入测试来源,,,,active\n';
     const previewResponse = await multipart(server, '/api/carbon/factors/import/preview', 'carbon-factors.csv', csv, adminToken);
     assert.strictEqual(previewResponse.status, 200);
     const preview = previewResponse.body.data;
@@ -174,9 +221,11 @@ function multipart(server, pathname, filename, content, token) {
 
     const factorExport = await request(server, 'GET', '/api/carbon/factors/export?format=csv&energyTypeCode=electricity', undefined, adminToken);
     assert.strictEqual(factorExport.status, 200);
+    assert(factorExport.body.toString('utf8').startsWith('﻿"能源类型编码","地区","因子年份","活动数据单位","因子值","排放单位","因子来源","来源链接","有效开始日期","有效结束日期","状态"'), '碳因子导出必须输出中文表头。');
     assert(!factorExport.body.toString('utf8').includes(tmpDir), '因子导出不得泄露本地路径。');
     const emissionExport = await request(server, 'GET', '/api/carbon/emissions/export?format=csv&normalizedMonth=2028-01', undefined, adminToken);
     assert.strictEqual(emissionExport.status, 200);
+    assert(emissionExport.body.toString('utf8').startsWith('﻿"碳排放记录ID","月份","能源类型编码"'), '碳排放导出必须输出中文表头。');
     assert(!emissionExport.body.toString('utf8').includes(tmpDir), '排放导出不得泄露本地路径。');
 
     console.log('carbon accounting API tests passed');

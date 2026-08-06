@@ -8,7 +8,8 @@ body { color: #183153; background: #eef5ff; font-family: var(--el-font-family); 
 .muted { color:#6d809e; line-height:1.7; }
 .action-row { display:flex; flex-wrap:wrap; gap:8px; }
 .filter-bar { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:16px; }
-.filter-bar .el-input, .filter-bar .el-select { width:220px; }
+.filter-bar .el-input { width:220px; }
+:is(.management-toolbar, .filter-row, .filter-bar) .el-select { width:clamp(180px, 20vw, 260px); max-width:100%; }
 .drawer-form { padding: 4px 10px 24px 0; }
 .table-actions { display:flex; flex-wrap:wrap; gap:6px; }
 .empty-state { display:grid; place-items:center; min-height:260px; color:#6d809e; text-align:center; }

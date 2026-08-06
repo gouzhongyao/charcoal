@@ -1,7 +1,7 @@
 const express = require('express');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticate } = require('../middleware/auth');
-const { requirePermission } = require('../middleware/permission');
+const { requireAnyPermission, requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
 const { recordOperation } = require('../services/sessionService');
@@ -28,9 +28,14 @@ const {
 const { sendSuccess } = require('../utils/response');
 
 const router = express.Router();
+// 旧综合 prediction:view 仅用于未完成菜单迁移的历史会话兼容；新的细分角色必须按资源域读取。
+const requirePredictionContractView = requireAnyPermission('prediction:config:view', 'prediction:run:view', 'prediction:result:view', 'prediction:view');
+const requirePredictionConfigView = requireAnyPermission('prediction:config:view', 'prediction:view');
+const requirePredictionRunView = requireAnyPermission('prediction:run:view', 'prediction:view');
+const requirePredictionResultView = requireAnyPermission('prediction:result:view', 'prediction:view');
 
 function buildContentDisposition(fileName, fallbackName) {
-  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || 'prediction-export.xlsx';
+  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || '00000000.xlsx';
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
@@ -38,14 +43,14 @@ function audit(req, operation, targetType, targetId, detail) {
   recordOperation({ userId: req.user.id, operation, targetType, targetId: String(targetId || ''), detail, ip: req.ip });
 }
 
-router.get('/contract', authenticate, requirePermission('prediction:config:view'), (req, res) => {
+router.get('/contract', authenticate, requirePredictionContractView, (req, res) => {
   sendSuccess(res, getPredictionManagementContract(), { meta: { contractOnly: false } });
 });
 
 router.get('/configs/export', authenticate, requirePermission('prediction:config:export'), asyncHandler(async (req, res) => {
   const result = exportPredictionConfigs(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `prediction-configs.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);
@@ -68,10 +73,10 @@ router.post('/configs/import/execute', authenticate, requirePermission('predicti
   sendSuccess(res, result);
 }));
 
-router.get('/configs/:configId', authenticate, requirePermission('prediction:config:view'), asyncHandler(async (req, res) => {
+router.get('/configs/:configId', authenticate, requirePredictionConfigView, asyncHandler(async (req, res) => {
   sendSuccess(res, getPredictionConfig(req.params.configId));
 }));
-router.get('/configs', authenticate, requirePermission('prediction:config:view'), asyncHandler(async (req, res) => {
+router.get('/configs', authenticate, requirePredictionConfigView, asyncHandler(async (req, res) => {
   const result = listPredictionConfigs(req.query);
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination } });
 }));
@@ -101,11 +106,11 @@ router.post('/configs/:configId/runs', authenticate, requirePermission('predicti
   sendSuccess(res, result, { statusCode: 201 });
 }));
 
-router.get('/runs/stats', authenticate, requirePermission('prediction:run:view'), asyncHandler(async (req, res) => {
+router.get('/runs/stats', authenticate, requirePredictionRunView, asyncHandler(async (req, res) => {
   const result = buildPredictionStats(req.query);
   sendSuccess(res, result, { meta: result.meta });
 }));
-router.get('/runs/:runId/results', authenticate, requirePermission('prediction:result:view'), asyncHandler(async (req, res) => {
+router.get('/runs/:runId/results', authenticate, requirePredictionResultView, asyncHandler(async (req, res) => {
   const result = listPredictionResults({ ...req.query, runId: req.params.runId });
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination, sort: result.sort } });
 }));
@@ -114,10 +119,10 @@ router.patch('/runs/:runId/status', authenticate, requirePermission('prediction:
   audit(req, 'prediction.run.status', 'prediction_run', run.id, { status: run.status });
   sendSuccess(res, run);
 }));
-router.get('/runs/:runId', authenticate, requirePermission('prediction:run:view'), asyncHandler(async (req, res) => {
+router.get('/runs/:runId', authenticate, requirePredictionRunView, asyncHandler(async (req, res) => {
   sendSuccess(res, getPredictionRun(req.params.runId));
 }));
-router.get('/runs', authenticate, requirePermission('prediction:run:view'), asyncHandler(async (req, res) => {
+router.get('/runs', authenticate, requirePredictionRunView, asyncHandler(async (req, res) => {
   const result = listPredictionRuns(req.query);
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination, sort: result.sort } });
 }));
@@ -131,12 +136,12 @@ router.post('/runs', authenticate, requirePermission('prediction:run:create'), r
 router.get('/results/export', authenticate, requirePermission('prediction:result:export'), asyncHandler(async (req, res) => {
   const result = exportPredictionResults(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `prediction-results.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);
 }));
-router.get('/results', authenticate, requirePermission('prediction:result:view'), asyncHandler(async (req, res) => {
+router.get('/results', authenticate, requirePredictionResultView, asyncHandler(async (req, res) => {
   const result = listPredictionResults(req.query);
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination, sort: result.sort } });
 }));

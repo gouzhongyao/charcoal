@@ -29,7 +29,7 @@ const TEMPLATE_DEFINITIONS = {
     recommendedFormat: 'xlsx',
     appliesTo: ['能耗管理', '用能预算'],
     contractRoute: 'POST /api/energy-budgets/import/preview -> POST /api/energy-budgets/import/execute',
-    description: '用于预演并受控导入用能预算；periodMonth、energyTypeCode/能源类型、organizationScope、budgetValue、unit、remark、status 与后端契约一致。能源类型必须为 active；相同月份、能源类型和组织范围已存在或同文件重复时默认 skip warning，不覆盖、不物理删除既有预算。',
+    description: '用于预演并受控导入用能预算；预算月份、能源类型编码、组织范围、预算值、单位、备注、状态与后端契约一致。能源类型必须为 active；相同月份、能源类型和组织范围已存在或同文件重复时默认 skip warning，不覆盖、不物理删除既有预算。',
     headers: [...ENERGY_BUDGET_IMPORT_HEADERS],
     rows: [
       ['2026-01', 'electricity', '整体', '12000', 'kWh', '全公司电力月度预算', 'active'],
@@ -47,7 +47,7 @@ const TEMPLATE_DEFINITIONS = {
     appliesTo: ['数据导入', '能耗统计', '预测管理历史数据'],
     contractRoute: 'POST /api/imports/batches',
     description: '用于上传能耗记录；预测管理的历史数据沿用此能耗记录导入结构，导入后按训练月份读取历史能耗。',
-    headers: ['period', 'energy_type', 'energy_name', 'value', 'unit', 'organization_unit', 'site', 'department', 'production_line', 'meter_name', 'data_time', 'business_dimension', 'remark'],
+    headers: ['月份', '能源类型编码', '能源类型名称', '用量', '单位', '用能单元', '厂区', '部门', '产线', '仪表编码', '数据时间', '业务维度', '备注'],
     rows: [
       ['2026-01', 'electricity', '电力', '1000', 'kWh', '烟测集团/生产部', '烟测园区', '生产部', '一线', 'E-001', '2026-01-01 00:00:00', 'monthly-energy', '能耗导入与预测历史样例'],
       ['2026/02', 'natural_gas', '天然气', '50', 'm3', '烟测集团/动力部', '烟测园区', '动力部', '', 'G-001', '2026-02-01 00:00:00', 'monthly-energy', '碳核算缺失因子样例'],
@@ -65,11 +65,11 @@ const TEMPLATE_DEFINITIONS = {
     recommendedFormat: 'xlsx',
     appliesTo: ['基础台账', '计量抄表'],
     contractRoute: 'POST /api/meter-readings/import',
-    description: '用于批量导入计量抄表记录；导入只写入 meter_reading_records，不自动写入 energy_records，也不自动进入能耗统计。',
-    headers: ['reading_date', 'meter_code', 'meter_name', 'previous_value', 'current_value', 'multiplier', 'usage_value', 'unit', 'organization_unit', 'remark'],
+    description: '用于批量导入计量抄表记录；导入只写入计量抄表记录，不自动写入能耗记录，也不自动进入能耗统计。',
+    headers: ['抄表日期', '计量器具编码', '计量器具名称', '上期表码', '本期表码', '倍率', '用量', '单位', '用能单元', '备注'],
     rows: [
-      ['2026-02-28', 'E-001', '一车间电表', '12000', '12500', '1', '', 'kWh', '烟测集团/生产部', 'usage_value 为空时按表码差×倍率计算'],
-      ['2026-02-28', '', '锅炉房热量表', '100', '110', '10', '', 'MJ', '烟测集团/锅炉房', 'meter_code 为空时用 用能单元 + meter_name 匹配']
+      ['2026-02-28', 'E-001', '一车间电表', '12000', '12500', '1', '', 'kWh', '烟测集团/生产部', '用量为空时按表码差×倍率计算'],
+      ['2026-02-28', '', '锅炉房热量表', '100', '110', '10', '', 'MJ', '烟测集团/锅炉房', '计量器具编码为空时用用能单元和计量器具名称匹配']
     ]
   },
   'production-units': {
@@ -82,8 +82,8 @@ const TEMPLATE_DEFINITIONS = {
     recommendedFormat: 'xlsx',
     appliesTo: ['基础台账', '产能单元'],
     contractRoute: 'POST /api/production/units/import/preview -> POST /api/production/units/import/execute',
-    description: '用于预演并受控导入产能单元；unitCode、unitName、organizationUnitCode、productName、outputUnit、remark、status 与后端契约一致。organizationUnitCode 必须匹配 active 用能单元；已有产能单元编码或同文件重复默认 skip warning，不覆盖、不恢复、不物理删除既有台账。',
-    headers: ['unitCode', 'unitName', 'organizationUnitCode', 'productName', 'outputUnit', 'remark', 'status'],
+    description: '用于预演并受控导入产能单元；产能单元编码、产能单元名称、所属用能单元编码、产品名称、产量单位、备注、状态与后端契约一致。所属用能单元编码必须匹配 active 用能单元；已有产能单元编码或同文件重复默认 skip warning，不覆盖、不恢复、不物理删除既有台账。',
+    headers: ['产能单元编码', '产能单元名称', '所属用能单元编码', '产品名称', '产量单位', '备注', '状态'],
     rows: [
       ['PU-001', '一线产能单元', 'OU-001', '产品A', 't', '所属用能单元必须已存在且 active', 'active'],
       ['PU-002', '二线产能单元', 'OU-002', '产品B', '件', '重复编码按 skip 处理，不覆盖既有单元', 'inactive']
@@ -103,7 +103,7 @@ const TEMPLATE_DEFINITIONS = {
     headers: ['产能单元编码', '产能单元名称', '月份', '产量值', '产量单位', '数据来源', '备注'],
     rows: [
       ['PU-001', '一线产能单元', '2026-01', '1000', 't', 'upload', '编码优先；名称仅用于辅助校验/展示'],
-      ['PU-002', '二线产能单元', '2026/02', '2500', '件', '', 'data_source 为空时默认 upload']
+      ['PU-002', '二线产能单元', '2026/02', '2500', '件', '', '数据来源为空时默认按上传文件处理']
     ]
   },
   [GENERATION_RECORD_IMPORT_TEMPLATE_ID]: {
@@ -116,11 +116,11 @@ const TEMPLATE_DEFINITIONS = {
     recommendedFormat: 'xlsx',
     appliesTo: ['基础台账', '发电自用', '发电记录导入'],
     contractRoute: 'POST /api/generation/records/import/preview -> POST /api/generation/records/import/execute',
-    description: '用于预演并受控导入发电自用记录；用能单元编码必填且必须匹配 active 用能单元，同用能单元同月份 photovoltaic 已有 active 发电记录或同文件重复候选时默认 skip warning，不覆盖、不作废旧记录；导入只写 generation_records，不写 energy_records、carbon_emissions 或单位产品能耗。',
+    description: '用于预演并受控导入发电自用记录；用能单元编码必填且必须匹配启用的用能单元，同用能单元同月份已有启用的光伏发电记录或同文件重复候选时默认跳过并记录告警，不覆盖、不作废旧记录；导入只写发电自用记录，不写能耗记录、碳排放结果或单位产品能耗。',
     headers: [...GENERATION_RECORD_IMPORT_HEADERS],
     rows: [
       ['OU-001', '一车间', '2026-01', '1200', '900', '300', 'upload', '编码优先；名称仅用于辅助校验/展示'],
-      ['OU-002', '二车间', '2026/02', '850', '700', '150', '', 'data_source 为空时默认 upload']
+      ['OU-002', '二车间', '2026/02', '850', '700', '150', '', '数据来源为空时默认按上传文件处理']
     ]
   },
   'organization-units': {
@@ -134,7 +134,7 @@ const TEMPLATE_DEFINITIONS = {
     appliesTo: ['基础台账', '用能单元'],
     contractRoute: 'POST /api/organization/units/import',
     description: '用于批量导入组织/用能单元；父级必须已存在，重复编码默认 skip 并写 warning，不覆盖已有台账。',
-    headers: ['unit_code', 'unit_name', 'parent_code', 'parent_name', 'unit_type', 'area', 'sort_order', 'status', 'remark'],
+    headers: ['用能单元编码', '用能单元名称', '父级编码', '父级名称', '用能单元类型', '面积', '排序', '状态', '备注'],
     rows: [
       ['OU-001', '生产部', '', '', 'department', '1200', '10', 'active', '根级用能单元样例'],
       ['OU-002', '一车间', 'OU-001', '生产部', 'workshop', '600', '20', 'active', '父级必须已存在；同文件前一行不会被当作已存在父级']
@@ -151,10 +151,10 @@ const TEMPLATE_DEFINITIONS = {
     appliesTo: ['基础台账', '计量器具'],
     contractRoute: 'POST /api/meters/import',
     description: '用于批量导入计量器具；能源类型和用能单元必须已存在，重复编码默认 skip 并写 warning，不覆盖已有台账。',
-    headers: ['meter_code', 'meter_name', 'meter_type', 'energy_type_code', 'organization_unit_code', 'organization_unit', 'online_status', 'gateway_id', 'multiplier', 'allow_manual_reading', 'flow_direction', 'install_location', 'status', 'remark'],
+    headers: ['计量器具编码', '计量器具名称', '计量器具类型', '能源类型编码', '用能单元编码', '用能单元', '在线状态', '网关ID', '倍率', '允许手工抄表', '流向', '安装位置', '状态', '备注'],
     rows: [
       ['M-001', '一车间电表', 'electricity', 'electricity', 'OU-002', '生产部/一车间', 'unknown', 'GW-001', '1', '1', 'input', '配电室', 'active', '能源类型和用能单元必须已存在'],
-      ['H-001', '锅炉房热量表', 'heat', 'heat', 'OU-003', '生产部/锅炉房', 'offline', '', '10', '1', 'input', '锅炉房', 'active', 'online_status 仅作台账字段']
+      ['H-001', '锅炉房热量表', 'heat', 'heat', 'OU-003', '生产部/锅炉房', 'offline', '', '10', '1', 'input', '锅炉房', 'active', '在线状态仅作台账字段']
     ]
   },
   [CARBON_FACTOR_IMPORT_TEMPLATE_ID]: {
@@ -184,7 +184,7 @@ const TEMPLATE_DEFINITIONS = {
     recommendedFormat: 'xlsx',
     appliesTo: ['预测管理', '预测配置草稿'],
     contractRoute: 'POST /api/predictions/configs/import/preview -> POST /api/predictions/configs/import/execute',
-    description: '仅用于导入可编辑的 draft 预测配置；不会运行预测，不会写 prediction_results、energy_records 或 carbon_emissions。预测结果必须由后端基于已入库能耗数据生成。',
+    description: '仅用于导入可编辑的草稿预测配置；不会运行预测，不会写预测结果、能耗记录或碳排放结果。预测结果必须由后端基于已入库能耗数据生成。',
     headers: [...PREDICTION_CONFIG_IMPORT_HEADERS],
     rows: [
       ['电力趋势预测草稿', '导入后可编辑，运行时由服务端读取已入库能耗', 'electricity', '生产部', 'A园区', '生产部', '', '2026-01', '2026-03', '2026-04', '2026-06', 'moving_average', '3', 'draft']
@@ -202,7 +202,7 @@ const TEMPLATE_DEFINITIONS = {
     contractRoute: 'POST /api/imports/batches',
     reusableTemplateType: 'energy-records',
     description: '预测历史数据复用能耗记录导入结构；请先下载/填写并导入本模板或能耗数据导入模板，再在预测管理中选择训练月份。',
-    headers: ['period', 'energy_type', 'energy_name', 'value', 'unit', 'organization_unit', 'site', 'department', 'production_line', 'meter_name', 'data_time', 'business_dimension', 'remark'],
+    headers: ['月份', '能源类型编码', '能源类型名称', '用量', '单位', '用能单元', '厂区', '部门', '产线', '仪表编码', '数据时间', '业务维度', '备注'],
     rows: [
       ['2026-01', 'electricity', '电力', '1000', 'kWh', '烟测集团/生产部', '烟测园区', '生产部', '一线', 'E-001', '2026-01-01 00:00:00', 'prediction-history', '预测训练历史第 1 月'],
       ['2026-02', 'electricity', '电力', '1100', 'kWh', '烟测集团/生产部', '烟测园区', '生产部', '一线', 'E-001', '2026-02-01 00:00:00', 'prediction-history', '预测训练历史第 2 月'],

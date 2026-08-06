@@ -37,7 +37,7 @@ const PREDICTION_CONFIG_STATUSES = Object.freeze(['draft', 'active', 'archived']
 const PREDICTION_CONFIG_IMPORT_TYPE = 'prediction_config';
 const PREDICTION_CONFIG_IMPORT_TEMPLATE_ID = 'prediction-configs';
 const PREDICTION_CONFIG_IMPORT_CONFIRM_TEXT = '确认导入预测配置草稿';
-const PREDICTION_CONFIG_IMPORT_HEADERS = Object.freeze(['name', 'note', 'energyTypeCode', 'organizationScope', 'site', 'department', 'sourceBatchId', 'trainStartMonth', 'trainEndMonth', 'predictStartMonth', 'predictEndMonth', 'algorithm', 'windowSize', 'status']);
+const PREDICTION_CONFIG_IMPORT_HEADERS = Object.freeze(['配置名称', '备注', '能源类型编码', '组织范围', '厂区', '部门', '能耗批次ID', '训练开始月份', '训练结束月份', '预测开始月份', '预测结束月份', '算法', '窗口大小', '状态']);
 const PREDICTION_CONFIG_IMPORT_ALIASES = Object.freeze({
   name: ['name', '名称', '配置名称'], note: ['note', 'remark', '备注', '说明'],
   energyTypeCode: ['energyTypeCode', 'energy_type_code', '能源类型', '能源类型编码'],
@@ -50,13 +50,21 @@ const PREDICTION_CONFIG_IMPORT_ALIASES = Object.freeze({
   predictEndMonth: ['predictEndMonth', 'predict_end_month', '目标结束月份', '预测结束月份'],
   algorithm: ['algorithm', '算法'], windowSize: ['windowSize', 'window_size', '窗口大小'], status: ['status', '状态']
 });
-const PREDICTION_CONFIG_EXPORT_FIELDS = Object.freeze(PREDICTION_CONFIG_IMPORT_HEADERS.map((key) => ({ key, header: key })));
+const PREDICTION_CONFIG_EXPORT_FIELDS = Object.freeze([
+  { key: 'name', header: '配置名称' }, { key: 'note', header: '备注' },
+  { key: 'energyTypeCode', header: '能源类型编码' }, { key: 'organizationScope', header: '组织范围' },
+  { key: 'site', header: '厂区' }, { key: 'department', header: '部门' },
+  { key: 'sourceBatchId', header: '能耗批次ID' }, { key: 'trainStartMonth', header: '训练开始月份' },
+  { key: 'trainEndMonth', header: '训练结束月份' }, { key: 'predictStartMonth', header: '预测开始月份' },
+  { key: 'predictEndMonth', header: '预测结束月份' }, { key: 'algorithm', header: '算法' },
+  { key: 'windowSize', header: '窗口大小' }, { key: 'status', header: '状态' }
+]);
 const PREDICTION_RESULT_EXPORT_FIELDS = Object.freeze([
-  { key: 'predictionRunId', header: 'predictionRunId' }, { key: 'predictionRunName', header: 'predictionRunName' },
-  { key: 'algorithm', header: 'algorithm' }, { key: 'runStatus', header: 'runStatus' },
-  { key: 'energyTypeCode', header: 'energyTypeCode' }, { key: 'targetMonth', header: 'targetMonth' },
-  { key: 'predictedValue', header: 'predictedValue' }, { key: 'predictedUnit', header: 'predictedUnit' },
-  { key: 'confidenceLow', header: 'confidenceLow' }, { key: 'confidenceHigh', header: 'confidenceHigh' }, { key: 'methodNote', header: 'methodNote' }
+  { key: 'predictionRunId', header: '预测运行ID' }, { key: 'predictionRunName', header: '预测运行名称' },
+  { key: 'algorithm', header: '算法' }, { key: 'runStatus', header: '运行状态' },
+  { key: 'energyTypeCode', header: '能源类型编码' }, { key: 'targetMonth', header: '预测月份' },
+  { key: 'predictedValue', header: '预测值' }, { key: 'predictedUnit', header: '预测单位' },
+  { key: 'confidenceLow', header: '置信区间下限' }, { key: 'confidenceHigh', header: '置信区间上限' }, { key: 'methodNote', header: '方法说明' }
 ]);
 
 function nullableText(value) { return normalizeText(value) || null; }

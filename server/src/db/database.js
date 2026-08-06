@@ -764,32 +764,33 @@ function migrateImportAuditSourceColumns(db) {
   return changed;
 }
 
-// 每项最后一个值是父菜单 route_path；仅超管获得全部种子，普通 user 保持个人中心最小权限。
+// 每项最后两个值依次为父菜单 route_path、是否在动态菜单可见；仅超管获得全部种子，普通 user 保持个人资料最小权限。
 const RBAC_MENU_SEEDS = [
   ['directory', '系统管理', '/system', null, null, 'Setting', 100, null],
   ['menu', '用户管理', '/system/users', 'system/users/index', 'system:user:view', 'User', 110, '/system'],
   ['menu', '角色管理', '/system/roles', 'system/roles/index', 'system:role:view', 'Avatar', 120, '/system'],
   ['menu', '菜单管理', '/system/menus', 'system/menus/index', 'system:menu:view', 'Menu', 130, '/system'],
   ['menu', '备份恢复', '/system/backups', 'system/backups/index', 'system:backup:view', 'FolderOpened', 140, '/system'],
-  ['menu', '个人中心', '/profile', 'profile/index', 'system:profile:update', 'UserFilled', 10, null],
+  ['menu', '个人中心', '/profile', 'profile/index', 'system:profile:update', 'UserFilled', 10, null, 0],
   ['menu', '工作台', '/dashboard', 'dashboard/index', 'dashboard:view', 'DataBoard', 20, null],
-  ['menu', '数据导入', '/imports', 'imports/index', 'imports:view', 'UploadFilled', 30, null],
   ['directory', '能耗管理', '/energy', null, null, 'TrendCharts', 40, null],
-  ['menu', '能耗统计', '/energy/statistics', 'energy/statistics/index', 'energy:statistics:view', 'Histogram', 41, '/energy'],
+  ['menu', '能耗统计', '/energy/statistics', 'energy/statistics/index', 'energy:records:view', 'Histogram', 41, '/energy'],
   ['menu', '用能预算', '/energy/budgets', 'energy/budgets/index', 'energy:budget:view', 'Wallet', 42, '/energy'],
+  ['menu', '能耗数据导入', '/imports', 'imports/index', 'imports:view', 'UploadFilled', 43, '/energy'],
   ['directory', '基础台账', '/ledger', null, null, 'Collection', 50, null],
-  ['menu', '组织管理', '/ledger/organization', 'ledger/organization/index', 'ledger:organization:view', 'OfficeBuilding', 51, '/ledger'],
-  ['menu', '计量器具', '/ledger/meters', 'ledger/meters/index', 'ledger:meter:view', 'Monitor', 52, '/ledger'],
-  ['menu', '计量抄表', '/ledger/meter-readings', 'ledger/meter-readings/index', 'ledger:meter-reading:view', 'DocumentChecked', 53, '/ledger'],
+  ['menu', '组织管理', '/ledger/organization', 'ledger/organization/index', 'ledger:units:view', 'OfficeBuilding', 51, '/ledger'],
+  ['menu', '计量器具', '/ledger/meters', 'ledger/meters/index', 'ledger:meters:view', 'Monitor', 52, '/ledger'],
+  ['menu', '计量抄表', '/ledger/meter-readings', 'ledger/meter-readings/index', 'ledger:readings:view', 'DocumentChecked', 53, '/ledger'],
   ['menu', '生产单元', '/ledger/production-units', 'ledger/production-units/index', 'ledger:production-unit:view', 'Box', 54, '/ledger'],
   ['menu', '月度产量', '/ledger/production-output', 'ledger/production-output/index', 'ledger:production-output:view', 'Tickets', 55, '/ledger'],
   ['menu', '发电自用', '/ledger/generation', 'ledger/generation/index', 'ledger:generation:view', 'Lightning', 56, '/ledger'],
   ['button', '产能单元模板下载', null, null, 'ledger:production:template', null, 541, '/ledger/production-units'],
   ['button', '产能单元导入', null, null, 'ledger:production:import', null, 542, '/ledger/production-units'],
   ['button', '产能单元导出', null, null, 'ledger:production:export', null, 543, '/ledger/production-units'],
-  ['menu', '碳核算', '/carbon', 'carbon/index', 'carbon:view', 'WindPower', 60, null],
-  ['menu', '预测管理', '/predictions', 'predictions/index', 'prediction:view', 'DataAnalysis', 70, null],
-  ['button', '预测配置查看', null, null, 'prediction:config:view', null, 701, '/predictions'],
+  ['menu', '碳核算', '/carbon', 'carbon/index', 'carbon:emissions:view', 'WindPower', 60, null],
+  ['button', '碳因子查看', null, null, 'carbon:factors:view', null, 601, '/carbon'],
+
+  ['menu', '预测管理', '/predictions', 'predictions/index', 'prediction:config:view', 'DataAnalysis', 70, null],
   ['button', '预测配置新增', null, null, 'prediction:config:create', null, 702, '/predictions'],
   ['button', '预测配置编辑', null, null, 'prediction:config:update', null, 703, '/predictions'],
   ['button', '预测配置状态', null, null, 'prediction:config:status', null, 704, '/predictions'],
@@ -820,6 +821,50 @@ const RBAC_MENU_SEEDS = [
   ['button', '修改密码', null, null, 'system:profile:change-password', null, 11, '/profile']
 ];
 
+// 旧种子菜单使用页面旧名；升级时永远保留旧菜单 ID 与其角色关联。
+// 同名 canonical 行可能来自早期按钮种子，故只合并其授权后删除，不用它覆盖旧页面的路由/组件/可见性。
+const RBAC_LEGACY_VIEW_MIGRATIONS = [
+  { legacyPermissionCode: 'energy:statistics:view', permissionCode: 'energy:records:view' },
+  { legacyPermissionCode: 'ledger:organization:view', permissionCode: 'ledger:units:view' },
+  { legacyPermissionCode: 'ledger:meter:view', permissionCode: 'ledger:meters:view' },
+  { legacyPermissionCode: 'ledger:meter-reading:view', permissionCode: 'ledger:readings:view' },
+  { legacyPermissionCode: 'carbon:view', permissionCode: 'carbon:emissions:view', dependentViewPermissionCodes: ['carbon:factors:view'] },
+  { legacyPermissionCode: 'prediction:view', permissionCode: 'prediction:config:view', dependentViewPermissionCodes: ['prediction:run:view', 'prediction:result:view'] }
+];
+
+function migrateLegacyViewMenuPermission(db, migration, timestamp = new Date().toISOString()) {
+  const legacyMenu = db.prepare('SELECT id FROM sys_menus WHERE permission_code = ?').get(migration.legacyPermissionCode);
+  if (!legacyMenu) return false;
+
+  const canonicalMenu = db.prepare('SELECT id FROM sys_menus WHERE permission_code = ?').get(migration.permissionCode);
+  const grant = db.prepare(`INSERT OR IGNORE INTO sys_role_menus (role_id, menu_id, created_at)
+    SELECT role_id, ?, created_at FROM sys_role_menus WHERE menu_id = ?`);
+  (migration.dependentViewPermissionCodes || []).forEach((permissionCode) => {
+    const dependentMenu = db.prepare('SELECT id FROM sys_menus WHERE permission_code = ?').get(permissionCode);
+    if (dependentMenu) grant.run(dependentMenu.id, legacyMenu.id);
+  });
+
+  if (!canonicalMenu || canonicalMenu.id === legacyMenu.id) {
+    db.prepare('UPDATE sys_menus SET permission_code = ?, updated_at = ? WHERE id = ?')
+      .run(migration.permissionCode, timestamp, legacyMenu.id);
+    return true;
+  }
+
+  // 角色原有 canonical 查看授权也归并到保留的旧菜单 ID，避免重复菜单或关联丢失。
+  grant.run(legacyMenu.id, canonicalMenu.id);
+  // permission_code 唯一约束要求先释放新增种子占用的 canonical 键，再提升保留的旧行。
+  db.prepare('UPDATE sys_menus SET permission_code = NULL, updated_at = ? WHERE id = ?').run(timestamp, canonicalMenu.id);
+  db.prepare('UPDATE sys_menus SET permission_code = ?, updated_at = ? WHERE id = ?')
+    .run(migration.permissionCode, timestamp, legacyMenu.id);
+  db.prepare('DELETE FROM sys_role_menus WHERE menu_id = ?').run(canonicalMenu.id);
+  db.prepare('DELETE FROM sys_menus WHERE id = ?').run(canonicalMenu.id);
+  return true;
+}
+
+function migrateLegacyViewMenuPermissions(db, timestamp = new Date().toISOString()) {
+  return RBAC_LEGACY_VIEW_MIGRATIONS.reduce((changed, migration) => migrateLegacyViewMenuPermission(db, migration, timestamp) || changed, false);
+}
+
 function migrateLegacyImportMenuPermission(db, timestamp = new Date().toISOString()) {
   const legacyMenu = db.prepare("SELECT id FROM sys_menus WHERE permission_code = 'import:view'").get();
   if (!legacyMenu) return false;
@@ -841,6 +886,53 @@ function migrateLegacyImportMenuPermission(db, timestamp = new Date().toISOStrin
   return true;
 }
 
+function migrateNavigationMenuStructure(db, timestamp = new Date().toISOString()) {
+  // 个人中心保留权限与角色关联，但只能通过固定路由和右上角用户菜单访问。
+  const profileResult = db.prepare(`UPDATE sys_menus SET visible = 0, updated_at = ?
+    WHERE (route_path = '/profile' OR permission_code = 'system:profile:update') AND visible <> 0`).run(timestamp);
+  const energyMenu = db.prepare("SELECT id FROM sys_menus WHERE route_path = '/energy' AND menu_type = 'directory'").get();
+  const importMenu = db.prepare("SELECT id FROM sys_menus WHERE route_path = '/imports' OR permission_code = 'imports:view'").get();
+  if (!energyMenu || !importMenu) {
+    return profileResult.changes > 0;
+  }
+
+  // 复用既有导入菜单 ID，仅调整层级和展示名称，避免丢失既有角色授权或产生重复菜单。
+  const importResult = db.prepare(`UPDATE sys_menus SET parent_id = ?, menu_name = ?, updated_at = ?
+    WHERE id = ? AND (parent_id IS NOT ? OR menu_name <> ?)`)
+    .run(energyMenu.id, '能耗数据导入', timestamp, importMenu.id, energyMenu.id, '能耗数据导入');
+  return profileResult.changes > 0 || importResult.changes > 0;
+}
+
+// 合并旧版重复创建的内置目录，保留最早 ID、已有角色授权及所有子菜单归属。
+function dedupeBuiltinDirectoryMenus(db) {
+  const directoryRoutes = RBAC_MENU_SEEDS
+    .filter(([menuType]) => menuType === 'directory')
+    .map(([, , routePath]) => routePath)
+    .filter(Boolean);
+  let changed = false;
+  const grant = db.prepare(`INSERT OR IGNORE INTO sys_role_menus (role_id, menu_id, created_at)
+    SELECT role_id, ?, created_at FROM sys_role_menus WHERE menu_id = ?`);
+  const moveChildren = db.prepare('UPDATE sys_menus SET parent_id = ? WHERE parent_id = ?');
+  const removeGrants = db.prepare('DELETE FROM sys_role_menus WHERE menu_id = ?');
+  const removeMenu = db.prepare('DELETE FROM sys_menus WHERE id = ?');
+
+  directoryRoutes.forEach((routePath) => {
+    const directories = db.prepare(`SELECT id FROM sys_menus
+      WHERE menu_type = 'directory' AND route_path = ? ORDER BY id`).all(routePath);
+    if (directories.length < 2) return;
+    const canonicalId = directories[0].id;
+    directories.slice(1).forEach((directory) => {
+      moveChildren.run(canonicalId, directory.id);
+      grant.run(canonicalId, directory.id);
+      removeGrants.run(directory.id);
+      removeMenu.run(directory.id);
+      changed = true;
+    });
+  });
+
+  return changed;
+}
+
 function ensureRbacSeedData(db) {
   const bcrypt = require('bcryptjs');
   const now = new Date().toISOString();
@@ -853,7 +945,9 @@ function ensureRbacSeedData(db) {
       VALUES (?, ?, ?, 'active', 1, ?, ?)`)
       .run('user', '普通用户', '注册用户的最低权限角色。', now, now);
 
-    const systemMenu = db.prepare('SELECT id FROM sys_menus WHERE permission_code IS NULL AND route_path = ?').get('/system');
+    dedupeBuiltinDirectoryMenus(db);
+    const systemMenu = db.prepare(`SELECT id FROM sys_menus
+      WHERE menu_type = 'directory' AND permission_code IS NULL AND route_path = ? ORDER BY id LIMIT 1`).get('/system');
     let systemMenuId = systemMenu && systemMenu.id;
     if (!systemMenuId) {
       systemMenuId = db.prepare(`INSERT INTO sys_menus (menu_type, menu_name, route_path, icon, sort_order, visible, status, is_builtin, created_at, updated_at)
@@ -862,21 +956,27 @@ function ensureRbacSeedData(db) {
     }
     const insertMenu = db.prepare(`INSERT OR IGNORE INTO sys_menus
       (parent_id, menu_type, menu_name, route_path, component, permission_code, icon, sort_order, visible, status, is_builtin, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 1, ?, ?)`);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`);
     const menuIdByRoute = new Map(db.prepare('SELECT id, route_path AS routePath FROM sys_menus WHERE route_path IS NOT NULL').all()
       .map((menu) => [menu.routePath, menu.id]));
     menuIdByRoute.set('/system', systemMenuId);
-    RBAC_MENU_SEEDS.slice(1).forEach(([menuType, menuName, routePath, component, permissionCode, icon, sortOrder, parentRoutePath]) => {
+    RBAC_MENU_SEEDS.slice(1).forEach(([menuType, menuName, routePath, component, permissionCode, icon, sortOrder, parentRoutePath, visible = 1]) => {
       const parentId = parentRoutePath ? menuIdByRoute.get(parentRoutePath) : null;
       if (parentRoutePath && !parentId) {
         throw new Error(`RBAC 菜单种子缺少父菜单：${parentRoutePath}`);
       }
-      insertMenu.run(parentId || null, menuType, menuName, routePath, component, permissionCode, icon, sortOrder, now, now);
+      // directory 没有 permission_code 唯一键；按路由复用既有目录，避免每次初始化新增顶层菜单。
+      if (menuType === 'directory' && routePath && menuIdByRoute.has(routePath)) {
+        return;
+      }
+      insertMenu.run(parentId || null, menuType, menuName, routePath, component, permissionCode, icon, sortOrder, visible, now, now);
       if (routePath) {
-        const menu = db.prepare('SELECT id FROM sys_menus WHERE route_path = ?').get(routePath);
+        const menu = db.prepare('SELECT id FROM sys_menus WHERE route_path = ? ORDER BY id LIMIT 1').get(routePath);
         menuIdByRoute.set(routePath, menu.id);
       }
     });
+    migrateLegacyViewMenuPermissions(db, now);
+    migrateNavigationMenuStructure(db, now);
 
     const adminRole = db.prepare("SELECT id FROM sys_roles WHERE role_code = 'super_admin'").get();
     const userRole = db.prepare("SELECT id FROM sys_roles WHERE role_code = 'user'").get();

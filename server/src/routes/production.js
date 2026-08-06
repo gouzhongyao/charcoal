@@ -1,7 +1,7 @@
 const express = require('express');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticate } = require('../middleware/auth');
-const { requirePermission } = require('../middleware/permission');
+const { requireAnyPermission, requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { assertWritableAllowed } = require('../services/maintenanceState');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
@@ -26,23 +26,26 @@ const {
 const { sendSuccess } = require('../utils/response');
 
 const router = express.Router();
+const requireProductionUnitView = requireAnyPermission('ledger:production-unit:view', 'ledger:production:view');
+const requireProductionOutputView = requireAnyPermission('ledger:production-output:view', 'ledger:production:view');
+const requireProductionView = requireAnyPermission('ledger:production-unit:view', 'ledger:production-output:view', 'ledger:production:view');
 
 function buildContentDisposition(fileName, fallbackName) {
-  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || 'production-outputs.xlsx';
+  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || '00000000.xlsx';
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
-router.get('/statistics/unit-energy-intensity', authenticate, requirePermission('ledger:production:view'), asyncHandler(async (req, res) => {
+router.get('/statistics/unit-energy-intensity', authenticate, requireProductionUnitView, asyncHandler(async (req, res) => {
   const result = getUnitEnergyIntensity(req.query);
   sendSuccess(res, result.rows, { meta: result.meta });
 }));
 
-router.get('/stats', authenticate, requirePermission('ledger:production:view'), asyncHandler(async (req, res) => {
+router.get('/stats', authenticate, requireProductionView, asyncHandler(async (req, res) => {
   const result = getProductionStats(req.query);
   sendSuccess(res, result, { meta: result.meta });
 }));
 
-router.get('/units', authenticate, requirePermission('ledger:production:view'), asyncHandler(async (req, res) => {
+router.get('/units', authenticate, requireProductionUnitView, asyncHandler(async (req, res) => {
   const result = listProductionUnits(req.query);
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination } });
 }));
@@ -50,7 +53,7 @@ router.get('/units', authenticate, requirePermission('ledger:production:view'), 
 router.get('/units/export', authenticate, requirePermission('ledger:production:export'), asyncHandler(async (req, res) => {
   const result = exportProductionUnits(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `production-units.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);
@@ -97,7 +100,7 @@ router.delete('/units/:id', authenticate, requirePermission('ledger:production:d
 router.get('/outputs/export', authenticate, requirePermission('ledger:production:export'), asyncHandler(async (req, res) => {
   const result = exportProductionOutputs(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `production-outputs.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);
@@ -125,7 +128,7 @@ router.post('/outputs/import/execute', authenticate, requirePermission('ledger:p
   sendSuccess(res, audit);
 }));
 
-router.get('/outputs', authenticate, requirePermission('ledger:production:view'), asyncHandler(async (req, res) => {
+router.get('/outputs', authenticate, requireProductionOutputView, asyncHandler(async (req, res) => {
   const result = listProductionOutputs(req.query);
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination } });
 }));

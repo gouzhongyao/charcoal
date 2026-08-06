@@ -2,6 +2,8 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+// Excel 文件解析模块，用于校验预算模板首行和工作表名称。
+const XLSX = require('xlsx');
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'charcoal-energy-budget-'));
 process.env.DATA_DIR = path.join(tmpDir, 'data');
@@ -30,6 +32,11 @@ const {
   upsertEnergyBudget
 } = require('../services/energyBudgetService');
 const { getTemplateCsv, getTemplateDefinition, getTemplateXlsx } = require('../services/templateService');
+
+// 用能预算模板的独立中文标题契约，避免测试直接复用生产常量而同步改错。
+const EXPECTED_ENERGY_BUDGET_TEMPLATE_HEADERS = Object.freeze([
+  '预算月份', '能源类型编码', '组织范围', '预算值', '单位', '备注', '状态'
+]);
 
 function seedBaseData() {
   const db = openDatabase();
@@ -286,9 +293,24 @@ try {
 
   const budgetTemplate = getTemplateDefinition('energy-budgets');
   assert(budgetTemplate, '应注册 energy-budgets 模板。');
-  assert.deepStrictEqual(budgetTemplate.headers, ENERGY_BUDGET_IMPORT_HEADERS);
-  assert(getTemplateCsv('energy-budgets').csv.includes('energyTypeCode'));
-  assert(getTemplateXlsx('energy-budgets').buffer.length > 0);
+  assert.deepStrictEqual(budgetTemplate.headers, EXPECTED_ENERGY_BUDGET_TEMPLATE_HEADERS);
+  assert.deepStrictEqual(ENERGY_BUDGET_IMPORT_HEADERS, EXPECTED_ENERGY_BUDGET_TEMPLATE_HEADERS);
+  assert.strictEqual(new Set(budgetTemplate.headers).size, budgetTemplate.headers.length, '用能预算模板表头不得重复。');
+  const budgetTemplateCsv = getTemplateCsv('energy-budgets').csv;
+  assert.strictEqual(
+    budgetTemplateCsv.replace(/^﻿/, '').split(/\r?\n/, 1)[0],
+    EXPECTED_ENERGY_BUDGET_TEMPLATE_HEADERS.map((header) => `"${header}"`).join(','),
+    '用能预算 CSV 模板首行必须完整使用中文标题并保持固定顺序。'
+  );
+  assert(!budgetTemplateCsv.includes('energyTypeCode') && !budgetTemplateCsv.includes('energy_type_code'), '新预算模板不得暴露历史英文技术标题。');
+  const budgetTemplateXlsx = getTemplateXlsx('energy-budgets');
+  const budgetTemplateWorkbook = XLSX.read(budgetTemplateXlsx.buffer, { type: 'buffer' });
+  assert.deepStrictEqual(budgetTemplateWorkbook.SheetNames, ['用能预算导入模板']);
+  assert.deepStrictEqual(
+    XLSX.utils.sheet_to_json(budgetTemplateWorkbook.Sheets['用能预算导入模板'], { header: 1, blankrows: false })[0],
+    EXPECTED_ENERGY_BUDGET_TEMPLATE_HEADERS,
+    '用能预算 Excel 模板首行必须完整使用中文标题并保持固定顺序。'
+  );
 
   const importRows = [
     { periodMonth: '2027/01', energyTypeCode: 'electricity', organizationScope: '预算导入车间', budgetValue: '88', unit: 'kWh', remark: '待导入预算', status: 'active' },

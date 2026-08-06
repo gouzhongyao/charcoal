@@ -10,7 +10,30 @@ const productionUnitPreview = { batchId: 11, confirmText: '确认导入产能单
 assert.equal(canExecutePreview(productionUnitPreview), true); assert.deepEqual(buildControlledExecutePayload(productionUnitPreview, 'production').candidateRows.map((row) => row.unitCode), ['PU-001', 'PU-002']);
 const generation = { confirmText: '确认由抄表生成能耗记录', previewSignature: 'sig', summary: { wouldGenerate: 2 }, candidateReadingIds: [3, 5], filters: { monthStart: '2026-01' } };
 assert.equal(canExecutePreview(generation, 'reading-generation'), true); assert.deepEqual(buildControlledExecutePayload(generation, 'reading-generation').candidateReadingIds, [3, 5]);
+assert.equal(canExecutePreview(null), false, '导入预演空状态不得读取 previewSignature。');
+assert.equal(canExecutePreview(null, 'reading-generation'), false, '抄表生成预演空状态不得读取 previewSignature。');
 assert.equal(blankForm('productionOutputs').recordStatus, 'active');
 const ledgerApiSource = readFileSync(new URL('../api/ledger.js', import.meta.url), 'utf8');
 ['/production/units/import/preview', '/production/units/import/execute', '/production/units/export', "template('production-units', '产能单元')"].forEach((contract) => assert.ok(ledgerApiSource.includes(contract), `missing production-unit API contract: ${contract}`));
+
+// 六个台账二级路由必须绑定实际页面，并由 Shell 的路由出口在导航切换时保留可读错误态。
+const routerSource = readFileSync(new URL('../router/index.js', import.meta.url), 'utf8');
+[
+  "'ledger/organization/index': OrganizationUnits",
+  "'ledger/meters/index': Meters",
+  "'ledger/meter-readings/index': MeterReadings",
+  "'ledger/generation/index': Generation",
+  "'ledger/production-units/index': ProductionUnits",
+  "'ledger/production-output/index': ProductionOutputs"
+].forEach((contract) => assert.ok(routerSource.includes(contract), `missing ledger route component map: ${contract}`));
+[
+  ['OrganizationUnits.vue', 'units'], ['Meters.vue', 'meters'], ['MeterReadings.vue', 'readings'],
+  ['Generation.vue', 'generation'], ['ProductionUnits.vue', 'productionUnits'], ['ProductionOutputs.vue', 'productionOutputs']
+].forEach(([filename, kind]) => {
+  const pageSource = readFileSync(new URL(`../views/ledger/${filename}`, import.meta.url), 'utf8');
+  assert.match(pageSource, new RegExp(`<LedgerManagement kind="${kind}"`));
+});
+const layoutSource = readFileSync(new URL('../layouts/DefaultLayout.vue', import.meta.url), 'utf8');
+assert.match(layoutSource, /<router-view v-slot="\{ Component \}">/);
+assert.match(layoutSource, /<RouteErrorBoundary :route-key="route\.fullPath">/);
 console.log('ledger management logic tests passed');

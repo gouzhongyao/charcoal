@@ -47,8 +47,18 @@ const CARBON_FACTOR_IMPORT_BACKUP_REASON = 'carbon-factor-import';
 const CARBON_FACTOR_IMPORT_SIGNATURE_PREFIX = 'hmac-sha256:v1';
 const CARBON_FACTOR_IMPORT_AUDIT_DIGEST_PREFIX = 'hmac-sha256:v1:audit';
 const CARBON_FACTOR_IMPORT_HMAC_SECRET_META_KEY = 'carbon_factor_import_hmac_secret';
-const CARBON_FACTOR_IMPORT_HEADERS = Object.freeze(['energyTypeCode', 'region', 'factorYear', 'unit', 'factorValue', 'factorUnit', 'source', 'sourceUrl', 'effectiveFrom', 'effectiveTo', 'status']);
-const CARBON_FACTOR_EXPORT_FIELDS = Object.freeze(CARBON_FACTOR_IMPORT_HEADERS.map((key) => ({ key, header: key })));
+// 碳因子内部 API 契约字段保持稳定，不与用户可见模板标题混用。
+const CARBON_FACTOR_FIELDS = Object.freeze(['energyTypeCode', 'region', 'factorYear', 'unit', 'factorValue', 'factorUnit', 'source', 'sourceUrl', 'effectiveFrom', 'effectiveTo', 'status']);
+// 碳因子模板与文件导出使用中文用户标题。
+const CARBON_FACTOR_IMPORT_HEADERS = Object.freeze(['能源类型编码', '地区', '因子年份', '活动数据单位', '因子值', '排放单位', '因子来源', '来源链接', '有效开始日期', '有效结束日期', '状态']);
+const CARBON_FACTOR_EXPORT_FIELDS = Object.freeze([
+  { key: 'energyTypeCode', header: '能源类型编码' }, { key: 'region', header: '地区' },
+  { key: 'factorYear', header: '因子年份' }, { key: 'unit', header: '活动数据单位' },
+  { key: 'factorValue', header: '因子值' }, { key: 'factorUnit', header: '排放单位' },
+  { key: 'source', header: '因子来源' }, { key: 'sourceUrl', header: '来源链接' },
+  { key: 'effectiveFrom', header: '有效开始日期' }, { key: 'effectiveTo', header: '有效结束日期' },
+  { key: 'status', header: '状态' }
+]);
 const CARBON_FACTOR_IMPORT_ALIASES = Object.freeze({
   energyTypeCode: ['energyTypeCode', 'energy_type_code', 'energyType', '能源类型编码', '能源类型', '能源'],
   region: ['region', '地区', '区域'],
@@ -63,24 +73,24 @@ const CARBON_FACTOR_IMPORT_ALIASES = Object.freeze({
   status: ['status', '状态', '是否启用', 'isActive', 'is_active']
 });
 const CARBON_EMISSION_EXPORT_FIELDS = Object.freeze([
-  { key: 'id', header: 'id' },
-  { key: 'normalizedMonth', header: 'normalizedMonth' },
-  { key: 'energyTypeCode', header: 'energyTypeCode' },
-  { key: 'energyTypeName', header: 'energyTypeName' },
-  { key: 'organization', header: 'organization' },
-  { key: 'site', header: 'site' },
-  { key: 'department', header: 'department' },
-  { key: 'calculationMethod', header: 'calculationMethod' },
-  { key: 'activityValue', header: 'activityValue' },
-  { key: 'activityUnit', header: 'activityUnit' },
-  { key: 'factorValue', header: 'factorValue' },
-  { key: 'emissionValue', header: 'emissionValue' },
-  { key: 'emissionUnit', header: 'emissionUnit' },
-  { key: 'status', header: 'status' },
-  { key: 'factorRegion', header: 'factorRegion' },
-  { key: 'factorYear', header: 'factorYear' },
-  { key: 'factorSource', header: 'factorSource' },
-  { key: 'calculatedAt', header: 'calculatedAt' }
+  { key: 'id', header: '碳排放记录ID' },
+  { key: 'normalizedMonth', header: '月份' },
+  { key: 'energyTypeCode', header: '能源类型编码' },
+  { key: 'energyTypeName', header: '能源类型名称' },
+  { key: 'organization', header: '组织' },
+  { key: 'site', header: '厂区' },
+  { key: 'department', header: '部门' },
+  { key: 'calculationMethod', header: '核算方法' },
+  { key: 'activityValue', header: '活动数据值' },
+  { key: 'activityUnit', header: '活动数据单位' },
+  { key: 'factorValue', header: '因子值' },
+  { key: 'emissionValue', header: '排放量' },
+  { key: 'emissionUnit', header: '排放单位' },
+  { key: 'status', header: '状态' },
+  { key: 'factorRegion', header: '因子地区' },
+  { key: 'factorYear', header: '因子年份' },
+  { key: 'factorSource', header: '因子来源' },
+  { key: 'calculatedAt', header: '核算时间' }
 ]);
 
 function getNow() {
@@ -531,7 +541,7 @@ async function executeCarbonFactorImport(body = {}) { try { return await execute
 
 function getCarbonManagementContract() {
   return {
-    status: 'unified-management-api-ready', factorTable: 'carbon_factors', emissionTable: 'carbon_emissions', factorFields: CARBON_FACTOR_IMPORT_HEADERS, factorStatuses: FACTOR_STATUSES, emissionStatuses: EMISSION_STATUSES,
+    status: 'unified-management-api-ready', factorTable: 'carbon_factors', emissionTable: 'carbon_emissions', factorFields: CARBON_FACTOR_FIELDS, factorStatuses: FACTOR_STATUSES, emissionStatuses: EMISSION_STATUSES,
     deletionPolicy: '碳因子不提供物理删除；仅通过 PATCH /factors/:factorId/status 在 active/inactive 间启停。停用不会修改或删除既有 carbon_emissions，历史排放仍以已保存的因子值和活动数据追溯。',
     routes: { factorList: 'GET /api/carbon/factors', factorDetail: 'GET /api/carbon/factors/:factorId', factorCreate: 'POST /api/carbon/factors', factorUpdate: 'PUT /api/carbon/factors/:factorId', factorStatus: 'PATCH /api/carbon/factors/:factorId/status', factorExport: 'GET /api/carbon/factors/export?format=xlsx|csv', factorImportPreview: 'POST /api/carbon/factors/import/preview', factorImportExecute: 'POST /api/carbon/factors/import/execute', factorTemplate: 'GET /api/templates/carbon-factors.xlsx|csv', emissionList: 'GET /api/carbon/emissions', emissionStats: 'GET /api/carbon/emissions/stats', emissionStatistics: 'GET /api/carbon/emissions/statistics?groupBy=month|energyType|organization|site', emissionExport: 'GET /api/carbon/emissions/export?format=xlsx|csv', calculate: 'POST /api/carbon/emissions/calculate', missingFactors: 'GET /api/carbon/emissions/missing-factors' },
     permissions: { factorView: 'carbon:factors:view', factorCreate: 'carbon:factors:create', factorUpdate: 'carbon:factors:update', factorStatus: 'carbon:factors:status', factorExport: 'carbon:factors:export', factorTemplate: 'carbon:factor:template', factorImport: 'carbon:factor:import', emissionView: 'carbon:emissions:view', emissionCalculate: 'carbon:emissions:calculate', emissionExport: 'carbon:emissions:export' },

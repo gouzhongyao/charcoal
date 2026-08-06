@@ -56,13 +56,13 @@ const PRODUCTION_UNIT_IMPORT_SIGNATURE_PREFIX = 'hmac-sha256:v1';
 const DEFAULT_PRODUCTION_UNIT_IMPORT_HMAC_SECRET = 'charcoal-local-development-production-unit-import-hmac-secret';
 const PRODUCTION_UNIT_IMPORT_BACKUP_REASON = 'production-unit-import';
 const PRODUCTION_UNIT_EXPORT_FIELDS = Object.freeze([
-  { key: 'unitCode', header: 'unitCode' },
-  { key: 'unitName', header: 'unitName' },
-  { key: 'organizationUnitCode', header: 'organizationUnitCode' },
-  { key: 'productName', header: 'productName' },
-  { key: 'outputUnit', header: 'outputUnit' },
-  { key: 'remark', header: 'remark' },
-  { key: 'status', header: 'status' }
+  { key: 'unitCode', header: '产能单元编码' },
+  { key: 'unitName', header: '产能单元名称' },
+  { key: 'organizationUnitCode', header: '所属用能单元编码' },
+  { key: 'productName', header: '产品名称' },
+  { key: 'outputUnit', header: '产量单位' },
+  { key: 'remark', header: '备注' },
+  { key: 'status', header: '状态' }
 ]);
 const PRODUCTION_UNIT_IMPORT_ALIASES = Object.freeze({
   unitCode: ['unitCode', 'unit_code', 'production_unit_code', '产能单元编码', '产线编码'],

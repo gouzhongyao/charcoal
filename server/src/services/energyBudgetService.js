@@ -31,15 +31,15 @@ const ENERGY_BUDGET_IMPORT_BACKUP_REASON = 'energy-budget-import';
 const ENERGY_BUDGET_IMPORT_SIGNATURE_PREFIX = 'hmac-sha256:v1';
 const ENERGY_BUDGET_IMPORT_AUDIT_DIGEST_PREFIX = 'hmac-sha256:v1:audit';
 const ENERGY_BUDGET_IMPORT_HMAC_SECRET_META_KEY = 'energy_budget_import_hmac_secret';
-const ENERGY_BUDGET_IMPORT_HEADERS = Object.freeze(['periodMonth', 'energyTypeCode', 'organizationScope', 'budgetValue', 'unit', 'remark', 'status']);
+const ENERGY_BUDGET_IMPORT_HEADERS = Object.freeze(['预算月份', '能源类型编码', '组织范围', '预算值', '单位', '备注', '状态']);
 const ENERGY_BUDGET_EXPORT_FIELDS = Object.freeze([
-  { key: 'periodMonth', header: 'periodMonth' },
-  { key: 'energyTypeCode', header: 'energyTypeCode' },
-  { key: 'organizationScope', header: 'organizationScope' },
-  { key: 'budgetValue', header: 'budgetValue' },
-  { key: 'unit', header: 'unit' },
-  { key: 'remark', header: 'remark' },
-  { key: 'status', header: 'status' }
+  { key: 'periodMonth', header: '预算月份' },
+  { key: 'energyTypeCode', header: '能源类型编码' },
+  { key: 'organizationScope', header: '组织范围' },
+  { key: 'budgetValue', header: '预算值' },
+  { key: 'unit', header: '单位' },
+  { key: 'remark', header: '备注' },
+  { key: 'status', header: '状态' }
 ]);
 const ENERGY_BUDGET_IMPORT_ALIASES = Object.freeze({
   periodMonth: ['periodMonth', 'period_month', 'month', '月份', '预算月份'],

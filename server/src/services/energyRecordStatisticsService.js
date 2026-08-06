@@ -380,13 +380,13 @@ const LEDGER_BACKFILL_PREVIEW_EXPORT_FIELDS = Object.freeze([
   { key: 'wouldUpdate', header: '是否可作为回填候选' },
   { key: 'reasonCodes', header: '原因编码' },
   { key: 'reasons', header: '原因说明' },
-  { key: 'existingOrganizationUnitId', header: '原 organization_unit_id' },
-  { key: 'existingMeterDeviceId', header: '原 meter_device_id' },
-  { key: 'candidateOrganizationUnitId', header: '候选 organization_unit_id' },
+  { key: 'existingOrganizationUnitId', header: '原用能单元ID' },
+  { key: 'existingMeterDeviceId', header: '原计量器具ID' },
+  { key: 'candidateOrganizationUnitId', header: '候选用能单元ID' },
   { key: 'candidateOrganizationUnitCode', header: '候选用能单元编码' },
   { key: 'candidateOrganizationUnitName', header: '候选用能单元名称' },
   { key: 'candidateOrganizationUnitPath', header: '候选用能单元路径' },
-  { key: 'candidateMeterDeviceId', header: '候选 meter_device_id' },
+  { key: 'candidateMeterDeviceId', header: '候选计量器具ID' },
   { key: 'candidateMeterCode', header: '候选计量器具编码' },
   { key: 'candidateMeterName', header: '候选计量器具名称' },
   { key: 'candidateMeterEnergyTypeCode', header: '候选计量器具能源类型' },
@@ -544,41 +544,66 @@ function buildLedgerBackfillPreviewExportRows(items = []) {
       candidateMeterOrganizationUnitCode: matchedMeter.organizationUnitCode || '',
       candidateMeterOrganizationUnitName: matchedMeter.organizationUnitName || '',
       candidateMeterOrganizationUnitPath: matchedMeter.organizationUnitPath || '',
-      dryRunNotice: 'preview-only / dry-run / no-write：本文件仅为历史 energy_records 台账回填预演审计预案，不代表已执行回填，不会写入 energy_records。'
+      dryRunNotice: '本文件仅为历史能耗记录台账回填预演审计预案，不代表已执行回填，不会写入能耗记录。'
     };
   });
 }
 
+// 将内部筛选对象转换为审计文件中的中文展示文本，API JSON 字段保持不变。
+function formatLedgerBackfillExportFilters(filters = {}) {
+  const labels = {
+    normalizedMonthStart: '开始月份',
+    normalizedMonthEnd: '结束月份',
+    energyTypeCode: '能源类型编码',
+    organization: '组织',
+    keyword: '关键词',
+    site: '地点',
+    department: '部门',
+    organizationUnitId: '用能单元ID',
+    meterDeviceId: '计量器具ID',
+    sourceBatchId: '来源批次ID'
+  };
+  const entries = Object.entries(filters)
+    .filter(([, value]) => value !== null && value !== undefined && value !== '')
+    .map(([key, value]) => `${labels[key] || '其他条件'}=${value}`);
+  return entries.length ? entries.join('；') : '无筛选条件';
+}
+
+// 清理审计文件说明中的内部表名，仅影响文件展示层。
+function formatLedgerBackfillExportNotices(notices = []) {
+  return notices.map((notice) => String(notice || '').replaceAll('energy_records', '能耗记录')).join('；');
+}
+
 function buildLedgerBackfillPreviewExportMeta(preview, generatedAt) {
   return [
-    { field: '文件类型', value: '历史 energy_records 台账回填预演/审计预案' },
-    { field: 'dryRun', value: String(preview.dryRun === true) },
-    { field: 'previewOnly', value: String(preview.previewOnly === true) },
-    { field: 'writesEnergyRecords', value: String(preview.writesEnergyRecords === true) },
-    { field: 'noWriteNotice', value: 'preview-only / dry-run / no-write：本文件仅用于人工审计，不执行真实回填，不更新 energy_records。' },
-    { field: 'operation', value: preview.operation },
-    { field: 'scope', value: preview.scope },
-    { field: 'generatedAt', value: generatedAt },
-    { field: 'detailLimit', value: preview.detailLimit },
-    { field: 'exportedItemCount', value: Array.isArray(preview.items) ? preview.items.length : 0 },
-    { field: 'summary.totalScanned', value: preview.summary?.totalScanned || 0 },
-    { field: 'summary.wouldUpdate', value: preview.summary?.wouldUpdate || 0 },
-    { field: 'summary.candidateByMeter', value: preview.summary?.candidateByMeter || 0 },
-    { field: 'summary.candidateByOrganization', value: preview.summary?.candidateByOrganization || 0 },
-    { field: 'summary.ambiguous', value: preview.summary?.ambiguous || 0 },
-    { field: 'summary.missing', value: preview.summary?.missing || 0 },
-    { field: 'summary.blocked', value: preview.summary?.blocked || 0 },
-    { field: 'summary.alreadyLinked', value: preview.summary?.alreadyLinked || 0 },
-    { field: 'summary.alreadyPartial', value: preview.summary?.alreadyPartial || 0 },
-    { field: 'filters', value: JSON.stringify(preview.filters || {}) },
-    { field: 'notices', value: (preview.notices || []).join('；') }
+    { field: '文件类型', value: '历史能耗记录台账回填预演审计预案' },
+    { field: '是否仅预演', value: preview.dryRun === true ? '是' : '否' },
+    { field: '是否只读预览', value: preview.previewOnly === true ? '是' : '否' },
+    { field: '是否写入能耗记录', value: preview.writesEnergyRecords === true ? '是' : '否' },
+    { field: '只读说明', value: '本文件仅用于人工审计，不执行真实回填，不更新能耗记录。' },
+    { field: '操作类型', value: '历史能耗记录台账关联回填预演' },
+    { field: '数据范围', value: '仅启用状态能耗记录' },
+    { field: '生成时间', value: generatedAt },
+    { field: '明细数量上限', value: preview.detailLimit },
+    { field: '导出明细数量', value: Array.isArray(preview.items) ? preview.items.length : 0 },
+    { field: '扫描总数', value: preview.summary?.totalScanned || 0 },
+    { field: '可回填数量', value: preview.summary?.wouldUpdate || 0 },
+    { field: '按计量器具匹配数量', value: preview.summary?.candidateByMeter || 0 },
+    { field: '按组织匹配数量', value: preview.summary?.candidateByOrganization || 0 },
+    { field: '多候选数量', value: preview.summary?.ambiguous || 0 },
+    { field: '缺失候选数量', value: preview.summary?.missing || 0 },
+    { field: '阻断数量', value: preview.summary?.blocked || 0 },
+    { field: '已完整关联数量', value: preview.summary?.alreadyLinked || 0 },
+    { field: '已部分关联数量', value: preview.summary?.alreadyPartial || 0 },
+    { field: '筛选条件', value: formatLedgerBackfillExportFilters(preview.filters) },
+    { field: '注意事项', value: formatLedgerBackfillExportNotices(preview.notices) }
   ];
 }
 
 function renderLedgerBackfillPreviewCsv(metaRows, detailRows) {
   const detailHeaders = LEDGER_BACKFILL_PREVIEW_EXPORT_FIELDS.map((field) => field.header);
   const lines = [
-    ['历史 energy_records 台账回填预演/审计预案（preview-only / dry-run / no-write）'],
+    ['历史能耗记录台账回填预演审计预案（仅预演、不写入）'],
     [],
     ['元信息字段', '值'],
     ...metaRows.map((row) => [row.field, row.value]),
@@ -592,7 +617,7 @@ function renderLedgerBackfillPreviewCsv(metaRows, detailRows) {
 
 function renderLedgerBackfillPreviewXlsx(metaRows, detailRows) {
   const workbook = XLSX.utils.book_new();
-  const metaSheet = XLSX.utils.json_to_sheet(metaRows, { header: ['field', 'value'] });
+  const metaSheet = XLSX.utils.json_to_sheet(metaRows.map((row) => ({ 字段: row.field, 值: row.value })), { header: ['字段', '值'] });
   metaSheet['!cols'] = [{ wch: 28 }, { wch: 120 }];
   XLSX.utils.book_append_sheet(workbook, metaSheet, '预案元信息');
 
@@ -616,7 +641,7 @@ function renderLedgerBackfillPreviewExport(preview, format) {
   const date = generatedAt.slice(0, 10).replace(/-/g, '');
   const detailRows = buildLedgerBackfillPreviewExportRows(preview.items || []);
   const metaRows = buildLedgerBackfillPreviewExportMeta(preview, generatedAt);
-  const fileName = `energy-records-台账回填预演审计预案-${date}.${normalizedFormat}`;
+  const fileName = `能耗记录-台账回填预演审计预案-${date}.${normalizedFormat}`;
   if (normalizedFormat === 'csv') {
     return {
       fileName,

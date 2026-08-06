@@ -121,11 +121,11 @@ function executeBody(preview, overrides = {}) {
 
     const template = await request(server, 'GET', '/api/templates/production-units.csv', undefined, adminToken);
     assert.strictEqual(template.headers['x-template-type'], 'production-units');
-    assert(template.body.toString('utf8').includes('organizationUnitCode'), '产能单元模板必须包含组织映射字段。');
+    assert(template.body.toString('utf8').startsWith('﻿"产能单元编码","产能单元名称","所属用能单元编码","产品名称","产量单位","备注","状态"'), '产能单元模板必须使用中文表头。');
 
     const exportActive = await request(server, 'GET', `/api/production/units/export?format=csv&status=active&keyword=${encodeURIComponent('既有')}`, undefined, adminToken);
     const exportText = exportActive.body.toString('utf8');
-    assert(exportText.includes('unitCode'), '产能单元导出必须使用模板契约字段。');
+    assert(exportText.startsWith('﻿"产能单元编码","产能单元名称","所属用能单元编码","产品名称","产量单位","备注","状态"'), '产能单元导出必须使用中文表头。');
     assert(exportText.includes('PU-EXISTS'), '导出必须应用 keyword/status 筛选。');
     assert(!exportText.includes('PU-INACTIVE'), '导出不得包含不满足当前筛选的停用产能单元。');
     assert(String(exportActive.headers['content-disposition']).includes('filename*=UTF-8'), '导出必须提供中文文件名编码。');
@@ -135,10 +135,15 @@ function executeBody(preview, overrides = {}) {
     assert(String(exportXlsx.headers['content-type']).includes('spreadsheetml.sheet'));
     const exportWorkbook = XLSX.read(exportXlsx.body, { type: 'buffer' });
     assert.strictEqual(exportWorkbook.SheetNames[0], '产能单元');
-    assert(XLSX.utils.sheet_to_json(exportWorkbook.Sheets['产能单元']).some((row) => row.unitCode === 'PU-EXISTS'));
+    assert(XLSX.utils.sheet_to_json(exportWorkbook.Sheets['产能单元']).some((row) => row['产能单元编码'] === 'PU-EXISTS'));
+
+    const englishCsv = 'unitCode,unitName,organizationUnitCode,productName,outputUnit,remark,status\nPU-ENGLISH,英文表头兼容产线,PU-ORG,产品E,t,兼容性预演,active\n';
+    const englishPreviewResponse = await multipart(server, '/api/production/units/import/preview', 'production-units-english.csv', englishCsv, adminToken);
+    assert.strictEqual(englishPreviewResponse.status, 200);
+    assert.strictEqual(englishPreviewResponse.body.data.summary.wouldImport, 1, '产能单元导入必须继续兼容旧英文表头。');
 
     const csv = [
-      'unitCode,unitName,organizationUnitCode,productName,outputUnit,remark,status',
+      '产能单元编码,产能单元名称,所属用能单元编码,产品名称,产量单位,备注,状态',
       'PU-NEW,新建产线,PU-ORG,产品A,t,可导入,active',
       'PU-EXISTS,既有产线,PU-ORG,既有产品,t,重复跳过,active',
       'PU-BAD,无效组织产线,UNKNOWN-ORG,产品B,件,组织不存在,active',

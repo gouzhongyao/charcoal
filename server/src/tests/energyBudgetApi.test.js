@@ -68,13 +68,19 @@ function multipart(server, pathname, filename, content, token) {
     const template = await request(server, 'GET', '/api/templates/energy-budgets.csv', undefined, adminToken);
     assert.strictEqual(template.status, 200);
     assert.strictEqual(template.headers['x-template-type'], 'energy-budgets');
+    assert(template.body.startsWith('﻿"预算月份","能源类型编码","组织范围","预算值","单位","备注","状态"'), '预算模板必须输出中文表头。');
 
     await runWithMaintenance('budget-api-test', async () => {
       const blocked = await request(server, 'POST', '/api/energy-budgets', { periodMonth: '2028-01', energyTypeCode: 'electricity', budgetValue: 1 }, adminToken);
       assert.strictEqual(blocked.status, 423, '维护态必须在已授权写操作前拒绝。');
     });
 
-    const csv = 'periodMonth,energyTypeCode,organizationScope,budgetValue,unit,remark,status\n2028-01,electricity,接口导入单元,66,kWh,接口预演,active\n2028-01,electricity,接口导入单元,77,kWh,重复候选,active\n';
+    const englishCsv = 'periodMonth,energyTypeCode,organizationScope,budgetValue,unit,remark,status\n2028-02,electricity,英文表头兼容单元,55,kWh,兼容性预演,active\n';
+    const englishPreviewResponse = await multipart(server, '/api/energy-budgets/import/preview', 'energy-budgets-english.csv', englishCsv, adminToken);
+    assert.strictEqual(englishPreviewResponse.status, 200);
+    assert.strictEqual(englishPreviewResponse.body.data.summary.wouldImport, 1, '预算导入必须继续兼容旧英文表头。');
+
+    const csv = '预算月份,能源类型编码,组织范围,预算值,单位,备注,状态\n2028-01,electricity,接口导入单元,66,kWh,接口预演,active\n2028-01,electricity,接口导入单元,77,kWh,重复候选,active\n';
     const previewResponse = await multipart(server, '/api/energy-budgets/import/preview', 'energy-budgets.csv', csv, adminToken);
     assert.strictEqual(previewResponse.status, 200);
     const preview = previewResponse.body.data;
@@ -107,6 +113,9 @@ function multipart(server, pathname, filename, content, token) {
       assert.strictEqual(imported.sourceBatchId, preview.batchId);
       assert.strictEqual(imported.sourceRowNumber, 2);
     } finally { db.close(); }
+    const exported = await request(server, 'GET', '/api/energy-budgets/export?format=csv&periodMonth=2028-01', undefined, adminToken);
+    assert.strictEqual(exported.status, 200);
+    assert(exported.body.startsWith('﻿"预算月份","能源类型编码","组织范围","预算值","单位","备注","状态"'), '预算导出必须输出中文表头。');
     console.log('energy budget API tests passed');
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));

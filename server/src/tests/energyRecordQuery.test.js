@@ -150,9 +150,9 @@ assert(statisticsServiceJs.includes("fileName: `能耗明细-${date}.${format}`"
 assert(statisticsServiceJs.includes('normalizeEnergyRecordExportFormat'), '能耗明细导出格式必须限制为 xlsx/csv。');
 assert(statisticsServiceJs.includes('writesEnergyRecords: false'), '历史台账关联预演必须明确不写入 energy_records。');
 assert(statisticsServiceJs.includes('previewOnly: true'), '历史台账关联预演必须明确仅为 preview。');
-assert(statisticsServiceJs.includes('preview-only / dry-run / no-write'), '导出文件必须包含醒目的 preview-only / dry-run / no-write 元信息。');
-assert(statisticsServiceJs.includes('候选 organization_unit_id'), '导出字段应包含候选 organization_unit_id。');
-assert(statisticsServiceJs.includes('候选 meter_device_id'), '导出字段应包含候选 meter_device_id。');
+assert(statisticsServiceJs.includes('历史能耗记录台账回填预演审计预案（仅预演、不写入）'), '导出文件必须包含醒目的中文只读预演说明。');
+assert(statisticsServiceJs.includes('候选用能单元ID'), '导出字段应使用中文候选用能单元 ID 标题。');
+assert(statisticsServiceJs.includes('候选计量器具ID'), '导出字段应使用中文候选计量器具 ID 标题。');
 assert(statisticsServiceJs.includes('executeEnergyRecordLedgerBackfill'), '应提供受控执行历史台账回填服务。');
 assert(statisticsServiceJs.includes('previewSignature'), 'preview 与执行审计必须包含 previewSignature。');
 assert(statisticsServiceJs.includes("confirmText !== LEDGER_BACKFILL_CONFIRM_TEXT"), '执行服务必须校验固定确认文本。');
@@ -165,7 +165,7 @@ assert(statisticsServiceJs.includes('meter_device_id IS NULL'), '执行更新必
 assert(!/INSERT\s+INTO\s+energy_records/i.test(statisticsServiceJs), '能耗统计服务不得提供 INSERT energy_records 的回填路径。');
 assert(!/DELETE\s+FROM\s+energy_records/i.test(statisticsServiceJs), '能耗统计服务不得提供 DELETE energy_records 的回填路径。');
 assert(energyRecordsRouteJs.includes('router.use(authenticate)'), '能耗记录路由必须统一要求登录。');
-assert(energyRecordsRouteJs.includes("requireAnyPermission('energy:records:view', 'energy-records:view')"), '只读能耗记录接口必须兼容新旧查看权限键。');
+assert(energyRecordsRouteJs.includes("requireAnyPermission('energy:records:view', 'energy-records:view', 'energy:statistics:view')"), '只读能耗记录接口必须兼容新旧查看权限键。');
 assert(energyRecordsRouteJs.includes("router.get('/export', requireEnergyRecordView"), '应提供受保护的能耗明细导出接口。');
 assert(energyRecordsRouteJs.includes("requirePermission('energy:records:ledger-backfill:execute')"), '台账回填执行必须校验专用执行权限。');
 assert(energyRecordsRouteJs.includes("router.get('/ledger-backfill/preview/export'"), '应提供明确命名的历史台账关联预演审计预案 GET 导出接口。');
