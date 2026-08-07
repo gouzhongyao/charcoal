@@ -13,13 +13,26 @@ const { findLedgerAssociationsForImportRecord, loadActiveLedgerIndexes } = requi
 const MAX_PAGE_SIZE = 500;
 const ENERGY_RECORD_IMPORT_TYPE = 'energy_record';
 const METER_READING_IMPORT_TYPE = 'meter_reading';
+// 中央批次列表支持的导入类型与中文展示标签。
 const IMPORT_TYPE_LABELS = Object.freeze({
   energy_record: '能耗数据导入',
   meter_reading: '计量抄表导入',
   organization_unit: '组织/用能单元导入',
   meter_device: '计量器具导入',
+  production_unit: '产能单元导入',
   production_output: '月度产量导入',
-  generation_record: '发电记录导入'
+  generation_record: '发电记录导入',
+  energy_budget: '用能预算导入',
+  carbon_factor: '碳排放因子导入',
+  prediction_config: '预测配置导入',
+  energy_timeseries: '能耗时序数据导入',
+  shift_schedule: '排班计划导入',
+  device_state: '设备状态导入',
+  energy_conversion_factor: '能源折标系数导入',
+  energy_benchmark: '能效对标导入',
+  energy_flow_node: '能流节点导入',
+  energy_flow_edge: '能流边导入',
+  energy_flow_record: '显式边值导入'
 });
 const IMPORT_TYPE_VALUES = Object.freeze(Object.keys(IMPORT_TYPE_LABELS));
 
@@ -781,7 +794,7 @@ function getImportBatchFileDownload(batchId) {
     return {
       batchId: numericBatchId,
       filePath,
-      fileName: decodeUploadOriginalName(batch.originalFilename) || `import-batch-${numericBatchId}.${batch.fileType}`,
+      fileName: decodeUploadOriginalName(batch.originalFilename) || `导入批次原文件-${numericBatchId}.${batch.fileType}`,
       fileType: batch.fileType
     };
   } finally {

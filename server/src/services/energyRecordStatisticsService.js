@@ -617,7 +617,12 @@ function renderLedgerBackfillPreviewCsv(metaRows, detailRows) {
 
 function renderLedgerBackfillPreviewXlsx(metaRows, detailRows) {
   const workbook = XLSX.utils.book_new();
-  const metaSheet = XLSX.utils.json_to_sheet(metaRows.map((row) => ({ 字段: row.field, 值: row.value })), { header: ['字段', '值'] });
+  const metaSheet = XLSX.utils.aoa_to_sheet([
+    ['历史能耗记录台账回填预演审计预案（仅预演、不写入）'],
+    ['字段', '值'],
+    ...metaRows.map((row) => [row.field, row.value])
+  ]);
+  metaSheet['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 1 } }];
   metaSheet['!cols'] = [{ wch: 28 }, { wch: 120 }];
   XLSX.utils.book_append_sheet(workbook, metaSheet, '预案元信息');
 

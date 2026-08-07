@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS app_meta (
 
 CREATE TABLE IF NOT EXISTS import_batches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_unit', 'production_output', 'generation_record', 'energy_budget', 'carbon_factor', 'prediction_config')),
+  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_unit', 'production_output', 'generation_record', 'energy_budget', 'carbon_factor', 'prediction_config', 'energy_timeseries', 'shift_schedule', 'device_state', 'energy_conversion_factor', 'energy_benchmark', 'energy_flow_node', 'energy_flow_edge', 'energy_flow_record')),
   original_filename TEXT NOT NULL,
   stored_filename TEXT,
   file_type TEXT NOT NULL CHECK (file_type IN ('xlsx', 'xls', 'csv')),
@@ -379,6 +379,748 @@ CREATE TABLE IF NOT EXISTS prediction_results (
   UNIQUE (prediction_run_id, energy_type_id, target_month)
 );
 
+-- ENERGY_ANALYSIS_SCHEMA_START
+-- 能源分析时序事实、排班和设备状态均保留 UTC 区间、来源时区与作废审计。
+CREATE TABLE IF NOT EXISTS energy_timeseries_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  organization_unit_id INTEGER,
+  meter_device_id INTEGER,
+  energy_type_id INTEGER NOT NULL,
+  start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(start_utc) = 1),
+  end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  granularity_minutes INTEGER NOT NULL CHECK (granularity_minutes IN (15, 30, 60)),
+  original_unit TEXT NOT NULL,
+  original_value REAL NOT NULL CHECK (original_value >= 0),
+  normalized_unit TEXT NOT NULL,
+  normalized_value REAL NOT NULL CHECK (normalized_value >= 0),
+  source_reference TEXT NOT NULL,
+  data_source TEXT NOT NULL DEFAULT 'upload' CHECK (data_source IN ('manual', 'upload', 'calculation')),
+  record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
+  void_reason TEXT,
+  voided_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE SET NULL,
+  FOREIGN KEY (meter_device_id) REFERENCES meter_devices(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+  CHECK (unixepoch(start_utc) < unixepoch(end_utc)),
+  CHECK (is_utc_minute_boundary(start_utc) = 1 AND is_utc_minute_boundary(end_utc) = 1),
+  CHECK (unixepoch(end_utc) - unixepoch(start_utc) = granularity_minutes * 60),
+  CHECK (
+    (record_status = 'active' AND void_reason IS NULL AND voided_at IS NULL)
+    OR (
+      record_status = 'void'
+      AND trim(COALESCE(void_reason, '')) <> ''
+      AND is_strict_utc_iso(voided_at) = 1
+    )
+  )
+);
+
+CREATE TABLE IF NOT EXISTS shift_definitions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  shift_code TEXT NOT NULL,
+  shift_name TEXT NOT NULL,
+  start_minute INTEGER NOT NULL CHECK (start_minute BETWEEN 0 AND 1439),
+  end_minute INTEGER NOT NULL CHECK (end_minute BETWEEN 0 AND 1439),
+  crosses_midnight INTEGER NOT NULL DEFAULT 0 CHECK (crosses_midnight IN (0, 1)),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  source TEXT NOT NULL,
+  version TEXT NOT NULL,
+  effective_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_start_utc) = 1),
+  effective_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_end_utc) = 1),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  UNIQUE (shift_code, version),
+  CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc)),
+  CHECK ((crosses_midnight = 0 AND start_minute < end_minute) OR (crosses_midnight = 1 AND start_minute > end_minute))
+);
+
+CREATE TABLE IF NOT EXISTS shift_schedule_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  shift_definition_id INTEGER NOT NULL,
+  organization_unit_id INTEGER,
+  start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(start_utc) = 1),
+  end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  source_reference TEXT NOT NULL,
+  data_source TEXT NOT NULL DEFAULT 'upload' CHECK (data_source IN ('manual', 'upload', 'calculation')),
+  record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
+  void_reason TEXT,
+  voided_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (shift_definition_id) REFERENCES shift_definitions(id) ON DELETE RESTRICT,
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE SET NULL,
+  CHECK (unixepoch(start_utc) < unixepoch(end_utc)),
+  CHECK (
+    (record_status = 'active' AND void_reason IS NULL AND voided_at IS NULL)
+    OR (
+      record_status = 'void'
+      AND trim(COALESCE(void_reason, '')) <> ''
+      AND is_strict_utc_iso(voided_at) = 1
+    )
+  )
+);
+
+CREATE TABLE IF NOT EXISTS device_state_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  meter_device_id INTEGER NOT NULL,
+  organization_unit_id INTEGER,
+  device_state TEXT NOT NULL CHECK (device_state IN ('running', 'idle', 'stopped', 'offline', 'unknown')),
+  start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(start_utc) = 1),
+  end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  source_reference TEXT NOT NULL,
+  data_source TEXT NOT NULL DEFAULT 'upload' CHECK (data_source IN ('manual', 'upload', 'calculation')),
+  record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
+  void_reason TEXT,
+  voided_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (meter_device_id) REFERENCES meter_devices(id) ON DELETE RESTRICT,
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE SET NULL,
+  CHECK (unixepoch(start_utc) < unixepoch(end_utc)),
+  CHECK (
+    (record_status = 'active' AND void_reason IS NULL AND voided_at IS NULL)
+    OR (
+      record_status = 'void'
+      AND trim(COALESCE(void_reason, '')) <> ''
+      AND is_strict_utc_iso(voided_at) = 1
+    )
+  )
+);
+
+CREATE TABLE IF NOT EXISTS tou_schemes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scheme_code TEXT NOT NULL,
+  scheme_name TEXT NOT NULL,
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  source TEXT NOT NULL,
+  document_no TEXT,
+  version TEXT NOT NULL,
+  effective_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_start_utc) = 1),
+  effective_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_end_utc) = 1),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE (scheme_code, version),
+  CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc))
+);
+
+CREATE TABLE IF NOT EXISTS tou_period_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tou_scheme_id INTEGER NOT NULL,
+  day_of_week INTEGER NOT NULL CHECK (day_of_week BETWEEN 1 AND 7),
+  period_type TEXT NOT NULL CHECK (period_type IN ('peak', 'flat', 'valley')),
+  start_minute INTEGER NOT NULL CHECK (start_minute BETWEEN 0 AND 1439),
+  end_minute INTEGER NOT NULL CHECK (end_minute BETWEEN 1 AND 1440),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (tou_scheme_id) REFERENCES tou_schemes(id) ON DELETE CASCADE,
+  UNIQUE (tou_scheme_id, day_of_week, start_minute, end_minute),
+  CHECK (start_minute < end_minute)
+);
+
+CREATE TABLE IF NOT EXISTS energy_conversion_factors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  factor_code TEXT NOT NULL,
+  energy_type_id INTEGER NOT NULL,
+  source_unit TEXT NOT NULL,
+  factor_value REAL NOT NULL CHECK (factor_value > 0),
+  target_unit TEXT NOT NULL DEFAULT 'kgce' CHECK (target_unit = 'kgce'),
+  display_unit TEXT NOT NULL DEFAULT 'tce' CHECK (display_unit = 'tce'),
+  display_divisor REAL NOT NULL DEFAULT 1000 CHECK (display_divisor = 1000),
+  source TEXT NOT NULL,
+  document_no TEXT NOT NULL,
+  version TEXT NOT NULL,
+  effective_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_start_utc) = 1),
+  effective_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+  UNIQUE (factor_code, version),
+  CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc))
+);
+
+CREATE TABLE IF NOT EXISTS strategy_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  rule_code TEXT NOT NULL,
+  rule_name TEXT NOT NULL,
+  rule_version TEXT NOT NULL,
+  formula_version TEXT NOT NULL,
+  metric_code TEXT NOT NULL,
+  threshold_operator TEXT NOT NULL CHECK (threshold_operator IN ('gt', 'gte', 'lt', 'lte', 'between')),
+  threshold_value REAL,
+  threshold_min REAL,
+  threshold_max REAL,
+  threshold_unit TEXT NOT NULL,
+  reduction_rate REAL CHECK (reduction_rate IS NULL OR (reduction_rate > 0 AND reduction_rate <= 1)),
+  priority TEXT NOT NULL CHECK (priority IN ('low', 'medium', 'high')),
+  evidence_requirements_json TEXT NOT NULL,
+  recommendation_text TEXT NOT NULL,
+  source TEXT NOT NULL,
+  effective_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_start_utc) = 1),
+  effective_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE (rule_code, rule_version),
+  CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc)),
+  CHECK (
+    (threshold_operator = 'between' AND threshold_min IS NOT NULL AND threshold_max IS NOT NULL AND threshold_min <= threshold_max AND threshold_value IS NULL)
+    OR (threshold_operator <> 'between' AND threshold_value IS NOT NULL AND threshold_min IS NULL AND threshold_max IS NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS strategy_evaluation_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_code TEXT NOT NULL UNIQUE,
+  scope_type TEXT NOT NULL,
+  scope_reference TEXT NOT NULL,
+  start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(start_utc) = 1),
+  end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  formula_version TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
+  reason_codes_json TEXT,
+  started_at TEXT CHECK (started_at IS NULL OR is_strict_utc_iso(started_at) = 1),
+  completed_at TEXT CHECK (completed_at IS NULL OR is_strict_utc_iso(completed_at) = 1),
+  error_message TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  CHECK (unixepoch(start_utc) < unixepoch(end_utc))
+);
+
+CREATE TABLE IF NOT EXISTS strategy_rule_hits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  evaluation_run_id INTEGER NOT NULL,
+  strategy_rule_id INTEGER NOT NULL,
+  match_status TEXT NOT NULL CHECK (match_status IN ('matched', 'not_matched', 'not_evaluable')),
+  manual_status TEXT NOT NULL DEFAULT 'unconfirmed' CHECK (manual_status IN ('unconfirmed', 'accepted', 'rejected', 'resolved')),
+  actual_value REAL,
+  threshold_snapshot_json TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  reason_codes_json TEXT,
+  coverage_rate REAL NOT NULL CHECK (coverage_rate BETWEEN 0 AND 1),
+  priority TEXT NOT NULL CHECK (priority IN ('low', 'medium', 'high')),
+  estimated_saving REAL CHECK (estimated_saving IS NULL OR estimated_saving >= 0),
+  estimated_saving_unit TEXT,
+  data_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(data_start_utc) = 1),
+  data_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(data_end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  reviewed_at TEXT CHECK (reviewed_at IS NULL OR is_strict_utc_iso(reviewed_at) = 1),
+  review_note TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (evaluation_run_id) REFERENCES strategy_evaluation_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (strategy_rule_id) REFERENCES strategy_rules(id) ON DELETE RESTRICT,
+  UNIQUE (evaluation_run_id, strategy_rule_id),
+  CHECK (unixepoch(data_start_utc) < unixepoch(data_end_utc)),
+  CHECK ((match_status = 'not_evaluable' AND actual_value IS NULL AND estimated_saving IS NULL) OR (match_status <> 'not_evaluable' AND actual_value IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS benchmark_definitions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  benchmark_code TEXT NOT NULL,
+  benchmark_name TEXT NOT NULL,
+  benchmark_type TEXT NOT NULL CHECK (benchmark_type IN ('external_standard', 'manual_benchmark', 'internal_history_baseline')),
+  metric_code TEXT NOT NULL,
+  unit TEXT NOT NULL,
+  period_type TEXT NOT NULL,
+  scope_type TEXT NOT NULL,
+  scope_reference TEXT NOT NULL,
+  direction TEXT NOT NULL CHECK (direction IN ('lower_better', 'higher_better', 'range')),
+  source TEXT NOT NULL,
+  document_no TEXT,
+  version TEXT NOT NULL,
+  effective_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_start_utc) = 1),
+  effective_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  UNIQUE (benchmark_code, version),
+  CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc)),
+  CHECK (benchmark_type <> 'external_standard' OR document_no IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS benchmark_targets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (
+    source_row_number IS NULL
+    OR (typeof(source_row_number) = 'integer' AND source_row_number >= 1)
+  ),
+  benchmark_definition_id INTEGER NOT NULL,
+  target_value REAL,
+  lower_bound REAL,
+  upper_bound REAL,
+  reference_start_utc TEXT CHECK (reference_start_utc IS NULL OR is_strict_utc_iso(reference_start_utc) = 1),
+  reference_end_utc TEXT CHECK (reference_end_utc IS NULL OR is_strict_utc_iso(reference_end_utc) = 1),
+  frozen_value REAL,
+  frozen_at TEXT CHECK (frozen_at IS NULL OR is_strict_utc_iso(frozen_at) = 1),
+  sample_count INTEGER CHECK (sample_count IS NULL OR sample_count > 0),
+  production_summary_json TEXT,
+  source_data_digest TEXT,
+  is_frozen INTEGER NOT NULL DEFAULT 0 CHECK (is_frozen IN (0, 1)),
+  auto_refresh INTEGER NOT NULL DEFAULT 0 CHECK (auto_refresh IN (0, 1)),
+  version TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id),
+  FOREIGN KEY (benchmark_definition_id) REFERENCES benchmark_definitions(id) ON DELETE CASCADE,
+  UNIQUE (benchmark_definition_id, version),
+  CHECK (
+    (source_batch_id IS NULL AND source_row_number IS NULL)
+    OR (source_batch_id IS NOT NULL AND source_row_number IS NOT NULL)
+  ),
+  CHECK ((target_value IS NOT NULL AND lower_bound IS NULL AND upper_bound IS NULL) OR (target_value IS NULL AND lower_bound IS NOT NULL AND upper_bound IS NOT NULL AND lower_bound <= upper_bound)),
+  CHECK (
+    (reference_start_utc IS NULL AND reference_end_utc IS NULL)
+    OR (
+      reference_start_utc IS NOT NULL
+      AND reference_end_utc IS NOT NULL
+      AND unixepoch(reference_start_utc) < unixepoch(reference_end_utc)
+    )
+  ),
+  CHECK (is_frozen = 0 OR (frozen_value IS NOT NULL AND frozen_at IS NOT NULL AND source_data_digest IS NOT NULL AND auto_refresh = 0))
+);
+
+CREATE TABLE IF NOT EXISTS energy_flow_models (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  model_code TEXT NOT NULL,
+  model_name TEXT NOT NULL,
+  source TEXT NOT NULL,
+  document_no TEXT,
+  version TEXT NOT NULL,
+  effective_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_start_utc) = 1),
+  effective_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE (model_code, version),
+  CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc))
+);
+
+CREATE TABLE IF NOT EXISTS energy_flow_nodes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  energy_flow_model_id INTEGER NOT NULL,
+  node_code TEXT NOT NULL,
+  node_name TEXT NOT NULL,
+  node_type TEXT NOT NULL CHECK (node_type IN ('source', 'process', 'storage', 'sink', 'loss', 'boundary')),
+  organization_unit_id INTEGER,
+  x REAL NOT NULL,
+  y REAL NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_flow_model_id) REFERENCES energy_flow_models(id) ON DELETE CASCADE,
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE SET NULL,
+  UNIQUE (energy_flow_model_id, node_code),
+  UNIQUE (energy_flow_model_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS energy_flow_edges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  energy_flow_model_id INTEGER NOT NULL,
+  edge_code TEXT NOT NULL,
+  from_node_id INTEGER NOT NULL,
+  to_node_id INTEGER NOT NULL,
+  energy_type_id INTEGER NOT NULL,
+  unit TEXT NOT NULL,
+  source_type TEXT NOT NULL CHECK (source_type IN ('timeseries', 'monthly_energy', 'generation', 'explicit_edge_value')),
+  source_mapping_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_flow_model_id) REFERENCES energy_flow_models(id) ON DELETE CASCADE,
+  FOREIGN KEY (energy_flow_model_id, from_node_id) REFERENCES energy_flow_nodes(energy_flow_model_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (energy_flow_model_id, to_node_id) REFERENCES energy_flow_nodes(energy_flow_model_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+  UNIQUE (energy_flow_model_id, edge_code),
+  UNIQUE (energy_flow_model_id, id),
+  CHECK (from_node_id <> to_node_id),
+  CHECK (
+    CASE WHEN json_valid(source_mapping_json) = 1 THEN
+      json_type(source_mapping_json) = 'object'
+      AND typeof(json_extract(source_mapping_json, '$.reference')) = 'text'
+      AND trim(json_extract(source_mapping_json, '$.reference')) <> ''
+    ELSE 0 END
+  )
+);
+
+CREATE TABLE IF NOT EXISTS energy_flow_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  energy_flow_model_id INTEGER NOT NULL,
+  energy_flow_edge_id INTEGER NOT NULL,
+  start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(start_utc) = 1),
+  end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  original_unit TEXT NOT NULL,
+  original_value REAL NOT NULL CHECK (original_value >= 0),
+  source_type TEXT NOT NULL CHECK (source_type IN ('timeseries', 'monthly_energy', 'generation', 'explicit_edge_value')),
+  source_mapping_json TEXT NOT NULL,
+  formula_version TEXT NOT NULL,
+  record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
+  void_reason TEXT,
+  voided_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_flow_model_id) REFERENCES energy_flow_models(id) ON DELETE RESTRICT,
+  FOREIGN KEY (energy_flow_model_id, energy_flow_edge_id) REFERENCES energy_flow_edges(energy_flow_model_id, id) ON DELETE RESTRICT,
+  CHECK (unixepoch(start_utc) < unixepoch(end_utc)),
+  CHECK (
+    CASE WHEN json_valid(source_mapping_json) = 1 THEN
+      json_type(source_mapping_json) = 'object'
+      AND typeof(json_extract(source_mapping_json, '$.reference')) = 'text'
+      AND trim(json_extract(source_mapping_json, '$.reference')) <> ''
+    ELSE 0 END
+  ),
+  CHECK (
+    (record_status = 'active' AND void_reason IS NULL AND voided_at IS NULL)
+    OR (
+      record_status = 'void'
+      AND trim(COALESCE(void_reason, '')) <> ''
+      AND is_strict_utc_iso(voided_at) = 1
+    )
+  )
+);
+
+CREATE TABLE IF NOT EXISTS energy_balance_boundaries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  boundary_code TEXT NOT NULL,
+  boundary_name TEXT NOT NULL,
+  organization_unit_id INTEGER,
+  source TEXT NOT NULL,
+  document_no TEXT,
+  version TEXT NOT NULL,
+  effective_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_start_utc) = 1),
+  effective_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  generation_boundary_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (generation_boundary_confirmed IN (0, 1)),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE SET NULL,
+  UNIQUE (boundary_code, version),
+  CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc))
+);
+
+CREATE TABLE IF NOT EXISTS energy_balance_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  energy_balance_boundary_id INTEGER NOT NULL,
+  item_code TEXT NOT NULL,
+  item_name TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('input', 'self_generation', 'inventory_decrease', 'adjustment_increase', 'output', 'useful_utilization', 'known_loss', 'inventory_increase', 'adjustment_decrease')),
+  energy_type_id INTEGER NOT NULL,
+  original_unit TEXT NOT NULL,
+  source_type TEXT NOT NULL CHECK (source_type IN ('timeseries', 'monthly_energy', 'generation', 'explicit_edge_value', 'explicit_balance_value')),
+  source_mapping_json TEXT NOT NULL,
+  generation_anti_double_count_key TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (energy_balance_boundary_id) REFERENCES energy_balance_boundaries(id) ON DELETE CASCADE,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+  UNIQUE (energy_balance_boundary_id, item_code),
+  CHECK (
+    CASE WHEN json_valid(source_mapping_json) = 1 THEN
+      json_type(source_mapping_json) = 'object'
+      AND typeof(json_extract(source_mapping_json, '$.reference')) = 'text'
+      AND trim(json_extract(source_mapping_json, '$.reference')) <> ''
+    ELSE 0 END
+  )
+);
+
+CREATE TABLE IF NOT EXISTS energy_balance_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  energy_balance_boundary_id INTEGER NOT NULL,
+  energy_type_id INTEGER NOT NULL,
+  start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(start_utc) = 1),
+  end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  original_unit TEXT NOT NULL,
+  input_total_original REAL NOT NULL CHECK (input_total_original >= 0),
+  output_total_original REAL NOT NULL CHECK (output_total_original >= 0),
+  unexplained_original REAL NOT NULL,
+  input_total_kgce REAL CHECK (input_total_kgce IS NULL OR input_total_kgce >= 0),
+  output_total_kgce REAL CHECK (output_total_kgce IS NULL OR output_total_kgce >= 0),
+  unexplained_kgce REAL,
+  actual_factor_versions_json TEXT,
+  formula_version TEXT NOT NULL,
+  utilization_rate REAL CHECK (utilization_rate IS NULL OR utilization_rate BETWEEN 0 AND 1),
+  loss_rate REAL CHECK (loss_rate IS NULL OR loss_rate BETWEEN 0 AND 1),
+  completeness_rate REAL NOT NULL CHECK (completeness_rate BETWEEN 0 AND 1),
+  confirmation_status TEXT NOT NULL DEFAULT 'unconfirmed' CHECK (confirmation_status IN ('unconfirmed', 'accepted', 'rejected', 'resolved')),
+  reason_codes_json TEXT,
+  source_data_digest TEXT NOT NULL,
+  confirmed_at TEXT CHECK (confirmed_at IS NULL OR is_strict_utc_iso(confirmed_at) = 1),
+  confirmation_note TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (energy_balance_boundary_id) REFERENCES energy_balance_boundaries(id) ON DELETE RESTRICT,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+  CHECK (unixepoch(start_utc) < unixepoch(end_utc)),
+  CHECK (
+    actual_factor_versions_json IS NULL
+    OR is_valid_factor_versions_json(actual_factor_versions_json) = 1
+  ),
+  CHECK (
+    (input_total_kgce IS NULL AND output_total_kgce IS NULL AND unexplained_kgce IS NULL)
+    OR is_valid_factor_versions_json(actual_factor_versions_json) = 1
+  )
+);
+
+CREATE TABLE IF NOT EXISTS energy_balance_snapshot_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  energy_balance_snapshot_id INTEGER NOT NULL,
+  energy_balance_item_id INTEGER NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('input', 'self_generation', 'inventory_decrease', 'adjustment_increase', 'output', 'useful_utilization', 'known_loss', 'inventory_increase', 'adjustment_decrease')),
+  energy_type_id INTEGER NOT NULL,
+  original_unit TEXT NOT NULL,
+  original_value REAL NOT NULL CHECK (original_value >= 0),
+  conversion_factor_id INTEGER,
+  actual_factor_version TEXT,
+  actual_factor_value REAL CHECK (actual_factor_value IS NULL OR actual_factor_value > 0),
+  kgce_value REAL CHECK (kgce_value IS NULL OR kgce_value >= 0),
+  formula_version TEXT NOT NULL,
+  source_mapping_json TEXT NOT NULL,
+  reason_codes_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (energy_balance_snapshot_id) REFERENCES energy_balance_snapshots(id) ON DELETE CASCADE,
+  FOREIGN KEY (energy_balance_item_id) REFERENCES energy_balance_items(id) ON DELETE RESTRICT,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+  FOREIGN KEY (conversion_factor_id) REFERENCES energy_conversion_factors(id) ON DELETE SET NULL,
+  UNIQUE (energy_balance_snapshot_id, energy_balance_item_id),
+  CHECK (
+    kgce_value IS NULL
+    OR (
+      trim(COALESCE(actual_factor_version, '')) <> ''
+      AND actual_factor_value IS NOT NULL
+      AND actual_factor_value > 0
+    )
+  ),
+  CHECK (
+    CASE WHEN json_valid(source_mapping_json) = 1 THEN
+      json_type(source_mapping_json) = 'object'
+      AND typeof(json_extract(source_mapping_json, '$.reference')) = 'text'
+      AND trim(json_extract(source_mapping_json, '$.reference')) <> ''
+    ELSE 0 END
+  )
+);
+
+CREATE TABLE IF NOT EXISTS energy_balance_suggestions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  energy_balance_snapshot_id INTEGER NOT NULL,
+  strategy_rule_hit_id INTEGER,
+  suggestion_code TEXT NOT NULL,
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  priority TEXT NOT NULL CHECK (priority IN ('low', 'medium', 'high')),
+  threshold_json TEXT,
+  evidence_json TEXT NOT NULL,
+  estimated_saving REAL CHECK (estimated_saving IS NULL OR estimated_saving >= 0),
+  estimated_saving_unit TEXT,
+  manual_status TEXT NOT NULL DEFAULT 'unconfirmed' CHECK (manual_status IN ('unconfirmed', 'accepted', 'rejected', 'resolved')),
+  reviewed_at TEXT CHECK (reviewed_at IS NULL OR is_strict_utc_iso(reviewed_at) = 1),
+  review_note TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (energy_balance_snapshot_id) REFERENCES energy_balance_snapshots(id) ON DELETE CASCADE,
+  FOREIGN KEY (strategy_rule_hit_id) REFERENCES strategy_rule_hits(id) ON DELETE SET NULL,
+  UNIQUE (energy_balance_snapshot_id, suggestion_code)
+);
+
+-- 对标目标的导入批次与原始行号必须成对存在，且行号必须为正整数；触发器兼容旧库补列后的约束语义。
+CREATE TRIGGER IF NOT EXISTS trg_benchmark_targets_source_insert
+BEFORE INSERT ON benchmark_targets
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'benchmark target import source must contain batch and positive row together');
+END;
+
+-- 更新对标目标来源时继续维持批次与行号的成对、正整数约束。
+CREATE TRIGGER IF NOT EXISTS trg_benchmark_targets_source_update
+BEFORE UPDATE OF source_batch_id, source_row_number ON benchmark_targets
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'benchmark target import source must contain batch and positive row together');
+END;
+
+-- 内部历史基准必须在首次写入时固化完整参考期、摘要、数值和来源摘要。
+CREATE TRIGGER IF NOT EXISTS trg_benchmark_targets_internal_insert
+BEFORE INSERT ON benchmark_targets
+FOR EACH ROW
+WHEN (
+  SELECT benchmark_type
+  FROM benchmark_definitions
+  WHERE id = NEW.benchmark_definition_id
+) = 'internal_history_baseline'
+AND (
+  NEW.is_frozen <> 1
+  OR NEW.auto_refresh <> 0
+  OR NEW.reference_start_utc IS NULL
+  OR NEW.reference_end_utc IS NULL
+  OR NEW.frozen_at IS NULL
+  OR NEW.target_value IS NULL
+  OR NEW.frozen_value IS NULL
+  OR NEW.target_value <> NEW.frozen_value
+  OR trim(COALESCE(NEW.source_data_digest, '')) = ''
+  OR NEW.production_summary_json IS NULL
+  OR CASE WHEN json_valid(NEW.production_summary_json) = 1 THEN
+    json_type(NEW.production_summary_json) <> 'object'
+    OR json(NEW.production_summary_json) = '{}'
+  ELSE 1 END
+)
+BEGIN
+  SELECT RAISE(ABORT, 'internal history baseline target must be frozen and complete');
+END;
+
+-- 内部历史基准更新后仍须保持固化快照约束。
+CREATE TRIGGER IF NOT EXISTS trg_benchmark_targets_internal_update
+BEFORE UPDATE ON benchmark_targets
+FOR EACH ROW
+WHEN (
+  SELECT benchmark_type
+  FROM benchmark_definitions
+  WHERE id = NEW.benchmark_definition_id
+) = 'internal_history_baseline'
+AND (
+  NEW.is_frozen <> 1
+  OR NEW.auto_refresh <> 0
+  OR NEW.reference_start_utc IS NULL
+  OR NEW.reference_end_utc IS NULL
+  OR NEW.frozen_at IS NULL
+  OR NEW.target_value IS NULL
+  OR NEW.frozen_value IS NULL
+  OR NEW.target_value <> NEW.frozen_value
+  OR trim(COALESCE(NEW.source_data_digest, '')) = ''
+  OR NEW.production_summary_json IS NULL
+  OR CASE WHEN json_valid(NEW.production_summary_json) = 1 THEN
+    json_type(NEW.production_summary_json) <> 'object'
+    OR json(NEW.production_summary_json) = '{}'
+  ELSE 1 END
+)
+BEGIN
+  SELECT RAISE(ABORT, 'internal history baseline target must remain frozen and complete');
+END;
+
+-- 基准定义改为内部历史类型前，拒绝保留任何未固化的已有目标。
+CREATE TRIGGER IF NOT EXISTS trg_benchmark_definitions_internal_update
+BEFORE UPDATE OF benchmark_type ON benchmark_definitions
+FOR EACH ROW
+WHEN NEW.benchmark_type = 'internal_history_baseline'
+AND EXISTS (
+  SELECT 1
+  FROM benchmark_targets AS target
+  WHERE target.benchmark_definition_id = NEW.id
+    AND (
+      target.is_frozen <> 1
+      OR target.auto_refresh <> 0
+      OR target.reference_start_utc IS NULL
+      OR target.reference_end_utc IS NULL
+      OR target.frozen_at IS NULL
+      OR target.target_value IS NULL
+      OR target.frozen_value IS NULL
+      OR target.target_value <> target.frozen_value
+      OR trim(COALESCE(target.source_data_digest, '')) = ''
+      OR target.production_summary_json IS NULL
+      OR CASE WHEN json_valid(target.production_summary_json) = 1 THEN
+        json_type(target.production_summary_json) <> 'object'
+        OR json(target.production_summary_json) = '{}'
+      ELSE 1 END
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'existing targets must be frozen before changing benchmark type');
+END;
+
+-- 重叠事实由后续服务事务校验；以下索引用于同数据流区间候选查询与 active/void 过滤。
+CREATE INDEX IF NOT EXISTS idx_energy_timeseries_stream_range ON energy_timeseries_records(energy_type_id, meter_device_id, organization_unit_id, record_status, start_utc, end_utc);
+CREATE INDEX IF NOT EXISTS idx_energy_timeseries_batch ON energy_timeseries_records(source_batch_id);
+CREATE INDEX IF NOT EXISTS idx_shift_definitions_effective ON shift_definitions(status, effective_start_utc, effective_end_utc);
+CREATE INDEX IF NOT EXISTS idx_shift_schedule_scope_range ON shift_schedule_records(organization_unit_id, record_status, start_utc, end_utc);
+CREATE INDEX IF NOT EXISTS idx_shift_schedule_batch ON shift_schedule_records(source_batch_id);
+CREATE INDEX IF NOT EXISTS idx_device_state_meter_range ON device_state_records(meter_device_id, record_status, start_utc, end_utc);
+CREATE INDEX IF NOT EXISTS idx_device_state_batch ON device_state_records(source_batch_id);
+CREATE INDEX IF NOT EXISTS idx_tou_schemes_effective ON tou_schemes(status, effective_start_utc, effective_end_utc);
+CREATE INDEX IF NOT EXISTS idx_tou_period_rules_scheme_day ON tou_period_rules(tou_scheme_id, day_of_week, start_minute);
+CREATE INDEX IF NOT EXISTS idx_conversion_factors_match ON energy_conversion_factors(energy_type_id, source_unit, status, effective_start_utc, effective_end_utc);
+CREATE INDEX IF NOT EXISTS idx_conversion_factors_batch ON energy_conversion_factors(source_batch_id);
+CREATE INDEX IF NOT EXISTS idx_strategy_rules_status_metric ON strategy_rules(status, metric_code, rule_code);
+CREATE INDEX IF NOT EXISTS idx_strategy_runs_scope_range ON strategy_evaluation_runs(scope_type, scope_reference, start_utc, end_utc);
+CREATE INDEX IF NOT EXISTS idx_strategy_hits_run_status ON strategy_rule_hits(evaluation_run_id, match_status, manual_status);
+CREATE INDEX IF NOT EXISTS idx_benchmark_definitions_match ON benchmark_definitions(metric_code, unit, period_type, direction, status, effective_start_utc, effective_end_utc);
+CREATE INDEX IF NOT EXISTS idx_benchmark_definitions_batch ON benchmark_definitions(source_batch_id);
+CREATE INDEX IF NOT EXISTS idx_benchmark_targets_definition_status ON benchmark_targets(benchmark_definition_id, status);
+CREATE INDEX IF NOT EXISTS idx_benchmark_targets_batch ON benchmark_targets(source_batch_id);
+CREATE INDEX IF NOT EXISTS idx_energy_flow_models_effective ON energy_flow_models(status, effective_start_utc, effective_end_utc);
+CREATE INDEX IF NOT EXISTS idx_energy_flow_nodes_model_type ON energy_flow_nodes(energy_flow_model_id, node_type, status);
+CREATE INDEX IF NOT EXISTS idx_energy_flow_nodes_batch ON energy_flow_nodes(source_batch_id);
+CREATE INDEX IF NOT EXISTS idx_energy_flow_edges_model_type ON energy_flow_edges(energy_flow_model_id, source_type, status);
+CREATE INDEX IF NOT EXISTS idx_energy_flow_edges_batch ON energy_flow_edges(source_batch_id);
+CREATE INDEX IF NOT EXISTS idx_energy_flow_records_edge_range ON energy_flow_records(energy_flow_edge_id, record_status, start_utc, end_utc);
+CREATE INDEX IF NOT EXISTS idx_energy_flow_records_batch ON energy_flow_records(source_batch_id);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_boundaries_effective ON energy_balance_boundaries(status, effective_start_utc, effective_end_utc);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_items_boundary_role ON energy_balance_items(energy_balance_boundary_id, role, status);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_snapshots_boundary_range ON energy_balance_snapshots(energy_balance_boundary_id, energy_type_id, start_utc, end_utc);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_snapshots_confirmation ON energy_balance_snapshots(confirmation_status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_snapshot_items_snapshot ON energy_balance_snapshot_items(energy_balance_snapshot_id, role);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_suggestions_snapshot_status ON energy_balance_suggestions(energy_balance_snapshot_id, manual_status, priority);
+-- ENERGY_ANALYSIS_SCHEMA_END
+
 CREATE INDEX IF NOT EXISTS idx_import_batches_type_status_created ON import_batches(import_type, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_import_batches_status_created ON import_batches(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_import_errors_batch_row ON import_errors(batch_id, row_number);
@@ -555,7 +1297,3 @@ CREATE INDEX IF NOT EXISTS idx_sys_sessions_token_active ON sys_sessions(token_h
 CREATE INDEX IF NOT EXISTS idx_sys_sessions_user_active ON sys_sessions(user_id, expires_at, revoked_at);
 CREATE INDEX IF NOT EXISTS idx_sys_login_logs_username_created ON sys_login_logs(username, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sys_operation_logs_user_created ON sys_operation_logs(user_id, created_at DESC);
-
-INSERT OR IGNORE INTO app_meta (key, value) VALUES
-  ('schema_stage', 'rbac-backend-core'),
-  ('schema_version', '2026-08-05-rbac-backend-core');

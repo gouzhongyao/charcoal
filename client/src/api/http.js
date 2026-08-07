@@ -28,12 +28,13 @@ export function query(params = {}) { return Object.fromEntries(Object.entries(pa
 export async function request(config) { const response = await http(config); return response.data; }
 export function filenameFromDisposition(value = '') {
   const encoded = value.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
-  if (encoded) { try { return decodeURIComponent(encoded); } catch { return encoded; } }
+  if (encoded) { try { return decodeURIComponent(encoded); } catch {} }
   return value.match(/filename="?([^";]+)"?/i)?.[1] || '';
 }
 export async function download(config, fallbackName = '下载文件') {
   const response = await http({ ...config, responseType: 'blob' });
-  const fileName = filenameFromDisposition(response.headers['content-disposition']) || fallbackName;
+  const resolvedFallbackName = typeof fallbackName === 'function' ? fallbackName(response) : fallbackName;
+  const fileName = filenameFromDisposition(response.headers['content-disposition']) || resolvedFallbackName || '下载文件';
   const url = URL.createObjectURL(response.data); const link = document.createElement('a');
   link.href = url; link.download = fileName; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url);
 }

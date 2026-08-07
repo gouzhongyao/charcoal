@@ -7,6 +7,81 @@ const backupsDir = process.env.BACKUPS_DIR || path.join(dataDir, 'backups');
 const databasePath = process.env.SQLITE_PATH || path.join(dataDir, 'energy-carbon.sqlite');
 const schemaPath = path.join(__dirname, 'schema.sql');
 
+// 导入批次保留全部历史类型，并为阶段 3 预留八类能源分析导入。
+const IMPORT_BATCH_TYPES = Object.freeze([
+  'energy_record',
+  'meter_reading',
+  'organization_unit',
+  'meter_device',
+  'production_unit',
+  'production_output',
+  'generation_record',
+  'energy_budget',
+  'carbon_factor',
+  'prediction_config',
+  'energy_timeseries',
+  'shift_schedule',
+  'device_state',
+  'energy_conversion_factor',
+  'energy_benchmark',
+  'energy_flow_node',
+  'energy_flow_edge',
+  'energy_flow_record'
+]);
+
+// import_batches 重建 SQL 使用统一白名单，避免 schema 与旧库迁移枚举漂移。
+const IMPORT_BATCH_TYPES_SQL = IMPORT_BATCH_TYPES.map((importType) => `'${importType}'`).join(', ');
+
+// 能源分析 schema 片段标记用于独立幂等迁移和失败回滚测试。
+const ENERGY_ANALYSIS_SCHEMA_START_MARKER = '-- ENERGY_ANALYSIS_SCHEMA_START';
+const ENERGY_ANALYSIS_SCHEMA_END_MARKER = '-- ENERGY_ANALYSIS_SCHEMA_END';
+
+// 对标目标来源 INSERT 触发器作为旧库迁移后的规范定义。
+const BENCHMARK_TARGET_SOURCE_INSERT_TRIGGER_SQL = `CREATE TRIGGER trg_benchmark_targets_source_insert
+BEFORE INSERT ON benchmark_targets
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'benchmark target import source must contain batch and positive row together');
+END;`;
+
+// 对标目标来源 UPDATE 触发器作为旧库迁移后的规范定义。
+const BENCHMARK_TARGET_SOURCE_UPDATE_TRIGGER_SQL = `CREATE TRIGGER trg_benchmark_targets_source_update
+BEFORE UPDATE OF source_batch_id, source_row_number ON benchmark_targets
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'benchmark target import source must contain batch and positive row together');
+END;`;
+
+// 两个规范来源触发器在迁移事务中统一创建。
+const BENCHMARK_TARGET_SOURCE_TRIGGERS_SQL = `${BENCHMARK_TARGET_SOURCE_INSERT_TRIGGER_SQL}\n\n${BENCHMARK_TARGET_SOURCE_UPDATE_TRIGGER_SQL}`;
+
+// 严格 UTC ISO 时间戳格式与阶段 1 契约保持一致。
+const STRICT_UTC_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+
+// IANA 来源时区必须包含区域与地点分段。
+const IANA_TIME_ZONE_PATTERN = /^[A-Za-z_]+(?:\/[A-Za-z0-9_.+-]+)+$/;
+
+// 严格日历日期采用 YYYY-MM-DD 格式。
+const STRICT_ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
 const CARBON_EMISSIONS_TABLE_WITH_SUPERSEDED_SQL = `CREATE TABLE carbon_emissions__migration_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   energy_record_id INTEGER NOT NULL,
@@ -281,7 +356,7 @@ const PREDICTION_RUNS_TABLE_WITH_MANAGEMENT_STATUSES_SQL = `CREATE TABLE predict
 
 const IMPORT_BATCHES_TABLE_WITH_LEDGER_TYPES_SQL = `CREATE TABLE import_batches__migration_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_unit', 'production_output', 'generation_record', 'energy_budget', 'carbon_factor', 'prediction_config')),
+  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN (${IMPORT_BATCH_TYPES_SQL})),
   original_filename TEXT NOT NULL,
   stored_filename TEXT,
   file_type TEXT NOT NULL CHECK (file_type IN ('xlsx', 'xls', 'csv')),
@@ -410,12 +485,169 @@ function loadDatabaseDriver() {
   return require('better-sqlite3');
 }
 
+/**
+ * 判断值是否为严格 UTC ISO 时间戳。
+ * @param {*} value 待验证值。
+ * @returns {boolean} 是否有效。
+ */
+function isStrictUtcIso(value) {
+  if (typeof value !== 'string' || !STRICT_UTC_ISO_PATTERN.test(value)) {
+    return false;
+  }
+
+  const timeValue = Date.parse(value);
+  if (!Number.isFinite(timeValue)) {
+    return false;
+  }
+
+  const canonicalValue = new Date(timeValue).toISOString();
+  return value.includes('.')
+    ? canonicalValue === value
+    : canonicalValue.replace('.000Z', 'Z') === value;
+}
+
+/**
+ * 判断值是否为真实存在的严格日历日期。
+ * @param {*} value 待验证值。
+ * @returns {boolean} 是否有效。
+ */
+function isStrictIsoDate(value) {
+  if (typeof value !== 'string' || !STRICT_ISO_DATE_PATTERN.test(value)) {
+    return false;
+  }
+
+  const dateValue = Date.parse(`${value}T00:00:00.000Z`);
+  return Number.isFinite(dateValue)
+    && new Date(dateValue).toISOString().slice(0, 10) === value;
+}
+
+/**
+ * 判断值是否为可识别的 IANA 时区。
+ * @param {*} value 待验证值。
+ * @returns {boolean} 是否有效。
+ */
+function isValidIanaTimezone(value) {
+  if (typeof value !== 'string' || !IANA_TIME_ZONE_PATTERN.test(value)) {
+    return false;
+  }
+
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value }).format(new Date(0));
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+/**
+ * 判断 UTC 时间戳是否精确落在整分钟边界。
+ * @param {*} value 待验证值。
+ * @returns {boolean} 秒和毫秒是否均为零。
+ */
+function isUtcMinuteBoundary(value) {
+  if (!isStrictUtcIso(value)) {
+    return false;
+  }
+
+  return value.slice(17, 19) === '00'
+    && (!value.includes('.') || value.slice(20, 23) === '000');
+}
+
+/**
+ * 判断折标系数版本 JSON 是否只包含非空版本字符串。
+ * @param {*} value 待验证 JSON 文本。
+ * @returns {boolean} 是否为有效的非空数组或对象。
+ */
+function isValidFactorVersionsJson(value) {
+  if (typeof value !== 'string') {
+    return false;
+  }
+
+  let parsedValue;
+  try {
+    parsedValue = JSON.parse(value);
+  } catch (_error) {
+    return false;
+  }
+
+  if (Array.isArray(parsedValue)) {
+    return parsedValue.length > 0
+      && parsedValue.every((version) => typeof version === 'string' && version.trim() !== '');
+  }
+
+  if (parsedValue === null || typeof parsedValue !== 'object') {
+    return false;
+  }
+
+  const factorEntries = Object.entries(parsedValue);
+  return factorEntries.length > 0
+    && factorEntries.every(([factorCode, version]) => (
+      factorCode.trim() !== ''
+      && typeof version === 'string'
+      && version.trim() !== ''
+    ));
+}
+
+/**
+ * 为数据库连接注册能源分析 CHECK 约束使用的确定性函数。
+ * @param {object} db SQLite 数据库连接。
+ */
+function registerEnergyAnalysisSqliteFunctions(db) {
+  db.function('is_strict_utc_iso', { deterministic: true }, (value) => (
+    isStrictUtcIso(value) ? 1 : 0
+  ));
+  db.function('is_strict_iso_date', { deterministic: true }, (value) => (
+    isStrictIsoDate(value) ? 1 : 0
+  ));
+  db.function('is_valid_iana_timezone', { deterministic: true }, (value) => (
+    isValidIanaTimezone(value) ? 1 : 0
+  ));
+  db.function('is_utc_minute_boundary', { deterministic: true }, (value) => (
+    isUtcMinuteBoundary(value) ? 1 : 0
+  ));
+  db.function('is_valid_factor_versions_json', { deterministic: true }, (value) => (
+    isValidFactorVersionsJson(value) ? 1 : 0
+  ));
+}
+
 function openDatabase() {
   ensureLocalDataDirectories();
   const Database = loadDatabaseDriver();
   const db = new Database(databasePath);
+  registerEnergyAnalysisSqliteFunctions(db);
   db.pragma('foreign_keys = ON');
   return db;
+}
+
+/**
+ * 从完整 schema 中提取能源分析独立建表片段。
+ * @param {string} schemaText 完整 schema 文本。
+ * @returns {string} 能源分析建表和索引 SQL。
+ */
+function extractEnergyAnalysisSchemaSql(schemaText) {
+  const startIndex = schemaText.indexOf(ENERGY_ANALYSIS_SCHEMA_START_MARKER);
+  const endIndex = schemaText.indexOf(ENERGY_ANALYSIS_SCHEMA_END_MARKER);
+  const hasDuplicateMarker = startIndex !== schemaText.lastIndexOf(ENERGY_ANALYSIS_SCHEMA_START_MARKER)
+    || endIndex !== schemaText.lastIndexOf(ENERGY_ANALYSIS_SCHEMA_END_MARKER);
+  if (startIndex < 0 || endIndex <= startIndex || hasDuplicateMarker) {
+    throw new Error('能源分析 schema 迁移片段标记缺失、重复或顺序错误。');
+  }
+  return schemaText.slice(startIndex + ENERGY_ANALYSIS_SCHEMA_START_MARKER.length, endIndex).trim();
+}
+
+/**
+ * 在单一事务内幂等创建能源分析表和索引，失败时回滚本次全部 DDL。
+ * @param {object} db SQLite 数据库连接。
+ * @param {string} schemaText 完整 schema 文本。
+ * @returns {boolean} 调用前是否缺少能源分析主表。
+ */
+function ensureEnergyAnalysisTables(db, schemaText = fs.readFileSync(schemaPath, 'utf8')) {
+  const tableExisted = Boolean(getTableCreateSql(db, 'energy_timeseries_records'));
+  const energyAnalysisSql = extractEnergyAnalysisSchemaSql(schemaText);
+  db.transaction(() => {
+    db.exec(energyAnalysisSql);
+  })();
+  return !tableExisted;
 }
 
 function getTableCreateSql(db, tableName) {
@@ -433,7 +665,7 @@ function importBatchesImportTypeCheckAllowsLedgerTypes(createTableSql) {
 
 function importBatchesImportTypeCheckAllowsAuditTypes(createTableSql) {
   const sql = createTableSql || '';
-  return /import_type\s+TEXT[\s\S]*CHECK\s*\([\s\S]*import_type\s+IN\s*\([\s\S]*'organization_unit'[\s\S]*'meter_device'[\s\S]*'production_unit'[\s\S]*'production_output'[\s\S]*'generation_record'[\s\S]*'energy_budget'[\s\S]*'carbon_factor'[\s\S]*'prediction_config'/i.test(sql);
+  return IMPORT_BATCH_TYPES.every((importType) => sql.includes(`'${importType}'`));
 }
 
 function importBatchesHasAuditColumns(columns) {
@@ -634,6 +866,308 @@ function addColumnIfMissing(db, tableName, columnName, columnSql) {
   return true;
 }
 
+/**
+ * 为 SQLite 标识符添加双引号转义。
+ * @param {string} identifier 标识符。
+ * @returns {string} 可安全拼接到内部迁移 SQL 的标识符。
+ */
+function quoteSqlIdentifier(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
+/**
+ * 按顶层逗号拆分 CREATE TABLE 字段和表级约束，保留嵌套 CHECK 内容。
+ * @param {string} definitionSql 外层括号内定义。
+ * @returns {string[]} 字段和约束片段。
+ */
+function splitSqlDefinitionClauses(definitionSql) {
+  const clauses = [];
+  let clauseStart = 0;
+  let parenthesisDepth = 0;
+  let quoteCharacter = null;
+
+  for (let index = 0; index < definitionSql.length; index += 1) {
+    const character = definitionSql[index];
+    if (quoteCharacter) {
+      if (quoteCharacter === '[' && character === ']') {
+        quoteCharacter = null;
+      } else if (quoteCharacter !== '[' && character === quoteCharacter) {
+        if (definitionSql[index + 1] === quoteCharacter) {
+          index += 1;
+        } else {
+          quoteCharacter = null;
+        }
+      }
+      continue;
+    }
+
+    if (character === "'" || character === '"' || character === '`' || character === '[') {
+      quoteCharacter = character;
+    } else if (character === '(') {
+      parenthesisDepth += 1;
+    } else if (character === ')') {
+      parenthesisDepth -= 1;
+    } else if (character === ',' && parenthesisDepth === 0) {
+      clauses.push(definitionSql.slice(clauseStart, index).trim());
+      clauseStart = index + 1;
+    }
+  }
+
+  clauses.push(definitionSql.slice(clauseStart).trim());
+  return clauses.filter(Boolean);
+}
+
+/**
+ * 判断 CREATE TABLE 片段是否定义指定字段。
+ * @param {string} clause 字段或表约束片段。
+ * @param {string} columnName 字段名。
+ * @returns {boolean} 是否为该字段定义。
+ */
+function isSqlColumnClause(clause, columnName) {
+  const normalizedClause = clause.trim().replace(/^["`\[]|["`\]](?=\s)/g, '');
+  return new RegExp(`^${columnName}\\s`, 'i').test(normalizedClause);
+}
+
+/**
+ * 判断表级约束是否为 source_batch_id 外键。
+ * @param {string} clause 字段或表约束片段。
+ * @returns {boolean} 是否为来源批次外键。
+ */
+function isBenchmarkTargetSourceForeignKeyClause(clause) {
+  const normalizedClause = clause.replace(/["`\[\]]/g, ' ');
+  return /^\s*(?:constraint\s+\S+\s+)?foreign\s+key\s*\(\s*source_batch_id\s*\)/i.test(normalizedClause);
+}
+
+/**
+ * 基于旧表 SQL 构造保留全部非来源字段和约束的规范重建 SQL。
+ * @param {string} createTableSql benchmark_targets 原建表 SQL。
+ * @returns {string} 临时表建表 SQL。
+ */
+function buildBenchmarkTargetsSourceRebuildCreateSql(createTableSql) {
+  const bodyStart = createTableSql.indexOf('(');
+  const bodyEnd = createTableSql.lastIndexOf(')');
+  if (bodyStart < 0 || bodyEnd <= bodyStart) {
+    throw new Error('benchmark_targets 建表 SQL 无法解析，禁止执行来源外键重建。');
+  }
+
+  const originalClauses = splitSqlDefinitionClauses(createTableSql.slice(bodyStart + 1, bodyEnd));
+  const preservedClauses = originalClauses.filter((clause) => (
+    !isSqlColumnClause(clause, 'source_batch_id')
+    && !isSqlColumnClause(clause, 'source_row_number')
+    && !isBenchmarkTargetSourceForeignKeyClause(clause)
+  ));
+  const sourceColumnClauses = [
+    'source_batch_id INTEGER',
+    "source_row_number INTEGER CHECK (source_row_number IS NULL OR (typeof(source_row_number) = 'integer' AND source_row_number >= 1))"
+  ];
+  const idClauseIndex = preservedClauses.findIndex((clause) => isSqlColumnClause(clause, 'id'));
+  preservedClauses.splice(idClauseIndex >= 0 ? idClauseIndex + 1 : 0, 0, ...sourceColumnClauses);
+  preservedClauses.push(`CHECK (
+    (source_batch_id IS NULL AND source_row_number IS NULL)
+    OR (source_batch_id IS NOT NULL AND source_row_number IS NOT NULL)
+  )`);
+  preservedClauses.push('FOREIGN KEY (source_batch_id) REFERENCES import_batches(id)');
+
+  const tableSuffix = createTableSql.slice(bodyEnd + 1).trim();
+  return `CREATE TABLE benchmark_targets__migration_new (\n  ${preservedClauses.join(',\n  ')}\n)${tableSuffix ? ` ${tableSuffix}` : ''}`;
+}
+
+/**
+ * 检查来源批次外键是否唯一且符合 import_batches(id) 与受限删除契约。
+ * @param {object} db SQLite 数据库连接。
+ * @returns {boolean} 外键是否符合契约。
+ */
+function benchmarkTargetsHasCorrectSourceForeignKey(db) {
+  const sourceForeignKeys = db.prepare('PRAGMA foreign_key_list(benchmark_targets)').all()
+    .filter((foreignKey) => foreignKey.from === 'source_batch_id');
+  return sourceForeignKeys.length === 1
+    && sourceForeignKeys[0].table === 'import_batches'
+    && sourceForeignKeys[0].to === 'id'
+    && ['NO ACTION', 'RESTRICT'].includes(String(sourceForeignKeys[0].on_delete || '').toUpperCase());
+}
+
+/**
+ * 查找所有通过外键引用 benchmark_targets 的非系统表。
+ * @param {object} db SQLite 数据库连接。
+ * @returns {string[]} 排序后的安全引用表名。
+ */
+function getBenchmarkTargetsInboundForeignKeyTables(db) {
+  const tableNames = db.prepare(`SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name NOT GLOB 'sqlite_*' AND name <> 'benchmark_targets'
+    ORDER BY name`).all().map((table) => table.name);
+  return tableNames.filter((tableName) => db.prepare(
+    `PRAGMA foreign_key_list(${quoteSqlIdentifier(tableName)})`
+  ).all().some((foreignKey) => String(foreignKey.table || '').toLowerCase() === 'benchmark_targets'));
+}
+
+/**
+ * 在任何表结构或数据修改前拒绝重建存在未知入向外键的 benchmark_targets。
+ * @param {object} db SQLite 数据库连接。
+ */
+function assertBenchmarkTargetsCanBeSafelyRebuilt(db) {
+  const inboundTableNames = getBenchmarkTargetsInboundForeignKeyTables(db);
+  if (inboundTableNames.length > 0) {
+    throw new Error(`benchmark_targets 存在入向外键引用，禁止自动重建；引用表：${JSON.stringify(inboundTableNames)}`);
+  }
+}
+
+/**
+ * 校验旧库已有来源字段的配对、正整数和无孤儿边界。
+ * @param {object} db SQLite 数据库连接。
+ */
+function validateBenchmarkTargetImportSources(db) {
+  const invalidSource = db.prepare(`SELECT id FROM benchmark_targets
+    WHERE NOT (
+      (source_batch_id IS NULL AND source_row_number IS NULL)
+      OR (
+        source_batch_id IS NOT NULL
+        AND source_row_number IS NOT NULL
+        AND typeof(source_row_number) = 'integer'
+        AND source_row_number >= 1
+      )
+    )
+    LIMIT 1`).get();
+  if (invalidSource) {
+    throw new Error(`benchmark_targets 存在不完整或非法导入来源，记录 ID：${invalidSource.id}`);
+  }
+
+  const orphanSource = db.prepare(`SELECT target.id
+    FROM benchmark_targets AS target
+    LEFT JOIN import_batches AS batch ON batch.id = target.source_batch_id
+    WHERE target.source_batch_id IS NOT NULL AND batch.id IS NULL
+    LIMIT 1`).get();
+  if (orphanSource) {
+    throw new Error(`benchmark_targets 存在孤儿导入批次引用，记录 ID：${orphanSource.id}`);
+  }
+}
+
+/**
+ * 规范化触发器 SQL，忽略 IF NOT EXISTS、空白和末尾分号差异。
+ * @param {string} sql 触发器 SQL。
+ * @returns {string} 规范化文本。
+ */
+function normalizeTriggerSql(sql) {
+  return String(sql || '')
+    .replace(/\bIF\s+NOT\s+EXISTS\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .replace(/;\s*$/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * 严格校验并按需替换两个来源触发器，避免同名弱触发器绕过约束。
+ * @param {object} db SQLite 数据库连接。
+ * @param {string} triggerSql 待创建的触发器 SQL。
+ * @returns {boolean} 是否替换了触发器。
+ */
+function ensureBenchmarkTargetSourceTriggers(db, triggerSql = BENCHMARK_TARGET_SOURCE_TRIGGERS_SQL) {
+  const triggerRows = new Map(db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'trigger' AND name IN ('trg_benchmark_targets_source_insert', 'trg_benchmark_targets_source_update')`).all()
+    .map((trigger) => [trigger.name, trigger.sql]));
+  const usesCanonicalSql = triggerSql === BENCHMARK_TARGET_SOURCE_TRIGGERS_SQL;
+  const hasCanonicalTriggers = usesCanonicalSql
+    && normalizeTriggerSql(triggerRows.get('trg_benchmark_targets_source_insert')) === normalizeTriggerSql(BENCHMARK_TARGET_SOURCE_INSERT_TRIGGER_SQL)
+    && normalizeTriggerSql(triggerRows.get('trg_benchmark_targets_source_update')) === normalizeTriggerSql(BENCHMARK_TARGET_SOURCE_UPDATE_TRIGGER_SQL);
+  if (hasCanonicalTriggers) {
+    return false;
+  }
+
+  db.exec('DROP TRIGGER IF EXISTS trg_benchmark_targets_source_insert');
+  db.exec('DROP TRIGGER IF EXISTS trg_benchmark_targets_source_update');
+  db.exec(triggerSql);
+  return true;
+}
+
+/**
+ * 安全重建 benchmark_targets，保留原字段、约束、显式索引、非来源触发器和全部数据。
+ * @param {object} db SQLite 数据库连接。
+ * @param {string} createTableSql 原建表 SQL。
+ */
+function rebuildBenchmarkTargetsSourceForeignKey(db, createTableSql) {
+  const existingColumns = getTableColumns(db, 'benchmark_targets');
+  const quotedColumns = existingColumns.map(quoteSqlIdentifier).join(', ');
+  const explicitIndexes = db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'index' AND tbl_name = 'benchmark_targets' AND sql IS NOT NULL
+    ORDER BY name`).all()
+    .filter((index) => index.name !== 'idx_benchmark_targets_batch');
+  const preservedTriggers = db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'trigger' AND tbl_name = 'benchmark_targets'
+      AND name NOT IN ('trg_benchmark_targets_source_insert', 'trg_benchmark_targets_source_update')
+    ORDER BY name`).all();
+  // 其他表上的触发器也可能查询 benchmark_targets，重建期间需暂时移除并原样恢复。
+  const dependentTriggers = db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'trigger' AND tbl_name <> 'benchmark_targets'
+      AND instr(lower(COALESCE(sql, '')), 'benchmark_targets') > 0
+    ORDER BY name`).all();
+
+  db.exec('DROP TABLE IF EXISTS benchmark_targets__migration_new');
+  db.exec(buildBenchmarkTargetsSourceRebuildCreateSql(createTableSql));
+  db.exec(`INSERT INTO benchmark_targets__migration_new (${quotedColumns})
+    SELECT ${quotedColumns} FROM benchmark_targets`);
+  dependentTriggers.forEach((trigger) => db.exec(`DROP TRIGGER ${quoteSqlIdentifier(trigger.name)}`));
+  db.exec('DROP TABLE benchmark_targets');
+  db.exec('ALTER TABLE benchmark_targets__migration_new RENAME TO benchmark_targets');
+  explicitIndexes.forEach((index) => db.exec(index.sql));
+  preservedTriggers.forEach((trigger) => db.exec(trigger.sql));
+  dependentTriggers.forEach((trigger) => db.exec(trigger.sql));
+}
+
+/**
+ * 为阶段 2 旧库补充或修复对标目标导入来源列、外键、索引和成对约束触发器。
+ * @param {object} db SQLite 数据库连接。
+ * @param {string} triggerSql 来源一致性触发器 SQL，可用于隔离回滚验证。
+ * @returns {boolean} 是否修改了来源字段、外键或触发器。
+ */
+function migrateBenchmarkTargetsImportSourceColumns(db, triggerSql = BENCHMARK_TARGET_SOURCE_TRIGGERS_SQL) {
+  if (!getTableCreateSql(db, 'benchmark_targets')) {
+    return false;
+  }
+
+  const initialColumns = getTableColumns(db, 'benchmark_targets');
+  const requiresTableRebuild = initialColumns.includes('source_batch_id')
+    && !benchmarkTargetsHasCorrectSourceForeignKey(db);
+  if (requiresTableRebuild) {
+    // 未知扩展子表可能使用 CASCADE、SET NULL 或 NO ACTION；统一在任何修改前拒绝自动重建。
+    assertBenchmarkTargetsCanBeSafelyRebuilt(db);
+  }
+
+  let changed = false;
+  db.transaction(() => {
+    changed = addColumnIfMissing(
+      db,
+      'benchmark_targets',
+      'source_batch_id',
+      'source_batch_id INTEGER REFERENCES import_batches(id)'
+    ) || changed;
+    changed = addColumnIfMissing(
+      db,
+      'benchmark_targets',
+      'source_row_number',
+      "source_row_number INTEGER CHECK (source_row_number IS NULL OR (typeof(source_row_number) = 'integer' AND source_row_number >= 1))"
+    ) || changed;
+    validateBenchmarkTargetImportSources(db);
+
+    if (!benchmarkTargetsHasCorrectSourceForeignKey(db)) {
+      rebuildBenchmarkTargetsSourceForeignKey(db, getTableCreateSql(db, 'benchmark_targets'));
+      changed = true;
+    }
+
+    changed = ensureBenchmarkTargetSourceTriggers(db, triggerSql) || changed;
+    db.exec('CREATE INDEX IF NOT EXISTS idx_benchmark_targets_batch ON benchmark_targets(source_batch_id)');
+    if (!benchmarkTargetsHasCorrectSourceForeignKey(db)) {
+      throw new Error('benchmark_targets 来源批次外键重建后仍不符合契约。');
+    }
+    validateBenchmarkTargetImportSources(db);
+    const foreignKeyViolations = db.prepare('PRAGMA foreign_key_check(benchmark_targets)').all();
+    if (foreignKeyViolations.length > 0) {
+      throw new Error('benchmark_targets 来源迁移后外键检查失败。');
+    }
+  })();
+
+  return changed;
+}
+
 function migrateEnergyRecordLedgerColumns(db) {
   const createTableSql = getTableCreateSql(db, 'energy_records');
   if (!createTableSql) {
@@ -646,7 +1180,7 @@ function migrateEnergyRecordLedgerColumns(db) {
     db,
     'import_batches',
     'import_type',
-    "import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_output', 'generation_record', 'energy_budget', 'carbon_factor'))"
+    `import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN (${IMPORT_BATCH_TYPES_SQL}))`
   );
   const addedOrganizationUnit = addColumnIfMissing(
     db,
@@ -1025,16 +1559,21 @@ function initDatabase() {
     ensureEnergyBudgetsTable(db);
     migratePredictionRunsStatusCheck(db);
     ensurePredictionConfigsTable(db);
+    migrateBenchmarkTargetsImportSourceColumns(db);
+    ensureEnergyAnalysisTables(db, schema);
     db.exec('DROP INDEX IF EXISTS ux_carbon_emissions_record_method');
     db.exec(schema);
     ensureRbacSeedData(db);
-    db.prepare(
+    // 初始化完成后同步阶段和版本，便于隔离升级验证识别当前 schema。
+    const upsertAppMeta = db.prepare(
       `INSERT INTO app_meta (key, value, updated_at)
        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
        ON CONFLICT(key) DO UPDATE SET
          value = excluded.value,
          updated_at = excluded.updated_at`
-    ).run('schema_stage', 'rbac-backend-core');
+    );
+    upsertAppMeta.run('schema_stage', 'energy-analysis-foundation');
+    upsertAppMeta.run('schema_version', '2026-08-06-energy-analysis-foundation');
   } finally {
     db.close();
   }
@@ -1060,12 +1599,14 @@ module.exports = {
   backupsDir,
   databasePath,
   schemaPath,
+  IMPORT_BATCH_TYPES,
   buildCarbonEmissionsStatusMigrationSql,
   buildGenerationRecordsDataSourceMigrationSql,
   buildImportBatchesImportTypeMigrationSql,
   carbonEmissionsStatusCheckAllowsSuperseded,
   ensureLocalDataDirectories,
   ensureEnergyBudgetsTable,
+  ensureEnergyAnalysisTables,
   ensurePredictionConfigsTable,
   ensureRbacSeedData,
   generationRecordsDataSourceCheckAllowsUpload,
@@ -1075,6 +1616,7 @@ module.exports = {
   importBatchesImportTypeCheckAllowsAuditTypes,
   importBatchesImportTypeCheckAllowsLedgerTypes,
   initDatabase,
+  migrateBenchmarkTargetsImportSourceColumns,
   migrateCarbonEmissionsStatusCheck,
   migrateEnergyRecordLedgerColumns,
   migrateEnergyBudgetImportSourceColumns,

@@ -57,19 +57,34 @@ const EXPECTED_TEMPLATE_SHEET_NAMES = Object.freeze({
   'prediction-history': '预测历史模板'
 });
 
-// 用户可见下载路由的旧客户端 ASCII 兜底名不得继续暴露英文技术前缀。
-const EXPECTED_ROUTE_ASCII_FALLBACKS = Object.freeze({
-  'templates.js': '00000000.xlsx',
-  'imports.js': '00000000',
-  'energyBudgets.js': '00000000.xlsx',
-  'energyRecords.js': '00000000.xlsx',
-  'organization.js': '00000000.xlsx',
-  'meters.js': '00000000.xlsx',
-  'meterReadings.js': '00000000.xlsx',
-  'production.js': '00000000.xlsx',
-  'generation.js': '00000000.xlsx',
-  'carbon.js': '00000000.xlsx',
-  'predictions.js': '00000000.xlsx'
+// 十一类模板的旧客户端 ASCII 文件名采用唯一、稳定的拼音业务名称。
+const EXPECTED_TEMPLATE_ASCII_NAMES = Object.freeze({
+  'energy-budgets': 'yongneng-yusuan-template',
+  'energy-records': 'nenghao-jilu-template',
+  'meter-readings': 'jiliang-chaobiao-template',
+  'production-units': 'channeng-danyuan-template',
+  'production-outputs': 'yuedu-chanliang-template',
+  'generation-records': 'fadian-ziyong-template',
+  'organization-units': 'yongneng-danyuan-template',
+  meters: 'jiliang-qiju-template',
+  'carbon-factors': 'tan-yinzi-template',
+  'prediction-configs': 'yuce-peizhi-template',
+  'prediction-history': 'yuce-lishi-template'
+});
+
+// 十一类模板的 UTF-8 下载文件名与工作表名称分别独立约束。
+const EXPECTED_TEMPLATE_FILE_NAMES = Object.freeze({
+  'energy-budgets': '用能预算导入模板',
+  'energy-records': '能耗数据导入模板',
+  'meter-readings': '计量抄表导入模板',
+  'production-units': '产能单元导入模板',
+  'production-outputs': '月度产量导入模板',
+  'generation-records': '发电自用记录导入模板',
+  'organization-units': '用能单元导入模板',
+  meters: '计量器具导入模板',
+  'carbon-factors': '碳因子导入模板',
+  'prediction-configs': '预测配置草稿导入模板',
+  'prediction-history': '预测历史数据模板'
 });
 
 // 十二类常规数据导出的独立中文标题和工作表契约。
@@ -86,6 +101,24 @@ const EXPECTED_EXPORT_CONTRACTS = Object.freeze([
   { name: '碳排放结果', sheetName: '碳排放结果', run: exportCarbonEmissions, headers: ['碳排放记录ID', '月份', '能源类型编码', '能源类型名称', '组织', '厂区', '部门', '核算方法', '活动数据值', '活动数据单位', '因子值', '排放量', '排放单位', '状态', '因子地区', '因子年份', '因子来源', '核算时间'] },
   { name: '预测配置', sheetName: '预测配置草稿', run: exportPredictionConfigs, headers: ['配置名称', '备注', '能源类型编码', '组织范围', '厂区', '部门', '能耗批次ID', '训练开始月份', '训练结束月份', '预测开始月份', '预测结束月份', '算法', '窗口大小', '状态'] },
   { name: '预测结果', sheetName: '预测结果', run: exportPredictionResults, headers: ['预测运行ID', '预测运行名称', '算法', '运行状态', '能源类型编码', '预测月份', '预测值', '预测单位', '置信区间下限', '置信区间上限', '方法说明'] }
+]);
+
+// 十二类常规导出与两类预演审计的真实 HTTP 下载契约。
+const EXPECTED_HTTP_EXPORT_CONTRACTS = Object.freeze([
+  { name: '能耗明细', path: '/api/energy-records/export', asciiBase: 'nenghao-mingxi', chinesePrefix: '能耗明细-' },
+  { name: '用能预算', path: '/api/energy-budgets/export', asciiBase: 'yongneng-yusuan', chinesePrefix: '用能预算导出-' },
+  { name: '用能单元', path: '/api/organization/units/export', asciiBase: 'yongneng-danyuan', chinesePrefix: '用能单元导出-' },
+  { name: '计量器具', path: '/api/meters/export', asciiBase: 'jiliang-qiju', chinesePrefix: '计量器具导出-' },
+  { name: '计量抄表', path: '/api/meter-readings/export', asciiBase: 'jiliang-chaobiao', chinesePrefix: '计量抄表导出-' },
+  { name: '发电自用', path: '/api/generation/records/export', asciiBase: 'fadian-ziyong', chinesePrefix: '发电自用记录导出-' },
+  { name: '产能单元', path: '/api/production/units/export', asciiBase: 'channeng-danyuan', chinesePrefix: '产能单元导出-' },
+  { name: '月度产量', path: '/api/production/outputs/export', asciiBase: 'yuedu-chanliang', chinesePrefix: '月度产量导出-' },
+  { name: '碳因子', path: '/api/carbon/factors/export', asciiBase: 'tan-yinzi', chinesePrefix: '碳因子导出-' },
+  { name: '碳排放结果', path: '/api/carbon/emissions/export', asciiBase: 'tan-paifang-jieguo', chinesePrefix: '碳排放结果导出-' },
+  { name: '预测配置', path: '/api/predictions/configs/export', asciiBase: 'yuce-peizhi', chinesePrefix: '预测配置草稿导出-' },
+  { name: '预测结果', path: '/api/predictions/results/export', asciiBase: 'yuce-jieguo', chinesePrefix: '预测结果导出-' },
+  { name: '历史能耗台账回填预演审计', path: '/api/energy-records/ledger-backfill/preview/export', asciiBase: 'lishi-nenghao-huitian-preview', chinesePrefix: '能耗记录-台账回填预演审计预案-' },
+  { name: '抄表生成能耗记录预演审计', path: '/api/meter-readings/energy-record-generation/preview/export', asciiBase: 'chaobiao-nenghao-preview', chinesePrefix: '抄表生成能耗记录预演审计预案-' }
 ]);
 
 /** 读取模板首行表头，统一校验 CSV 与 Excel 下载内容。 */
@@ -114,14 +147,31 @@ function assertExactTemplateHeaders(templateType, format, body) {
   }
 }
 
-/** 校验下载路由的 ASCII 兜底名不包含用户可见的英文技术前缀。 */
-function assertRouteAsciiFallbacks() {
-  for (const [fileName, expectedFallback] of Object.entries(EXPECTED_ROUTE_ASCII_FALLBACKS)) {
-    const routeSource = fs.readFileSync(path.join(__dirname, '..', 'routes', fileName), 'utf8');
-    assert(
-      routeSource.includes(`|| '${expectedFallback}';`),
-      `${fileName} 必须使用中性 ASCII 兜底名 ${expectedFallback}。`
-    );
+/** 解析真实 HTTP Content-Disposition 中的 ASCII 与 UTF-8 文件名。 */
+function parseContentDisposition(value) {
+  const header = String(value || '');
+  const asciiName = header.match(/filename="([^"]+)"/i)?.[1] || '';
+  const encodedName = header.match(/filename\*=UTF-8''([^;]+)/i)?.[1] || '';
+  return {
+    asciiName,
+    utf8Name: encodedName ? decodeURIComponent(encodedName) : ''
+  };
+}
+
+/** 校验真实 HTTP 文件响应的文件名、扩展名和 CSV BOM。 */
+function assertHttpDownloadResponse(response, contract, format, observedAsciiNames) {
+  assert.strictEqual(response.status, 200, `${contract.name}.${format} HTTP 下载必须成功。`);
+  const names = parseContentDisposition(response.headers['content-disposition']);
+  const expectedAsciiName = `${contract.asciiBase}.${format}`;
+  assert.strictEqual(names.asciiName, expectedAsciiName, `${contract.name}.${format} ASCII fallback 必须唯一、稳定且扩展名正确。`);
+  assert(!observedAsciiNames.has(names.asciiName), `${contract.name}.${format} ASCII fallback 不得与其他用户可见文件碰撞。`);
+  observedAsciiNames.add(names.asciiName);
+  assert(names.utf8Name.startsWith(contract.chinesePrefix), `${contract.name}.${format} filename* 必须使用正确中文业务名称。`);
+  assert(names.utf8Name.endsWith(`.${format}`), `${contract.name}.${format} filename* 扩展名必须正确。`);
+  if (format === 'csv') {
+    assert.deepStrictEqual([...response.body.subarray(0, 3)], [0xef, 0xbb, 0xbf], `${contract.name}.csv 必须带 UTF-8 BOM。`);
+  } else {
+    assert.strictEqual(response.body.subarray(0, 2).toString('ascii'), 'PK', `${contract.name}.xlsx 必须返回有效 Excel ZIP 文件。`);
   }
 }
 
@@ -167,8 +217,11 @@ function assertPreviewExportContracts() {
     const xlsxResult = contract.run({ format: 'xlsx' });
     const workbook = XLSX.read(xlsxResult.body, { type: 'buffer' });
     assert.deepStrictEqual(workbook.SheetNames, ['预案元信息', '预演明细'], `${contract.name}.xlsx 必须使用中文工作表名称。`);
-    const metaRows = XLSX.utils.sheet_to_json(workbook.Sheets['预案元信息'], { header: 1, blankrows: false });
-    assert.deepStrictEqual(metaRows[0], ['字段', '值'], `${contract.name}.xlsx 元信息首行必须使用中文标签。`);
+    const metaSheet = workbook.Sheets['预案元信息'];
+    const metaRows = XLSX.utils.sheet_to_json(metaSheet, { header: 1, blankrows: false });
+    assert.deepStrictEqual(metaRows[0], [contract.title], `${contract.name}.xlsx 第一行必须是独立中文顶部标题。`);
+    assert.deepStrictEqual(metaRows[1], ['字段', '值'], `${contract.name}.xlsx 第二行必须使用中文元信息标签。`);
+    assert.deepStrictEqual(metaSheet['!merges'], [{ s: { c: 0, r: 0 }, e: { c: 1, r: 0 } }], `${contract.name}.xlsx 顶部标题必须合并 A1:B1。`);
     const detailRows = XLSX.utils.sheet_to_json(workbook.Sheets['预演明细'], { header: 1, blankrows: false });
     assert.deepStrictEqual(detailRows[0], contract.headers, `${contract.name}.xlsx 明细首行必须完整使用中文标题。`);
   });
@@ -226,6 +279,7 @@ function request(server, pathname, token) {
     });
     const adminToken = (await login('admin', 'AdminPassword123!')).data.token;
     const ordinaryToken = (await login('template-reader', 'Password123!')).data.token;
+    const observedAsciiNames = new Set();
 
     const ledgerTemplates = [
       'organization-units',
@@ -251,6 +305,11 @@ function request(server, pathname, token) {
         assert.strictEqual(allowed.headers['x-template-type'], templateType);
         assert(allowed.body.length > 0, `${pathname} 必须返回非空模板内容。`);
         assertExactTemplateHeaders(templateType, format, allowed.body);
+        assertHttpDownloadResponse(allowed, {
+          name: `${templateType} 模板`,
+          asciiBase: EXPECTED_TEMPLATE_ASCII_NAMES[templateType],
+          chinesePrefix: `${EXPECTED_TEMPLATE_FILE_NAMES[templateType]}.`
+        }, format, observedAsciiNames);
       }
     }
 
@@ -269,6 +328,11 @@ function request(server, pathname, token) {
         const allowed = await request(server, pathname, adminToken);
         assert.strictEqual(allowed.status, 200, `${templateType} 模板必须允许超级管理员下载。`);
         assertExactTemplateHeaders(templateType, format, allowed.body);
+        assertHttpDownloadResponse(allowed, {
+          name: `${templateType} 模板`,
+          asciiBase: EXPECTED_TEMPLATE_ASCII_NAMES[templateType],
+          chinesePrefix: `${EXPECTED_TEMPLATE_FILE_NAMES[templateType]}.`
+        }, format, observedAsciiNames);
       }
     }
     assert.strictEqual((await request(server, '/api/templates/%65nergy-budgets.csv', ordinaryToken)).status, 403, '编码路径不得绕过预算模板保护。');
@@ -279,8 +343,22 @@ function request(server, pathname, token) {
         assert.strictEqual(response.status, 200, `${templateType} 历史模板必须保持匿名可下载。`);
         assert.strictEqual(response.headers['x-template-type'], templateType);
         assertExactTemplateHeaders(templateType, format, response.body);
+        assertHttpDownloadResponse(response, {
+          name: `${templateType} 模板`,
+          asciiBase: EXPECTED_TEMPLATE_ASCII_NAMES[templateType],
+          chinesePrefix: `${EXPECTED_TEMPLATE_FILE_NAMES[templateType]}.`
+        }, format, observedAsciiNames);
       }
     }
+
+    for (const contract of EXPECTED_HTTP_EXPORT_CONTRACTS) {
+      for (const format of ['csv', 'xlsx']) {
+        const separator = contract.path.includes('?') ? '&' : '?';
+        const response = await request(server, `${contract.path}${separator}format=${format}`, adminToken);
+        assertHttpDownloadResponse(response, contract, format, observedAsciiNames);
+      }
+    }
+    assert.strictEqual(observedAsciiNames.size, 50, '11 类模板、12 类常规导出和 2 类预演的 CSV/XLSX ASCII fallback 必须全部唯一。');
 
     // 将实际下载的中文能耗模板回导解析，验证首行可被现有导入映射识别。
     const energyTemplateResponse = await request(server, '/api/templates/energy-records.csv');
@@ -298,8 +376,6 @@ function request(server, pathname, token) {
     // 旧英文表头继续映射到同一内部字段，作为历史文件兼容回归。
     const mappedEnglishRow = mapRowFields({ period: '2026-01', energy_type: 'electricity', value: '1000', unit: 'kWh', meter_name: 'E-001' }).mapped;
     assert.deepStrictEqual(mappedEnglishRow, { month: '2026-01', energyType: 'electricity', value: '1000', unit: 'kWh', meterCode: 'E-001' });
-
-    assertRouteAsciiFallbacks();
 
     console.log('template route permission tests passed');
   } finally {

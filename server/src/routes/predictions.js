@@ -35,7 +35,7 @@ const requirePredictionRunView = requireAnyPermission('prediction:run:view', 'pr
 const requirePredictionResultView = requireAnyPermission('prediction:result:view', 'prediction:view');
 
 function buildContentDisposition(fileName, fallbackName) {
-  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || '00000000.xlsx';
+  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || 'yuce-wenjian.xlsx';
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
@@ -50,7 +50,7 @@ router.get('/contract', authenticate, requirePredictionContractView, (req, res) 
 router.get('/configs/export', authenticate, requirePermission('prediction:config:export'), asyncHandler(async (req, res) => {
   const result = exportPredictionConfigs(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `yuce-peizhi.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);
@@ -136,7 +136,7 @@ router.post('/runs', authenticate, requirePermission('prediction:run:create'), r
 router.get('/results/export', authenticate, requirePermission('prediction:result:export'), asyncHandler(async (req, res) => {
   const result = exportPredictionResults(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `yuce-jieguo.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);

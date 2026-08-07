@@ -8,6 +8,8 @@ const integrationDataDir = path.join(rootDir, 'data', 'integration-smoke');
 const specialRootDir = path.join(integrationDataDir, 'special-cases');
 const defaultRunId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}`;
 const runId = sanitizeRunId(process.env.SPECIAL_VERIFY_RUN_ID || defaultRunId);
+// 专项验证管理员密码：仅用于脚本生成的隔离 SQLite，不作用于真实业务数据库。
+const specialVerificationAdminPassword = 'SpecialVerifyAdmin123!';
 
 function sanitizeRunId(value) {
   const sanitized = String(value || '')
@@ -48,6 +50,7 @@ function ensureScenarioEnv(name) {
   process.env.UPLOADS_DIR = uploadsDir;
   process.env.BACKUPS_DIR = backupsDir;
   process.env.SQLITE_PATH = sqlitePath;
+  process.env.CHARCOAL_ADMIN_PASSWORD = process.env.CHARCOAL_ADMIN_PASSWORD || specialVerificationAdminPassword;
   return { scenarioDir, dataDir, uploadsDir, backupsDir, sqlitePath };
 }
 
@@ -299,23 +302,45 @@ async function listenLocal(app) {
   });
 }
 
-async function requestMaintenanceBlocked(apiBase, route) {
+// 维护态路由请求模块：统一发送隔离环境中的受保护写请求。
+async function requestMaintenanceRoute(apiBase, route, token = null) {
+  // 请求头：按请求体和有效会话分别附加内容类型与 Bearer Token。
+  const headers = {
+    ...(route.body ? { 'Content-Type': 'application/json' } : {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {})
+  };
   const response = await fetch(`${apiBase}${route.path}`, {
     method: route.method,
-    headers: route.body ? { 'Content-Type': 'application/json' } : undefined,
+    headers,
     body: route.body ? JSON.stringify(route.body) : undefined
   });
   const body = await response.json();
-  assert(response.status === 423 && body && body.success === false && body.error && body.error.code === 'MAINTENANCE_IN_PROGRESS', '维护态真实路由应返回 423 / MAINTENANCE_IN_PROGRESS。', { route, status: response.status, body });
-  return { route: `${route.method} ${route.path}`, status: response.status, code: body.error.code };
+  return { route: `${route.method} ${route.path}`, status: response.status, body };
+}
+
+// 未认证验证模块：确认认证中间件优先于维护态写保护执行。
+async function requestUnauthenticatedWrite(apiBase, route) {
+  const result = await requestMaintenanceRoute(apiBase, route);
+  assert(result.status === 401 && result.body && result.body.success === false && result.body.error && result.body.error.code === 'UNAUTHENTICATED', '维护态中的未认证写请求应优先返回 401 / UNAUTHENTICATED。', { route, status: result.status, body: result.body });
+  return { route: result.route, status: result.status, code: result.body.error.code };
+}
+
+// 已认证验证模块：确认有效会话通过认证后由维护态写保护返回 423。
+async function requestMaintenanceBlocked(apiBase, route, token) {
+  const result = await requestMaintenanceRoute(apiBase, route, token);
+  assert(result.status === 423 && result.body && result.body.success === false && result.body.error && result.body.error.code === 'MAINTENANCE_IN_PROGRESS', '维护态中的已认证写请求应返回 423 / MAINTENANCE_IN_PROGRESS。', { route, status: result.status, body: result.body });
+  return { route: result.route, status: result.status, code: result.body.error.code };
 }
 
 async function scenarioMaintenanceRoutes() {
   const env = ensureScenarioEnv('maintenance-routes');
   const { initDatabase } = require('../server/src/db/database');
   const { app } = require('../server/src/index');
+  const { login } = require('../server/src/services/authService');
   const { runWithMaintenance } = require('../server/src/services/maintenanceState');
   initDatabase();
+  // 管理员令牌：在进入维护态前由隔离数据库创建，用于验证认证后的写保护语义。
+  const adminToken = login({ username: 'admin', password: process.env.CHARCOAL_ADMIN_PASSWORD }).token;
   const { server, port } = await listenLocal(app);
   const apiBase = `http://127.0.0.1:${port}/api`;
   const routes = [
@@ -332,11 +357,17 @@ async function scenarioMaintenanceRoutes() {
 
   try {
     const results = await runWithMaintenance('special:route-matrix', async () => {
+      // 未认证结果：先覆盖专项脚本列出的 9 条受保护写路由矩阵，锁定生产路由的认证优先顺序。
+      const unauthenticated = [];
+      for (const route of routes) {
+        unauthenticated.push(await requestUnauthenticatedWrite(apiBase, route));
+      }
+      // 维护态结果：再使用有效 Bearer Token 验证受保护写路由统一返回 423。
       const blocked = [];
       for (const route of routes) {
-        blocked.push(await requestMaintenanceBlocked(apiBase, route));
+        blocked.push(await requestMaintenanceBlocked(apiBase, route, adminToken));
       }
-      return blocked;
+      return { unauthenticated, blocked };
     });
     return { ok: true, scenario: 'maintenance-routes', sqlitePath: env.sqlitePath, apiBase, results };
   } finally {

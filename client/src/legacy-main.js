@@ -1,4 +1,5 @@
 import './legacy-styles.css';
+import { buildImportOriginalFileFallbackName } from './utils/specialModules.js';
 
 const DEFAULT_API_BASE = 'http://127.0.0.1:3002/api';
 const API_BASE_STORAGE_KEY = 'charcoal.apiBase';
@@ -1875,7 +1876,7 @@ async function downloadImportFile(batchId, filename) {
     objectUrl = URL.createObjectURL(blob);
     const link = createElement('a', {
       href: objectUrl,
-      download: headerFileName || filename || `import-batch-${batchId}`,
+      download: headerFileName || filename || buildImportOriginalFileFallbackName(batchId, response.headers.get('content-type')),
       style: 'display: none;'
     });
     document.body.append(link);

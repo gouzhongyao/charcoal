@@ -30,7 +30,7 @@ const requireCarbonFactorsView = requireAnyPermission('carbon:factors:view', 'ca
 const requireCarbonEmissionsView = requireAnyPermission('carbon:emissions:view', 'carbon:view');
 
 function buildContentDisposition(fileName, fallbackName) {
-  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || '00000000.xlsx';
+  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || 'tan-guanli.xlsx';
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
@@ -41,7 +41,7 @@ router.get('/contract', authenticate, requireCarbonContractView, (req, res) => {
 router.get('/factors/export', authenticate, requirePermission('carbon:factors:export'), asyncHandler(async (req, res) => {
   const result = exportCarbonFactors(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `tan-yinzi.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);
@@ -97,7 +97,7 @@ router.post('/emissions/calculate', authenticate, requirePermission('carbon:emis
 router.get('/emissions/export', authenticate, requirePermission('carbon:emissions:export'), asyncHandler(async (req, res) => {
   const result = exportCarbonEmissions(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `tan-paifang-jieguo.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);

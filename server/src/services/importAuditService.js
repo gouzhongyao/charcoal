@@ -4,7 +4,24 @@ const { openDatabase } = require('../db/database');
 const { badRequest, notFound } = require('../utils/errors');
 const { decodeUploadOriginalName } = require('../utils/filenameEncoding');
 
-const AUDIT_IMPORT_TYPES = Object.freeze(['production_unit', 'production_output', 'generation_record', 'energy_budget', 'carbon_factor', 'prediction_config']);
+// 统一导入审计支持的领域类型，包含能源分析八类正式导入批次。
+const AUDIT_IMPORT_TYPES = Object.freeze([
+  'production_unit',
+  'production_output',
+  'generation_record',
+  'energy_budget',
+  'carbon_factor',
+  'prediction_config',
+  'energy_timeseries',
+  'shift_schedule',
+  'device_state',
+  'energy_conversion_factor',
+  'energy_benchmark',
+  'energy_flow_node',
+  'energy_flow_edge',
+  'energy_flow_record'
+]);
+// 由领域服务维护生命周期和追溯的批次禁止走通用删除入口。
 const GENERIC_DELETE_FORBIDDEN_IMPORT_TYPES = Object.freeze([...AUDIT_IMPORT_TYPES, 'meter_reading']);
 const IMPORT_BATCH_STATUSES = Object.freeze(['pending', 'processing', 'completed', 'completed_with_errors', 'failed', 'cancelled']);
 const IMPORT_AUDIT_PHASES = Object.freeze(['preview', 'execute']);

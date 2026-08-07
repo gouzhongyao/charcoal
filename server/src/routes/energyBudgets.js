@@ -21,7 +21,7 @@ const { sendSuccess } = require('../utils/response');
 const router = express.Router();
 
 function buildContentDisposition(fileName, fallbackName) {
-  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || '00000000.xlsx';
+  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || 'yongneng-yusuan.xlsx';
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
@@ -42,7 +42,7 @@ router.get('/execution-comparison', authenticate, requirePermission('energy:budg
 router.get('/export', authenticate, requirePermission('energy:budget:export'), asyncHandler(async (req, res) => {
   const result = exportEnergyBudgets(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `yongneng-yusuan.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);

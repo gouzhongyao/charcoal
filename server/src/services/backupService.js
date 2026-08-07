@@ -6,7 +6,16 @@ const { assertWritableAllowed, runWithMaintenance } = require('./maintenanceStat
 const { badRequest, invalidBackup, notFound } = require('../utils/errors');
 
 const BACKUP_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(sqlite|db)$/i;
-const BACKUP_REASONS = new Set(['manual', 'pre-restore', 'ledger-backfill', 'meter-reading-energy-record-generation', 'production-output-import', 'generation-record-import']);
+// 允许进入备份文件名和审计元数据的正式备份原因。
+const BACKUP_REASONS = new Set([
+  'manual',
+  'pre-restore',
+  'ledger-backfill',
+  'meter-reading-energy-record-generation',
+  'production-output-import',
+  'generation-record-import',
+  'energy-analysis-import'
+]);
 const REQUIRED_BACKUP_SCHEMA = {
   app_meta: [
     ['key'],
@@ -250,13 +259,28 @@ function validateBackupFile(backupPath) {
   }
 }
 
-async function copyDatabaseToBackup(destinationPath) {
+/**
+ * 使用独立只读快照连接创建 SQLite 备份。
+ * @param {string} destinationPath 备份目标路径。
+ * @param {object} options 受控备份选项。
+ * @returns {Promise<string>} 备份方法。
+ */
+async function copyDatabaseToBackup(destinationPath, options = {}) {
+  const skipCheckpoint = options.skipCheckpoint === true;
   const db = openDatabase();
   try {
-    db.pragma('wal_checkpoint(TRUNCATE)');
+    // BEGIN IMMEDIATE 调用方持有 RESERVED 锁时不能执行 checkpoint，但在线备份仍可读取锁前已提交快照。
+    if (!skipCheckpoint) {
+      db.pragma('wal_checkpoint(TRUNCATE)');
+    }
     if (typeof db.backup === 'function') {
       await db.backup(destinationPath);
       return 'better-sqlite3-backup-api';
+    }
+    if (skipCheckpoint) {
+      throw badRequest('锁内备份要求 SQLite 在线备份 API 可用。', {
+        code: 'BACKUP_ONLINE_API_REQUIRED'
+      });
     }
   } finally {
     db.close();
@@ -279,7 +303,17 @@ async function createBackup(options = {}) {
     throw badRequest('备份文件名冲突，请稍后重试。', { backupName });
   }
 
-  const method = await copyDatabaseToBackup(backupPath);
+  let method;
+  try {
+    method = await copyDatabaseToBackup(backupPath, {
+      skipCheckpoint: options.skipCheckpoint === true
+    });
+  } catch (error) {
+    if (fs.existsSync(backupPath)) {
+      fs.rmSync(backupPath, { force: true });
+    }
+    throw error;
+  }
   const metadata = buildBackupMetadata(backupPath);
   return {
     ...metadata,

@@ -33,6 +33,19 @@ export function compactFieldMapping(mapping = {}) {
     .filter(([field, sourceHeader]) => field && sourceHeader));
 }
 
+/** 根据响应类型生成包含批次编号和原文件扩展名的中文下载兜底名称。 */
+export function buildImportOriginalFileFallbackName(batchId, contentType = '') {
+  const normalizedType = String(contentType || '').toLowerCase();
+  const extension = normalizedType.includes('spreadsheetml')
+    ? '.xlsx'
+    : normalizedType.includes('ms-excel')
+      ? '.xls'
+      : normalizedType.includes('csv')
+        ? '.csv'
+        : '';
+  return `导入批次原文件-${batchId}${extension}`;
+}
+
 /** 从 bootstrap 投影安全的本地部署信息，绝不把目录或数据库路径渲染到页面。 */
 export function projectBootstrapInfo(bootstrap = {}) {
   const maintenance = bootstrap.maintenance || {};

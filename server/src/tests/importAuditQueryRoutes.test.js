@@ -148,11 +148,13 @@ function insertIssue(db, batchId, input) {
     fs.writeFileSync(path.join(uploadsDir, 'production-query.csv'), 'unit_code,normalized_month\nPU-001,2026-01\n', 'utf8');
     fs.writeFileSync(path.join(uploadsDir, 'generation-query.csv'), '用能单元编码,月份\nGEN-001,2026-01\n', 'utf8');
     fs.writeFileSync(path.join(uploadsDir, 'energy-query.csv'), 'energy_type,month\nelectricity,2026-01\n', 'utf8');
+    fs.writeFileSync(path.join(uploadsDir, 'fallback-query.csv'), '原文件兜底测试\n', 'utf8');
 
     let productionBatchId;
     let generationBatchId;
     let energyBatchId;
     let badJsonBatchId;
+    let fallbackFileBatchId;
     let missingFileBatchId;
     let escapeFileBatchId;
     const db = openDatabase();
@@ -261,6 +263,14 @@ function insertIssue(db, batchId, input) {
         errorSummary: '坏 JSON 应安全返回原值。',
         createdAt: '2026-08-04T00:10:00.000Z'
       });
+      fallbackFileBatchId = insertBatch(db, {
+        importType: 'energy_record',
+        originalFilename: '',
+        storedFilename: 'fallback-query.csv',
+        fileSizeBytes: fs.statSync(path.join(uploadsDir, 'fallback-query.csv')).size,
+        fileSha256: 'fallback-file-sha256',
+        createdAt: '2026-08-04T00:15:00.000Z'
+      });
       missingFileBatchId = insertBatch(db, {
         importType: 'generation_record',
         originalFilename: '缺失原文件.csv',
@@ -294,7 +304,7 @@ function insertIssue(db, batchId, input) {
 
     const energyList = await requestJson(port, 'GET', '/api/imports/batches?importType=energy_record&pageSize=20');
     assert.strictEqual(energyList.statusCode, 200);
-    assert.deepStrictEqual(energyList.json.data.map((row) => row.id), [energyBatchId], '旧 energy_record 类型仍应可筛选查询。');
+    assert.deepStrictEqual(energyList.json.data.map((row) => row.id), [fallbackFileBatchId, energyBatchId], '旧 energy_record 类型及缺失原文件名的兼容批次仍应可筛选查询。');
 
     const detail = await requestJson(port, 'GET', `/api/imports/batches/${productionBatchId}`);
     assert.strictEqual(detail.statusCode, 200);
@@ -341,6 +351,12 @@ function insertIssue(db, batchId, input) {
     assert.strictEqual(download.body.toString('utf8'), 'unit_code,normalized_month\nPU-001,2026-01\n');
     assert(download.headers['content-disposition'].includes("filename*=UTF-8''"), '下载响应应包含 UTF-8 filename*。');
     assert(download.headers['content-disposition'].includes(encodeURIComponent('月度产量 查询.csv')), '中文原文件名应安全编码到 Content-Disposition。');
+
+    const fallbackDownload = await requestJson(port, 'GET', `/api/imports/batches/${fallbackFileBatchId}/download`);
+    assert.strictEqual(fallbackDownload.statusCode, 200);
+    assert.strictEqual(fallbackDownload.body.toString('utf8'), '原文件兜底测试\n', '缺少原始文件名时仍必须逐字节透传存储的原文件。');
+    assert(fallbackDownload.headers['content-disposition'].includes(`filename="daoru-pici-yuanwen-${fallbackFileBatchId}.csv"`), '原文件 ASCII 兜底应包含批次编号和原扩展名。');
+    assert(fallbackDownload.headers['content-disposition'].includes(encodeURIComponent(`导入批次原文件-${fallbackFileBatchId}.csv`)), '缺少原始文件名时 filename* 应使用包含批次编号和原扩展名的中文业务名称。');
 
     const missingDownload = await requestJson(port, 'GET', `/api/imports/batches/${missingFileBatchId}/download`);
     assert.strictEqual(missingDownload.statusCode, 404);

@@ -23,7 +23,7 @@ const requireEnergyRecordView = requireAnyPermission('energy:records:view', 'ene
 router.use(authenticate);
 
 function buildContentDisposition(fileName, fallbackName) {
-  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || '00000000.xlsx';
+  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || 'nenghao-wenjian.xlsx';
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
@@ -51,7 +51,7 @@ router.get('/statistics/dimension-breakdown', requireEnergyRecordView, asyncHand
 router.get('/ledger-backfill/preview/export', requireEnergyRecordView, asyncHandler(async (req, res) => {
   const result = exportEnergyRecordLedgerBackfillPreview(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `lishi-nenghao-huitian-preview.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.setHeader('X-Dry-Run', 'true');
@@ -73,7 +73,7 @@ router.post('/ledger-backfill/execute', requirePermission('energy:records:ledger
 router.get('/export', requireEnergyRecordView, asyncHandler(async (req, res) => {
   const result = exportEnergyRecords(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `nenghao-mingxi.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);

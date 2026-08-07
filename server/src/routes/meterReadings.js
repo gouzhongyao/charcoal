@@ -24,7 +24,7 @@ const router = express.Router();
 const requireMeterReadingView = requireAnyPermission('ledger:readings:view', 'ledger:meter-reading:view');
 
 function buildContentDisposition(fileName, fallbackName) {
-  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || '00000000.xlsx';
+  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || 'jiliang-chaobiao.xlsx';
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
@@ -35,7 +35,7 @@ router.get('/contract', authenticate, requireMeterReadingView, (req, res) => {
 router.get('/export', authenticate, requirePermission('ledger:readings:export'), asyncHandler(async (req, res) => {
   const result = exportMeterReadings(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `jiliang-chaobiao.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);
@@ -48,7 +48,7 @@ router.get('/stats', authenticate, requireMeterReadingView, asyncHandler(async (
 router.get('/energy-record-generation/preview/export', authenticate, requirePermission('ledger:readings:preview'), asyncHandler(async (req, res) => {
   const result = exportMeterReadingEnergyRecordGenerationPreview(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `chaobiao-nenghao-preview.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Dry-Run', 'true');
   res.setHeader('X-Preview-Only', 'true');

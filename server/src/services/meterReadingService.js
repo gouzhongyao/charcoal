@@ -1192,7 +1192,13 @@ function exportMeterReadingEnergyRecordGenerationPreview(query = {}) {
     return { fileName, format, contentType: 'text/csv; charset=utf-8', body: Buffer.from(`${UTF8_BOM}${lines.join('\n')}\n`, 'utf8'), rowCount: preview.items.length, fields: headers, previewSignature: preview.previewSignature };
   }
   const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([['字段', '值'], ...metaRows]), '预案元信息');
+  const metaSheet = XLSX.utils.aoa_to_sheet([
+    ['抄表生成能耗记录预演审计预案'],
+    ['字段', '值'],
+    ...metaRows
+  ]);
+  metaSheet['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 1 } }];
+  XLSX.utils.book_append_sheet(workbook, metaSheet, '预案元信息');
   const detailSheet = XLSX.utils.json_to_sheet(exportRows, { header: headers });
   detailSheet['!cols'] = headers.map((header) => ({ wch: Math.min(Math.max(String(header).length + 8, 12), 32) }));
   XLSX.utils.book_append_sheet(workbook, detailSheet, '预演明细');

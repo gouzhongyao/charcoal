@@ -22,7 +22,7 @@ const { sendSuccess } = require('../utils/response');
 const router = express.Router();
 
 function buildContentDisposition(fileName, fallbackName) {
-  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || '00000000.xlsx';
+  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || 'fadian-ziyong.xlsx';
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
@@ -43,7 +43,7 @@ router.get('/stats', authenticate, requirePermission('ledger:generation:view'), 
 router.get('/records/export', authenticate, requirePermission('ledger:generation:export'), asyncHandler(async (req, res) => {
   const result = exportGenerationRecords(req.query);
   res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `00000000.${result.format}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `fadian-ziyong.${result.format}`));
   res.setHeader('Content-Length', String(result.body.length));
   res.setHeader('X-Export-Row-Count', String(result.rowCount));
   res.status(200).send(result.body);

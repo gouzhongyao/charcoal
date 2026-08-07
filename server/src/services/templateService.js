@@ -1,4 +1,10 @@
 const XLSX = require('xlsx');
+const { AppError } = require('../utils/errors');
+const {
+  generateEnergyAnalysisTemplate,
+  getEnergyAnalysisTemplateDefinition,
+  listEnergyAnalysisTemplates
+} = require('./energyAnalysisTemplateService');
 const {
   GENERATION_RECORD_IMPORT_HEADERS,
   GENERATION_RECORD_IMPORT_TEMPLATE_ID
@@ -17,6 +23,11 @@ const {
 } = require('./predictionService');
 
 const UTF8_BOM = '﻿';
+
+// 已复审能源分析模板 ID 集合由独立模板服务生成，中央服务不重复维护模板定义。
+const ENERGY_ANALYSIS_TEMPLATE_TYPES = new Set(
+  listEnergyAnalysisTemplates().map((template) => template.id)
+);
 
 const TEMPLATE_DEFINITIONS = {
   [ENERGY_BUDGET_IMPORT_TEMPLATE_ID]: {
@@ -240,8 +251,78 @@ function getFileName(template, extension) {
   return `${template.baseFileName}.${extension}`;
 }
 
+/** 规范化中央模板类型，兼容携带 CSV/XLSX 扩展名的调用。 */
+function normalizeTemplateType(templateType) {
+  return String(templateType || '')
+    .trim()
+    .replace(/\.(csv|xlsx)$/i, '')
+    .toLowerCase();
+}
+
+/** 将能源分析模板定义适配为中央模板服务的统一元数据。 */
+function buildEnergyAnalysisTemplateDefinition(templateType) {
+  const definition = getEnergyAnalysisTemplateDefinition(templateType);
+  if (!definition) {
+    return null;
+  }
+
+  const xlsxRoute = `/api/templates/${definition.id}.xlsx`;
+  const csvRoute = definition.formats.includes('csv')
+    ? `/api/templates/${definition.id}.csv`
+    : null;
+  return {
+    type: definition.id,
+    name: definition.name,
+    baseFileName: definition.baseFileName,
+    asciiBaseFileName: definition.asciiBaseFileName,
+    sheetName: definition.sheetName,
+    route: xlsxRoute,
+    csvRoute,
+    recommendedFormat: 'xlsx',
+    formats: [...definition.formats],
+    appliesTo: ['能源分析'],
+    contractRoute: null,
+    description: `用于下载${definition.name}；当前仅接入中央模板服务，不代表领域预演或执行接口已开放。`,
+    headers: definition.headers ? [...definition.headers] : null,
+    rows: definition.rows,
+    sheetNames: definition.sheets.map((sheet) => sheet.name),
+    sheets: definition.sheets.map((sheet) => ({
+      name: sheet.name,
+      headers: [...sheet.headers]
+    }))
+  };
+}
+
+/** 将独立能源分析模板服务的稳定领域错误转换为 HTTP 可识别错误。 */
+function convertEnergyAnalysisTemplateError(error) {
+  if (error && error.code === 'TEMPLATE_FORMAT_UNSUPPORTED') {
+    return new AppError(error.code, error.message, {
+      statusCode: 400,
+      details: error.details || null
+    });
+  }
+  return error;
+}
+
+/** 调用独立能源分析模板服务生成文件，并适配中央下载结果。 */
+function generateRegisteredEnergyAnalysisTemplate(templateType, format) {
+  const template = buildEnergyAnalysisTemplateDefinition(templateType);
+  if (!template) {
+    return null;
+  }
+  try {
+    return {
+      ...generateEnergyAnalysisTemplate(template.type, format),
+      template
+    };
+  } catch (error) {
+    throw convertEnergyAnalysisTemplateError(error);
+  }
+}
+
+/** 列出历史模板和已注册能源分析模板，历史模板元数据保持原有结构。 */
 function listTemplates() {
-  return Object.values(TEMPLATE_DEFINITIONS).map((template) => ({
+  const historicalTemplates = Object.values(TEMPLATE_DEFINITIONS).map((template) => ({
     type: template.type,
     name: template.name,
     route: template.route,
@@ -259,23 +340,57 @@ function listTemplates() {
     description: template.description,
     headers: template.headers
   }));
+  const energyAnalysisTemplates = listEnergyAnalysisTemplates().map((listedTemplate) => {
+    const template = buildEnergyAnalysisTemplateDefinition(listedTemplate.id);
+    return {
+      type: template.type,
+      name: template.name,
+      route: template.route,
+      fileName: getFileName(template, 'xlsx'),
+      asciiFileName: `${template.asciiBaseFileName}.xlsx`,
+      csvRoute: template.csvRoute,
+      csvFileName: template.csvRoute ? getFileName(template, 'csv') : null,
+      recommendedFormat: template.recommendedFormat,
+      formats: [...template.formats],
+      downloads: {
+        xlsx: template.route,
+        ...(template.csvRoute ? { csv: template.csvRoute } : {})
+      },
+      appliesTo: template.appliesTo,
+      contractRoute: template.contractRoute,
+      reusableTemplateType: null,
+      description: template.description,
+      headers: template.headers,
+      sheetNames: [...template.sheetNames],
+      sheets: template.sheets.map((sheet) => ({
+        name: sheet.name,
+        headers: [...sheet.headers]
+      }))
+    };
+  });
+  return [...historicalTemplates, ...energyAnalysisTemplates];
 }
 
-function normalizeTemplateType(templateType) {
-  return String(templateType || '')
-    .trim()
-    .replace(/\.(csv|xlsx)$/i, '')
-    .toLowerCase();
-}
-
+/** 读取中央模板定义，能源分析模板由独立服务按需适配。 */
 function getTemplateDefinition(templateType) {
-  return TEMPLATE_DEFINITIONS[normalizeTemplateType(templateType)] || null;
+  const normalizedTemplateType = normalizeTemplateType(templateType);
+  if (Object.prototype.hasOwnProperty.call(TEMPLATE_DEFINITIONS, normalizedTemplateType)) {
+    return TEMPLATE_DEFINITIONS[normalizedTemplateType];
+  }
+  if (!ENERGY_ANALYSIS_TEMPLATE_TYPES.has(normalizedTemplateType)) {
+    return null;
+  }
+  return buildEnergyAnalysisTemplateDefinition(normalizedTemplateType);
 }
 
+/** 生成中央注册模板的 CSV 文件。 */
 function getTemplateCsv(templateType) {
   const template = getTemplateDefinition(templateType);
   if (!template) {
     return null;
+  }
+  if (ENERGY_ANALYSIS_TEMPLATE_TYPES.has(template.type)) {
+    return generateRegisteredEnergyAnalysisTemplate(template.type, 'csv');
   }
   return {
     template,
@@ -284,10 +399,14 @@ function getTemplateCsv(templateType) {
   };
 }
 
+/** 生成中央注册模板的 XLSX 文件。 */
 function getTemplateXlsx(templateType) {
   const template = getTemplateDefinition(templateType);
   if (!template) {
     return null;
+  }
+  if (ENERGY_ANALYSIS_TEMPLATE_TYPES.has(template.type)) {
+    return generateRegisteredEnergyAnalysisTemplate(template.type, 'xlsx');
   }
   return {
     template,

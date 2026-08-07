@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { buildImportBatchFilters, canUseGenericImportBatchDelete, chartPercentage, compactFieldMapping, dashboardScopeNotice, IMPORT_BATCH_TYPE_OPTIONS, projectBootstrapInfo } from '../utils/specialModules.js';
+import { buildImportBatchFilters, buildImportOriginalFileFallbackName, canUseGenericImportBatchDelete, chartPercentage, compactFieldMapping, dashboardScopeNotice, IMPORT_BATCH_TYPE_OPTIONS, projectBootstrapInfo } from '../utils/specialModules.js';
 
 // 导入批次筛选仅保留服务端允许的有效参数。
 assert.deepEqual(buildImportBatchFilters({ importType: 'energy_record', status: '', fileType: 'xlsx' }, { page: 2, pageSize: 50 }), {
@@ -22,6 +22,12 @@ assert.equal(canUseGenericImportBatchDelete({ importType: 'energy_record' }), tr
 assert.equal(canUseGenericImportBatchDelete({ importType: 'meter_reading' }), false);
 assert.equal(canUseGenericImportBatchDelete({ importType: 'production_output' }), false);
 assert.equal(canUseGenericImportBatchDelete({ importType: 'generation_record' }), false);
+
+// 原文件下载缺少响应文件名时，中文兜底必须保留批次编号和响应对应的原扩展名。
+assert.equal(buildImportOriginalFileFallbackName(17, 'text/csv; charset=utf-8'), '导入批次原文件-17.csv');
+assert.equal(buildImportOriginalFileFallbackName(18, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'), '导入批次原文件-18.xlsx');
+assert.equal(buildImportOriginalFileFallbackName(19, 'application/vnd.ms-excel'), '导入批次原文件-19.xls');
+assert.equal(buildImportOriginalFileFallbackName(20, 'application/octet-stream'), '导入批次原文件-20');
 
 // 映射值和图表比例不得引入空字段或伪造零值。
 assert.deepEqual(compactFieldMapping({ period: '月份', value: ' ', ' ': '数值' }), { period: '月份' });
@@ -47,9 +53,15 @@ const energyApiSource = readFileSync(new URL('../api/energy.js', import.meta.url
 const importsApiSource = readFileSync(new URL('../api/imports.js', import.meta.url), 'utf8');
 const legacyMainSource = readFileSync(new URL('../legacy-main.js', import.meta.url), 'utf8');
 assert.match(httpSource, /fallbackName = '下载文件'/);
+assert.match(httpSource, /if \(encoded\) \{ try \{ return decodeURIComponent\(encoded\); \} catch \{\} \}/);
+assert.doesNotMatch(httpSource, /catch \{ return encoded; \}/);
+assert.match(httpSource, /typeof fallbackName === 'function' \? fallbackName\(response\) : fallbackName/);
+assert.match(httpSource, /filenameFromDisposition\(response\.headers\['content-disposition'\]\) \|\| resolvedFallbackName \|\| '下载文件'/);
 assert.match(energyApiSource, /'历史能耗台账回填预演审计预案\.xlsx'/);
 assert.doesNotMatch(energyApiSource, /energy-records-台账回填/);
-assert.match(importsApiSource, /`导入批次原文件-\$\{batchId\}`/);
+assert.match(importsApiSource, /import \{ buildImportOriginalFileFallbackName \} from '@\/utils\/specialModules'/);
+assert.match(importsApiSource, /buildImportOriginalFileFallbackName\(batchId, response\.headers\?\.\['content-type'\]\)/);
+assert.match(importsApiSource, /`能耗数据导入模板\.\$\{safeExtension\}`/);
 assert.doesNotMatch(importsApiSource, /`import-batch-\$\{batchId\}`/);
 assert.match(legacyMainSource, /'导入模板\.xlsx'/);
 assert.match(legacyMainSource, /'历史能耗台账回填预演审计预案\.xlsx'/);

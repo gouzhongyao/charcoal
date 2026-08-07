@@ -12,7 +12,7 @@ const { sendSuccess } = require('../utils/response');
 const router = express.Router();
 
 function buildContentDisposition(fileName, fallbackName) {
-  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || '00000000';
+  const fallback = String(fallbackName || fileName).replace(/[^A-Za-z0-9._-]+/g, '-') || 'daoru-pici-yuanwen';
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
@@ -74,7 +74,7 @@ router.delete('/batches/:batchId', authenticate, requirePermission('imports:dele
 router.get('/batches/:batchId/download', authenticate, requirePermission('imports:download'), asyncHandler(async (req, res, next) => {
   const result = getImportBatchFileDownload(req.params.batchId);
   res.setHeader('Content-Type', getImportFileContentType(result.fileType));
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `${result.batchId}.${result.fileType}`));
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `daoru-pici-yuanwen-${result.batchId}.${result.fileType}`));
   res.sendFile(result.filePath, (error) => {
     if (error && !res.headersSent) {
       next(error);

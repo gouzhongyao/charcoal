@@ -633,9 +633,12 @@ try {
   const workbook = XLSX.read(previewExportXlsx.body, { type: 'buffer' });
   assert(workbook.SheetNames.includes('预案元信息'), 'xlsx 导出应包含预案元信息工作表。');
   assert(workbook.SheetNames.includes('预演明细'), 'xlsx 导出应包含预演明细工作表。');
-  const metaSheet = XLSX.utils.sheet_to_json(workbook.Sheets['预案元信息']);
-  assert(metaSheet.length > 0 && Object.prototype.hasOwnProperty.call(metaSheet[0], '字段') && Object.prototype.hasOwnProperty.call(metaSheet[0], '值'), 'xlsx 预案元信息表头必须使用中文。');
-  const metaLabels = metaSheet.map((row) => row['字段']);
+  const metaWorksheet = workbook.Sheets['预案元信息'];
+  const metaTable = XLSX.utils.sheet_to_json(metaWorksheet, { header: 1, blankrows: false });
+  assert.deepStrictEqual(metaTable[0], ['历史能耗记录台账回填预演审计预案（仅预演、不写入）'], 'xlsx 预案元信息第一行必须使用独立中文顶部标题。');
+  assert.deepStrictEqual(metaTable[1], ['字段', '值'], 'xlsx 预案元信息第二行必须使用中文字段和值标签。');
+  assert.deepStrictEqual(metaWorksheet['!merges'], [{ s: { c: 0, r: 0 }, e: { c: 1, r: 0 } }], 'xlsx 预案元信息顶部标题必须合并 A1:B1。');
+  const metaLabels = metaTable.slice(2).map((row) => row[0]);
   assert(metaLabels.includes('是否写入能耗记录') && metaLabels.includes('筛选条件'), 'xlsx 元信息标签必须使用中文展示名称。');
   assert(!metaLabels.some((label) => ['dryRun', 'previewOnly', 'writesEnergyRecords', 'filters'].includes(label)), 'xlsx 元信息不得暴露内部技术字段名。');
   const detailSheet = XLSX.utils.sheet_to_json(workbook.Sheets['预演明细']);
@@ -899,9 +902,13 @@ try {
   const workbook = XLSX.read(exportXlsx.body, { type: 'buffer' });
   assert(workbook.SheetNames.includes('预案元信息'));
   assert(workbook.SheetNames.includes('预演明细'));
-  const generationMetaRows = XLSX.utils.sheet_to_json(workbook.Sheets['预案元信息']);
-  assert(generationMetaRows.some((row) => row['字段'] === '是否写入能耗记录' && row['值'] === '否'), '抄表生成 xlsx 应使用中文元信息标签和值。');
-  assert(!generationMetaRows.some((row) => ['writesEnergyRecords', 'filters', 'fixedConfirmText'].includes(row['字段'])), '抄表生成 xlsx 不得暴露内部技术字段名。');
+  const generationMetaSheet = workbook.Sheets['预案元信息'];
+  const generationMetaRows = XLSX.utils.sheet_to_json(generationMetaSheet, { header: 1, blankrows: false });
+  assert.deepStrictEqual(generationMetaRows[0], ['抄表生成能耗记录预演审计预案'], '抄表生成 xlsx 第一行必须使用独立中文顶部标题。');
+  assert.deepStrictEqual(generationMetaRows[1], ['字段', '值'], '抄表生成 xlsx 第二行必须使用中文字段和值标签。');
+  assert.deepStrictEqual(generationMetaSheet['!merges'], [{ s: { c: 0, r: 0 }, e: { c: 1, r: 0 } }], '抄表生成 xlsx 顶部标题必须合并 A1:B1。');
+  assert(generationMetaRows.slice(2).some((row) => row[0] === '是否写入能耗记录' && row[1] === '否'), '抄表生成 xlsx 应使用中文元信息标签和值。');
+  assert(!generationMetaRows.slice(2).some((row) => ['writesEnergyRecords', 'filters', 'fixedConfirmText'].includes(row[0])), '抄表生成 xlsx 不得暴露内部技术字段名。');
 
   await assert.rejects(
     () => executeMeterReadingEnergyRecordGeneration({ confirmText: '错误确认文本', previewSignature: preview.previewSignature, expectedWouldGenerate: preview.summary.wouldGenerate, candidateReadingIds: preview.candidateReadingIds, filters: preview.filters, acknowledgeSkippedRisks: true, requireBackup: true }),
