@@ -31,6 +31,42 @@ const expectedPermissions = [
   'ledger:generation:view', 'imports:view', 'dashboard:view', 'system:backup:view',
   'system:user:view', 'system:role:view', 'system:menu:view'
 ];
+// 四个能源页面及其按钮共用的二十六个权限契约。
+const energyModulePermissions = [
+  'energy:analysis:view',
+  'energy:analysis:config:view',
+  'energy:analysis:shift:manage',
+  'energy:analysis:tou:manage',
+  'energy:strategy:rule:manage',
+  'energy:strategy:evaluate',
+  'energy:strategy:run',
+  'energy:strategy:review',
+  'energy:analysis:timeseries:preview',
+  'energy:analysis:timeseries:execute',
+  'energy:analysis:operations:preview',
+  'energy:analysis:operations:execute',
+  'energy:benchmarks:view',
+  'energy:benchmarks:manage',
+  'energy:benchmarks:analyze',
+  'energy:benchmarks:export',
+  'energy:benchmarks:import:preview',
+  'energy:benchmarks:import:execute',
+  'energy:flows:view',
+  'energy:flows:manage',
+  'energy:flows:import:preview',
+  'energy:flows:import:execute',
+  'energy:balance:view',
+  'energy:balance:manage',
+  'energy:balance:calculate',
+  'energy:balance:suggestion:review'
+];
+// 四个页面菜单冻结的路由与组件映射。
+const energyPageContracts = [
+  ['/energy/analysis', 'energy/analysis/index', 'energy:analysis:view'],
+  ['/energy/benchmarks', 'energy/benchmarks/index', 'energy:benchmarks:view'],
+  ['/energy/flows', 'energy/flows/index', 'energy:flows:view'],
+  ['/energy/balances', 'energy/balances/index', 'energy:balance:view']
+];
 
 function request(server, method, pathname, body, token) {
   return new Promise((resolve, reject) => {
@@ -55,6 +91,7 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
   let sampleFactorId;
   let sampleConfigId;
   let sampleRunId;
+  let energyUserId;
   try {
     initDatabase();
     const db = openDatabase();
@@ -87,7 +124,65 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
       assert.strictEqual(menu.permissionCode, permissionCode, `${routePath} 必须升级为 canonical view permission`);
     });
     legacyMappings.forEach(([legacyPermissionCode]) => assert.strictEqual(migratedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?').get(legacyPermissionCode).total, 0));
+    const energyDirectory = migratedDb.prepare("SELECT id FROM sys_menus WHERE route_path = '/energy' AND menu_type = 'directory'").get();
+    assert(energyDirectory, '能耗管理目录必须存在。');
+    energyPageContracts.forEach(([routePath, component, permissionCode]) => {
+      const pageMenu = migratedDb.prepare(`SELECT id, parent_id AS parentId, component, permission_code AS permissionCode,
+          menu_type AS menuType, visible, status
+        FROM sys_menus WHERE route_path = ?`).get(routePath);
+      assert(pageMenu, `缺少页面菜单 ${routePath}。`);
+      assert.strictEqual(pageMenu.parentId, energyDirectory.id, `${routePath} 必须位于能耗管理目录下。`);
+      assert.strictEqual(pageMenu.component, component);
+      assert.strictEqual(pageMenu.permissionCode, permissionCode);
+      assert.strictEqual(pageMenu.menuType, 'menu');
+      assert.strictEqual(pageMenu.visible, 1);
+      assert.strictEqual(pageMenu.status, 'active');
+    });
+    energyModulePermissions.forEach((permissionCode) => {
+      assert.strictEqual(
+        migratedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?').get(permissionCode).total,
+        1,
+        `${permissionCode} 必须且只能种入一次。`
+      );
+    });
+    const energyRoleId = migratedDb.prepare(`INSERT INTO sys_roles (role_code, role_name, status, created_at, updated_at)
+      VALUES ('energy_module_operator', '能源四模块操作员', 'active', ?, ?)`).run(now, now).lastInsertRowid;
+    energyUserId = migratedDb.prepare(`INSERT INTO sys_users (username, display_name, password_hash, status, created_at, updated_at)
+      VALUES ('energy-operator', '能源四模块操作员', ?, 'active', ?, ?)`).run(passwordHash, now, now).lastInsertRowid;
+    migratedDb.prepare('INSERT INTO sys_user_roles (user_id, role_id, created_at) VALUES (?, ?, ?)')
+      .run(energyUserId, energyRoleId, now);
+    const migratedGrant = migratedDb.prepare('INSERT INTO sys_role_menus (role_id, menu_id, created_at) VALUES (?, ?, ?)');
+    migratedGrant.run(energyRoleId, energyDirectory.id, now);
+    energyModulePermissions.forEach((permissionCode) => {
+      const menu = migratedDb.prepare('SELECT id FROM sys_menus WHERE permission_code = ?').get(permissionCode);
+      migratedGrant.run(energyRoleId, menu.id, now);
+    });
     migratedDb.close();
+
+    initDatabase();
+    const repeatedDb = openDatabase();
+    try {
+      energyModulePermissions.forEach((permissionCode) => {
+        assert.strictEqual(
+          repeatedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?').get(permissionCode).total,
+          1,
+          `重复初始化不得复制 ${permissionCode}。`
+        );
+      });
+      assert.strictEqual(
+        repeatedDb.prepare(`SELECT COUNT(*) AS total
+          FROM sys_role_menus AS role_menu
+          JOIN sys_roles AS role ON role.id = role_menu.role_id
+          JOIN sys_menus AS menu ON menu.id = role_menu.menu_id
+          WHERE role.role_code = 'energy_module_operator'
+            AND menu.permission_code IN (${energyModulePermissions.map(() => '?').join(', ')})`)
+          .get(...energyModulePermissions).total,
+        energyModulePermissions.length,
+        '重复初始化必须保留普通角色的全部能源模块授权。'
+      );
+    } finally {
+      repeatedDb.close();
+    }
 
     const sampleDb = openDatabase();
     try {
@@ -114,6 +209,17 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
     const routes = flattenMenus(getUserMenus(userId));
     assert.strictEqual(routes.some((menu) => menu.routePath === '/profile'), false, '个人中心不得进入动态菜单');
     assert.strictEqual(routes.find((menu) => menu.routePath === '/imports').parentId, routes.find((menu) => menu.routePath === '/energy').id, '导入菜单必须嵌套在能耗管理');
+    const energyProfile = getProfile(energyUserId);
+    energyModulePermissions.forEach((permissionCode) => {
+      assert(energyProfile.permissions.includes(permissionCode), `普通能源角色必须获得 ${permissionCode}。`);
+    });
+    const energyRoutes = flattenMenus(getUserMenus(energyUserId));
+    energyPageContracts.forEach(([routePath, component]) => {
+      const pageRoute = energyRoutes.find((menu) => menu.routePath === routePath);
+      assert(pageRoute, `普通能源角色菜单缺少 ${routePath}。`);
+      assert.strictEqual(pageRoute.component, component);
+      assert.strictEqual(pageRoute.parentId, energyRoutes.find((menu) => menu.routePath === '/energy').id);
+    });
 
     server = await new Promise((resolve) => { const instance = app.listen(0, '127.0.0.1', () => resolve(instance)); });
     const login = await request(server, 'POST', '/api/login', { username: 'legacy-viewer', password: 'Password123!' });
@@ -139,6 +245,18 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
     ]) {
       const result = await request(server, 'GET', pathname, null, token);
       assert.strictEqual(result.status, 200, `${pathname} 必须接受迁移后的查看权限`);
+    }
+    const energyLogin = await request(server, 'POST', '/api/login', { username: 'energy-operator', password: 'Password123!' });
+    assert.strictEqual(energyLogin.status, 200, '普通能源角色必须可登录。');
+    const energyToken = energyLogin.body.data.token;
+    for (const pathname of [
+      '/api/energy-analysis/config/shifts',
+      '/api/energy-benchmarks/definitions',
+      '/api/energy-flows/models',
+      '/api/energy-balances/contract'
+    ]) {
+      const result = await request(server, 'GET', pathname, null, energyToken);
+      assert.strictEqual(result.status, 200, `${pathname} 必须接受普通能源角色授权。`);
     }
     const admin = await request(server, 'POST', '/api/login', { username: 'admin', password: 'AdminPassword123!' });
     assert.strictEqual(admin.status, 200, '超级管理员登录不得回归');

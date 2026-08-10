@@ -3125,5 +3125,6 @@ module.exports = {
   normalizeEnergyLoadCurveInput,
   normalizeEnergyLoadSummaryInput,
   normalizeMonthlyConsumptionAnalysisInput,
-  normalizeShiftConsumptionAnalysisInput
+  normalizeShiftConsumptionAnalysisInput,
+  normalizeTimeOfUseConsumptionAnalysisInput
 };

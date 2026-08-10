@@ -59,11 +59,33 @@ function multipart(server, pathname, filename, content, token) {
     const ordinaryLogin = await request(server, 'POST', '/api/login', { username: 'budgetreader', password: 'Password123!' });
     const adminToken = adminLogin.body.data.token;
 
+    // API 执行比较数据模块：构造全年无预算但存在 active 实际用能的场景。
+    const comparisonDb = openDatabase();
+    try {
+      const electricityId = comparisonDb.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
+      comparisonDb.prepare(`INSERT INTO energy_records (
+        energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value,
+        organization, site, department, duplicate_key, record_status, created_at, updated_at
+      ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'), datetime('now'))`)
+        .run(electricityId, '2029-01', '2029-01', 'kWh', 18, 'kWh', 18, '接口总厂', '接口园区', '接口无预算单元', 'budget-api-missing-budget');
+    } finally {
+      comparisonDb.close();
+    }
+
     assert.strictEqual((await request(server, 'GET', '/api/energy-budgets')).status, 401, '预算列表必须拒绝未登录请求。');
     const forbidden = await request(server, 'GET', '/api/energy-budgets', undefined, ordinaryLogin.body.data.token);
     assert.strictEqual(forbidden.status, 403, '无预算权限用户必须被服务端拒绝。');
     assert.strictEqual(ordinary.id > 0, true);
     assert.strictEqual((await request(server, 'GET', '/api/energy-budgets', undefined, adminToken)).status, 200);
+    const missingBudgetComparison = await request(server, 'GET', '/api/energy-budgets/execution-comparison?monthStart=2029-01&monthEnd=2029-12&energyTypeCode=electricity', undefined, adminToken);
+    assert.strictEqual(missingBudgetComparison.status, 200);
+    assert.strictEqual(missingBudgetComparison.body.data.length, 1, '年度范围无预算时 API 仍应返回实际用能组合。');
+    assert.strictEqual(missingBudgetComparison.body.data[0].comparisonStatus, 'missing_budget');
+    assert.strictEqual(missingBudgetComparison.body.data[0].warningLevel, 'missing_budget');
+    assert.strictEqual(missingBudgetComparison.body.data[0].budgetUnit, null);
+    assert.strictEqual(missingBudgetComparison.body.data[0].actualUnit, 'kWh');
+    assert.strictEqual(missingBudgetComparison.body.meta.summary.missingBudgetCount, 1);
+    assert.strictEqual(missingBudgetComparison.body.meta.summary.unitMismatchCount, 0);
     assert.strictEqual((await request(server, 'GET', '/api/templates/energy-budgets.csv')).status, 401, '预算模板下载必须受认证保护。');
     const template = await request(server, 'GET', '/api/templates/energy-budgets.csv', undefined, adminToken);
     assert.strictEqual(template.status, 200);

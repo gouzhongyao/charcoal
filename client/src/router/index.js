@@ -9,6 +9,11 @@ import Menus from '@/views/system/Menus.vue';
 import MigrationPlaceholder from '@/views/MigrationPlaceholder.vue';
 import EnergyStatistics from '@/views/energy/EnergyStatistics.vue';
 import BudgetManagement from '@/views/energy/BudgetManagement.vue';
+// 能源分析、对标、能流和平衡正式页面组件模块。
+import EnergyAnalysis from '@/views/energy/analysis/index.vue';
+import EnergyBenchmarks from '@/views/energy/benchmarks/index.vue';
+import EnergyFlows from '@/views/energy/flows/index.vue';
+import EnergyBalances from '@/views/energy/balances/index.vue';
 import OrganizationUnits from '@/views/ledger/OrganizationUnits.vue';
 import Meters from '@/views/ledger/Meters.vue';
 import MeterReadings from '@/views/ledger/MeterReadings.vue';
@@ -42,6 +47,10 @@ const componentMap = Object.freeze({
   'imports/index': ImportCenter,
   'energy/statistics/index': EnergyStatistics,
   'energy/budgets/index': BudgetManagement,
+  'energy/analysis/index': EnergyAnalysis,
+  'energy/benchmarks/index': EnergyBenchmarks,
+  'energy/flows/index': EnergyFlows,
+  'energy/balances/index': EnergyBalances,
   'ledger/organization/index': OrganizationUnits,
   'ledger/meters/index': Meters,
   'ledger/meter-readings/index': MeterReadings,

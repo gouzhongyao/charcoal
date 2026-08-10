@@ -428,9 +428,8 @@ function setEnergyBudgetStatus(budgetId, statusInput) {
   }
 }
 
-function buildActualEnergyWhere(periodMonth, energyTypeId, organizationScope) {
-  const where = ["er.record_status = 'active'", 'er.normalized_month = @periodMonth', 'er.energy_type_id = @energyTypeId'];
-  const params = { periodMonth, energyTypeId };
+// 实际能耗组织范围匹配模块：沿用预算既有的组织文本精确匹配口径。
+function buildActualOrganizationMatch(where, params, organizationScope) {
   if (organizationScope && organizationScope !== WHOLE_ORGANIZATION_SCOPE) {
     where.push(`(
       er.organization = @organizationScope
@@ -442,31 +441,175 @@ function buildActualEnergyWhere(periodMonth, energyTypeId, organizationScope) {
     )`);
     params.organizationScope = organizationScope;
   }
+}
+
+// 单月实际能耗筛选模块：保留既有导出函数契约，并为单位安全分组提供筛选条件。
+function buildActualEnergyWhere(periodMonth, energyTypeId, organizationScope) {
+  const where = ["er.record_status = 'active'", 'er.normalized_month = @periodMonth', 'er.energy_type_id = @energyTypeId'];
+  const params = { periodMonth, energyTypeId };
+  buildActualOrganizationMatch(where, params, organizationScope);
   return { whereSql: `WHERE ${where.join(' AND ')}`, params };
 }
 
-function getActualUsage(db, periodMonth, energyTypeId, organizationScope) {
+// 实际能耗单位分组模块：同月、同能源、同组织范围内严格按 normalized_unit 分组。
+function getActualUsageGroups(db, periodMonth, energyTypeId, organizationScope) {
   const { whereSql, params } = buildActualEnergyWhere(periodMonth, energyTypeId, organizationScope);
-  const row = db.prepare(
+  return db.prepare(
     `SELECT
        COALESCE(SUM(er.normalized_value), 0) AS actualValue,
        COUNT(er.id) AS recordCount,
-       MIN(er.normalized_unit) AS normalizedUnit
+       er.normalized_unit AS normalizedUnit
      FROM energy_records er
      LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id
-     ${whereSql}`
-  ).get(params);
-  return {
+     ${whereSql}
+     GROUP BY er.normalized_unit
+     ORDER BY er.normalized_unit ASC`
+  ).all(params).map((row) => ({
     actualValue: Number(row.actualValue || 0),
     recordCount: Number(row.recordCount || 0),
     normalizedUnit: row.normalizedUnit || null
+  }));
+}
+
+// 执行比较筛选标准化模块：预算与实际数据共用同一月份、能源和组织范围上下文。
+function normalizeExecutionComparisonFilters(db, query = {}) {
+  const periodMonth = normalizeOptionalMonth(firstDefined(query, ['periodMonth', 'period_month', 'normalizedMonth', 'month']), 'periodMonth');
+  const monthStart = normalizeOptionalMonth(firstDefined(query, ['monthStart', 'periodMonthStart', 'period_month_start']), 'monthStart');
+  const monthEnd = normalizeOptionalMonth(firstDefined(query, ['monthEnd', 'periodMonthEnd', 'period_month_end']), 'monthEnd');
+  if (monthStart && monthEnd && monthStart > monthEnd) {
+    throw badRequest('月份范围无效：monthStart 不能晚于 monthEnd。', { code: 'INVALID_MONTH_RANGE', monthStart, monthEnd });
+  }
+  const organizationScopeProvided = Object.prototype.hasOwnProperty.call(query, 'organizationScope') || Object.prototype.hasOwnProperty.call(query, 'organization_scope');
+  return {
+    periodMonth,
+    monthStart,
+    monthEnd,
+    energyType: resolveEnergyType(db, query, { optional: true }),
+    organizationScopeProvided,
+    organizationScope: organizationScopeProvided ? normalizeOrganizationScope(firstDefined(query, ['organizationScope', 'organization_scope'])) : null
   };
 }
 
-function buildBudgetWarning(hasBudget, budgetValue, actualValue, usageRate, actualRecordCount) {
-  const hasActualValue = actualRecordCount > 0 && actualValue > 0;
+// 年度或月份范围实际能耗筛选模块：只读取 active 记录，不跨单位汇总。
+function buildActualRangeWhere(filters) {
+  const where = ["er.record_status = 'active'"];
+  const params = {};
+  if (filters.periodMonth) {
+    where.push('er.normalized_month = @periodMonth');
+    params.periodMonth = filters.periodMonth;
+  }
+  if (filters.monthStart) {
+    where.push('er.normalized_month >= @monthStart');
+    params.monthStart = filters.monthStart;
+  }
+  if (filters.monthEnd) {
+    where.push('er.normalized_month <= @monthEnd');
+    params.monthEnd = filters.monthEnd;
+  }
+  if (filters.energyType) {
+    where.push('er.energy_type_id = @energyTypeId');
+    params.energyTypeId = filters.energyType.id;
+  }
+  if (filters.organizationScopeProvided) {
+    buildActualOrganizationMatch(where, params, filters.organizationScope);
+  }
+  return { whereSql: `WHERE ${where.join(' AND ')}`, params };
+}
+
+// 实际能耗组合读取模块：保留组织字段用于判断是否已有对应 active 预算覆盖。
+function listActualUsageGroups(db, filters) {
+  const { whereSql, params } = buildActualRangeWhere(filters);
+  return db.prepare(
+    `SELECT
+       er.normalized_month AS periodMonth,
+       er.energy_type_id AS energyTypeId,
+       et.code AS energyTypeCode,
+       et.name AS energyTypeName,
+       er.normalized_unit AS normalizedUnit,
+       er.organization,
+       er.site,
+       er.department,
+       ou.unit_code AS organizationUnitCode,
+       ou.unit_name AS organizationUnitName,
+       ou.unit_path AS organizationUnitPath,
+       COALESCE(SUM(er.normalized_value), 0) AS actualValue,
+       COUNT(er.id) AS recordCount
+     FROM energy_records er
+     JOIN energy_types et ON et.id = er.energy_type_id
+     LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id
+     ${whereSql}
+     GROUP BY er.normalized_month, er.energy_type_id, et.code, et.name, er.normalized_unit,
+              er.organization, er.site, er.department, ou.unit_code, ou.unit_name, ou.unit_path
+     ORDER BY er.normalized_month ASC, et.display_order ASC, er.normalized_unit ASC`
+  ).all(params).map((row) => ({
+    ...row,
+    actualValue: Number(row.actualValue || 0),
+    recordCount: Number(row.recordCount || 0),
+    normalizedUnit: row.normalizedUnit || null
+  }));
+}
+
+// 预算覆盖判断模块：整体预算覆盖同月同能源全部组织，其他范围沿用既有组织键匹配。
+function budgetMatchesActualGroup(budget, actual) {
+  if (budget.periodMonth !== actual.periodMonth || budget.energyTypeId !== actual.energyTypeId) return false;
+  if (budget.organizationScope === WHOLE_ORGANIZATION_SCOPE) return true;
+  const organizationKeys = [
+    actual.organization,
+    actual.site,
+    actual.department,
+    actual.organizationUnitCode,
+    actual.organizationUnitName,
+    actual.organizationUnitPath
+  ].map(normalizeText).filter(Boolean);
+  return organizationKeys.includes(budget.organizationScope);
+}
+
+// 无预算实际组合组织键模块：优先使用用能单元名称，再回退到现有组织文本字段。
+function getActualOrganizationScope(actual, requestedOrganizationScope) {
+  return requestedOrganizationScope || normalizeText(actual.organizationUnitName) || normalizeText(actual.department)
+    || normalizeText(actual.site) || normalizeText(actual.organization) || normalizeText(actual.organizationUnitCode)
+    || normalizeText(actual.organizationUnitPath) || WHOLE_ORGANIZATION_SCOPE;
+}
+
+// 无预算实际组合合并模块：仅合并月份、能源、单位和组织范围完全一致的数据。
+function mergeActualOnlyGroups(actualGroups, requestedOrganizationScope) {
+  const merged = new Map();
+  actualGroups.forEach((actual) => {
+    const organizationScope = getActualOrganizationScope(actual, requestedOrganizationScope);
+    const key = `${actual.periodMonth} ${actual.energyTypeId} ${actual.normalizedUnit || ''} ${organizationScope}`;
+    const existing = merged.get(key);
+    if (existing) {
+      existing.actualValue += actual.actualValue;
+      existing.recordCount += actual.recordCount;
+      return;
+    }
+    merged.set(key, {
+      periodMonth: actual.periodMonth,
+      energyTypeId: actual.energyTypeId,
+      energyTypeCode: actual.energyTypeCode,
+      energyTypeName: actual.energyTypeName,
+      organizationScope,
+      normalizedUnit: actual.normalizedUnit,
+      actualValue: actual.actualValue,
+      recordCount: actual.recordCount
+    });
+  });
+  return Array.from(merged.values());
+}
+
+// 预算预警模块：单位不一致时优先返回不可比较状态，不计算使用率或阈值预警。
+function buildBudgetWarning(comparisonStatus, hasBudget, budgetValue, actualValue, usageRate, actualRecordCount) {
+  const hasActualRecord = actualRecordCount > 0;
+  const hasActualValue = hasActualRecord && actualValue > 0;
+  if (comparisonStatus === 'unit_mismatch') {
+    return {
+      warningLevel: 'unit_mismatch',
+      warningLabel: '单位不一致',
+      warningReason: '预算单位与实际 normalized_unit 不一致，且没有可靠换算规则，当前组合不可比较。'
+    };
+  }
   if (!hasBudget) {
-    return hasActualValue
+    return hasActualRecord
       ? {
         warningLevel: 'missing_budget',
         warningLabel: '未配置预算',
@@ -475,7 +618,7 @@ function buildBudgetWarning(hasBudget, budgetValue, actualValue, usageRate, actu
       : {
         warningLevel: 'normal',
         warningLabel: '未触发预警',
-        warningReason: '未配置 active 预算且暂无实际用能值，未触发预算预警。'
+        warningReason: '未配置 active 预算且暂无实际用能记录，未触发预算预警。'
       };
   }
   if (!hasActualValue) {
@@ -513,14 +656,23 @@ function buildBudgetWarning(hasBudget, budgetValue, actualValue, usageRate, actu
   };
 }
 
+// 执行比较行构建模块：预算单位与实际单位一致时才计算差异、使用率和阈值预警。
 function buildComparisonRow(budget, actual) {
   const hasBudget = Boolean(budget);
   const budgetValue = hasBudget ? Number(budget.budgetValue || 0) : null;
+  const budgetUnit = hasBudget ? budget.unit : null;
   const actualValue = Number(actual.actualValue || 0);
   const actualRecordCount = Number(actual.recordCount || 0);
-  const usageRate = hasBudget && budgetValue > 0 ? actualValue / budgetValue : null;
-  const warning = buildBudgetWarning(hasBudget, budgetValue, actualValue, usageRate, actualRecordCount);
-  const variance = hasBudget ? actualValue - budgetValue : null;
+  const actualUnit = actual.normalizedUnit || null;
+  const hasActualRecord = actualRecordCount > 0;
+  const unitsMatch = !hasActualRecord || (Boolean(budgetUnit) && Boolean(actualUnit) && budgetUnit === actualUnit);
+  const comparisonStatus = !hasBudget
+    ? (hasActualRecord ? 'missing_budget' : 'no_data')
+    : (!hasActualRecord ? 'no_actual' : (unitsMatch ? 'comparable' : 'unit_mismatch'));
+  const isComparable = hasBudget && comparisonStatus !== 'unit_mismatch';
+  const usageRate = isComparable && budgetValue > 0 ? actualValue / budgetValue : null;
+  const warning = buildBudgetWarning(comparisonStatus, hasBudget, budgetValue, actualValue, usageRate, actualRecordCount);
+  const variance = isComparable ? actualValue - budgetValue : null;
   return {
     budgetId: hasBudget ? budget.id : null,
     periodMonth: hasBudget ? budget.periodMonth : actual.periodMonth,
@@ -532,11 +684,14 @@ function buildComparisonRow(budget, actual) {
     actualValue,
     variance,
     usageRate,
-    overBudget: hasBudget ? warning.warningLevel === 'exceeded' : false,
-    unit: hasBudget ? budget.unit : actual.normalizedUnit,
-    actualUnit: actual.normalizedUnit,
+    overBudget: isComparable ? warning.warningLevel === 'exceeded' : false,
+    unit: hasBudget ? budgetUnit : actualUnit,
+    budgetUnit,
+    actualUnit,
     actualRecordCount,
     budgetStatus: hasBudget ? budget.status : 'none',
+    comparisonStatus,
+    isComparable,
     warningLevel: warning.warningLevel,
     warningLabel: warning.warningLabel,
     warningReason: warning.warningReason,
@@ -544,37 +699,70 @@ function buildComparisonRow(budget, actual) {
   };
 }
 
+// 比较摘要模块：按单位返回安全合计；存在多个单位时不再输出伪可比的标量合计。
 function summarizeComparisonRows(rows = []) {
-  const comparableRows = rows.filter((row) => row.budgetValue !== null);
-  const totalBudgetValue = comparableRows.reduce((sum, row) => sum + Number(row.budgetValue || 0), 0);
-  const totalActualValue = rows.reduce((sum, row) => sum + Number(row.actualValue || 0), 0);
+  const budgetRowsById = new Map();
+  rows.forEach((row) => {
+    if (!row.budgetId) return;
+    const existing = budgetRowsById.get(row.budgetId);
+    if (!existing || row.comparisonStatus === 'comparable') budgetRowsById.set(row.budgetId, row);
+  });
+  const budgetRows = Array.from(budgetRowsById.values());
+  const totalsByUnitMap = new Map();
+  const ensureUnitTotal = (unit) => {
+    const key = unit || '__NO_UNIT__';
+    if (!totalsByUnitMap.has(key)) {
+      totalsByUnitMap.set(key, { unit: unit || null, budgetValue: 0, actualValue: 0, budgetRowCount: 0, actualRecordCount: 0 });
+    }
+    return totalsByUnitMap.get(key);
+  };
+  budgetRows.forEach((row) => {
+    const total = ensureUnitTotal(row.budgetUnit || row.unit);
+    total.budgetValue += Number(row.budgetValue || 0);
+    total.budgetRowCount += 1;
+  });
+  rows.forEach((row) => {
+    if (Number(row.actualRecordCount || 0) <= 0) return;
+    const total = ensureUnitTotal(row.actualUnit);
+    total.actualValue += Number(row.actualValue || 0);
+    total.actualRecordCount += Number(row.actualRecordCount || 0);
+  });
+  const totalsByUnit = Array.from(totalsByUnitMap.values()).map((item) => ({
+    ...item,
+    variance: item.budgetRowCount > 0 ? item.actualValue - item.budgetValue : null,
+    usageRate: item.budgetValue > 0 ? item.actualValue / item.budgetValue : null
+  }));
+  const scalarTotal = totalsByUnit.length === 1 ? totalsByUnit[0] : null;
+  const exceededBudgetIds = new Set(rows.filter((row) => row.budgetId && row.warningLevel === 'exceeded').map((row) => row.budgetId));
   return {
     rowCount: rows.length,
-    budgetRowCount: comparableRows.length,
-    overBudgetCount: comparableRows.filter((row) => row.overBudget).length,
+    budgetRowCount: budgetRows.length,
+    comparableRowCount: rows.filter((row) => row.isComparable).length,
+    overBudgetCount: exceededBudgetIds.size,
     nearingCount: rows.filter((row) => row.warningLevel === 'nearing').length,
     exceededCount: rows.filter((row) => row.warningLevel === 'exceeded').length,
     missingBudgetCount: rows.filter((row) => row.warningLevel === 'missing_budget').length,
+    unitMismatchCount: rows.filter((row) => row.warningLevel === 'unit_mismatch').length,
     warningThreshold: WARNING_THRESHOLD,
-    totalBudgetValue,
-    totalActualValue,
-    totalVariance: comparableRows.length ? totalActualValue - totalBudgetValue : null,
-    totalUsageRate: totalBudgetValue > 0 ? totalActualValue / totalBudgetValue : null,
-    note: 'P2 按相同能源类型的 active energy_records.normalized_value 与 active 预算对比；默认 80% 接近预算、100% 超预算；无 active 预算但有实际值提示未配置预算；不做跨能源折标煤、不做碳预算、不联动预测、通知或审批。'
+    summaryUnit: scalarTotal?.unit || null,
+    totalBudgetValue: scalarTotal ? scalarTotal.budgetValue : (totalsByUnit.length === 0 ? 0 : null),
+    totalActualValue: scalarTotal ? scalarTotal.actualValue : (totalsByUnit.length === 0 ? 0 : null),
+    totalVariance: scalarTotal?.budgetRowCount ? scalarTotal.variance : null,
+    totalUsageRate: scalarTotal?.budgetValue > 0 ? scalarTotal.usageRate : null,
+    totalsByUnit,
+    note: '按月份、能源类型、组织范围和 normalized_unit 比较 active 实际能耗与 active 预算；单位不一致时返回 unit_mismatch 且不计算使用率；无 active 预算但有实际记录时返回 missing_budget；不做跨能源折标煤、不做碳预算、不联动预测、通知或审批。'
   };
 }
 
+// 预算执行比较主流程：以 active 预算组合与 active 实际能耗组合的并集生成结果。
 function getEnergyBudgetExecutionComparison(query = {}) {
-  const periodMonth = normalizeOptionalMonth(firstDefined(query, ['periodMonth', 'period_month', 'normalizedMonth', 'month']), 'periodMonth');
-  const organizationScopeProvided = Object.prototype.hasOwnProperty.call(query, 'organizationScope') || Object.prototype.hasOwnProperty.call(query, 'organization_scope');
-  const organizationScope = organizationScopeProvided ? normalizeOrganizationScope(firstDefined(query, ['organizationScope', 'organization_scope'])) : null;
   const db = openDatabase();
   try {
-    const energyType = resolveEnergyType(db, query, { optional: true });
+    const filters = normalizeExecutionComparisonFilters(db, query);
     const budgetQuery = { ...query, status: 'active' };
-    if (periodMonth) budgetQuery.periodMonth = periodMonth;
-    if (energyType) budgetQuery.energyTypeId = energyType.id;
-    if (organizationScopeProvided) budgetQuery.organizationScope = organizationScope;
+    if (filters.periodMonth) budgetQuery.periodMonth = filters.periodMonth;
+    if (filters.energyType) budgetQuery.energyTypeId = filters.energyType.id;
+    if (filters.organizationScopeProvided) budgetQuery.organizationScope = filters.organizationScope;
     const { whereSql, params } = buildBudgetWhere(budgetQuery);
     const budgets = db.prepare(
       `SELECT
@@ -596,23 +784,38 @@ function getEnergyBudgetExecutionComparison(query = {}) {
        ORDER BY eb.period_month ASC, et.display_order ASC, eb.organization_scope ASC, eb.id ASC`
     ).all(params).map(mapBudgetRow);
 
-    const rows = budgets.map((budget) => buildComparisonRow(
-      budget,
-      getActualUsage(db, budget.periodMonth, budget.energyTypeId, budget.organizationScope)
-    ));
+    const rows = [];
+    budgets.forEach((budget) => {
+      const actualGroups = getActualUsageGroups(db, budget.periodMonth, budget.energyTypeId, budget.organizationScope);
+      if (actualGroups.length === 0) {
+        rows.push(buildComparisonRow(budget, { actualValue: 0, recordCount: 0, normalizedUnit: null }));
+        return;
+      }
+      actualGroups.forEach((actual) => rows.push(buildComparisonRow(budget, actual)));
+    });
 
-    if (rows.length === 0 && periodMonth && energyType) {
-      const syntheticScope = organizationScope || WHOLE_ORGANIZATION_SCOPE;
-      const actual = getActualUsage(db, periodMonth, energyType.id, syntheticScope);
+    const actualGroups = listActualUsageGroups(db, filters);
+    const actualOnlyGroups = actualGroups.filter((actual) => !budgets.some((budget) => budgetMatchesActualGroup(budget, actual)));
+    mergeActualOnlyGroups(actualOnlyGroups, filters.organizationScopeProvided ? filters.organizationScope : null)
+      .forEach((actual) => rows.push(buildComparisonRow(null, actual)));
+
+    if (rows.length === 0 && filters.periodMonth && filters.energyType) {
       rows.push(buildComparisonRow(null, {
-        ...actual,
-        periodMonth,
-        energyTypeId: energyType.id,
-        energyTypeCode: energyType.code,
-        energyTypeName: energyType.name,
-        organizationScope: syntheticScope
+        actualValue: 0,
+        recordCount: 0,
+        normalizedUnit: null,
+        periodMonth: filters.periodMonth,
+        energyTypeId: filters.energyType.id,
+        energyTypeCode: filters.energyType.code,
+        energyTypeName: filters.energyType.name,
+        organizationScope: filters.organizationScope || WHOLE_ORGANIZATION_SCOPE
       }));
     }
+
+    rows.sort((left, right) => left.periodMonth.localeCompare(right.periodMonth)
+      || String(left.energyTypeCode).localeCompare(String(right.energyTypeCode))
+      || String(left.organizationScope).localeCompare(String(right.organizationScope))
+      || String(left.actualUnit || left.budgetUnit || '').localeCompare(String(right.actualUnit || right.budgetUnit || '')));
 
     return {
       rows,
@@ -621,9 +824,9 @@ function getEnergyBudgetExecutionComparison(query = {}) {
         activeBudgetsOnly: true,
         actualRecordStatus: 'active',
         warningThreshold: WARNING_THRESHOLD,
-        warningPolicy: '默认 80% 接近预算、100% 超预算；无 active 预算但有实际用能值提示未配置预算；阈值不持久化。',
-        organizationScopePolicy: '整体表示不限制组织范围；非整体文本按 energy_records.organization/site/department 或用能单元编码、名称、路径精确匹配。',
-        conversionPolicy: '不做跨能源折标煤；预算值应与对应能源 normalized_value 单位保持一致。'
+        warningPolicy: '默认 80% 接近预算、100% 超预算；无 active 预算但有实际记录提示未配置预算；预算单位与实际单位不一致时返回 unit_mismatch 且不计算使用率；阈值不持久化。',
+        organizationScopePolicy: '整体表示不限制组织范围；非整体文本按 energy_records.organization/site/department 或用能单元编码、名称、路径精确匹配。无预算实际组合优先使用用能单元名称作为组织范围键。',
+        conversionPolicy: '实际数据按 periodMonth + energyTypeCode + normalizedUnit + 组织范围分组；仅同单位比较，不做单位换算或跨能源折标煤。'
       }
     };
   } finally {
@@ -964,10 +1167,11 @@ function getEnergyBudgetContract() {
     export: { formats: ['xlsx', 'csv'], fields: ENERGY_BUDGET_EXPORT_FIELDS, maxRows: MAX_ENERGY_BUDGET_EXPORT_ROWS, appliesCurrentFilters: true },
     template: { type: ENERGY_BUDGET_IMPORT_TEMPLATE_ID, headers: ENERGY_BUDGET_IMPORT_HEADERS, aliases: ENERGY_BUDGET_IMPORT_ALIASES },
     import: { preview: { dryRun: true, writesEnergyBudgets: false, persistsImportBatch: true, response: ['summary', 'items', 'candidateRowIds', 'candidateRows', 'previewSignature', 'previewAuditDigest', 'batchId'], duplicateStrategy: 'skip' }, execute: { requiredFields: ['confirmText', 'previewSignature', 'expectedWouldImport', 'candidateRowIds', 'candidateRows', 'requireBackup', 'acknowledgeSkippedRisks'], confirmText: ENERGY_BUDGET_IMPORT_CONFIRM_TEXT, requireBackup: true, defaultDuplicateStrategy: 'skip', writes: '仅写入 energy_budgets 并关联统一 import_batches/import_errors 审计；不覆盖或物理删除既有预算。' } },
-    executionComparisonFields: ['warningLevel', 'warningLabel', 'warningReason', 'warningThreshold', 'summary.nearingCount', 'summary.exceededCount', 'summary.missingBudgetCount'],
-    warningLevels: ['normal', 'nearing', 'exceeded', 'missing_budget'],
+    executionComparisonFields: ['comparisonStatus', 'isComparable', 'budgetUnit', 'actualUnit', 'warningLevel', 'warningLabel', 'warningReason', 'warningThreshold', 'summary.nearingCount', 'summary.exceededCount', 'summary.missingBudgetCount', 'summary.unitMismatchCount', 'summary.totalsByUnit'],
+    comparisonStatuses: ['comparable', 'no_actual', 'missing_budget', 'unit_mismatch', 'no_data'],
+    warningLevels: ['normal', 'nearing', 'exceeded', 'missing_budget', 'unit_mismatch'],
     uniqueness: 'periodMonth + energyType + organizationScope 唯一；手工 POST 保持既有同 key 更新兼容性，导入重复始终 skip，不物理删除。',
-    executionComparisonPolicy: '只读取 active energy_records.normalized_value 与 active energy_budgets 对比；停用预算不参与对比；默认 80% 接近预算、100% 超预算；无 active 预算但有实际用能值提示未配置预算；阈值不持久化；不做跨能源折标煤、碳预算、预测联动、通知或审批。'
+    executionComparisonPolicy: '以 active 预算组合与 active 实际能耗组合的并集生成结果；实际数据按月份、能源类型、normalizedUnit 和现有组织范围键分组；停用预算不参与；默认 80% 接近预算、100% 超预算；无 active 预算但有实际记录返回 missing_budget；预算单位与实际单位不一致返回 unit_mismatch 且不计算差异、使用率或阈值预警；不做单位换算、跨能源折标煤、碳预算、预测联动、通知或审批。'
   };
 }
 

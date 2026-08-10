@@ -866,8 +866,26 @@ CREATE TABLE IF NOT EXISTS energy_balance_items (
   )
 );
 
+CREATE TABLE IF NOT EXISTS energy_balance_calculation_runs (
+  calculation_run_id TEXT PRIMARY KEY,
+  energy_balance_boundary_id INTEGER NOT NULL,
+  start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(start_utc) = 1),
+  end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  source_data_digest TEXT NOT NULL,
+  formula_version TEXT NOT NULL,
+  conversion_formula_version TEXT NOT NULL,
+  created_by_user_id INTEGER,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (energy_balance_boundary_id) REFERENCES energy_balance_boundaries(id) ON DELETE RESTRICT,
+  FOREIGN KEY (created_by_user_id) REFERENCES sys_users(id) ON DELETE SET NULL,
+  CHECK (length(trim(calculation_run_id)) BETWEEN 1 AND 64),
+  CHECK (unixepoch(start_utc) < unixepoch(end_utc))
+);
+
 CREATE TABLE IF NOT EXISTS energy_balance_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  calculation_run_id TEXT NOT NULL,
   energy_balance_boundary_id INTEGER NOT NULL,
   energy_type_id INTEGER NOT NULL,
   start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(start_utc) = 1),
@@ -892,6 +910,7 @@ CREATE TABLE IF NOT EXISTS energy_balance_snapshots (
   confirmation_note TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (calculation_run_id) REFERENCES energy_balance_calculation_runs(calculation_run_id) ON DELETE CASCADE,
   FOREIGN KEY (energy_balance_boundary_id) REFERENCES energy_balance_boundaries(id) ON DELETE RESTRICT,
   FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
   CHECK (unixepoch(start_utc) < unixepoch(end_utc)),
@@ -907,8 +926,11 @@ CREATE TABLE IF NOT EXISTS energy_balance_snapshots (
 
 CREATE TABLE IF NOT EXISTS energy_balance_snapshot_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  calculation_run_id TEXT NOT NULL,
   energy_balance_snapshot_id INTEGER NOT NULL,
   energy_balance_item_id INTEGER NOT NULL,
+  item_code TEXT NOT NULL CHECK (length(trim(item_code)) BETWEEN 1 AND 100),
+  item_name TEXT NOT NULL CHECK (length(trim(item_name)) BETWEEN 1 AND 200),
   role TEXT NOT NULL CHECK (role IN ('input', 'self_generation', 'inventory_decrease', 'adjustment_increase', 'output', 'useful_utilization', 'known_loss', 'inventory_increase', 'adjustment_decrease')),
   energy_type_id INTEGER NOT NULL,
   original_unit TEXT NOT NULL,
@@ -921,6 +943,7 @@ CREATE TABLE IF NOT EXISTS energy_balance_snapshot_items (
   source_mapping_json TEXT NOT NULL,
   reason_codes_json TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (calculation_run_id) REFERENCES energy_balance_calculation_runs(calculation_run_id) ON DELETE CASCADE,
   FOREIGN KEY (energy_balance_snapshot_id) REFERENCES energy_balance_snapshots(id) ON DELETE CASCADE,
   FOREIGN KEY (energy_balance_item_id) REFERENCES energy_balance_items(id) ON DELETE RESTRICT,
   FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
@@ -945,6 +968,7 @@ CREATE TABLE IF NOT EXISTS energy_balance_snapshot_items (
 
 CREATE TABLE IF NOT EXISTS energy_balance_suggestions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  calculation_run_id TEXT NOT NULL,
   energy_balance_snapshot_id INTEGER NOT NULL,
   strategy_rule_hit_id INTEGER,
   suggestion_code TEXT NOT NULL,
@@ -957,13 +981,141 @@ CREATE TABLE IF NOT EXISTS energy_balance_suggestions (
   estimated_saving_unit TEXT,
   manual_status TEXT NOT NULL DEFAULT 'unconfirmed' CHECK (manual_status IN ('unconfirmed', 'accepted', 'rejected', 'resolved')),
   reviewed_at TEXT CHECK (reviewed_at IS NULL OR is_strict_utc_iso(reviewed_at) = 1),
+  reviewed_by_user_id INTEGER,
   review_note TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (calculation_run_id) REFERENCES energy_balance_calculation_runs(calculation_run_id) ON DELETE CASCADE,
   FOREIGN KEY (energy_balance_snapshot_id) REFERENCES energy_balance_snapshots(id) ON DELETE CASCADE,
   FOREIGN KEY (strategy_rule_hit_id) REFERENCES strategy_rule_hits(id) ON DELETE SET NULL,
+  FOREIGN KEY (reviewed_by_user_id) REFERENCES sys_users(id) ON DELETE SET NULL,
   UNIQUE (energy_balance_snapshot_id, suggestion_code)
 );
+
+-- 计算运行的一等身份、来源窗口和公式元数据创建后不可修改。
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_calculation_runs_immutable_update
+BEFORE UPDATE ON energy_balance_calculation_runs
+FOR EACH ROW WHEN NEW.calculation_run_id IS NOT OLD.calculation_run_id
+  OR NEW.energy_balance_boundary_id IS NOT OLD.energy_balance_boundary_id
+  OR NEW.start_utc IS NOT OLD.start_utc
+  OR NEW.end_utc IS NOT OLD.end_utc
+  OR NEW.source_timezone IS NOT OLD.source_timezone
+  OR NEW.source_data_digest IS NOT OLD.source_data_digest
+  OR NEW.formula_version IS NOT OLD.formula_version
+  OR NEW.conversion_formula_version IS NOT OLD.conversion_formula_version
+  OR NEW.created_by_user_id IS NOT OLD.created_by_user_id
+  OR NEW.created_at IS NOT OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance calculation run immutable');
+END;
+
+-- 快照运行身份创建后不可改变，避免既有项目和建议在快照换绑后跨运行混入。
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshots_run_insert
+BEFORE INSERT ON energy_balance_snapshots
+FOR EACH ROW WHEN NEW.calculation_run_id IS NULL OR trim(NEW.calculation_run_id) = ''
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot run required');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshots_run_update
+BEFORE UPDATE OF calculation_run_id ON energy_balance_snapshots
+FOR EACH ROW WHEN NEW.calculation_run_id IS NULL
+  OR trim(NEW.calculation_run_id) = ''
+  OR NEW.calculation_run_id <> OLD.calculation_run_id
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot run immutable');
+END;
+
+-- 快照项目必须与所属快照绑定到同一个计算运行，避免跨运行混入历史明细。
+-- 快照的边界、时间窗、来源时区、摘要和公式版本必须与所属计算运行完全一致。
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshots_metadata_insert
+BEFORE INSERT ON energy_balance_snapshots
+FOR EACH ROW WHEN NOT EXISTS (
+  SELECT 1 FROM energy_balance_calculation_runs AS calculation_run
+  WHERE calculation_run.calculation_run_id = NEW.calculation_run_id
+    AND calculation_run.energy_balance_boundary_id = NEW.energy_balance_boundary_id
+    AND calculation_run.start_utc = NEW.start_utc
+    AND calculation_run.end_utc = NEW.end_utc
+    AND calculation_run.source_timezone = NEW.source_timezone
+    AND calculation_run.source_data_digest = NEW.source_data_digest
+    AND calculation_run.formula_version = NEW.formula_version
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot run metadata mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshots_metadata_update
+BEFORE UPDATE OF calculation_run_id, energy_balance_boundary_id, start_utc, end_utc, source_timezone, source_data_digest, formula_version ON energy_balance_snapshots
+FOR EACH ROW WHEN NOT EXISTS (
+  SELECT 1 FROM energy_balance_calculation_runs AS calculation_run
+  WHERE calculation_run.calculation_run_id = NEW.calculation_run_id
+    AND calculation_run.energy_balance_boundary_id = NEW.energy_balance_boundary_id
+    AND calculation_run.start_utc = NEW.start_utc
+    AND calculation_run.end_utc = NEW.end_utc
+    AND calculation_run.source_timezone = NEW.source_timezone
+    AND calculation_run.source_data_digest = NEW.source_data_digest
+    AND calculation_run.formula_version = NEW.formula_version
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot run metadata mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshot_items_run_insert
+BEFORE INSERT ON energy_balance_snapshot_items
+FOR EACH ROW
+WHEN NEW.calculation_run_id IS NULL OR NEW.calculation_run_id <> (
+  SELECT calculation_run_id FROM energy_balance_snapshots WHERE id = NEW.energy_balance_snapshot_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot item run mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshot_items_run_update
+BEFORE UPDATE OF calculation_run_id, energy_balance_snapshot_id ON energy_balance_snapshot_items
+FOR EACH ROW
+WHEN NEW.calculation_run_id IS NULL OR NEW.calculation_run_id <> (
+  SELECT calculation_run_id FROM energy_balance_snapshots WHERE id = NEW.energy_balance_snapshot_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot item run mismatch');
+END;
+
+-- 快照项目编码和名称在计算时冻结，后续主项目变更不得改写历史标识。
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshot_items_identity_insert
+BEFORE INSERT ON energy_balance_snapshot_items
+FOR EACH ROW WHEN NEW.item_code IS NULL OR trim(NEW.item_code) = ''
+  OR NEW.item_name IS NULL OR trim(NEW.item_name) = ''
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot item identity required');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshot_items_identity_update
+BEFORE UPDATE OF item_code, item_name ON energy_balance_snapshot_items
+FOR EACH ROW WHEN NEW.item_code IS NOT OLD.item_code OR NEW.item_name IS NOT OLD.item_name
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot item identity immutable');
+END;
+
+-- 优化建议必须与所属快照绑定到同一个计算运行，内容摘要不得承担运行身份。
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_suggestions_run_insert
+BEFORE INSERT ON energy_balance_suggestions
+FOR EACH ROW
+WHEN NEW.calculation_run_id IS NULL OR NEW.calculation_run_id <> (
+  SELECT calculation_run_id FROM energy_balance_snapshots WHERE id = NEW.energy_balance_snapshot_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance suggestion run mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_suggestions_run_update
+BEFORE UPDATE OF calculation_run_id, energy_balance_snapshot_id ON energy_balance_suggestions
+FOR EACH ROW
+WHEN NEW.calculation_run_id IS NULL OR NEW.calculation_run_id <> (
+  SELECT calculation_run_id FROM energy_balance_snapshots WHERE id = NEW.energy_balance_snapshot_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance suggestion run mismatch');
+END;
 
 -- 对标目标的导入批次与原始行号必须成对存在，且行号必须为正整数；触发器兼容旧库补列后的约束语义。
 CREATE TRIGGER IF NOT EXISTS trg_benchmark_targets_source_insert
@@ -1115,9 +1267,14 @@ CREATE INDEX IF NOT EXISTS idx_energy_flow_records_edge_range ON energy_flow_rec
 CREATE INDEX IF NOT EXISTS idx_energy_flow_records_batch ON energy_flow_records(source_batch_id);
 CREATE INDEX IF NOT EXISTS idx_energy_balance_boundaries_effective ON energy_balance_boundaries(status, effective_start_utc, effective_end_utc);
 CREATE INDEX IF NOT EXISTS idx_energy_balance_items_boundary_role ON energy_balance_items(energy_balance_boundary_id, role, status);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_runs_boundary_created ON energy_balance_calculation_runs(energy_balance_boundary_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_runs_digest ON energy_balance_calculation_runs(source_data_digest, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_snapshots_run ON energy_balance_snapshots(calculation_run_id, id);
 CREATE INDEX IF NOT EXISTS idx_energy_balance_snapshots_boundary_range ON energy_balance_snapshots(energy_balance_boundary_id, energy_type_id, start_utc, end_utc);
 CREATE INDEX IF NOT EXISTS idx_energy_balance_snapshots_confirmation ON energy_balance_snapshots(confirmation_status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_snapshot_items_run ON energy_balance_snapshot_items(calculation_run_id, energy_balance_snapshot_id, role);
 CREATE INDEX IF NOT EXISTS idx_energy_balance_snapshot_items_snapshot ON energy_balance_snapshot_items(energy_balance_snapshot_id, role);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_suggestions_run_status ON energy_balance_suggestions(calculation_run_id, manual_status, priority);
 CREATE INDEX IF NOT EXISTS idx_energy_balance_suggestions_snapshot_status ON energy_balance_suggestions(energy_balance_snapshot_id, manual_status, priority);
 -- ENERGY_ANALYSIS_SCHEMA_END
 

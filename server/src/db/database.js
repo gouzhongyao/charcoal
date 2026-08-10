@@ -36,6 +36,134 @@ const IMPORT_BATCH_TYPES_SQL = IMPORT_BATCH_TYPES.map((importType) => `'${import
 const ENERGY_ANALYSIS_SCHEMA_START_MARKER = '-- ENERGY_ANALYSIS_SCHEMA_START';
 const ENERGY_ANALYSIS_SCHEMA_END_MARKER = '-- ENERGY_ANALYSIS_SCHEMA_END';
 
+// 平衡计算运行表为每次执行提供不可混淆的一等身份，内容摘要仅保留指纹语义。
+const ENERGY_BALANCE_CALCULATION_RUNS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS energy_balance_calculation_runs (
+  calculation_run_id TEXT PRIMARY KEY,
+  energy_balance_boundary_id INTEGER NOT NULL,
+  start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(start_utc) = 1),
+  end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  source_data_digest TEXT NOT NULL,
+  formula_version TEXT NOT NULL,
+  conversion_formula_version TEXT NOT NULL,
+  created_by_user_id INTEGER,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (energy_balance_boundary_id) REFERENCES energy_balance_boundaries(id) ON DELETE RESTRICT,
+  FOREIGN KEY (created_by_user_id) REFERENCES sys_users(id) ON DELETE SET NULL,
+  CHECK (length(trim(calculation_run_id)) BETWEEN 1 AND 64),
+  CHECK (unixepoch(start_utc) < unixepoch(end_utc))
+);`;
+
+// 旧库补列后使用触发器恢复新库的非空与同运行一致性约束。
+const ENERGY_BALANCE_RUN_BINDING_TRIGGERS_SQL = `CREATE TRIGGER IF NOT EXISTS trg_energy_balance_calculation_runs_immutable_update
+BEFORE UPDATE ON energy_balance_calculation_runs
+FOR EACH ROW WHEN NEW.calculation_run_id IS NOT OLD.calculation_run_id
+  OR NEW.energy_balance_boundary_id IS NOT OLD.energy_balance_boundary_id
+  OR NEW.start_utc IS NOT OLD.start_utc
+  OR NEW.end_utc IS NOT OLD.end_utc
+  OR NEW.source_timezone IS NOT OLD.source_timezone
+  OR NEW.source_data_digest IS NOT OLD.source_data_digest
+  OR NEW.formula_version IS NOT OLD.formula_version
+  OR NEW.conversion_formula_version IS NOT OLD.conversion_formula_version
+  OR NEW.created_by_user_id IS NOT OLD.created_by_user_id
+  OR NEW.created_at IS NOT OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance calculation run immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshots_run_insert
+BEFORE INSERT ON energy_balance_snapshots
+FOR EACH ROW WHEN NEW.calculation_run_id IS NULL OR trim(NEW.calculation_run_id) = ''
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot run required');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshots_run_update
+BEFORE UPDATE OF calculation_run_id ON energy_balance_snapshots
+FOR EACH ROW WHEN NEW.calculation_run_id IS NULL
+  OR trim(NEW.calculation_run_id) = ''
+  OR NEW.calculation_run_id <> OLD.calculation_run_id
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot run immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshots_metadata_insert
+BEFORE INSERT ON energy_balance_snapshots
+FOR EACH ROW WHEN NOT EXISTS (
+  SELECT 1 FROM energy_balance_calculation_runs AS calculation_run
+  WHERE calculation_run.calculation_run_id = NEW.calculation_run_id
+    AND calculation_run.energy_balance_boundary_id = NEW.energy_balance_boundary_id
+    AND calculation_run.start_utc = NEW.start_utc
+    AND calculation_run.end_utc = NEW.end_utc
+    AND calculation_run.source_timezone = NEW.source_timezone
+    AND calculation_run.source_data_digest = NEW.source_data_digest
+    AND calculation_run.formula_version = NEW.formula_version
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot run metadata mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshots_metadata_update
+BEFORE UPDATE OF calculation_run_id, energy_balance_boundary_id, start_utc, end_utc, source_timezone, source_data_digest, formula_version ON energy_balance_snapshots
+FOR EACH ROW WHEN NOT EXISTS (
+  SELECT 1 FROM energy_balance_calculation_runs AS calculation_run
+  WHERE calculation_run.calculation_run_id = NEW.calculation_run_id
+    AND calculation_run.energy_balance_boundary_id = NEW.energy_balance_boundary_id
+    AND calculation_run.start_utc = NEW.start_utc
+    AND calculation_run.end_utc = NEW.end_utc
+    AND calculation_run.source_timezone = NEW.source_timezone
+    AND calculation_run.source_data_digest = NEW.source_data_digest
+    AND calculation_run.formula_version = NEW.formula_version
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot run metadata mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshot_items_run_insert
+BEFORE INSERT ON energy_balance_snapshot_items
+FOR EACH ROW
+WHEN NEW.calculation_run_id IS NULL OR NEW.calculation_run_id <> (
+  SELECT calculation_run_id FROM energy_balance_snapshots WHERE id = NEW.energy_balance_snapshot_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot item run mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshot_items_run_update
+BEFORE UPDATE OF calculation_run_id, energy_balance_snapshot_id ON energy_balance_snapshot_items
+FOR EACH ROW
+WHEN NEW.calculation_run_id IS NULL OR NEW.calculation_run_id <> (
+  SELECT calculation_run_id FROM energy_balance_snapshots WHERE id = NEW.energy_balance_snapshot_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot item run mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshot_items_identity_insert
+BEFORE INSERT ON energy_balance_snapshot_items
+FOR EACH ROW WHEN NEW.item_code IS NULL OR trim(NEW.item_code) = ''
+  OR NEW.item_name IS NULL OR trim(NEW.item_name) = ''
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot item identity required');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_snapshot_items_identity_update
+BEFORE UPDATE OF item_code, item_name ON energy_balance_snapshot_items
+FOR EACH ROW WHEN NEW.item_code IS NOT OLD.item_code OR NEW.item_name IS NOT OLD.item_name
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance snapshot item identity immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_suggestions_run_insert
+BEFORE INSERT ON energy_balance_suggestions
+FOR EACH ROW
+WHEN NEW.calculation_run_id IS NULL OR NEW.calculation_run_id <> (
+  SELECT calculation_run_id FROM energy_balance_snapshots WHERE id = NEW.energy_balance_snapshot_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance suggestion run mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_suggestions_run_update
+BEFORE UPDATE OF calculation_run_id, energy_balance_snapshot_id ON energy_balance_suggestions
+FOR EACH ROW
+WHEN NEW.calculation_run_id IS NULL OR NEW.calculation_run_id <> (
+  SELECT calculation_run_id FROM energy_balance_snapshots WHERE id = NEW.energy_balance_snapshot_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance suggestion run mismatch');
+END;`;
+
 // 对标目标来源 INSERT 触发器作为旧库迁移后的规范定义。
 const BENCHMARK_TARGET_SOURCE_INSERT_TRIGGER_SQL = `CREATE TRIGGER trg_benchmark_targets_source_insert
 BEFORE INSERT ON benchmark_targets
@@ -867,6 +995,166 @@ function addColumnIfMissing(db, tableName, columnName, columnSql) {
 }
 
 /**
+ * 为既有平衡快照补充一等计算运行身份，并恢复快照、项目和建议的一致绑定。
+ * @param {object} db SQLite 数据库连接。
+ * @returns {boolean} 是否修改了旧库结构或回填了运行身份。
+ */
+function migrateEnergyBalanceCalculationRuns(db) {
+  if (!getTableCreateSql(db, 'energy_balance_snapshots')) {
+    return false;
+  }
+
+  let changed = false;
+  db.transaction(() => {
+    const runTableExisted = Boolean(getTableCreateSql(db, 'energy_balance_calculation_runs'));
+    db.exec(ENERGY_BALANCE_CALCULATION_RUNS_TABLE_SQL);
+    changed = !runTableExisted || changed;
+    changed = addColumnIfMissing(
+      db,
+      'energy_balance_snapshots',
+      'calculation_run_id',
+      'calculation_run_id TEXT REFERENCES energy_balance_calculation_runs(calculation_run_id) ON DELETE CASCADE'
+    ) || changed;
+    if (getTableCreateSql(db, 'energy_balance_snapshot_items')) {
+      changed = addColumnIfMissing(
+        db,
+        'energy_balance_snapshot_items',
+        'calculation_run_id',
+        'calculation_run_id TEXT REFERENCES energy_balance_calculation_runs(calculation_run_id) ON DELETE CASCADE'
+      ) || changed;
+      changed = addColumnIfMissing(
+        db,
+        'energy_balance_snapshot_items',
+        'item_code',
+        'item_code TEXT'
+      ) || changed;
+      changed = addColumnIfMissing(
+        db,
+        'energy_balance_snapshot_items',
+        'item_name',
+        'item_name TEXT'
+      ) || changed;
+    }
+    if (getTableCreateSql(db, 'energy_balance_suggestions')) {
+      changed = addColumnIfMissing(
+        db,
+        'energy_balance_suggestions',
+        'calculation_run_id',
+        'calculation_run_id TEXT REFERENCES energy_balance_calculation_runs(calculation_run_id) ON DELETE CASCADE'
+      ) || changed;
+      changed = addColumnIfMissing(
+        db,
+        'energy_balance_suggestions',
+        'reviewed_by_user_id',
+        'reviewed_by_user_id INTEGER REFERENCES sys_users(id) ON DELETE SET NULL'
+      ) || changed;
+    }
+
+    const snapshots = db.prepare(`SELECT id,
+        calculation_run_id AS calculationRunId,
+        energy_balance_boundary_id AS boundaryId,
+        start_utc AS startUtc,
+        end_utc AS endUtc,
+        source_timezone AS sourceTimeZone,
+        source_data_digest AS sourceDataDigest,
+        formula_version AS formulaVersion,
+        created_at AS createdAt
+      FROM energy_balance_snapshots ORDER BY id`).all();
+    const insertRun = db.prepare(`INSERT OR IGNORE INTO energy_balance_calculation_runs (
+        calculation_run_id, energy_balance_boundary_id, start_utc, end_utc,
+        source_timezone, source_data_digest, formula_version,
+        conversion_formula_version, created_by_user_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'standard-coal-conversion:v1', NULL, ?)`);
+    const updateSnapshotRun = db.prepare(
+      'UPDATE energy_balance_snapshots SET calculation_run_id = ? WHERE id = ? AND calculation_run_id IS NULL'
+    );
+    snapshots.forEach((snapshot) => {
+      const calculationRunId = snapshot.calculationRunId || `legacy-snapshot-${snapshot.id}`;
+      const insertResult = insertRun.run(
+        calculationRunId,
+        snapshot.boundaryId,
+        snapshot.startUtc,
+        snapshot.endUtc,
+        snapshot.sourceTimeZone,
+        snapshot.sourceDataDigest,
+        snapshot.formulaVersion,
+        snapshot.createdAt
+      );
+      const updateResult = updateSnapshotRun.run(calculationRunId, snapshot.id);
+      changed = insertResult.changes > 0 || updateResult.changes > 0 || changed;
+    });
+
+    if (getTableCreateSql(db, 'energy_balance_snapshot_items')) {
+      const itemUpdate = db.prepare(`UPDATE energy_balance_snapshot_items
+        SET calculation_run_id = (
+          SELECT snapshot.calculation_run_id FROM energy_balance_snapshots AS snapshot
+          WHERE snapshot.id = energy_balance_snapshot_items.energy_balance_snapshot_id
+        )
+        WHERE calculation_run_id IS NULL`).run();
+      changed = itemUpdate.changes > 0 || changed;
+      const identityUpdate = db.prepare(`UPDATE energy_balance_snapshot_items
+        SET item_code = COALESCE(NULLIF(trim(item_code), ''), (
+              SELECT item.item_code FROM energy_balance_items AS item
+              WHERE item.id = energy_balance_snapshot_items.energy_balance_item_id
+            )),
+            item_name = COALESCE(NULLIF(trim(item_name), ''), (
+              SELECT item.item_name FROM energy_balance_items AS item
+              WHERE item.id = energy_balance_snapshot_items.energy_balance_item_id
+            ))
+        WHERE item_code IS NULL OR trim(item_code) = ''
+           OR item_name IS NULL OR trim(item_name) = ''`).run();
+      changed = identityUpdate.changes > 0 || changed;
+      const missingIdentity = db.prepare(`SELECT id FROM energy_balance_snapshot_items
+        WHERE item_code IS NULL OR trim(item_code) = ''
+           OR item_name IS NULL OR trim(item_name) = '' LIMIT 1`).get();
+      if (missingIdentity) {
+        throw new Error(`无法回填平衡快照项目历史标识：${missingIdentity.id}`);
+      }
+    }
+    if (getTableCreateSql(db, 'energy_balance_suggestions')) {
+      const suggestionUpdate = db.prepare(`UPDATE energy_balance_suggestions
+        SET calculation_run_id = (
+          SELECT snapshot.calculation_run_id FROM energy_balance_snapshots AS snapshot
+          WHERE snapshot.id = energy_balance_suggestions.energy_balance_snapshot_id
+        )
+        WHERE calculation_run_id IS NULL`).run();
+      changed = suggestionUpdate.changes > 0 || changed;
+    }
+
+    [
+      'trg_energy_balance_calculation_runs_immutable_update',
+      'trg_energy_balance_snapshots_run_insert',
+      'trg_energy_balance_snapshots_run_update',
+      'trg_energy_balance_snapshots_metadata_insert',
+      'trg_energy_balance_snapshots_metadata_update',
+      'trg_energy_balance_snapshot_items_run_insert',
+      'trg_energy_balance_snapshot_items_run_update',
+      'trg_energy_balance_snapshot_items_identity_insert',
+      'trg_energy_balance_snapshot_items_identity_update',
+      'trg_energy_balance_suggestions_run_insert',
+      'trg_energy_balance_suggestions_run_update'
+    ].forEach((triggerName) => db.exec(`DROP TRIGGER IF EXISTS ${triggerName}`));
+    db.exec(ENERGY_BALANCE_RUN_BINDING_TRIGGERS_SQL);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_energy_balance_runs_boundary_created
+      ON energy_balance_calculation_runs(energy_balance_boundary_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_energy_balance_runs_digest
+      ON energy_balance_calculation_runs(source_data_digest, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_energy_balance_snapshots_run
+      ON energy_balance_snapshots(calculation_run_id, id);`);
+    if (getTableCreateSql(db, 'energy_balance_snapshot_items')) {
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_energy_balance_snapshot_items_run
+        ON energy_balance_snapshot_items(calculation_run_id, energy_balance_snapshot_id, role);`);
+    }
+    if (getTableCreateSql(db, 'energy_balance_suggestions')) {
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_energy_balance_suggestions_run_status
+        ON energy_balance_suggestions(calculation_run_id, manual_status, priority);`);
+    }
+  })();
+
+  return changed;
+}
+
+/**
  * 为 SQLite 标识符添加双引号转义。
  * @param {string} identifier 标识符。
  * @returns {string} 可安全拼接到内部迁移 SQL 的标识符。
@@ -1306,11 +1594,37 @@ const RBAC_MENU_SEEDS = [
   ['menu', '菜单管理', '/system/menus', 'system/menus/index', 'system:menu:view', 'Menu', 130, '/system'],
   ['menu', '备份恢复', '/system/backups', 'system/backups/index', 'system:backup:view', 'FolderOpened', 140, '/system'],
   ['menu', '个人中心', '/profile', 'profile/index', 'system:profile:update', 'UserFilled', 10, null, 0],
-  ['menu', '工作台', '/dashboard', 'dashboard/index', 'dashboard:view', 'DataBoard', 20, null],
+  ['menu', '驾驶舱', '/dashboard', 'dashboard/index', 'dashboard:view', 'DataBoard', 20, null],
   ['directory', '能耗管理', '/energy', null, null, 'TrendCharts', 40, null],
   ['menu', '能耗统计', '/energy/statistics', 'energy/statistics/index', 'energy:records:view', 'Histogram', 41, '/energy'],
   ['menu', '用能预算', '/energy/budgets', 'energy/budgets/index', 'energy:budget:view', 'Wallet', 42, '/energy'],
   ['menu', '能耗数据导入', '/imports', 'imports/index', 'imports:view', 'UploadFilled', 43, '/energy'],
+  ['menu', '能源消费分析', '/energy/analysis', 'energy/analysis/index', 'energy:analysis:view', 'DataAnalysis', 44, '/energy'],
+  ['button', '分析配置查看', null, null, 'energy:analysis:config:view', null, 4401, '/energy/analysis'],
+  ['button', '排班配置维护', null, null, 'energy:analysis:shift:manage', null, 4402, '/energy/analysis'],
+  ['button', '峰谷方案维护', null, null, 'energy:analysis:tou:manage', null, 4403, '/energy/analysis'],
+  ['button', '策略规则维护', null, null, 'energy:strategy:rule:manage', null, 4404, '/energy/analysis'],
+  ['button', '策略预演', null, null, 'energy:strategy:evaluate', null, 4405, '/energy/analysis'],
+  ['button', '策略运行', null, null, 'energy:strategy:run', null, 4406, '/energy/analysis'],
+  ['button', '策略复核', null, null, 'energy:strategy:review', null, 4407, '/energy/analysis'],
+  ['button', '时序导入预演', null, null, 'energy:analysis:timeseries:preview', null, 4408, '/energy/analysis'],
+  ['button', '时序导入执行', null, null, 'energy:analysis:timeseries:execute', null, 4409, '/energy/analysis'],
+  ['button', '运营记录导入预演', null, null, 'energy:analysis:operations:preview', null, 4410, '/energy/analysis'],
+  ['button', '运营记录导入执行', null, null, 'energy:analysis:operations:execute', null, 4411, '/energy/analysis'],
+  ['menu', '能效对标', '/energy/benchmarks', 'energy/benchmarks/index', 'energy:benchmarks:view', 'Aim', 45, '/energy'],
+  ['button', '对标配置维护', null, null, 'energy:benchmarks:manage', null, 4501, '/energy/benchmarks'],
+  ['button', '对标分析', null, null, 'energy:benchmarks:analyze', null, 4502, '/energy/benchmarks'],
+  ['button', '对标导出', null, null, 'energy:benchmarks:export', null, 4503, '/energy/benchmarks'],
+  ['button', '对标导入预演', null, null, 'energy:benchmarks:import:preview', null, 4504, '/energy/benchmarks'],
+  ['button', '对标导入执行', null, null, 'energy:benchmarks:import:execute', null, 4505, '/energy/benchmarks'],
+  ['menu', '能流分析', '/energy/flows', 'energy/flows/index', 'energy:flows:view', 'Share', 46, '/energy'],
+  ['button', '能流配置维护', null, null, 'energy:flows:manage', null, 4601, '/energy/flows'],
+  ['button', '能流导入预演', null, null, 'energy:flows:import:preview', null, 4602, '/energy/flows'],
+  ['button', '能流导入执行', null, null, 'energy:flows:import:execute', null, 4603, '/energy/flows'],
+  ['menu', '能效平衡与优化', '/energy/balances', 'energy/balances/index', 'energy:balance:view', 'ScaleToOriginal', 47, '/energy'],
+  ['button', '平衡配置维护', null, null, 'energy:balance:manage', null, 4701, '/energy/balances'],
+  ['button', '平衡快照计算', null, null, 'energy:balance:calculate', null, 4702, '/energy/balances'],
+  ['button', '优化建议复核', null, null, 'energy:balance:suggestion:review', null, 4703, '/energy/balances'],
   ['directory', '基础台账', '/ledger', null, null, 'Collection', 50, null],
   ['menu', '组织管理', '/ledger/organization', 'ledger/organization/index', 'ledger:units:view', 'OfficeBuilding', 51, '/ledger'],
   ['menu', '计量器具', '/ledger/meters', 'ledger/meters/index', 'ledger:meters:view', 'Monitor', 52, '/ledger'],
@@ -1420,21 +1734,30 @@ function migrateLegacyImportMenuPermission(db, timestamp = new Date().toISOStrin
   return true;
 }
 
+// 将历史 /dashboard 菜单名称幂等升级为“驾驶舱”，只更新名称并保留原菜单身份与授权。
+function migrateDashboardMenuName(db, timestamp = new Date().toISOString()) {
+  const dashboardResult = db.prepare(`UPDATE sys_menus SET menu_name = '驾驶舱', updated_at = ?
+    WHERE route_path = '/dashboard' AND menu_name <> '驾驶舱'`).run(timestamp);
+  return dashboardResult.changes > 0;
+}
+
 function migrateNavigationMenuStructure(db, timestamp = new Date().toISOString()) {
+  // 驾驶舱更名迁移必须先复用旧菜单 ID，避免角色关联或动态路由契约变化。
+  const dashboardChanged = migrateDashboardMenuName(db, timestamp);
   // 个人中心保留权限与角色关联，但只能通过固定路由和右上角用户菜单访问。
   const profileResult = db.prepare(`UPDATE sys_menus SET visible = 0, updated_at = ?
     WHERE (route_path = '/profile' OR permission_code = 'system:profile:update') AND visible <> 0`).run(timestamp);
   const energyMenu = db.prepare("SELECT id FROM sys_menus WHERE route_path = '/energy' AND menu_type = 'directory'").get();
   const importMenu = db.prepare("SELECT id FROM sys_menus WHERE route_path = '/imports' OR permission_code = 'imports:view'").get();
   if (!energyMenu || !importMenu) {
-    return profileResult.changes > 0;
+    return dashboardChanged || profileResult.changes > 0;
   }
 
   // 复用既有导入菜单 ID，仅调整层级和展示名称，避免丢失既有角色授权或产生重复菜单。
   const importResult = db.prepare(`UPDATE sys_menus SET parent_id = ?, menu_name = ?, updated_at = ?
     WHERE id = ? AND (parent_id IS NOT ? OR menu_name <> ?)`)
     .run(energyMenu.id, '能耗数据导入', timestamp, importMenu.id, energyMenu.id, '能耗数据导入');
-  return profileResult.changes > 0 || importResult.changes > 0;
+  return dashboardChanged || profileResult.changes > 0 || importResult.changes > 0;
 }
 
 // 合并旧版重复创建的内置目录，保留最早 ID、已有角色授权及所有子菜单归属。
@@ -1560,6 +1883,7 @@ function initDatabase() {
     migratePredictionRunsStatusCheck(db);
     ensurePredictionConfigsTable(db);
     migrateBenchmarkTargetsImportSourceColumns(db);
+    migrateEnergyBalanceCalculationRuns(db);
     ensureEnergyAnalysisTables(db, schema);
     db.exec('DROP INDEX IF EXISTS ux_carbon_emissions_record_method');
     db.exec(schema);
@@ -1618,6 +1942,7 @@ module.exports = {
   initDatabase,
   migrateBenchmarkTargetsImportSourceColumns,
   migrateCarbonEmissionsStatusCheck,
+  migrateEnergyBalanceCalculationRuns,
   migrateEnergyRecordLedgerColumns,
   migrateEnergyBudgetImportSourceColumns,
   migrateGenerationRecordsDataSourceCheck,

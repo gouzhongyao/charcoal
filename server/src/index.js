@@ -17,6 +17,13 @@ const meterReadingRoutes = require('./routes/meterReadings');
 const productionRoutes = require('./routes/production');
 const generationRoutes = require('./routes/generation');
 const energyBudgetRoutes = require('./routes/energyBudgets');
+const energyAnalysisImportRoutes = require('./routes/energyAnalysisImports');
+const energyBenchmarkImportRoutes = require('./routes/energyBenchmarkImports');
+const energyFlowImportRoutes = require('./routes/energyFlowImports');
+const energyBenchmarkRoutes = require('./routes/energyBenchmarks');
+const energyAnalysisRoutes = require('./routes/energyAnalysis');
+const energyFlowRoutes = require('./routes/energyFlows');
+const energyBalanceRoutes = require('./routes/energyBalances');
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const roleRoutes = require('./routes/roles');
@@ -84,6 +91,13 @@ app.use(cors({
   },
   exposedHeaders: ['Content-Disposition', 'Content-Length', 'X-Recommended-Format', 'X-Backup-Name']
 }));
+
+// 受控导入和自带请求体限制的对标路由必须先完成认证、授权和维护态检查，再解析 JSON。
+app.use('/api/energy-analysis/imports', energyAnalysisImportRoutes);
+app.use('/api/energy-benchmarks/imports', energyBenchmarkImportRoutes);
+app.use('/api/energy-flow-imports', energyFlowImportRoutes);
+app.use('/api/energy-benchmarks', energyBenchmarkRoutes);
+
 app.use(express.json({ limit: '2mb' }));
 
 app.use('/api', systemRoutes);
@@ -102,6 +116,9 @@ app.use('/api/meter-readings', meterReadingRoutes);
 app.use('/api/production', productionRoutes);
 app.use('/api/generation', generationRoutes);
 app.use('/api/energy-budgets', energyBudgetRoutes);
+app.use('/api/energy-analysis', energyAnalysisRoutes);
+app.use('/api/energy-flows', energyFlowRoutes);
+app.use('/api/energy-balances', energyBalanceRoutes);
 app.use('/api', authRoutes);
 app.use('/api/system/users', userRoutes);
 app.use('/api/system/roles', roleRoutes);

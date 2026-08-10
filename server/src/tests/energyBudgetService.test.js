@@ -61,6 +61,34 @@ function seedBaseData() {
   }
 }
 
+// 执行比较测试数据写入模块：显式控制月份、单位、组织和状态，覆盖单位安全与组织隔离场景。
+function insertComparisonEnergyRecord(input) {
+  const db = openDatabase();
+  try {
+    db.prepare(`INSERT INTO energy_records (
+      energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value,
+      organization, site, department, duplicate_key, record_status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`)
+      .run(
+        input.energyTypeId,
+        input.organizationUnitId,
+        input.periodMonth,
+        input.periodMonth,
+        input.unit,
+        input.value,
+        input.unit,
+        input.value,
+        input.organization,
+        input.site,
+        input.department,
+        input.duplicateKey,
+        input.recordStatus || 'active'
+      );
+  } finally {
+    db.close();
+  }
+}
+
 (async () => {
 try {
   initDatabase();
@@ -165,6 +193,10 @@ try {
   assert.strictEqual(activeComparison.rows[0].budgetValue, 87.5);
   assert.strictEqual(activeComparison.rows[0].actualValue, 70, '执行对比应汇总同月同能源同组织范围 active 能耗，不含 void。');
   assert.strictEqual(activeComparison.rows[0].actualRecordCount, 2);
+  assert.strictEqual(activeComparison.rows[0].budgetUnit, 'kWh');
+  assert.strictEqual(activeComparison.rows[0].actualUnit, 'kWh');
+  assert.strictEqual(activeComparison.rows[0].comparisonStatus, 'comparable');
+  assert.strictEqual(activeComparison.rows[0].isComparable, true);
   assert.strictEqual(activeComparison.rows[0].variance, -17.5);
   assert.strictEqual(activeComparison.rows[0].usageRate, 0.8);
   assert.strictEqual(activeComparison.rows[0].overBudget, false);
@@ -224,9 +256,160 @@ try {
   assert.strictEqual(noBudgetNoActual.rows.length, 1);
   assert.strictEqual(noBudgetNoActual.rows[0].budgetId, null);
   assert.strictEqual(noBudgetNoActual.rows[0].actualValue, 0);
+  assert.strictEqual(noBudgetNoActual.rows[0].comparisonStatus, 'no_data');
   assert.strictEqual(noBudgetNoActual.rows[0].warningLevel, 'normal', '无预算且无实际值不应误报未配置预算。');
   assert.strictEqual(noBudgetNoActual.summary.budgetRowCount, 0);
   assert.strictEqual(noBudgetNoActual.summary.missingBudgetCount, 0);
+
+  // 全年无预算但存在实际用能时，年度范围必须从实际组合生成 missing_budget 行。
+  insertComparisonEnergyRecord({
+    energyTypeId: ids.electricityId,
+    organizationUnitId: ids.workshopUnitId,
+    periodMonth: '2030-01',
+    unit: 'kWh',
+    value: 12,
+    organization: '预算总厂',
+    site: 'A园区',
+    department: '预算车间',
+    duplicateKey: 'budget-annual-no-budget'
+  });
+  const annualMissingBudget = getEnergyBudgetExecutionComparison({ monthStart: '2030-01', monthEnd: '2030-12', energyTypeCode: 'electricity' });
+  assert.strictEqual(annualMissingBudget.rows.length, 1, '全年没有 active 预算时也必须返回实际用能组合。');
+  assert.strictEqual(annualMissingBudget.rows[0].organizationScope, '预算车间');
+  assert.strictEqual(annualMissingBudget.rows[0].actualValue, 12);
+  assert.strictEqual(annualMissingBudget.rows[0].actualUnit, 'kWh');
+  assert.strictEqual(annualMissingBudget.rows[0].comparisonStatus, 'missing_budget');
+  assert.strictEqual(annualMissingBudget.rows[0].warningLevel, 'missing_budget');
+  assert.strictEqual(annualMissingBudget.summary.missingBudgetCount, 1);
+
+  // 部分月份有预算时，未配置预算的月份仍应独立进入并集结果。
+  upsertEnergyBudget({ periodMonth: '2031-01', energyTypeCode: 'electricity', organizationScope: '预算车间', budgetValue: 100, unit: 'kWh' });
+  insertComparisonEnergyRecord({
+    energyTypeId: ids.electricityId,
+    organizationUnitId: ids.workshopUnitId,
+    periodMonth: '2031-01',
+    unit: 'kWh',
+    value: 40,
+    organization: '预算总厂',
+    site: 'A园区',
+    department: '预算车间',
+    duplicateKey: 'budget-partial-budget-january'
+  });
+  insertComparisonEnergyRecord({
+    energyTypeId: ids.electricityId,
+    organizationUnitId: ids.workshopUnitId,
+    periodMonth: '2031-02',
+    unit: 'kWh',
+    value: 25,
+    organization: '预算总厂',
+    site: 'A园区',
+    department: '预算车间',
+    duplicateKey: 'budget-partial-budget-february'
+  });
+  const partialBudgetComparison = getEnergyBudgetExecutionComparison({ monthStart: '2031-01', monthEnd: '2031-12', energyTypeCode: 'electricity', organizationScope: '预算车间' });
+  assert.deepStrictEqual(partialBudgetComparison.rows.map((row) => row.periodMonth), ['2031-01', '2031-02']);
+  assert.strictEqual(partialBudgetComparison.rows[0].comparisonStatus, 'comparable');
+  assert.strictEqual(partialBudgetComparison.rows[0].usageRate, 0.4);
+  assert.strictEqual(partialBudgetComparison.rows[1].comparisonStatus, 'missing_budget');
+  assert.strictEqual(partialBudgetComparison.summary.missingBudgetCount, 1);
+
+  // 同能源混合 kWh/MWh 时必须拆成两行，且不同单位行不得计算使用率或伪装单位。
+  upsertEnergyBudget({ periodMonth: '2032-01', energyTypeCode: 'electricity', organizationScope: '预算车间', budgetValue: 100, unit: 'kWh' });
+  insertComparisonEnergyRecord({
+    energyTypeId: ids.electricityId,
+    organizationUnitId: ids.workshopUnitId,
+    periodMonth: '2032-01',
+    unit: 'kWh',
+    value: 40,
+    organization: '预算总厂',
+    site: 'A园区',
+    department: '预算车间',
+    duplicateKey: 'budget-mixed-unit-kwh'
+  });
+  insertComparisonEnergyRecord({
+    energyTypeId: ids.electricityId,
+    organizationUnitId: ids.workshopUnitId,
+    periodMonth: '2032-01',
+    unit: 'MWh',
+    value: 2,
+    organization: '预算总厂',
+    site: 'A园区',
+    department: '预算车间',
+    duplicateKey: 'budget-mixed-unit-mwh'
+  });
+  const mixedUnitComparison = getEnergyBudgetExecutionComparison({ periodMonth: '2032-01', energyTypeCode: 'electricity', organizationScope: '预算车间' });
+  assert.strictEqual(mixedUnitComparison.rows.length, 2);
+  const comparableKwhRow = mixedUnitComparison.rows.find((row) => row.actualUnit === 'kWh');
+  const mismatchMwhRow = mixedUnitComparison.rows.find((row) => row.actualUnit === 'MWh');
+  assert.strictEqual(comparableKwhRow.budgetUnit, 'kWh');
+  assert.strictEqual(comparableKwhRow.comparisonStatus, 'comparable');
+  assert.strictEqual(comparableKwhRow.actualValue, 40);
+  assert.strictEqual(comparableKwhRow.usageRate, 0.4);
+  assert.strictEqual(mismatchMwhRow.unit, 'kWh', '兼容 unit 字段继续表示预算单位。');
+  assert.strictEqual(mismatchMwhRow.budgetUnit, 'kWh');
+  assert.strictEqual(mismatchMwhRow.actualUnit, 'MWh');
+  assert.strictEqual(mismatchMwhRow.actualValue, 2);
+  assert.strictEqual(mismatchMwhRow.comparisonStatus, 'unit_mismatch');
+  assert.strictEqual(mismatchMwhRow.isComparable, false);
+  assert.strictEqual(mismatchMwhRow.usageRate, null);
+  assert.strictEqual(mismatchMwhRow.variance, null);
+  assert.strictEqual(mismatchMwhRow.warningLevel, 'unit_mismatch');
+  assert.strictEqual(mixedUnitComparison.summary.unitMismatchCount, 1);
+  assert.strictEqual(mixedUnitComparison.summary.totalBudgetValue, null, '多单位摘要不得直接输出跨单位标量合计。');
+  assert.strictEqual(mixedUnitComparison.summary.totalActualValue, null, '多单位摘要不得直接输出跨单位标量合计。');
+  assert.deepStrictEqual(mixedUnitComparison.summary.totalsByUnit.map((row) => row.unit).sort(), ['MWh', 'kWh']);
+
+  // 预算单位与唯一实际单位不一致时，也必须返回明确的不可比较状态。
+  upsertEnergyBudget({ periodMonth: '2033-01', energyTypeCode: 'heat', organizationScope: '预算车间', budgetValue: 1, unit: 'GJ' });
+  insertComparisonEnergyRecord({
+    energyTypeId: ids.heatId,
+    organizationUnitId: ids.workshopUnitId,
+    periodMonth: '2033-01',
+    unit: 'MJ',
+    value: 300,
+    organization: '预算总厂',
+    site: 'A园区',
+    department: '预算车间',
+    duplicateKey: 'budget-unit-mismatch-heat'
+  });
+  const unitMismatchComparison = getEnergyBudgetExecutionComparison({ periodMonth: '2033-01', energyTypeCode: 'heat', organizationScope: '预算车间' });
+  assert.strictEqual(unitMismatchComparison.rows.length, 1);
+  assert.strictEqual(unitMismatchComparison.rows[0].budgetUnit, 'GJ');
+  assert.strictEqual(unitMismatchComparison.rows[0].actualUnit, 'MJ');
+  assert.strictEqual(unitMismatchComparison.rows[0].comparisonStatus, 'unit_mismatch');
+  assert.strictEqual(unitMismatchComparison.rows[0].usageRate, null);
+  assert.strictEqual(unitMismatchComparison.rows[0].overBudget, false);
+  assert.strictEqual(unitMismatchComparison.summary.unitMismatchCount, 1);
+
+  // 组织范围筛选必须隔离其它组织的同月同能源实际记录。
+  upsertEnergyBudget({ periodMonth: '2034-01', energyTypeCode: 'electricity', organizationScope: '预算车间', budgetValue: 100, unit: 'kWh' });
+  insertComparisonEnergyRecord({
+    energyTypeId: ids.electricityId,
+    organizationUnitId: ids.workshopUnitId,
+    periodMonth: '2034-01',
+    unit: 'kWh',
+    value: 30,
+    organization: '预算总厂',
+    site: 'A园区',
+    department: '预算车间',
+    duplicateKey: 'budget-scope-workshop'
+  });
+  insertComparisonEnergyRecord({
+    energyTypeId: ids.electricityId,
+    organizationUnitId: ids.otherUnitId,
+    periodMonth: '2034-01',
+    unit: 'kWh',
+    value: 70,
+    organization: '其它总厂',
+    site: 'B园区',
+    department: '其它车间',
+    duplicateKey: 'budget-scope-other'
+  });
+  const isolatedScopeComparison = getEnergyBudgetExecutionComparison({ periodMonth: '2034-01', energyTypeCode: 'electricity', organizationScope: '预算车间' });
+  assert.strictEqual(isolatedScopeComparison.rows.length, 1);
+  assert.strictEqual(isolatedScopeComparison.rows[0].actualValue, 30);
+  assert.strictEqual(isolatedScopeComparison.rows[0].actualRecordCount, 1);
+  assert.strictEqual(isolatedScopeComparison.rows[0].usageRate, 0.3);
 
   const zeroBudget = upsertEnergyBudget({ periodMonth: '2026-11', energyTypeCode: 'electricity', organizationScope: '预算车间', budgetValue: 0, unit: 'kWh' });
   const zeroActualDb = openDatabase();
@@ -347,11 +530,14 @@ try {
 
   const contract = getEnergyBudgetContract();
   assert.strictEqual(contract.status, 'unified-management-api-ready');
-  assert(contract.executionComparisonPolicy.includes('停用预算不参与对比'));
+  assert(contract.executionComparisonPolicy.includes('停用预算不参与'));
   assert(contract.executionComparisonPolicy.includes('80% 接近预算'));
   assert(contract.executionComparisonPolicy.includes('100% 超预算'));
-  assert(contract.executionComparisonPolicy.includes('不做跨能源折标煤'));
-  assert.deepStrictEqual(contract.warningLevels, ['normal', 'nearing', 'exceeded', 'missing_budget']);
+  assert(contract.executionComparisonPolicy.includes('unit_mismatch'));
+  assert(contract.executionComparisonPolicy.includes('不做单位换算'));
+  assert(contract.executionComparisonPolicy.includes('跨能源折标煤'));
+  assert.deepStrictEqual(contract.comparisonStatuses, ['comparable', 'no_actual', 'missing_budget', 'unit_mismatch', 'no_data']);
+  assert.deepStrictEqual(contract.warningLevels, ['normal', 'nearing', 'exceeded', 'missing_budget', 'unit_mismatch']);
 
   console.log('energy budget service tests passed');
 } finally {

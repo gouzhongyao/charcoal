@@ -21,13 +21,32 @@ const { initDatabase, openDatabase } = require('../db/database');
 const { errorHandler, notFoundHandler } = require('../middleware/errorHandler');
 const energyAnalysisRoutes = require('../routes/energyAnalysis');
 const {
+  CONFIGURATION_QUERY_FIELDS,
+  CONFIGURATION_STATUS_FIELDS,
   ENERGY_ANALYSIS_LOAD_SUMMARY_PERMISSION,
   ENERGY_ANALYSIS_PERMISSIONS,
+  ENERGY_CONFIGURATION_VIEW_PERMISSION,
+  ENERGY_INTENSITY_INPUT_FIELDS,
+  ENERGY_SHIFT_CONFIGURATION_MANAGE_PERMISSION,
   ENERGY_STRATEGY_EVALUATE_PERMISSION,
+  ENERGY_STRATEGY_REVIEW_PERMISSION,
+  ENERGY_STRATEGY_RULE_MANAGE_PERMISSION,
+  ENERGY_STRATEGY_RUN_PERMISSION,
+  ENERGY_TOU_CONFIGURATION_MANAGE_PERMISSION,
   LOAD_CURVE_INPUT_FIELDS,
   LOAD_SUMMARY_INPUT_FIELDS,
   MONTHLY_ANALYSIS_INPUT_FIELDS,
-  STRATEGY_EVALUATION_INPUT_FIELDS
+  PEAK_CONTRIBUTION_INPUT_FIELDS,
+  SHIFT_AND_DEVICE_STATE_INPUT_FIELDS,
+  SHIFT_CONFIGURATION_CREATE_FIELDS,
+  SHIFT_CONFIGURATION_VERSION_FIELDS,
+  STRATEGY_EVALUATION_INPUT_FIELDS,
+  STRATEGY_HIT_STATUS_INPUT_FIELDS,
+  STRATEGY_RULE_CREATE_FIELDS,
+  STRATEGY_RULE_VERSION_FIELDS,
+  TIME_OF_USE_INPUT_FIELDS,
+  TOU_CONFIGURATION_CREATE_FIELDS,
+  TOU_CONFIGURATION_VERSION_FIELDS
 } = energyAnalysisRoutes;
 const { getUserPermissions, login, register } = require('../services/authService');
 const { MAX_RULE_CODES } = require('../services/energyStrategyEvaluationService');
@@ -463,13 +482,50 @@ function seedAnalysisData() {
         `energy-analysis-api:monthly:${index + 1}`
       );
     });
+    // 严格消费强度接口只读取现有月度能耗和生产事实。
+    const productionUnitId = Number(db.prepare(
+      `INSERT INTO production_units
+         (unit_code, unit_name, organization_unit_id, product_name, output_unit, status)
+       VALUES ('ANALYSIS-API-PU', '能源分析 API 产能单元', ?, '测试产品', 't', 'active')`
+    ).run(organizationUnitId).lastInsertRowid);
+    db.prepare(
+      `INSERT INTO production_output_records
+         (production_unit_id, normalized_month, output_value, output_unit, data_source, record_status)
+       VALUES (?, ?, ?, 't', 'manual', 'active')`
+    ).run(productionUnitId, '2026-01', 10);
+    db.prepare(
+      `INSERT INTO production_output_records
+         (production_unit_id, normalized_month, output_value, output_unit, data_source, record_status)
+       VALUES (?, ?, ?, 't', 'manual', 'active')`
+    ).run(productionUnitId, '2026-02', 20);
+    // 峰平谷接口必须显式指定完整覆盖窗口的单一方案。
+    const touSchemeId = Number(db.prepare(
+      `INSERT INTO tou_schemes (
+         scheme_code, scheme_name, source_timezone, source, document_no, version,
+         effective_start_utc, effective_end_utc, status
+       ) VALUES ('ANALYSIS-API-TOU', '能源分析 API 峰平谷方案', 'Asia/Shanghai',
+                 'test', 'ANALYSIS-API-TOU-DOC', 'v1',
+                 '2026-01-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z', 'active')`
+    ).run().lastInsertRowid);
+    const insertTouRule = db.prepare(
+      `INSERT INTO tou_period_rules
+         (tou_scheme_id, day_of_week, period_type, start_minute, end_minute)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+    for (let dayOfWeek = 1; dayOfWeek <= 7; dayOfWeek += 1) {
+      insertTouRule.run(touSchemeId, dayOfWeek, 'peak', 0, 480);
+      insertTouRule.run(touSchemeId, dayOfWeek, 'flat', 480, 960);
+      insertTouRule.run(touSchemeId, dayOfWeek, 'valley', 960, 1440);
+    }
     return {
       electricityId: Number(electricity.id),
       naturalGasId: Number(naturalGas.id),
       organizationUnitId,
       inactiveOrganizationUnitId,
       meterDeviceId,
-      inactiveMeterDeviceId
+      inactiveMeterDeviceId,
+      productionUnitId,
+      touSchemeId
     };
   } finally {
     db.close();
@@ -560,16 +616,33 @@ function restoreDefaultTimeseries(ids) {
 }
 
 /**
- * 校验公开权限、字段白名单和 Router 精确包含四条指定只读语义路由。
+ * 校验公开权限、字段白名单和 Router 精确包含分析、配置及策略路由。
  */
 function testStaticRouterContract() {
   assert.strictEqual(ENERGY_ANALYSIS_LOAD_SUMMARY_PERMISSION, 'energy:analysis:view');
   assert.strictEqual(ENERGY_STRATEGY_EVALUATE_PERMISSION, 'energy:strategy:evaluate');
+  assert.strictEqual(ENERGY_STRATEGY_RUN_PERMISSION, 'energy:strategy:run');
+  assert.strictEqual(ENERGY_STRATEGY_REVIEW_PERMISSION, 'energy:strategy:review');
+  assert.strictEqual(ENERGY_CONFIGURATION_VIEW_PERMISSION, 'energy:analysis:config:view');
+  assert.strictEqual(ENERGY_SHIFT_CONFIGURATION_MANAGE_PERMISSION, 'energy:analysis:shift:manage');
+  assert.strictEqual(ENERGY_TOU_CONFIGURATION_MANAGE_PERMISSION, 'energy:analysis:tou:manage');
+  assert.strictEqual(ENERGY_STRATEGY_RULE_MANAGE_PERMISSION, 'energy:strategy:rule:manage');
   assert.deepStrictEqual(ENERGY_ANALYSIS_PERMISSIONS, {
     loadSummary: 'energy:analysis:view',
     monthlyAnalysis: 'energy:analysis:view',
     loadCurve: 'energy:analysis:view',
-    strategyEvaluate: 'energy:strategy:evaluate'
+    timeOfUseAnalysis: 'energy:analysis:view',
+    shiftAnalysis: 'energy:analysis:view',
+    deviceStateAnalysis: 'energy:analysis:view',
+    peakContribution: 'energy:analysis:view',
+    energyIntensity: 'energy:analysis:view',
+    configurationView: 'energy:analysis:config:view',
+    shiftConfigurationManage: 'energy:analysis:shift:manage',
+    touConfigurationManage: 'energy:analysis:tou:manage',
+    strategyRuleManage: 'energy:strategy:rule:manage',
+    strategyEvaluate: 'energy:strategy:evaluate',
+    strategyRun: 'energy:strategy:run',
+    strategyHitReview: 'energy:strategy:review'
   });
   assert.deepStrictEqual(LOAD_CURVE_INPUT_FIELDS, [
     'meterDeviceId', 'energyTypeCode', 'unit', 'startUtc', 'endUtc',
@@ -587,7 +660,30 @@ function testStaticRouterContract() {
     ...LOAD_SUMMARY_INPUT_FIELDS,
     'ruleCodes'
   ]);
-  // Express 路由栈必须只有指定 GET 和只读语义 POST，不得出现 PUT/PATCH/DELETE 或隐藏写接口。
+  assert.deepStrictEqual(TIME_OF_USE_INPUT_FIELDS, [
+    'meterDeviceId', 'energyTypeCode', 'unit', 'startUtc', 'endUtc',
+    'sourceTimeZone', 'touSchemeId'
+  ]);
+  assert.deepStrictEqual(SHIFT_AND_DEVICE_STATE_INPUT_FIELDS, [
+    'meterDeviceId', 'energyTypeCode', 'unit', 'startUtc', 'endUtc', 'sourceTimeZone'
+  ]);
+  assert.deepStrictEqual(PEAK_CONTRIBUTION_INPUT_FIELDS, [
+    'organizationUnitId', 'energyTypeCode', 'unit', 'startUtc', 'endUtc',
+    'sourceTimeZone', 'outputIntervalMinutes', 'topContributors'
+  ]);
+  assert.deepStrictEqual(ENERGY_INTENSITY_INPUT_FIELDS, [
+    'productionUnitId', 'startMonth', 'endMonth', 'energyTypeCode', 'unit'
+  ]);
+  assert.deepStrictEqual(STRATEGY_HIT_STATUS_INPUT_FIELDS, ['manualStatus', 'reviewNote']);
+  assert.deepStrictEqual(CONFIGURATION_QUERY_FIELDS, ['status', 'code']);
+  assert.deepStrictEqual(CONFIGURATION_STATUS_FIELDS, ['status']);
+  assert.strictEqual(SHIFT_CONFIGURATION_CREATE_FIELDS.includes('shiftCode'), true);
+  assert.strictEqual(SHIFT_CONFIGURATION_VERSION_FIELDS.includes('shiftCode'), false);
+  assert.strictEqual(TOU_CONFIGURATION_CREATE_FIELDS.includes('periodRules'), true);
+  assert.strictEqual(TOU_CONFIGURATION_VERSION_FIELDS.includes('schemeCode'), false);
+  assert.strictEqual(STRATEGY_RULE_CREATE_FIELDS.includes('metricCode'), true);
+  assert.strictEqual(STRATEGY_RULE_VERSION_FIELDS.includes('ruleCode'), false);
+  // Express 路由栈必须精确包含统一只读分析、策略预演及受维护态保护的写接口。
   const routeDefinitions = energyAnalysisRoutes.stack
     .filter((layer) => layer.route)
     .map((layer) => ({
@@ -598,15 +694,33 @@ function testStaticRouterContract() {
     { path: '/consumption/load-summary', methods: ['get'] },
     { path: '/consumption/monthly-analysis', methods: ['get'] },
     { path: '/consumption/load-curve', methods: ['get'] },
-    { path: '/strategies/evaluate', methods: ['post'] }
+    { path: '/consumption/time-of-use', methods: ['get'] },
+    { path: '/consumption/shifts', methods: ['get'] },
+    { path: '/consumption/device-states', methods: ['get'] },
+    { path: '/consumption/peak-contribution', methods: ['get'] },
+    { path: '/consumption/intensity', methods: ['get'] },
+    { path: '/config/shifts', methods: ['get'] },
+    { path: '/config/shifts', methods: ['post'] },
+    { path: '/config/shifts/:shiftDefinitionId/versions', methods: ['post'] },
+    { path: '/config/shifts/:shiftDefinitionId/status', methods: ['patch'] },
+    { path: '/config/tou-schemes', methods: ['get'] },
+    { path: '/config/tou-schemes', methods: ['post'] },
+    { path: '/config/tou-schemes/:touSchemeId/versions', methods: ['post'] },
+    { path: '/config/tou-schemes/:touSchemeId/status', methods: ['patch'] },
+    { path: '/config/strategy-rules', methods: ['get'] },
+    { path: '/config/strategy-rules', methods: ['post'] },
+    { path: '/config/strategy-rules/:strategyRuleId/versions', methods: ['post'] },
+    { path: '/config/strategy-rules/:strategyRuleId/status', methods: ['patch'] },
+    { path: '/strategies/evaluate', methods: ['post'] },
+    { path: '/strategies/runs', methods: ['post'] },
+    { path: '/strategies/hits/:hitId/manual-status', methods: ['patch'] }
   ]);
   assert.strictEqual(JSON.stringify(routeDefinitions).includes('put'), false);
-  assert.strictEqual(JSON.stringify(routeDefinitions).includes('patch'), false);
   assert.strictEqual(JSON.stringify(routeDefinitions).includes('delete'), false);
 }
 
 /**
- * 校验未认证、无权限和两个最小权限账号的独立互拒矩阵。
+ * 校验未认证、无权限和各策略最小权限账号的独立互拒矩阵。
  * @param {object} server 隔离 HTTP 服务。
  * @param {object} tokens 测试令牌。
  * @param {number} meterDeviceId 表计 ID。
@@ -617,6 +731,7 @@ async function testAuthenticationAndPermissionMatrix(server, tokens, meterDevice
   const monthlyPath = createMonthlyAnalysisPath();
   const curvePath = createLoadCurvePath(meterDeviceId);
   const postPath = `${ROUTE_BASE}/strategies/evaluate`;
+  const runPath = `${ROUTE_BASE}/strategies/runs`;
   const postBody = createStrategyBody(meterDeviceId, { ruleCodes: ['API_LOAD_RATE'] });
 
   const anonymousGet = await requestJson(server, 'GET', getPath, undefined);
@@ -663,6 +778,39 @@ async function testAuthenticationAndPermissionMatrix(server, tokens, meterDevice
   assert.strictEqual(evaluateDeniedCurve.status, 403, 'evaluate-only 不得查询固定 UTC 负荷曲线。');
   const evaluateAllowed = await requestJson(server, 'POST', postPath, postBody, tokens.evaluateOnly);
   assert.strictEqual(evaluateAllowed.status, 200, 'evaluate-only 必须可执行只读策略预演。');
+  const evaluateDeniedRun = await requestJson(server, 'POST', runPath, postBody, tokens.evaluateOnly);
+  assert.strictEqual(evaluateDeniedRun.status, 403, 'evaluate-only 不得持久化运行。');
+
+  const runDeniedEvaluate = await requestJson(server, 'POST', postPath, postBody, tokens.runOnly);
+  assert.strictEqual(runDeniedEvaluate.status, 403, 'run-only 不得执行预演。');
+  const runAllowed = await requestJson(server, 'POST', runPath, postBody, tokens.runOnly);
+  assert.strictEqual(runAllowed.status, 201, 'run-only 必须可持久化运行。');
+  const createdHitId = runAllowed.body.data.hits[0].id;
+  const runDeniedReview = await requestJson(
+    server,
+    'PATCH',
+    `${ROUTE_BASE}/strategies/hits/${createdHitId}/manual-status`,
+    { manualStatus: 'accepted', reviewNote: 'run-only 不得执行复核。' },
+    tokens.runOnly
+  );
+  assert.strictEqual(runDeniedReview.status, 403, 'run-only 不得人工复核。');
+  const reviewDeniedRun = await requestJson(server, 'POST', runPath, postBody, tokens.reviewOnly);
+  assert.strictEqual(reviewDeniedRun.status, 403, 'review-only 不得持久化运行。');
+  const reviewAllowed = await requestJson(
+    server,
+    'PATCH',
+    `${ROUTE_BASE}/strategies/hits/${createdHitId}/manual-status`,
+    { manualStatus: 'accepted', reviewNote: 'review-only 人工复核。' },
+    tokens.reviewOnly
+  );
+  assert.strictEqual(reviewAllowed.status, 200, 'review-only 必须可人工复核。');
+  const cleanupDb = openDatabase();
+  try {
+    cleanupDb.prepare('DELETE FROM strategy_rule_hits').run();
+    cleanupDb.prepare('DELETE FROM strategy_evaluation_runs').run();
+  } finally {
+    cleanupDb.close();
+  }
 }
 
 /**
@@ -762,6 +910,409 @@ async function testSuccessfulEndpoints(server, tokens, meterDeviceId) {
   assert.strictEqual(strategyResponse.body.meta.maintenanceAllowed, true);
   assert.strictEqual(strategyResponse.body.meta.formulaVersion, strategyResponse.body.data.formulaVersion);
   assert.deepStrictEqual(getStrategyWriteCounts(), { runs: 0, hits: 0 });
+}
+
+/**
+ * 校验新增只读消费接口、正式策略运行、人工状态流、权限和维护态边界。
+ * @param {object} server 隔离 HTTP 服务。
+ * @param {object} tokens 测试令牌。
+ * @param {object} ids 测试主数据 ID。
+ */
+async function testExtendedConsumptionAndStrategyEndpoints(server, tokens, ids) {
+  const commonQuery = {
+    meterDeviceId: ids.meterDeviceId,
+    energyTypeCode: 'electricity',
+    unit: 'kWh',
+    startUtc: WINDOW_START_UTC,
+    endUtc: WINDOW_END_UTC,
+    sourceTimeZone: SOURCE_TIME_ZONE
+  };
+  const requestQuery = async (pathName, query) => {
+    const search = new URLSearchParams();
+    Object.entries(query).forEach(([fieldName, value]) => search.append(fieldName, String(value)));
+    return requestJson(
+      server,
+      'GET',
+      `${ROUTE_BASE}${pathName}?${search.toString()}`,
+      undefined,
+      tokens.viewOnly
+    );
+  };
+
+  const touResponse = await requestQuery('/consumption/time-of-use', {
+    ...commonQuery,
+    touSchemeId: ids.touSchemeId,
+    ignoredField: 'must-not-reach-service'
+  });
+  assert.strictEqual(touResponse.status, 200);
+  assert.strictEqual(touResponse.body.data.formulaVersion, 'time-of-use-consumption-analysis:v1');
+  assert.strictEqual(touResponse.body.meta.readOnly, true);
+
+  const shiftResponse = await requestQuery('/consumption/shifts', {
+    ...commonQuery,
+    ignoredField: 'must-not-reach-service'
+  });
+  assert.strictEqual(shiftResponse.status, 200);
+  assert.strictEqual(shiftResponse.body.data.formulaVersion, 'shift-consumption-analysis:v1');
+  assert.strictEqual(shiftResponse.body.data.quality.reasonCodes.includes('MISSING_SHIFT_SCHEDULE'), true);
+
+  const deviceStateResponse = await requestQuery('/consumption/device-states', {
+    ...commonQuery,
+    ignoredField: 'must-not-reach-service'
+  });
+  assert.strictEqual(deviceStateResponse.status, 200);
+  assert.strictEqual(
+    deviceStateResponse.body.data.formulaVersion,
+    'device-state-consumption-analysis:v1'
+  );
+  assert.strictEqual(deviceStateResponse.body.data.meta.explicitIdleOnly, true);
+
+  const peakResponse = await requestQuery('/consumption/peak-contribution', {
+    organizationUnitId: ids.organizationUnitId,
+    energyTypeCode: 'electricity',
+    unit: 'kWh',
+    startUtc: WINDOW_START_UTC,
+    endUtc: WINDOW_END_UTC,
+    sourceTimeZone: SOURCE_TIME_ZONE,
+    outputIntervalMinutes: 15,
+    topContributors: 10,
+    ignoredField: 'must-not-reach-service'
+  });
+  assert.strictEqual(peakResponse.status, 200);
+  assert.strictEqual(peakResponse.body.data.formulaVersion, 'peak-contribution-analysis:v1');
+  assert.strictEqual(peakResponse.body.data.peak.energy, 40);
+  assert.strictEqual(peakResponse.body.data.automationBoundary.infersRootCause, false);
+
+  const intensityResponse = await requestQuery('/consumption/intensity', {
+    productionUnitId: ids.productionUnitId,
+    startMonth: '2026-01',
+    endMonth: '2026-02',
+    energyTypeCode: 'electricity',
+    unit: 'kWh',
+    ignoredField: 'must-not-reach-service'
+  });
+  assert.strictEqual(intensityResponse.status, 200);
+  assert.strictEqual(intensityResponse.body.data.formulaVersion, 'energy-intensity-analysis:v1');
+  assert.deepStrictEqual(
+    intensityResponse.body.data.facets[0].monthly.map((row) => row.intensity.value),
+    [10, 10]
+  );
+  assert.strictEqual(intensityResponse.body.data.meta.generationOffsetApplied, false);
+
+  const strategyBody = createStrategyBody(ids.meterDeviceId, {
+    ruleCodes: ['API_LOAD_RATE'],
+    ignoredField: 'must-not-reach-service'
+  });
+  const deniedRun = await requestJson(
+    server,
+    'POST',
+    `${ROUTE_BASE}/strategies/runs`,
+    strategyBody,
+    tokens.evaluateOnly
+  );
+  assert.strictEqual(deniedRun.status, 403, '预演权限不得替代持久化运行权限。');
+  await runWithMaintenance('energy-analysis-api-write-protection', async () => {
+    const blockedRun = await requestJson(
+      server,
+      'POST',
+      `${ROUTE_BASE}/strategies/runs`,
+      strategyBody,
+      tokens.runOnly
+    );
+    assert.strictEqual(blockedRun.status, 423);
+    assert.strictEqual(blockedRun.body.error.code, 'MAINTENANCE_IN_PROGRESS');
+  });
+  assert.deepStrictEqual(getStrategyWriteCounts(), { runs: 0, hits: 0 });
+
+  const runResponse = await requestJson(
+    server,
+    'POST',
+    `${ROUTE_BASE}/strategies/runs`,
+    strategyBody,
+    tokens.runOnly
+  );
+  assert.strictEqual(runResponse.status, 201);
+  assert.strictEqual(runResponse.body.data.dryRun, false);
+  assert.strictEqual(runResponse.body.data.persistsEvaluationRun, true);
+  assert.strictEqual(runResponse.body.data.hits.length, 1);
+  assert.strictEqual(runResponse.body.data.hits[0].manualStatus, 'unconfirmed');
+  assert.strictEqual(runResponse.body.meta.readOnly, false);
+  assert.deepStrictEqual(getStrategyWriteCounts(), { runs: 1, hits: 1 });
+
+  const hitId = runResponse.body.data.hits[0].id;
+  const reviewResponse = await requestJson(
+    server,
+    'PATCH',
+    `${ROUTE_BASE}/strategies/hits/${hitId}/manual-status`,
+    {
+      manualStatus: 'accepted',
+      reviewNote: 'API 人工复核已接受。',
+      ignoredField: 'must-not-reach-service'
+    },
+    tokens.reviewOnly
+  );
+  assert.strictEqual(reviewResponse.status, 200);
+  assert.strictEqual(reviewResponse.body.data.manualStatus, 'accepted');
+  assert.strictEqual(reviewResponse.body.data.reviewNote, 'API 人工复核已接受。');
+  const db = openDatabase();
+  try {
+    const auditCount = db.prepare(
+      `SELECT COUNT(*) AS total
+         FROM sys_operation_logs
+        WHERE (operation = 'energy.strategy.run' AND target_id = ?)
+           OR (operation = 'energy.strategy.hit.review' AND target_id = ?)`
+    ).get(String(runResponse.body.data.run.id), String(hitId)).total;
+    assert.strictEqual(auditCount, 2, '正式运行和人工复核必须原子写入统一操作审计。');
+    db.prepare('DELETE FROM strategy_rule_hits').run();
+    db.prepare('DELETE FROM strategy_evaluation_runs').run();
+  } finally {
+    db.close();
+  }
+  assert.deepStrictEqual(getStrategyWriteCounts(), { runs: 0, hits: 0 });
+}
+
+/**
+ * 构造完整七天 TOU 周期规则。
+ * @returns {object[]} 完整周期规则。
+ */
+function createApiTouPeriodRules() {
+  const periodRules = [];
+  for (let dayOfWeek = 1; dayOfWeek <= 7; dayOfWeek += 1) {
+    periodRules.push(
+      { dayOfWeek, periodType: 'valley', startMinute: 0, endMinute: 480 },
+      { dayOfWeek, periodType: 'flat', startMinute: 480, endMinute: 1080 },
+      { dayOfWeek, periodType: 'peak', startMinute: 1080, endMinute: 1440 }
+    );
+  }
+  return periodRules;
+}
+
+/**
+ * 校验排班、TOU 和策略规则受控查询、创建、版本化、启停及原子审计接口。
+ * @param {object} server 隔离 HTTP 服务。
+ * @param {object} tokens 测试令牌。
+ */
+async function testConfigurationEndpoints(server, tokens) {
+  const forbiddenList = await requestJson(
+    server,
+    'GET',
+    `${ROUTE_BASE}/config/shifts`,
+    undefined,
+    tokens.viewOnly
+  );
+  assert.strictEqual(forbiddenList.status, 403, '普通分析查看权限不得读取生产配置。');
+  const shiftManagerReachedShiftService = await requestJson(
+    server,
+    'POST',
+    `${ROUTE_BASE}/config/shifts`,
+    {},
+    tokens.shiftManager
+  );
+  assert.strictEqual(shiftManagerReachedShiftService.status, 400, '排班维护权限必须能进入排班服务校验。');
+  const shiftManagerDeniedTou = await requestJson(
+    server,
+    'POST',
+    `${ROUTE_BASE}/config/tou-schemes`,
+    {},
+    tokens.shiftManager
+  );
+  assert.strictEqual(shiftManagerDeniedTou.status, 403, '排班维护权限不得维护 TOU 方案。');
+  const shiftManagerDeniedStrategyRule = await requestJson(
+    server,
+    'POST',
+    `${ROUTE_BASE}/config/strategy-rules`,
+    {},
+    tokens.shiftManager
+  );
+  assert.strictEqual(shiftManagerDeniedStrategyRule.status, 403, '排班维护权限不得维护策略规则。');
+
+  const shiftCreate = await requestJson(server, 'POST', `${ROUTE_BASE}/config/shifts`, {
+    shiftCode: 'API-CONFIG-SHIFT',
+    shiftName: 'API 配置班次',
+    startMinute: 480,
+    endMinute: 1020,
+    crossesMidnight: false,
+    sourceTimeZone: SOURCE_TIME_ZONE,
+    source: 'api-config-test',
+    version: 'api-config-shift:v1',
+    effectiveStartUtc: '2026-01-01T00:00:00.000Z',
+    effectiveEndUtc: '2027-01-01T00:00:00.000Z',
+    status: 'active',
+    ignoredField: 'must-not-reach-service'
+  }, tokens.full);
+  assert.strictEqual(shiftCreate.status, 201);
+  assert.strictEqual(shiftCreate.body.data.shiftCode, 'API-CONFIG-SHIFT');
+  const shiftVersion = await requestJson(
+    server,
+    'POST',
+    `${ROUTE_BASE}/config/shifts/${shiftCreate.body.data.id}/versions`,
+    { shiftCode: 'MUST-NOT-CHANGE', shiftName: 'API 配置班次 v2', version: 'api-config-shift:v2', status: 'active' },
+    tokens.full
+  );
+  assert.strictEqual(shiftVersion.status, 201);
+  assert.strictEqual(shiftVersion.body.data.shiftCode, 'API-CONFIG-SHIFT');
+  const shiftStatus = await requestJson(
+    server,
+    'PATCH',
+    `${ROUTE_BASE}/config/shifts/${shiftVersion.body.data.id}/status`,
+    { status: 'inactive', shiftName: 'must-not-change' },
+    tokens.full
+  );
+  assert.strictEqual(shiftStatus.status, 200);
+  assert.strictEqual(shiftStatus.body.data.status, 'inactive');
+  const shiftList = await requestJson(
+    server,
+    'GET',
+    `${ROUTE_BASE}/config/shifts?code=API-CONFIG-SHIFT&ignored=1`,
+    undefined,
+    tokens.full
+  );
+  assert.strictEqual(shiftList.status, 200);
+  assert.strictEqual(shiftList.body.data.items.length, 2);
+
+  const touCreate = await requestJson(server, 'POST', `${ROUTE_BASE}/config/tou-schemes`, {
+    schemeCode: 'API-CONFIG-TOU',
+    schemeName: 'API 配置 TOU',
+    sourceTimeZone: SOURCE_TIME_ZONE,
+    source: 'api-config-test',
+    documentNo: 'API-CONFIG-TOU-DOC',
+    version: 'api-config-tou:v1',
+    effectiveStartUtc: '2026-01-01T00:00:00.000Z',
+    effectiveEndUtc: '2027-01-01T00:00:00.000Z',
+    status: 'active',
+    periodRules: createApiTouPeriodRules(),
+    ignoredField: 'must-not-reach-service'
+  }, tokens.full);
+  assert.strictEqual(touCreate.status, 201);
+  assert.strictEqual(touCreate.body.data.periodRules.length, 21);
+  const touVersion = await requestJson(
+    server,
+    'POST',
+    `${ROUTE_BASE}/config/tou-schemes/${touCreate.body.data.id}/versions`,
+    { schemeCode: 'MUST-NOT-CHANGE', schemeName: 'API 配置 TOU v2', version: 'api-config-tou:v2', status: 'active' },
+    tokens.full
+  );
+  assert.strictEqual(touVersion.status, 201);
+  assert.strictEqual(touVersion.body.data.periodRules.length, 21);
+  const touStatus = await requestJson(
+    server,
+    'PATCH',
+    `${ROUTE_BASE}/config/tou-schemes/${touVersion.body.data.id}/status`,
+    { status: 'inactive' },
+    tokens.full
+  );
+  assert.strictEqual(touStatus.status, 200);
+  const touList = await requestJson(
+    server,
+    'GET',
+    `${ROUTE_BASE}/config/tou-schemes?code=API-CONFIG-TOU`,
+    undefined,
+    tokens.full
+  );
+  assert.strictEqual(touList.status, 200);
+  assert.strictEqual(touList.body.data.items.length, 2);
+
+  const ruleCreate = await requestJson(server, 'POST', `${ROUTE_BASE}/config/strategy-rules`, {
+    ruleCode: 'API-CONFIG-RULE',
+    ruleName: 'API 配置策略规则',
+    ruleVersion: 'api-config-rule:v1',
+    formulaVersion: 'load-analysis:v1',
+    metricCode: 'load_rate',
+    thresholdOperator: 'gte',
+    thresholdValue: 80,
+    thresholdUnit: '%',
+    reductionRate: 0.1,
+    priority: 'high',
+    evidenceRequirements: { minimumCoverageRate: 1, maxEvidenceItems: 10, savingBasis: 'window_total_energy' },
+    recommendationText: '请人工复核后调整用能计划。',
+    source: 'api-config-test',
+    effectiveStartUtc: '2026-01-01T00:00:00.000Z',
+    effectiveEndUtc: '2027-01-01T00:00:00.000Z',
+    sourceTimeZone: SOURCE_TIME_ZONE,
+    status: 'active',
+    executable: 'require("child_process")'
+  }, tokens.full);
+  assert.strictEqual(ruleCreate.status, 201);
+  assert.strictEqual(ruleCreate.body.data.metricCode, 'load_rate');
+  const ruleVersion = await requestJson(
+    server,
+    'POST',
+    `${ROUTE_BASE}/config/strategy-rules/${ruleCreate.body.data.id}/versions`,
+    { ruleCode: 'MUST-NOT-CHANGE', ruleName: 'API 配置策略规则 v2', ruleVersion: 'api-config-rule:v2', thresholdValue: 85, status: 'active' },
+    tokens.full
+  );
+  assert.strictEqual(ruleVersion.status, 201);
+  assert.strictEqual(ruleVersion.body.data.ruleCode, 'API-CONFIG-RULE');
+  assert.strictEqual(ruleVersion.body.data.thresholdValue, 85);
+  const ruleStatus = await requestJson(
+    server,
+    'PATCH',
+    `${ROUTE_BASE}/config/strategy-rules/${ruleVersion.body.data.id}/status`,
+    { status: 'inactive' },
+    tokens.full
+  );
+  assert.strictEqual(ruleStatus.status, 200);
+  const ruleList = await requestJson(
+    server,
+    'GET',
+    `${ROUTE_BASE}/config/strategy-rules?code=API-CONFIG-RULE`,
+    undefined,
+    tokens.full
+  );
+  assert.strictEqual(ruleList.status, 200);
+  assert.strictEqual(ruleList.body.data.items.length, 2);
+
+  await runWithMaintenance('energy-analysis-config-write-protection', async () => {
+    const blockedCreate = await requestJson(server, 'POST', `${ROUTE_BASE}/config/shifts`, {
+      shiftCode: 'API-CONFIG-MAINTENANCE',
+      shiftName: '维护态不得创建',
+      startMinute: 0,
+      endMinute: 480,
+      crossesMidnight: false,
+      sourceTimeZone: SOURCE_TIME_ZONE,
+      source: 'api-config-test',
+      version: 'api-config-maintenance:v1',
+      effectiveStartUtc: '2026-01-01T00:00:00.000Z',
+      effectiveEndUtc: '2027-01-01T00:00:00.000Z',
+      status: 'active'
+    }, tokens.full);
+    assert.strictEqual(blockedCreate.status, 423);
+    const allowedList = await requestJson(
+      server,
+      'GET',
+      `${ROUTE_BASE}/config/shifts?code=API-CONFIG-SHIFT`,
+      undefined,
+      tokens.full
+    );
+    assert.strictEqual(allowedList.status, 200, '维护态必须允许配置只读查询。');
+  });
+
+  const db = openDatabase();
+  try {
+    assert.strictEqual(
+      db.prepare("SELECT COUNT(*) AS total FROM shift_definitions WHERE shift_code = 'API-CONFIG-MAINTENANCE'").get().total,
+      0,
+      '维护态阻断不得写入配置。'
+    );
+    const operationCount = db.prepare(
+      `SELECT COUNT(*) AS total
+         FROM sys_operation_logs
+        WHERE operation IN (
+          'energy.shift.configuration.create',
+          'energy.shift.configuration.version.create',
+          'energy.shift.configuration.status',
+          'energy.tou.configuration.create',
+          'energy.tou.configuration.version.create',
+          'energy.tou.configuration.status',
+          'energy.strategy.rule.configuration.create',
+          'energy.strategy.rule.configuration.version.create',
+          'energy.strategy.rule.configuration.status'
+        )`
+    ).get().total;
+    assert.strictEqual(operationCount, 9, '九个配置写接口必须各自产生统一原子审计。');
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -1536,8 +2087,7 @@ async function testStrategyValidationAndDegradation(server, token, meterDeviceId
 }
 
 /**
- * 校验全局 JSON parser 当前将畸形和超限错误交给现有通用 errorHandler 脱敏。
- * 阶段 8 负责在中央错误映射中进一步细分稳定 400/413。
+ * 校验全局 JSON parser 对畸形正文脱敏，并将超限正文映射为稳定 413 契约。
  * @param {object} server 隔离 HTTP 服务。
  * @param {string} token 策略预演权限令牌。
  */
@@ -1549,15 +2099,19 @@ async function testCurrentGlobalJsonErrorContract(server, token) {
   assert.strictEqual(malformed.body.error.details, null);
   assertUnifiedEnvelope(malformed, false);
 
+  const oversizedMarker = 'ENERGY_ANALYSIS_OVERSIZED_SECRET';
   const oversized = await requestRawJson(
     server,
     evaluatePath,
-    JSON.stringify({ padding: 'x'.repeat(2 * 1024 * 1024 + 1024) }),
+    JSON.stringify({ padding: `${oversizedMarker}${'x'.repeat(2 * 1024 * 1024 + 1024)}` }),
     token
   );
-  assert.strictEqual(oversized.status, 500);
-  assert.strictEqual(oversized.body.error.code, 'INTERNAL_ERROR');
+  assert.strictEqual(oversized.status, 413);
+  assert.strictEqual(oversized.body.error.code, 'PAYLOAD_TOO_LARGE');
+  assert.strictEqual(oversized.body.error.message, '请求正文超过允许大小。');
   assert.strictEqual(oversized.body.error.details, null);
+  assert(!oversized.text.includes(oversizedMarker));
+  assert(!oversized.text.includes('entity.too.large'));
   assertUnifiedEnvelope(oversized, false);
 }
 
@@ -1677,13 +2231,19 @@ async function testUnknownRoutes(server, tokens, meterDeviceId) {
   try {
     testStaticRouterContract();
     initDatabase();
-    // 普通用户分别代表无权限、仅查看、仅预演和双权限账号。
+    // 普通用户分别代表无权限、只读分析、三类策略权限、排班维护和全权限账号。
     register({ username: 'analysis-api-denied', password: 'Password123!' });
     register({ username: 'analysis-api-view', password: 'Password123!' });
     register({ username: 'analysis-api-evaluate', password: 'Password123!' });
+    register({ username: 'analysis-api-run', password: 'Password123!' });
+    register({ username: 'analysis-api-review', password: 'Password123!' });
+    register({ username: 'analysis-api-shift-manager', password: 'Password123!' });
     register({ username: 'analysis-api-full', password: 'Password123!' });
     grantPermissions('analysis-api-view', [ENERGY_ANALYSIS_LOAD_SUMMARY_PERMISSION]);
     grantPermissions('analysis-api-evaluate', [ENERGY_STRATEGY_EVALUATE_PERMISSION]);
+    grantPermissions('analysis-api-run', [ENERGY_STRATEGY_RUN_PERMISSION]);
+    grantPermissions('analysis-api-review', [ENERGY_STRATEGY_REVIEW_PERMISSION]);
+    grantPermissions('analysis-api-shift-manager', [ENERGY_SHIFT_CONFIGURATION_MANAGE_PERMISSION]);
     grantPermissions('analysis-api-full', [...new Set(Object.values(ENERGY_ANALYSIS_PERMISSIONS))]);
     // 普通注册账号不会因新增 Router 自动获得未写入 RBAC 种子的权限。
     const deniedUser = openDatabase();
@@ -1705,12 +2265,17 @@ async function testUnknownRoutes(server, tokens, meterDeviceId) {
       denied: login({ username: 'analysis-api-denied', password: 'Password123!' }).token,
       viewOnly: login({ username: 'analysis-api-view', password: 'Password123!' }).token,
       evaluateOnly: login({ username: 'analysis-api-evaluate', password: 'Password123!' }).token,
+      runOnly: login({ username: 'analysis-api-run', password: 'Password123!' }).token,
+      reviewOnly: login({ username: 'analysis-api-review', password: 'Password123!' }).token,
+      shiftManager: login({ username: 'analysis-api-shift-manager', password: 'Password123!' }).token,
       full: login({ username: 'analysis-api-full', password: 'Password123!' }).token
     };
     server = await startIsolatedServer();
 
     await testAuthenticationAndPermissionMatrix(server, tokens, ids.meterDeviceId);
     await testSuccessfulEndpoints(server, tokens, ids.meterDeviceId);
+    await testExtendedConsumptionAndStrategyEndpoints(server, tokens, ids);
+    await testConfigurationEndpoints(server, tokens);
     await testMaintenanceReadAvailability(server, tokens, ids.meterDeviceId);
     await testLoadSummaryValidation(server, tokens.viewOnly, ids.meterDeviceId);
     await testLoadCurveValidation(server, tokens.viewOnly, ids.meterDeviceId);

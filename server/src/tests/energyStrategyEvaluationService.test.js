@@ -23,7 +23,9 @@ const {
   normalizeRuleCodes,
   parseEvidenceRequirements,
   previewEnergyStrategies,
-  stableStringify
+  runEnergyStrategyEvaluation,
+  stableStringify,
+  updateStrategyRuleHitStatus
 } = require('../services/energyStrategyEvaluationService');
 
 // 策略测试统一使用上海来源时区。
@@ -32,6 +34,23 @@ const SOURCE_TIME_ZONE = 'Asia/Shanghai';
 const WINDOW_START_UTC = '2026-07-15T00:00:00.000Z';
 // 策略测试窗口结束时间。
 const WINDOW_END_UTC = '2026-07-15T01:00:00.000Z';
+// 正常策略业务写统一使用隔离库内置管理员身份。
+let auditActorUserId = null;
+
+/**
+ * 构造策略写操作审计选项。
+ * @param {object} db SQLite 连接。
+ * @param {object} overrides 覆盖选项。
+ * @returns {object} 策略服务写入选项。
+ */
+function createWriteOptions(db, overrides = {}) {
+  return {
+    db,
+    actorUserId: auditActorUserId,
+    actorIp: '127.0.0.1',
+    ...overrides
+  };
+}
 
 /**
  * 捕获同步业务错误并断言稳定 details.code。
@@ -1064,6 +1083,203 @@ function testInjectionAndDatabaseOwnership(db, ids, insertTimeseries, insertRule
 }
 
 /**
+ * 验证正式评价原子写入运行和命中，并执行受限人工状态流。
+ * @param {object} db SQLite 连接。
+ * @param {object} ids 主数据 ID。
+ * @param {Function} insertTimeseries 时序写入函数。
+ * @param {Function} insertRule 规则写入函数。
+ */
+function testPersistentEvaluationAndManualStatus(db, ids, insertTimeseries, insertRule) {
+  resetScenario(db);
+  insertQuarterHourSeries(insertTimeseries, [10, 20, 30, 40]);
+  insertRule({
+    ruleCode: 'PERSISTED_LOAD_RATE',
+    thresholdValue: 60,
+    priority: 'high',
+    recommendation: '请人工复核持久化规则证据。'
+  });
+  insertRule({
+    ruleCode: 'PERSISTED_PEAK',
+    metricCode: 'peak_interval_energy',
+    thresholdOperator: 'gt',
+    thresholdValue: 50,
+    thresholdUnit: 'kWh/15min'
+  });
+
+  const result = runEnergyStrategyEvaluation(createInput(ids.meterDeviceId), createWriteOptions(db));
+  assert.strictEqual(result.dryRun, false);
+  assert.strictEqual(result.persistsEvaluationRun, true);
+  assert.strictEqual(result.run.status, 'completed');
+  assert.strictEqual(result.hits.length, 2);
+  assert.strictEqual(result.meta.writesEvaluationRuns, true);
+  assert.strictEqual(result.meta.writesRuleHits, true);
+  assert.strictEqual(result.meta.writesOperationAudit, true);
+  assert.strictEqual(Number.isInteger(result.meta.operationLogId), true);
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,
+    1
+  );
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total,
+    2
+  );
+  const matchedHit = result.hits.find((hit) => hit.ruleCode === 'PERSISTED_LOAD_RATE');
+  assert(matchedHit);
+  assert.strictEqual(matchedHit.matchStatus, 'matched');
+  assert.strictEqual(matchedHit.manualStatus, 'unconfirmed');
+  assert.strictEqual(matchedHit.threshold.value, 60);
+  assert.strictEqual(
+    matchedHit.evidenceSnapshot.evidence.some((item) => item.startsWith('data-summary-sha256:')),
+    true
+  );
+
+  const accepted = updateStrategyRuleHitStatus(matchedHit.id, {
+    manualStatus: 'accepted',
+    reviewNote: '已核对原始时序证据。'
+  }, createWriteOptions(db));
+  assert.strictEqual(accepted.manualStatus, 'accepted');
+  assert.strictEqual(accepted.reviewNote, '已核对原始时序证据。');
+  assert.strictEqual(typeof accepted.reviewedAt, 'string');
+  const resolved = updateStrategyRuleHitStatus(matchedHit.id, {
+    manualStatus: 'resolved',
+    reviewNote: '已由人工流程完成处置。'
+  }, createWriteOptions(db));
+  assert.strictEqual(resolved.manualStatus, 'resolved');
+  assert.strictEqual(resolved.reviewNote, '已由人工流程完成处置。');
+  assert.strictEqual(
+    db.prepare(
+      `SELECT COUNT(*) AS total
+         FROM sys_operation_logs
+        WHERE operation IN ('energy.strategy.run', 'energy.strategy.hit.review')`
+    ).get().total >= 3,
+    true,
+    '正式运行和每次成功人工复核必须写入统一操作审计。'
+  );
+  assertBadRequestCode(
+    () => updateStrategyRuleHitStatus(result.hits[1].id, { manualStatus: 'rejected' }, createWriteOptions(db)),
+    'STRATEGY_HIT_REVIEW_NOTE_REQUIRED'
+  );
+  assert.throws(
+    () => updateStrategyRuleHitStatus(matchedHit.id, {
+      manualStatus: 'accepted',
+      reviewNote: '不得重开终结记录。'
+    }, createWriteOptions(db)),
+    (error) => error && error.code === 'STRATEGY_HIT_STATUS_CONFLICT' && error.statusCode === 409
+  );
+  assert.strictEqual(db.inTransaction, false);
+
+  // 调用方事务由调用方持有，服务不得代为提交。
+  resetScenario(db);
+  insertQuarterHourSeries(insertTimeseries, [10, 20, 30, 40]);
+  insertRule({ ruleCode: 'CALLER_TRANSACTION_RULE' });
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const callerTransactionResult = runEnergyStrategyEvaluation(
+      createInput(ids.meterDeviceId),
+      createWriteOptions(db)
+    );
+    assert.strictEqual(callerTransactionResult.meta.reusedCallerTransaction, true);
+    assert.strictEqual(db.inTransaction, true);
+  } finally {
+    db.exec('ROLLBACK');
+  }
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,
+    0,
+    '调用方回滚后正式运行和命中必须全部撤销。'
+  );
+  resetScenario(db);
+}
+
+/**
+ * 验证策略业务写入与操作审计处于同一 SQLite 事务。
+ * @param {object} db SQLite 连接。
+ * @param {object} ids 主数据 ID。
+ * @param {Function} insertTimeseries 时序写入函数。
+ * @param {Function} insertRule 规则写入函数。
+ */
+function testAtomicOperationAuditRollback(db, ids, insertTimeseries, insertRule) {
+  resetScenario(db);
+  insertQuarterHourSeries(insertTimeseries, [10, 20, 30, 40]);
+  insertRule({ ruleCode: 'AUDIT_ROLLBACK_RULE' });
+  const beforeRunCount = db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total;
+  const beforeHitCount = db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total;
+  const beforeAuditCount = db.prepare('SELECT COUNT(*) AS total FROM sys_operation_logs').get().total;
+
+  assert.throws(() => runEnergyStrategyEvaluation(
+    createInput(ids.meterDeviceId),
+    createWriteOptions(db, {
+      auditWriter() {
+        throw new Error('injected strategy run audit failure');
+      }
+    })
+  ), /injected strategy run audit failure/);
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,
+    beforeRunCount,
+    '正式运行审计失败时评价运行必须回滚。'
+  );
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total,
+    beforeHitCount,
+    '正式运行审计失败时规则命中必须回滚。'
+  );
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM sys_operation_logs').get().total,
+    beforeAuditCount,
+    '故障审计不得产生操作日志。'
+  );
+
+  const persisted = runEnergyStrategyEvaluation(createInput(ids.meterDeviceId), createWriteOptions(db));
+  const hitId = persisted.hits[0].id;
+  assert.strictEqual(persisted.hits[0].manualStatus, 'unconfirmed');
+  const auditCountBeforeReview = db.prepare('SELECT COUNT(*) AS total FROM sys_operation_logs').get().total;
+  assert.throws(() => updateStrategyRuleHitStatus(hitId, {
+    manualStatus: 'accepted',
+    reviewNote: '该状态更新必须随审计失败回滚。'
+  }, createWriteOptions(db, {
+    auditWriter() {
+      throw new Error('injected strategy review audit failure');
+    }
+  })), /injected strategy review audit failure/);
+  assert.strictEqual(
+    db.prepare('SELECT manual_status AS manualStatus FROM strategy_rule_hits WHERE id = ?').get(hitId).manualStatus,
+    'unconfirmed',
+    '人工复核审计失败时命中状态必须保持原值。'
+  );
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM sys_operation_logs').get().total,
+    auditCountBeforeReview,
+    '人工复核审计失败不得产生操作日志。'
+  );
+  resetScenario(db);
+}
+
+/**
+ * 验证策略业务写入口拒绝缺失或非法操作者。
+ * @param {object} db SQLite 连接。
+ * @param {object} ids 主数据 ID。
+ */
+function testAuditActorRequired(db, ids) {
+  [undefined, null, 0, -1, 1.5, '1'].forEach((actorUserId) => {
+    const options = actorUserId === undefined ? { db } : { db, actorUserId };
+    assertBadRequestCode(
+      () => runEnergyStrategyEvaluation(createInput(ids.meterDeviceId), options),
+      'ENERGY_STRATEGY_AUDIT_ACTOR_REQUIRED'
+    );
+    assertBadRequestCode(
+      () => updateStrategyRuleHitStatus(1, { manualStatus: 'accepted' }, options),
+      'ENERGY_STRATEGY_AUDIT_ACTOR_REQUIRED'
+    );
+  });
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,
+    0,
+    '非法操作者不得产生策略评价运行。'
+  );
+}
+
+/**
  * 验证公开纯函数的严格边界，避免配置解析宽松化。
  */
 function testPublicValidationHelpers() {
@@ -1109,10 +1325,12 @@ try {
   db = database.openDatabase();
   // 测试主数据和写入助手在隔离库中复用。
   const ids = seedMasterData(db);
+  auditActorUserId = Number(db.prepare("SELECT id FROM sys_users WHERE username = 'admin'").get().id);
   const insertTimeseries = createTimeseriesInserter(db, ids);
   const insertRule = createRuleInserter(db);
 
   testPublicValidationHelpers();
+  testAuditActorRequired(db, ids);
   testSupportedMetrics(db, ids, insertTimeseries, insertRule);
   testNotEvaluableMetricQuality(db, ids, insertTimeseries, insertRule);
   testRuleSelection(db, ids, insertTimeseries, insertRule);
@@ -1123,6 +1341,8 @@ try {
   testAutomationAndSavingGates(db, ids, insertTimeseries, insertRule);
   testConsistentReadSnapshot(db, ids, insertTimeseries, insertRule);
   testInjectionAndDatabaseOwnership(db, ids, insertTimeseries, insertRule);
+  testPersistentEvaluationAndManualStatus(db, ids, insertTimeseries, insertRule);
+  testAtomicOperationAuditRollback(db, ids, insertTimeseries, insertRule);
 
   assert.strictEqual(
     db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,

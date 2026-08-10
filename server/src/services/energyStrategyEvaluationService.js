@@ -2,8 +2,12 @@
 
 const crypto = require('crypto');
 const database = require('../db/database');
-const { badRequest } = require('../utils/errors');
-const { ENERGY_ANALYSIS_VERSIONS } = require('./energyAnalysisContracts');
+const { AppError, badRequest, notFound } = require('../utils/errors');
+const { sanitizeAuditDetail } = require('./sessionService');
+const {
+  ENERGY_ANALYSIS_VERSIONS,
+  MANUAL_HANDLING_STATUSES
+} = require('./energyAnalysisContracts');
 const {
   getEnergyLoadSummary,
   normalizeEnergyLoadSummaryInput
@@ -37,6 +41,15 @@ const AUTOMATION_BOUNDARY = Object.freeze({
   changesDeviceState: false,
   requiresManualReview: true
 });
+// 策略命中人工状态允许的单向流转，避免已终结记录被静默重开。
+const STRATEGY_HIT_STATUS_TRANSITIONS = Object.freeze({
+  unconfirmed: Object.freeze(['accepted', 'rejected']),
+  accepted: Object.freeze(['rejected', 'resolved']),
+  rejected: Object.freeze([]),
+  resolved: Object.freeze([])
+});
+// 人工复核备注长度上限，防止无界正文写入本地数据库。
+const MAX_STRATEGY_REVIEW_NOTE_LENGTH = 1000;
 
 /**
  * 判断值是否为非数组普通对象。
@@ -832,16 +845,546 @@ function previewEnergyStrategies(input, options = {}) {
   }
 }
 
+/**
+ * 构造不会暴露业务输入的唯一评价运行编码。
+ * @returns {string} 运行编码。
+ */
+function createStrategyRunCode() {
+  const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, '');
+  const randomSuffix = crypto.randomBytes(8).toString('hex');
+  return `energy-strategy-run-${timestamp}-${randomSuffix}`;
+}
+
+/**
+ * 将 JSON 文本安全解析为对象或数组，数据库已有异常文本降级为空值。
+ * @param {*} rawJson 原始 JSON 文本。
+ * @returns {*} 解析结果或空值。
+ */
+function parseStoredJson(rawJson) {
+  if (typeof rawJson !== 'string' || rawJson.trim() === '') return null;
+  try {
+    return JSON.parse(rawJson);
+  } catch (_error) {
+    return null;
+  }
+}
+
+/**
+ * 将持久化命中行映射为稳定契约。
+ * @param {object} row 数据库命中行。
+ * @returns {object} 命中记录。
+ */
+function mapStrategyRuleHitRow(row) {
+  return {
+    id: Number(row.id),
+    evaluationRunId: Number(row.evaluationRunId),
+    strategyRuleId: Number(row.strategyRuleId),
+    ruleCode: row.ruleCode,
+    ruleName: row.ruleName,
+    ruleVersion: row.ruleVersion,
+    formulaVersion: row.formulaVersion,
+    metricCode: row.metricCode,
+    matchStatus: row.matchStatus,
+    manualStatus: row.manualStatus,
+    actualValue: row.actualValue === null ? null : Number(row.actualValue),
+    threshold: parseStoredJson(row.thresholdSnapshotJson),
+    evidenceSnapshot: parseStoredJson(row.evidenceJson),
+    reasonCodes: parseStoredJson(row.reasonCodesJson) || [],
+    coverageRate: Number(row.coverageRate),
+    priority: row.priority,
+    estimatedSaving: row.estimatedSaving === null ? null : Number(row.estimatedSaving),
+    estimatedSavingUnit: row.estimatedSavingUnit,
+    dataRange: {
+      startUtc: row.dataStartUtc,
+      endUtc: row.dataEndUtc,
+      sourceTimeZone: row.sourceTimeZone
+    },
+    reviewedAt: row.reviewedAt,
+    reviewNote: row.reviewNote,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  };
+}
+
+/**
+ * 查询单条持久化策略命中。
+ * @param {object} db SQLite 连接。
+ * @param {number} hitId 命中 ID。
+ * @returns {object|null} 命中记录。
+ */
+function getStrategyRuleHitWithDb(db, hitId) {
+  const row = db.prepare(
+    `SELECT hit.id,
+            hit.evaluation_run_id AS evaluationRunId,
+            hit.strategy_rule_id AS strategyRuleId,
+            rule.rule_code AS ruleCode,
+            rule.rule_name AS ruleName,
+            rule.rule_version AS ruleVersion,
+            rule.formula_version AS formulaVersion,
+            rule.metric_code AS metricCode,
+            hit.match_status AS matchStatus,
+            hit.manual_status AS manualStatus,
+            hit.actual_value AS actualValue,
+            hit.threshold_snapshot_json AS thresholdSnapshotJson,
+            hit.evidence_json AS evidenceJson,
+            hit.reason_codes_json AS reasonCodesJson,
+            hit.coverage_rate AS coverageRate,
+            hit.priority,
+            hit.estimated_saving AS estimatedSaving,
+            hit.estimated_saving_unit AS estimatedSavingUnit,
+            hit.data_start_utc AS dataStartUtc,
+            hit.data_end_utc AS dataEndUtc,
+            hit.source_timezone AS sourceTimeZone,
+            hit.reviewed_at AS reviewedAt,
+            hit.review_note AS reviewNote,
+            hit.created_at AS createdAt,
+            hit.updated_at AS updatedAt
+       FROM strategy_rule_hits AS hit
+       JOIN strategy_rules AS rule ON rule.id = hit.strategy_rule_id
+      WHERE hit.id = ?`
+  ).get(hitId);
+  return row ? mapStrategyRuleHitRow(row) : null;
+}
+
+/**
+ * 将确定性评价结果写入策略命中表。
+ * @param {object} db SQLite 连接。
+ * @param {number} evaluationRunId 评价运行 ID。
+ * @param {object} evaluation 规则评价结果。
+ * @param {object} preview 预演总结果。
+ * @param {string} nowUtc 写入时间。
+ * @returns {number} 命中记录 ID。
+ */
+function insertStrategyRuleHit(db, evaluationRunId, evaluation, preview, nowUtc) {
+  const evidenceSnapshot = {
+    evidence: evaluation.evidence,
+    evidencePolicy: evaluation.evidencePolicy,
+    dataSummaryDigest: evaluation.dataSummaryDigest,
+    evaluationDigest: evaluation.evaluationDigest,
+    configurationErrors: evaluation.configurationErrors,
+    recommendation: evaluation.recommendation,
+    source: evaluation.source,
+    effectiveRange: evaluation.effectiveRange,
+    evidenceRequirements: evaluation.evidenceRequirements,
+    automationBoundary: preview.automationBoundary
+  };
+  const result = db.prepare(
+    `INSERT INTO strategy_rule_hits (
+       evaluation_run_id,
+       strategy_rule_id,
+       match_status,
+       manual_status,
+       actual_value,
+       threshold_snapshot_json,
+       evidence_json,
+       reason_codes_json,
+       coverage_rate,
+       priority,
+       estimated_saving,
+       estimated_saving_unit,
+       data_start_utc,
+       data_end_utc,
+       source_timezone,
+       reviewed_at,
+       review_note,
+       created_at,
+       updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`
+  ).run(
+    evaluationRunId,
+    evaluation.strategyRuleId,
+    evaluation.matchStatus,
+    evaluation.reviewStatus,
+    evaluation.actualValue,
+    JSON.stringify(evaluation.threshold),
+    JSON.stringify(evidenceSnapshot),
+    evaluation.reasonCodes.length > 0 ? JSON.stringify(evaluation.reasonCodes) : null,
+    evaluation.coverageRate,
+    evaluation.priority,
+    evaluation.estimatedSaving,
+    evaluation.estimatedSavingUnit,
+    preview.dataRange.startUtc,
+    preview.dataRange.endUtc,
+    preview.dataRange.sourceTimeZone,
+    nowUtc,
+    nowUtc
+  );
+  return Number(result.lastInsertRowid);
+}
+
+/**
+ * 使用当前业务连接写入统一操作审计，确保审计失败可回滚业务写入。
+ * @param {object} db SQLite 连接。
+ * @param {object} audit 审计上下文和详情。
+ * @returns {number} 操作日志 ID。
+ */
+function insertOperationLogWithDb(db, audit) {
+  const result = db.prepare(
+    `INSERT INTO sys_operation_logs (
+       user_id,
+       operation,
+       target_type,
+       target_id,
+       detail_json,
+       ip,
+       created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    audit.userId === undefined ? null : audit.userId,
+    audit.operation,
+    audit.targetType || null,
+    audit.targetId === undefined || audit.targetId === null ? null : String(audit.targetId),
+    JSON.stringify(sanitizeAuditDetail(audit.detail)),
+    audit.ip || null,
+    audit.createdAt || new Date().toISOString()
+  );
+  return Number(result.lastInsertRowid);
+}
+
+/**
+ * 在当前业务事务内执行受控审计写入；测试可注入故障以验证整体回滚。
+ * @param {object} db SQLite 连接。
+ * @param {object} options 服务调用选项。
+ * @param {object} audit 固定业务审计内容。
+ * @returns {number} 操作日志 ID。
+ */
+function writeOperationAuditWithDb(db, options, audit) {
+  const auditWriter = isPlainObject(options) && typeof options.auditWriter === 'function'
+    ? options.auditWriter
+    : insertOperationLogWithDb;
+  return auditWriter(db, {
+    ...audit,
+    userId: requireAuditActorUserId(options),
+    ip: isPlainObject(options) ? options.actorIp || null : null
+  });
+}
+
+/**
+ * 强制策略业务写操作携带有效正整数操作者。
+ * @param {object} options 服务调用选项。
+ * @returns {number} 操作者用户 ID。
+ */
+function requireAuditActorUserId(options) {
+  const actorUserId = isPlainObject(options) ? options.actorUserId : undefined;
+  if (!Number.isSafeInteger(actorUserId) || actorUserId <= 0) {
+    throw badRequest('策略业务写操作必须提供有效正整数操作者。', {
+      code: 'ENERGY_STRATEGY_AUDIT_ACTOR_REQUIRED',
+      field: 'actorUserId'
+    });
+  }
+  return actorUserId;
+}
+
+/**
+ * 正式执行本地确定性策略评价，并在同一事务内写入运行和全部规则命中。
+ * @param {*} input 策略评价输入。
+ * @param {object} options 可注入调用方 SQLite 连接、操作者、IP 和审计写入器。
+ * @returns {object} 已持久化运行和命中结果。
+ */
+function runEnergyStrategyEvaluation(input, options = {}) {
+  const normalizedInput = normalizeStrategyPreviewInput(input);
+  requireAuditActorUserId(options);
+  const callerDatabase = isPlainObject(options) && options.db ? options.db : null;
+  const db = callerDatabase || database.openDatabase();
+  const shouldCloseDatabase = callerDatabase === null;
+  const shouldOwnWriteTransaction = db.inTransaction !== true;
+  let ownedWriteTransactionActive = false;
+  try {
+    if (shouldOwnWriteTransaction) {
+      db.exec('BEGIN IMMEDIATE');
+      ownedWriteTransactionActive = true;
+    }
+    const runCode = createStrategyRunCode();
+    const nowUtc = new Date().toISOString();
+    const scopeReference = stableStringify({
+      meterDeviceId: normalizedInput.loadSummaryInput.meterDeviceId,
+      energyTypeCode: normalizedInput.loadSummaryInput.energyTypeCode,
+      unit: normalizedInput.loadSummaryInput.unit,
+      sourceTimeZone: normalizedInput.loadSummaryInput.sourceTimeZone
+    });
+    const runInsert = db.prepare(
+      `INSERT INTO strategy_evaluation_runs (
+         run_code,
+         scope_type,
+         scope_reference,
+         start_utc,
+         end_utc,
+         source_timezone,
+         formula_version,
+         status,
+         reason_codes_json,
+         started_at,
+         completed_at,
+         error_message,
+         created_at,
+         updated_at
+       ) VALUES (?, 'meter_device', ?, ?, ?, ?, ?, 'running', NULL, ?, NULL, NULL, ?, ?)`
+    ).run(
+      runCode,
+      scopeReference,
+      normalizedInput.loadSummaryInput.startUtc,
+      normalizedInput.loadSummaryInput.endUtc,
+      normalizedInput.loadSummaryInput.sourceTimeZone,
+      SUPPORTED_FORMULA_VERSION,
+      nowUtc,
+      nowUtc,
+      nowUtc
+    );
+    const evaluationRunId = Number(runInsert.lastInsertRowid);
+    const preview = previewEnergyStrategies({
+      ...normalizedInput.loadSummaryInput,
+      ruleCodes: normalizedInput.ruleCodes
+    }, { db });
+    const hitIds = preview.evaluations.map((evaluation) => insertStrategyRuleHit(
+      db,
+      evaluationRunId,
+      evaluation,
+      preview,
+      nowUtc
+    ));
+    const completedAt = new Date().toISOString();
+    const runReasonCodes = [...new Set(preview.evaluations.flatMap((evaluation) => (
+      evaluation.reasonCodes || []
+    )))];
+    db.prepare(
+      `UPDATE strategy_evaluation_runs
+          SET status = 'completed',
+              reason_codes_json = ?,
+              completed_at = ?,
+              updated_at = ?
+        WHERE id = ?`
+    ).run(
+      runReasonCodes.length > 0 ? JSON.stringify(runReasonCodes) : null,
+      completedAt,
+      completedAt,
+      evaluationRunId
+    );
+    const hits = hitIds.map((hitId) => getStrategyRuleHitWithDb(db, hitId));
+    const operationLogId = writeOperationAuditWithDb(db, options, {
+      operation: 'energy.strategy.run',
+      targetType: 'energy_strategy',
+      targetId: evaluationRunId,
+      detail: {
+        runCode,
+        selectedRuleCount: preview.ruleSelection.selectedRuleCount,
+        hitIds
+      },
+      createdAt: completedAt
+    });
+    const response = {
+      contractVersion: preview.contractVersion,
+      formulaVersion: preview.formulaVersion,
+      dryRun: false,
+      persistsEvaluationRun: true,
+      run: {
+        id: evaluationRunId,
+        runCode,
+        scopeType: 'meter_device',
+        scopeReference: parseStoredJson(scopeReference),
+        status: 'completed',
+        reasonCodes: runReasonCodes,
+        startedAt: nowUtc,
+        completedAt
+      },
+      ruleSelection: preview.ruleSelection,
+      dataSelection: preview.dataSelection,
+      scope: preview.scope,
+      dataRange: preview.dataRange,
+      dataSummary: preview.dataSummary,
+      dataSummaryDigest: preview.dataSummaryDigest,
+      hits,
+      automationBoundary: { ...AUTOMATION_BOUNDARY },
+      usesAI: false,
+      issuesControlCommand: false,
+      changesDeviceState: false,
+      requiresManualReview: true,
+      meta: {
+        callerDatabaseConnection: callerDatabase !== null,
+        reusedCallerTransaction: !shouldOwnWriteTransaction,
+        writesEvaluationRuns: true,
+        writesRuleHits: true,
+        writesOperationAudit: true,
+        operationLogId,
+        writeTransaction: 'atomic'
+      }
+    };
+    if (ownedWriteTransactionActive) {
+      db.exec('COMMIT');
+      ownedWriteTransactionActive = false;
+    }
+    return response;
+  } catch (error) {
+    if (ownedWriteTransactionActive && db.inTransaction === true) {
+      try {
+        db.exec('ROLLBACK');
+      } catch (_rollbackError) {
+        // 回滚失败不覆盖原始业务错误。
+      }
+    }
+    throw error;
+  } finally {
+    if (shouldCloseDatabase) db.close();
+  }
+}
+
+/**
+ * 规范策略命中人工状态输入。
+ * @param {*} input 原始输入。
+ * @returns {object} 规范人工状态和备注。
+ */
+function normalizeStrategyHitStatusInput(input) {
+  if (!isPlainObject(input)) {
+    throw badRequest('策略命中人工状态输入必须是对象。', {
+      code: 'INVALID_STRATEGY_HIT_STATUS_INPUT'
+    });
+  }
+  const manualStatus = typeof input.manualStatus === 'string' ? input.manualStatus.trim() : '';
+  if (!MANUAL_HANDLING_STATUSES.includes(manualStatus) || manualStatus === 'unconfirmed') {
+    throw badRequest('manualStatus 只允许 accepted、rejected 或 resolved。', {
+      code: 'INVALID_STRATEGY_HIT_MANUAL_STATUS',
+      allowedValues: ['accepted', 'rejected', 'resolved']
+    });
+  }
+  let reviewNote = null;
+  if (input.reviewNote !== undefined && input.reviewNote !== null && input.reviewNote !== '') {
+    if (typeof input.reviewNote !== 'string'
+      || input.reviewNote.trim() === ''
+      || input.reviewNote.length > MAX_STRATEGY_REVIEW_NOTE_LENGTH) {
+      throw badRequest(`reviewNote 必须是长度不超过 ${MAX_STRATEGY_REVIEW_NOTE_LENGTH} 的非空字符串。`, {
+        code: 'INVALID_STRATEGY_HIT_REVIEW_NOTE',
+        maximumLength: MAX_STRATEGY_REVIEW_NOTE_LENGTH
+      });
+    }
+    reviewNote = input.reviewNote.trim();
+  }
+  if ((manualStatus === 'rejected' || manualStatus === 'resolved') && !reviewNote) {
+    throw badRequest('拒绝或解决策略命中时必须填写 reviewNote。', {
+      code: 'STRATEGY_HIT_REVIEW_NOTE_REQUIRED',
+      manualStatus
+    });
+  }
+  return { manualStatus, reviewNote };
+}
+
+/**
+ * 规范策略命中 ID。
+ * @param {*} value 原始 ID。
+ * @returns {number} 正整数 ID。
+ */
+function normalizeStrategyHitId(value) {
+  const normalizedText = typeof value === 'number' ? String(value) : value;
+  if (typeof normalizedText !== 'string' || !/^\d+$/.test(normalizedText.trim())) {
+    throw badRequest('hitId 必须是正整数。', { code: 'INVALID_STRATEGY_HIT_ID' });
+  }
+  const hitId = Number(normalizedText.trim());
+  if (!Number.isSafeInteger(hitId) || hitId <= 0) {
+    throw badRequest('hitId 必须是正整数。', { code: 'INVALID_STRATEGY_HIT_ID' });
+  }
+  return hitId;
+}
+
+/**
+ * 更新策略命中人工状态并保留复核时间和备注。
+ * @param {*} hitId 原始命中 ID。
+ * @param {*} input 状态更新输入。
+ * @param {object} options 可注入调用方 SQLite 连接、操作者、IP 和审计写入器。
+ * @returns {object} 更新后的命中记录。
+ */
+function updateStrategyRuleHitStatus(hitId, input, options = {}) {
+  const normalizedHitId = normalizeStrategyHitId(hitId);
+  const normalizedInput = normalizeStrategyHitStatusInput(input);
+  requireAuditActorUserId(options);
+  const callerDatabase = isPlainObject(options) && options.db ? options.db : null;
+  const db = callerDatabase || database.openDatabase();
+  const shouldCloseDatabase = callerDatabase === null;
+  const shouldOwnWriteTransaction = db.inTransaction !== true;
+  let ownedWriteTransactionActive = false;
+  try {
+    if (shouldOwnWriteTransaction) {
+      db.exec('BEGIN IMMEDIATE');
+      ownedWriteTransactionActive = true;
+    }
+    const existing = getStrategyRuleHitWithDb(db, normalizedHitId);
+    if (!existing) {
+      throw notFound('策略规则命中不存在。', { hitId: normalizedHitId });
+    }
+    const allowedTargets = STRATEGY_HIT_STATUS_TRANSITIONS[existing.manualStatus] || [];
+    if (!allowedTargets.includes(normalizedInput.manualStatus)) {
+      throw new AppError('STRATEGY_HIT_STATUS_CONFLICT', '策略命中状态不允许执行该流转。', {
+        statusCode: 409,
+        details: {
+          hitId: normalizedHitId,
+          currentStatus: existing.manualStatus,
+          targetStatus: normalizedInput.manualStatus,
+          allowedTargets
+        }
+      });
+    }
+    const reviewedAt = new Date().toISOString();
+    db.prepare(
+      `UPDATE strategy_rule_hits
+          SET manual_status = ?,
+              reviewed_at = ?,
+              review_note = ?,
+              updated_at = ?
+        WHERE id = ?`
+    ).run(
+      normalizedInput.manualStatus,
+      reviewedAt,
+      normalizedInput.reviewNote,
+      reviewedAt,
+      normalizedHitId
+    );
+    const updated = getStrategyRuleHitWithDb(db, normalizedHitId);
+    writeOperationAuditWithDb(db, options, {
+      operation: 'energy.strategy.hit.review',
+      targetType: 'energy_strategy',
+      targetId: normalizedHitId,
+      detail: {
+        evaluationRunId: updated.evaluationRunId,
+        previousManualStatus: existing.manualStatus,
+        manualStatus: updated.manualStatus,
+        reviewNote: updated.reviewNote
+      },
+      createdAt: reviewedAt
+    });
+    if (ownedWriteTransactionActive) {
+      db.exec('COMMIT');
+      ownedWriteTransactionActive = false;
+    }
+    return updated;
+  } catch (error) {
+    if (ownedWriteTransactionActive && db.inTransaction === true) {
+      try {
+        db.exec('ROLLBACK');
+      } catch (_rollbackError) {
+        // 回滚失败不覆盖原始业务错误。
+      }
+    }
+    throw error;
+  } finally {
+    if (shouldCloseDatabase) db.close();
+  }
+}
+
 module.exports = {
   DEFAULT_MAX_EVIDENCE_ITEMS,
   MAX_EVIDENCE_ITEMS,
   MAX_RULE_CODES,
+  MAX_STRATEGY_REVIEW_NOTE_LENGTH,
   MAX_STRATEGY_RULES,
+  STRATEGY_HIT_STATUS_TRANSITIONS,
   SUPPORTED_FORMULA_VERSION,
   SUPPORTED_METRIC_CODES,
   createDataSummaryDigest,
+  getStrategyRuleHitWithDb,
+  insertOperationLogWithDb,
+  mapStrategyRuleHitRow,
   normalizeRuleCodes,
+  normalizeStrategyHitStatusInput,
   parseEvidenceRequirements,
   previewEnergyStrategies,
-  stableStringify
+  runEnergyStrategyEvaluation,
+  stableStringify,
+  updateStrategyRuleHitStatus
 };

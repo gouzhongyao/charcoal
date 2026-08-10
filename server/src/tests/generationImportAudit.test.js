@@ -9,6 +9,7 @@ process.env.DATA_DIR = path.join(tmpDir, 'data');
 process.env.SQLITE_PATH = path.join(process.env.DATA_DIR, 'generation-import-audit.sqlite');
 process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
 process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
+process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 process.env.GENERATION_RECORD_IMPORT_HMAC_SECRET = 'test-generation-record-import-audit-secret';
 
 const { getDatabaseInfo, initDatabase, openDatabase } = require('../db/database');

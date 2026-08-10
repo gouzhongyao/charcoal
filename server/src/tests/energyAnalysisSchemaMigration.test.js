@@ -14,7 +14,7 @@ process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
 process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
-// 阶段 2 必须创建的二十一张业务表。
+// 阶段 2 必须创建的二十二张业务表。
 const EXPECTED_TABLES = [
   'energy_timeseries_records',
   'shift_definitions',
@@ -34,6 +34,7 @@ const EXPECTED_TABLES = [
   'energy_flow_records',
   'energy_balance_boundaries',
   'energy_balance_items',
+  'energy_balance_calculation_runs',
   'energy_balance_snapshots',
   'energy_balance_snapshot_items',
   'energy_balance_suggestions'
@@ -70,7 +71,10 @@ const EXPECTED_INDEXES = [
   'idx_strategy_hits_run_status',
   'idx_benchmark_definitions_match',
   'idx_energy_flow_records_edge_range',
+  'idx_energy_balance_runs_boundary_created',
+  'idx_energy_balance_snapshots_run',
   'idx_energy_balance_snapshots_boundary_range',
+  'idx_energy_balance_suggestions_run_status',
   'idx_energy_balance_suggestions_snapshot_status'
 ];
 
@@ -715,6 +719,13 @@ try {
       (boundary_code, boundary_name, organization_unit_id, source, version, effective_start_utc, effective_end_utc, source_timezone)
       VALUES ('EA-BAL', '隔离平衡边界', ?, '测试人工配置', 'energy-balance:v1',
        '2026-01-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z', 'Asia/Shanghai')`).run(organizationUnitId).lastInsertRowid;
+    const calculationRunId = 'schema-new-run-1';
+    newDb.prepare(`INSERT INTO energy_balance_calculation_runs
+      (calculation_run_id, energy_balance_boundary_id, start_utc, end_utc,
+       source_timezone, source_data_digest, formula_version, conversion_formula_version)
+      VALUES (?, ?, '2026-07-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z',
+       'Asia/Shanghai', 'sha256:test', 'energy-balance:v1', 'standard-coal-conversion:v1')`)
+      .run(calculationRunId, boundaryId);
     assertConstraintFailure(
       () => newDb.prepare(`INSERT INTO energy_balance_items
         (energy_balance_boundary_id, item_code, item_name, role, energy_type_id, original_unit, source_type, source_mapping_json)
@@ -732,11 +743,18 @@ try {
     );
 
     // 任一 kgce 汇总存在时必须记录有效且非空的实际系数版本集合。
+    const factorCalculationRunId = 'schema-factor-run';
+    newDb.prepare(`INSERT INTO energy_balance_calculation_runs
+      (calculation_run_id, energy_balance_boundary_id, start_utc, end_utc,
+       source_timezone, source_data_digest, formula_version, conversion_formula_version)
+      VALUES (?, ?, '2026-06-01T00:00:00Z', '2026-07-01T00:00:00Z',
+       'Asia/Shanghai', 'sha256:factor-test', 'energy-balance:v1', 'standard-coal-conversion:v1')`)
+      .run(factorCalculationRunId, boundaryId);
     const insertBalanceSnapshot = newDb.prepare(`INSERT INTO energy_balance_snapshots
-      (energy_balance_boundary_id, energy_type_id, start_utc, end_utc, source_timezone, original_unit,
+      (calculation_run_id, energy_balance_boundary_id, energy_type_id, start_utc, end_utc, source_timezone, original_unit,
        input_total_original, output_total_original, unexplained_original, input_total_kgce, output_total_kgce,
        unexplained_kgce, actual_factor_versions_json, formula_version, completeness_rate, source_data_digest)
-      VALUES (?, ?, '2026-06-01T00:00:00Z', '2026-07-01T00:00:00Z', 'Asia/Shanghai', 'kWh',
+      VALUES (?, ?, ?, '2026-06-01T00:00:00Z', '2026-07-01T00:00:00Z', 'Asia/Shanghai', 'kWh',
        10, 8, 2, ?, ?, ?, ?, 'energy-balance:v1', 1, ?)`);
     const invalidFactorVersionsJsonValues = [
       null,
@@ -753,44 +771,120 @@ try {
       '[1]',
       '{"factor":1}'
     ];
-    invalidFactorVersionsJsonValues.forEach((factorVersionsJson, index) => {
+    invalidFactorVersionsJsonValues.forEach((factorVersionsJson) => {
       assertConstraintFailure(
-        () => insertBalanceSnapshot.run(boundaryId, energyTypeId, 1, 0.8, 0.2, factorVersionsJson, `sha256:bad-factor-${index}`),
+        () => insertBalanceSnapshot.run(factorCalculationRunId, boundaryId, energyTypeId, 1, 0.8, 0.2, factorVersionsJson, 'sha256:factor-test'),
         'kgce 汇总必须拒绝缺失、空白、嵌套或非字符串的实际系数版本 JSON。'
       );
     });
-    const objectFactorSnapshotId = insertBalanceSnapshot.run(boundaryId, energyTypeId,
-      1, 0.8, 0.2, '{"electricity":"v1"}', 'sha256:object-factor').lastInsertRowid;
+    const objectFactorSnapshotId = insertBalanceSnapshot.run(factorCalculationRunId, boundaryId, energyTypeId,
+      1, 0.8, 0.2, '{"electricity":"v1"}', 'sha256:factor-test').lastInsertRowid;
     assert(objectFactorSnapshotId, '非空字符串键值对象应作为合法系数版本集合。');
-    const originalOnlySnapshotId = insertBalanceSnapshot.run(boundaryId, energyTypeId,
-      null, null, null, null, 'sha256:original-only').lastInsertRowid;
+    const originalOnlySnapshotId = insertBalanceSnapshot.run(factorCalculationRunId, boundaryId, energyTypeId,
+      null, null, null, null, 'sha256:factor-test').lastInsertRowid;
     assert(originalOnlySnapshotId, '纯原单位快照不得强制要求折标系数版本。');
 
     const snapshotId = newDb.prepare(`INSERT INTO energy_balance_snapshots
-      (energy_balance_boundary_id, energy_type_id, start_utc, end_utc, source_timezone, original_unit,
+      (calculation_run_id, energy_balance_boundary_id, energy_type_id, start_utc, end_utc, source_timezone, original_unit,
        input_total_original, output_total_original, unexplained_original, input_total_kgce, output_total_kgce, unexplained_kgce,
        actual_factor_versions_json, formula_version, utilization_rate, loss_rate, completeness_rate, confirmation_status, source_data_digest)
-      VALUES (?, ?, '2026-07-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z', 'Asia/Shanghai', 'kWh',
-       100, 90, 10, 12.29, 11.061, 1.229, '["electricity:v1"]', 'energy-balance:v1', 0.8, 0.1, 1, 'unconfirmed', 'sha256:test')`).run(boundaryId, energyTypeId).lastInsertRowid;
+      VALUES (?, ?, ?, '2026-07-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z', 'Asia/Shanghai', 'kWh',
+       100, 90, 10, 12.29, 11.061, 1.229, '["electricity:v1"]', 'energy-balance:v1', 0.8, 0.1, 1, 'unconfirmed', 'sha256:test')`)
+      .run(calculationRunId, boundaryId, energyTypeId).lastInsertRowid;
     const insertBalanceSnapshotItem = newDb.prepare(`INSERT INTO energy_balance_snapshot_items
-      (energy_balance_snapshot_id, energy_balance_item_id, role, energy_type_id, original_unit, original_value,
-       actual_factor_version, actual_factor_value, kgce_value, formula_version, source_mapping_json)
-      VALUES (?, ?, 'input', ?, 'kWh', 100, ?, ?, ?, 'energy-balance:v1', '{"reference":"test:balance"}')`);
+      (calculation_run_id, energy_balance_snapshot_id, energy_balance_item_id, item_code, item_name,
+       role, energy_type_id, original_unit, original_value, actual_factor_version, actual_factor_value,
+       kgce_value, formula_version, source_mapping_json)
+      VALUES (?, ?, ?, 'SCHEMA-INPUT', 'Schema 输入项目', 'input', ?, 'kWh', 100, ?, ?, ?,
+       'energy-balance:v1', '{"reference":"test:balance"}')`);
     assertConstraintFailure(
-      () => insertBalanceSnapshotItem.run(snapshotId, balanceItemId, energyTypeId, null, 0.1229, 12.29),
+      () => insertBalanceSnapshotItem.run(calculationRunId, snapshotId, balanceItemId, energyTypeId, null, 0.1229, 12.29),
       '快照项目 kgce_value 非空时必须记录实际系数版本。'
     );
     assertConstraintFailure(
-      () => insertBalanceSnapshotItem.run(snapshotId, balanceItemId, energyTypeId, 'electricity-factor:v1', null, 12.29),
+      () => insertBalanceSnapshotItem.run(calculationRunId, snapshotId, balanceItemId, energyTypeId, 'electricity-factor:v1', null, 12.29),
       '快照项目 kgce_value 非空时必须记录正数实际系数值。'
     );
-    insertBalanceSnapshotItem.run(originalOnlySnapshotId, balanceItemId, energyTypeId, null, null, null);
-    insertBalanceSnapshotItem.run(snapshotId, balanceItemId, energyTypeId, 'electricity-factor:v1', 0.1229, 12.29);
+    insertBalanceSnapshotItem.run(factorCalculationRunId, originalOnlySnapshotId, balanceItemId, energyTypeId, null, null, null);
+    insertBalanceSnapshotItem.run(calculationRunId, snapshotId, balanceItemId, energyTypeId, 'electricity-factor:v1', 0.1229, 12.29);
     assertConstraintFailure(
       () => newDb.prepare(`INSERT INTO energy_balance_suggestions
-        (energy_balance_snapshot_id, suggestion_code, title, content, priority, evidence_json, manual_status)
-        VALUES (?, 'EA-SUG', '建议', '仅供人工核查', 'high', '["snapshot"]', 'pending')`).run(snapshotId),
+        (calculation_run_id, energy_balance_snapshot_id, suggestion_code, title, content, priority, evidence_json, manual_status)
+        VALUES (?, ?, 'EA-SUG', '建议', '仅供人工核查', 'high', '["snapshot"]', 'pending')`)
+        .run(calculationRunId, snapshotId),
       '建议人工状态必须使用 unconfirmed/accepted/rejected/resolved。'
+    );
+
+    // 快照、快照项目和建议必须绑定同一一等运行身份，内容摘要不能替代运行分组。
+    const secondCalculationRunId = 'schema-new-run-2';
+    newDb.prepare(`INSERT INTO energy_balance_calculation_runs
+      (calculation_run_id, energy_balance_boundary_id, start_utc, end_utc,
+       source_timezone, source_data_digest, formula_version, conversion_formula_version)
+      VALUES (?, ?, '2026-07-01T00:00:00Z', '2026-08-01T00:00:00Z',
+       'Asia/Shanghai', 'sha256:test', 'energy-balance:v1', 'standard-coal-conversion:v1')`)
+      .run(secondCalculationRunId, boundaryId);
+    const snapshotColumns = new Map(newDb.prepare('PRAGMA table_info(energy_balance_snapshots)').all()
+      .map((column) => [column.name, column]));
+    const snapshotItemColumns = new Map(newDb.prepare('PRAGMA table_info(energy_balance_snapshot_items)').all()
+      .map((column) => [column.name, column]));
+    const suggestionColumns = new Map(newDb.prepare('PRAGMA table_info(energy_balance_suggestions)').all()
+      .map((column) => [column.name, column]));
+    assert.strictEqual(snapshotColumns.get('calculation_run_id').notnull, 1);
+    assert.strictEqual(snapshotItemColumns.get('calculation_run_id').notnull, 1);
+    assert.strictEqual(snapshotItemColumns.get('item_code').notnull, 1);
+    assert.strictEqual(snapshotItemColumns.get('item_name').notnull, 1);
+    assert.strictEqual(suggestionColumns.get('calculation_run_id').notnull, 1);
+    assert(suggestionColumns.has('reviewed_by_user_id'));
+    assert.throws(
+      () => newDb.prepare("UPDATE energy_balance_calculation_runs SET source_data_digest = 'sha256:changed' WHERE calculation_run_id = ?")
+        .run(calculationRunId),
+      /energy balance calculation run immutable/,
+      '计算运行创建后不得修改身份或来源元数据。'
+    );
+    assert.throws(
+      () => newDb.prepare("UPDATE energy_balance_snapshots SET source_data_digest = 'sha256:changed' WHERE id = ?")
+        .run(snapshotId),
+      /energy balance snapshot run metadata mismatch/,
+      '快照更新后仍须与所属计算运行保持元数据一致。'
+    );
+    assert.throws(
+      () => newDb.prepare(`INSERT INTO energy_balance_snapshots
+        (calculation_run_id, energy_balance_boundary_id, energy_type_id, start_utc, end_utc,
+         source_timezone, original_unit, input_total_original, output_total_original,
+         unexplained_original, formula_version, completeness_rate, source_data_digest)
+        VALUES (?, ?, ?, '2026-07-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z',
+         'Asia/Shanghai', 'kWh', 10, 8, 2, 'energy-balance:v1', 1, 'sha256:mismatch')`)
+        .run(calculationRunId, boundaryId, energyTypeId),
+      /energy balance snapshot run metadata mismatch/,
+      '快照插入时必须与所属计算运行保持元数据一致。'
+    );
+    assert.throws(
+      () => newDb.prepare('UPDATE energy_balance_snapshots SET calculation_run_id = ? WHERE id = ?')
+        .run(secondCalculationRunId, snapshotId),
+      /energy balance snapshot (run immutable|run metadata mismatch)/,
+      '快照创建后不得换绑到其他运行并使既有项目或建议失配。'
+    );
+    assert.throws(
+      () => insertBalanceSnapshotItem.run(
+        secondCalculationRunId,
+        snapshotId,
+        balanceItemId,
+        energyTypeId,
+        'electricity-factor:v1',
+        0.1229,
+        12.29
+      ),
+      /energy balance snapshot item run mismatch/,
+      '快照项目不得绑定到所属快照之外的其他运行。'
+    );
+    assert.throws(
+      () => newDb.prepare(`INSERT INTO energy_balance_suggestions
+        (calculation_run_id, energy_balance_snapshot_id, suggestion_code, title, content, priority,
+         evidence_json, manual_status)
+        VALUES (?, ?, 'EA-RUN-MISMATCH', '建议', '仅供人工核查', 'high', '["snapshot"]', 'unconfirmed')`)
+        .run(secondCalculationRunId, snapshotId),
+      /energy balance suggestion run mismatch/,
+      '建议不得绑定到所属快照之外的其他运行。'
     );
 
     const tableSqlAssertions = [
@@ -858,6 +952,209 @@ try {
     assert.deepStrictEqual(upgradedDb.prepare('PRAGMA foreign_key_check').all(), [], '旧库升级和二次初始化后外键检查必须通过。');
   } finally {
     upgradedDb.close();
+  }
+
+  // 旧平衡库相同摘要的历史快照必须逐条回填独立运行 ID，子记录按所属快照绑定且迁移幂等。
+  const legacyBalancePath = path.join(dataDir, 'energy-balance-run-legacy.sqlite');
+  const legacyBalanceModule = loadDatabaseModule(legacyBalancePath);
+  const legacyBalanceDb = legacyBalanceModule.openDatabase();
+  try {
+    legacyBalanceDb.exec(`CREATE TABLE sys_users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT
+    );
+    CREATE TABLE energy_balance_boundaries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT
+    );
+    CREATE TABLE energy_balance_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      item_code TEXT NOT NULL,
+      item_name TEXT NOT NULL
+    );
+    CREATE TABLE energy_balance_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      energy_balance_boundary_id INTEGER NOT NULL,
+      start_utc TEXT NOT NULL,
+      end_utc TEXT NOT NULL,
+      source_timezone TEXT NOT NULL,
+      source_data_digest TEXT NOT NULL,
+      formula_version TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (energy_balance_boundary_id) REFERENCES energy_balance_boundaries(id) ON DELETE RESTRICT
+    );
+    CREATE TABLE energy_balance_snapshot_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      energy_balance_snapshot_id INTEGER NOT NULL,
+      energy_balance_item_id INTEGER NOT NULL,
+      role TEXT NOT NULL,
+      FOREIGN KEY (energy_balance_snapshot_id) REFERENCES energy_balance_snapshots(id) ON DELETE CASCADE
+    );
+    CREATE TABLE energy_balance_suggestions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      energy_balance_snapshot_id INTEGER NOT NULL,
+      manual_status TEXT NOT NULL,
+      priority TEXT NOT NULL,
+      FOREIGN KEY (energy_balance_snapshot_id) REFERENCES energy_balance_snapshots(id) ON DELETE CASCADE
+    );
+    INSERT INTO energy_balance_boundaries (id) VALUES (1);
+    INSERT INTO energy_balance_items (id, item_code, item_name)
+    VALUES (1, 'LEGACY-INPUT', '旧输入项目'), (2, 'LEGACY-OUTPUT', '旧输出项目');
+    INSERT INTO energy_balance_snapshots
+      (id, energy_balance_boundary_id, start_utc, end_utc, source_timezone,
+       source_data_digest, formula_version, created_at)
+    VALUES
+      (1, 1, '2026-06-30T16:00:00.000Z', '2026-07-31T16:00:00.000Z',
+       'Asia/Shanghai', 'sha256:legacy-same-input', 'energy-balance:v1', '2026-08-01T00:00:00.000Z'),
+      (2, 1, '2026-06-30T16:00:00.000Z', '2026-07-31T16:00:00.000Z',
+       'Asia/Shanghai', 'sha256:legacy-same-input', 'energy-balance:v1', '2026-08-01T00:00:00.000Z');
+    INSERT INTO energy_balance_snapshot_items
+      (id, energy_balance_snapshot_id, energy_balance_item_id, role)
+    VALUES (1, 1, 1, 'input'), (2, 2, 2, 'output');
+    INSERT INTO energy_balance_suggestions
+      (id, energy_balance_snapshot_id, manual_status, priority)
+    VALUES (1, 1, 'unconfirmed', 'high'), (2, 2, 'accepted', 'medium');`);
+
+    assert.strictEqual(
+      legacyBalanceModule.migrateEnergyBalanceCalculationRuns(legacyBalanceDb),
+      true,
+      '首次旧平衡迁移必须补列并回填运行身份。'
+    );
+    const migratedSnapshots = legacyBalanceDb.prepare(`SELECT id,
+        calculation_run_id AS calculationRunId, source_data_digest AS sourceDataDigest
+      FROM energy_balance_snapshots ORDER BY id`).all();
+    assert.deepStrictEqual(migratedSnapshots, [
+      { id: 1, calculationRunId: 'legacy-snapshot-1', sourceDataDigest: 'sha256:legacy-same-input' },
+      { id: 2, calculationRunId: 'legacy-snapshot-2', sourceDataDigest: 'sha256:legacy-same-input' }
+    ]);
+    assert.notStrictEqual(
+      migratedSnapshots[0].calculationRunId,
+      migratedSnapshots[1].calculationRunId,
+      '相同内容摘要的两次历史计算不得被合并为同一运行。'
+    );
+    assert.deepStrictEqual(
+      legacyBalanceDb.prepare(`SELECT energy_balance_snapshot_id AS snapshotId,
+          calculation_run_id AS calculationRunId, item_code AS itemCode, item_name AS itemName
+        FROM energy_balance_snapshot_items ORDER BY id`).all(),
+      [
+        {
+          snapshotId: 1,
+          calculationRunId: 'legacy-snapshot-1',
+          itemCode: 'LEGACY-INPUT',
+          itemName: '旧输入项目'
+        },
+        {
+          snapshotId: 2,
+          calculationRunId: 'legacy-snapshot-2',
+          itemCode: 'LEGACY-OUTPUT',
+          itemName: '旧输出项目'
+        }
+      ]
+    );
+    assert.deepStrictEqual(
+      legacyBalanceDb.prepare(`SELECT energy_balance_snapshot_id AS snapshotId,
+          calculation_run_id AS calculationRunId, reviewed_by_user_id AS reviewedByUserId
+        FROM energy_balance_suggestions ORDER BY id`).all(),
+      [
+        { snapshotId: 1, calculationRunId: 'legacy-snapshot-1', reviewedByUserId: null },
+        { snapshotId: 2, calculationRunId: 'legacy-snapshot-2', reviewedByUserId: null }
+      ]
+    );
+    assert.strictEqual(
+      legacyBalanceDb.prepare("SELECT COUNT(*) AS total FROM energy_balance_calculation_runs WHERE source_data_digest = 'sha256:legacy-same-input'").get().total,
+      2,
+      '内容摘要只能作为指纹，必须保留两条独立运行。'
+    );
+    const expectedBalanceTriggerNames = [
+      'trg_energy_balance_calculation_runs_immutable_update',
+      'trg_energy_balance_snapshots_run_insert',
+      'trg_energy_balance_snapshots_run_update',
+      'trg_energy_balance_snapshots_metadata_insert',
+      'trg_energy_balance_snapshots_metadata_update',
+      'trg_energy_balance_snapshot_items_run_insert',
+      'trg_energy_balance_snapshot_items_run_update',
+      'trg_energy_balance_snapshot_items_identity_insert',
+      'trg_energy_balance_snapshot_items_identity_update',
+      'trg_energy_balance_suggestions_run_insert',
+      'trg_energy_balance_suggestions_run_update'
+    ];
+    expectedBalanceTriggerNames.forEach((triggerName) => {
+      assert(
+        legacyBalanceDb.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(triggerName),
+        `旧库迁移后缺少 ${triggerName}。`
+      );
+    });
+    ['idx_energy_balance_runs_boundary_created', 'idx_energy_balance_runs_digest',
+      'idx_energy_balance_snapshots_run', 'idx_energy_balance_snapshot_items_run',
+      'idx_energy_balance_suggestions_run_status'].forEach((indexName) => {
+      assert(
+        legacyBalanceDb.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(indexName),
+        `旧库迁移后缺少 ${indexName}。`
+      );
+    });
+    assert.throws(
+      () => legacyBalanceDb.prepare('UPDATE energy_balance_snapshots SET calculation_run_id = ? WHERE id = 1')
+        .run('legacy-snapshot-2'),
+      /energy balance snapshot (run immutable|run metadata mismatch)/,
+      '旧库迁移后快照运行身份必须保持不可变。'
+    );
+    assert.throws(
+      () => legacyBalanceDb.prepare("UPDATE energy_balance_calculation_runs SET formula_version = 'changed' WHERE calculation_run_id = 'legacy-snapshot-1'").run(),
+      /energy balance calculation run immutable/,
+      '旧库迁移后计算运行身份和元数据必须不可修改。'
+    );
+    assert.throws(
+      () => legacyBalanceDb.prepare("UPDATE energy_balance_snapshots SET source_data_digest = 'sha256:changed' WHERE id = 1").run(),
+      /energy balance snapshot run metadata mismatch/,
+      '旧库迁移后快照元数据必须继续匹配所属运行。'
+    );
+    legacyBalanceDb.prepare(
+      "UPDATE energy_balance_items SET item_code = 'MASTER-RENAMED', item_name = '主项目新名称' WHERE id = 1"
+    ).run();
+    assert.deepStrictEqual(
+      legacyBalanceDb.prepare(
+        'SELECT item_code AS itemCode, item_name AS itemName FROM energy_balance_snapshot_items WHERE id = 1'
+      ).get(),
+      { itemCode: 'LEGACY-INPUT', itemName: '旧输入项目' },
+      '旧库迁移后主项目变更不得污染历史快照标识。'
+    );
+    assert.throws(
+      () => legacyBalanceDb.prepare(
+        "UPDATE energy_balance_snapshot_items SET item_name = '非法历史改写' WHERE id = 1"
+      ).run(),
+      /energy balance snapshot item identity immutable/,
+      '旧库迁移后快照项目标识必须保持不可变。'
+    );
+    assert.throws(
+      () => legacyBalanceDb.prepare(`INSERT INTO energy_balance_snapshot_items
+        (energy_balance_snapshot_id, energy_balance_item_id, item_code, item_name, role, calculation_run_id)
+        VALUES (1, 1, 'LEGACY-INPUT', '旧输入项目', 'input', 'legacy-snapshot-2')`).run(),
+      /energy balance snapshot item run mismatch/,
+      '旧库迁移后快照项目不得跨运行绑定。'
+    );
+    assert.throws(
+      () => legacyBalanceDb.prepare(`INSERT INTO energy_balance_suggestions
+        (energy_balance_snapshot_id, manual_status, priority, calculation_run_id)
+        VALUES (1, 'unconfirmed', 'high', 'legacy-snapshot-2')`).run(),
+      /energy balance suggestion run mismatch/,
+      '旧库迁移后建议不得跨运行绑定。'
+    );
+    assert.throws(
+      () => legacyBalanceDb.prepare(`INSERT INTO energy_balance_snapshots
+        (energy_balance_boundary_id, start_utc, end_utc, source_timezone,
+         source_data_digest, formula_version, created_at)
+        VALUES (1, '2026-07-31T16:00:00.000Z', '2026-08-31T16:00:00.000Z',
+         'Asia/Shanghai', 'sha256:no-run', 'energy-balance:v1', '2026-09-01T00:00:00.000Z')`).run(),
+      /energy balance snapshot (run required|run metadata mismatch)/,
+      '旧库补列后新增快照必须显式绑定运行。'
+    );
+    assert.strictEqual(
+      legacyBalanceModule.migrateEnergyBalanceCalculationRuns(legacyBalanceDb),
+      false,
+      '二次运行身份迁移不得重复回填或新增运行。'
+    );
+    assert.strictEqual(legacyBalanceDb.prepare('SELECT COUNT(*) AS total FROM energy_balance_calculation_runs').get().total, 2);
+    assert.deepStrictEqual(legacyBalanceDb.prepare('PRAGMA foreign_key_check').all(), []);
+  } finally {
+    legacyBalanceDb.close();
   }
 
   // 已有来源两列但缺少外键的部分迁移库必须安全重建，并替换同名弱触发器。

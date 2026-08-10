@@ -8,6 +8,7 @@ process.env.DATA_DIR = path.join(tmpDir, 'data');
 process.env.SQLITE_PATH = path.join(process.env.DATA_DIR, 'generation-import-execute.sqlite');
 process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
 process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
+process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
 const { initDatabase, openDatabase } = require('../db/database');
 const backupService = require('../services/backupService');

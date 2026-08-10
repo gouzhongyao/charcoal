@@ -958,69 +958,210 @@ async function executeEnergyRecordLedgerBackfill(body = {}) {
   }
 }
 
-function getDashboardSummary() {
+// 驾驶舱月份参数只接受完整自然年内的 YYYY-MM 起止范围。
+const DASHBOARD_MONTH_PATTERN = /^(\d{4})-(0[1-9]|1[0-2])$/;
+
+// 规范化驾驶舱年度摘要范围；无参数时保留原有全月份统计口径。
+function normalizeDashboardSummaryRange(query = {}) {
+  // 通过属性存在性区分“未传参数”和“传入空值”，避免空参数被静默当成兼容模式。
+  const hasStart = Object.prototype.hasOwnProperty.call(query, 'normalizedMonthStart');
+  const hasEnd = Object.prototype.hasOwnProperty.call(query, 'normalizedMonthEnd');
+  if (!hasStart && !hasEnd) {
+    return {
+      filteredByMonth: false,
+      normalizedMonthStart: null,
+      normalizedMonthEnd: null
+    };
+  }
+  if (!hasStart || !hasEnd) {
+    throw badRequest('normalizedMonthStart 与 normalizedMonthEnd 必须同时提供。', {
+      code: 'DASHBOARD_MONTH_RANGE_REQUIRED'
+    });
+  }
+
+  // 起止月份统一去除首尾空白后再执行严格格式校验。
+  const normalizedMonthStart = String(query.normalizedMonthStart ?? '').trim();
+  const normalizedMonthEnd = String(query.normalizedMonthEnd ?? '').trim();
+  [
+    ['normalizedMonthStart', normalizedMonthStart],
+    ['normalizedMonthEnd', normalizedMonthEnd]
+  ].forEach(([fieldName, value]) => {
+    if (!DASHBOARD_MONTH_PATTERN.test(value)) {
+      throw badRequest(`${fieldName} 必须使用 YYYY-MM 格式，且月份范围为 01-12。`, {
+        code: 'INVALID_MONTH_FILTER',
+        fieldName,
+        rawValue: value
+      });
+    }
+  });
+
+  // 驾驶舱年度摘要禁止跨自然年，确保前端年度选择与统计口径一致。
+  if (normalizedMonthStart.slice(0, 4) !== normalizedMonthEnd.slice(0, 4)) {
+    throw badRequest('驾驶舱月份范围必须位于同一自然年。', {
+      code: 'INVALID_DASHBOARD_YEAR_RANGE',
+      normalizedMonthStart,
+      normalizedMonthEnd
+    });
+  }
+  if (normalizedMonthStart > normalizedMonthEnd) {
+    throw badRequest('月份范围开始值不能晚于结束值。', {
+      code: 'INVALID_MONTH_RANGE',
+      normalizedMonthStart,
+      normalizedMonthEnd
+    });
+  }
+
+  return {
+    filteredByMonth: true,
+    normalizedMonthStart,
+    normalizedMonthEnd
+  };
+}
+
+// 构造无领域权限的明确状态，禁止用空对象伪装成功响应。
+function buildUnauthorizedDashboardDomain() {
+  return { authorized: false, status: 'forbidden' };
+}
+
+// 查询驾驶舱能耗与当前导入审计摘要；月份范围只作用于已授权的 active 能耗记录。
+function getDashboardSummary(query = {}, access = {}) {
+  // 即使当前账号无能耗权限，也保留原有月份参数校验契约。
+  const range = normalizeDashboardSummaryRange(query);
+  const energyAuthorized = access.energyAuthorized === true;
+  const importsAuthorized = access.importsAuthorized === true;
+  const energyRangeSql = range.filteredByMonth
+    ? ' AND er.normalized_month >= @normalizedMonthStart AND er.normalized_month <= @normalizedMonthEnd'
+    : '';
+  const energyRangeParams = range.filteredByMonth
+    ? {
+        normalizedMonthStart: range.normalizedMonthStart,
+        normalizedMonthEnd: range.normalizedMonthEnd
+      }
+    : {};
   const db = openDatabase();
   try {
-    const energy = db.prepare(
-      `SELECT
-         COUNT(er.id) AS activeRecordCount,
-         COALESCE(SUM(er.normalized_value), 0) AS totalNormalizedValue,
-         COUNT(DISTINCT et.code) AS energyTypeCount,
-         MIN(er.normalized_month) AS monthStart,
-         MAX(er.normalized_month) AS monthEnd,
-         MAX(er.created_at) AS latestRecordAt
-       FROM energy_records er
-       JOIN energy_types et ON et.id = er.energy_type_id
-       WHERE er.record_status = 'active'`
-    ).get();
-    const batches = db.prepare(
-      `SELECT
-         COUNT(*) AS batchCount,
-         SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completedBatchCount,
-         SUM(CASE WHEN status = 'completed_with_errors' THEN 1 ELSE 0 END) AS completedWithErrorsBatchCount,
-         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failedBatchCount,
-         COALESCE(SUM(success_count), 0) AS importedRowCount,
-         COALESCE(SUM(failure_count), 0) AS failedRowCount,
-         COALESCE(SUM(skipped_count), 0) AS skippedRowCount,
-         MAX(created_at) AS latestBatchAt
-       FROM import_batches`
-    ).get();
-    const errors = db.prepare(
-      `SELECT
-         COUNT(*) AS importErrorCount,
-         SUM(CASE WHEN severity = 'error' THEN 1 ELSE 0 END) AS blockingErrorCount,
-         SUM(CASE WHEN severity = 'warning' THEN 1 ELSE 0 END) AS warningCount
-       FROM import_errors`
-    ).get();
-
-    return {
-      scope: 'energy-records-and-imports-only',
-      excludes: ['carbon-accounting', 'prediction'],
-      energy: {
-        ...energy,
-        totalNormalizedValue: Number(energy.totalNormalizedValue || 0),
+    let energy = buildUnauthorizedDashboardDomain();
+    if (energyAuthorized) {
+      // 兼容总量保留旧有跨单位直接求和口径，新页面不得将其作为权威总量展示。
+      const energySummary = db.prepare(
+        `SELECT
+           COUNT(er.id) AS activeRecordCount,
+           COALESCE(SUM(er.normalized_value), 0) AS totalNormalizedValue,
+           COUNT(DISTINCT et.code) AS energyTypeCount,
+           MIN(er.normalized_month) AS monthStart,
+           MAX(er.normalized_month) AS monthEnd,
+           MAX(er.created_at) AS latestRecordAt
+         FROM energy_records er
+         JOIN energy_types et ON et.id = er.energy_type_id
+         WHERE er.record_status = 'active'${energyRangeSql}`
+      ).get(energyRangeParams);
+      // 单位安全总量按能源类型编码与标准化单位分组，是驾驶舱能耗合计的权威字段。
+      const totals = db.prepare(
+        `SELECT
+           et.code AS energyTypeCode,
+           et.name AS energyTypeName,
+           er.normalized_unit AS normalizedUnit,
+           COUNT(er.id) AS recordCount,
+           COALESCE(SUM(er.normalized_value), 0) AS totalNormalizedValue
+         FROM energy_records er
+         JOIN energy_types et ON et.id = er.energy_type_id
+         WHERE er.record_status = 'active'${energyRangeSql}
+         GROUP BY et.code, et.name, er.normalized_unit, et.display_order
+         ORDER BY et.display_order ASC, et.code ASC, er.normalized_unit ASC`
+      ).all(energyRangeParams).map((row) => ({
+        ...row,
+        recordCount: Number(row.recordCount || 0),
+        totalNormalizedValue: Number(row.totalNormalizedValue || 0)
+      }));
+      energy = {
+        authorized: true,
+        status: Number(energySummary.activeRecordCount || 0) > 0 ? 'available' : 'empty',
+        ...energySummary,
+        totalNormalizedValue: Number(energySummary.totalNormalizedValue || 0),
+        totals,
+        authoritativeTotalField: 'totals',
         monthRange: {
-          start: energy.monthStart,
-          end: energy.monthEnd
+          start: energySummary.monthStart,
+          end: energySummary.monthEnd
+        },
+        scope: {
+          filteredByMonth: range.filteredByMonth,
+          normalizedMonthStart: range.normalizedMonthStart,
+          normalizedMonthEnd: range.normalizedMonthEnd,
+          recordStatus: 'active'
         }
-      },
-      imports: {
+      };
+    }
+
+    let imports = buildUnauthorizedDashboardDomain();
+    let errors = buildUnauthorizedDashboardDomain();
+    if (importsAuthorized) {
+      // 导入批次始终表示当前全量审计摘要，不按驾驶舱能耗年份过滤。
+      const batches = db.prepare(
+        `SELECT
+           COUNT(*) AS batchCount,
+           SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completedBatchCount,
+           SUM(CASE WHEN status = 'completed_with_errors' THEN 1 ELSE 0 END) AS completedWithErrorsBatchCount,
+           SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failedBatchCount,
+           COALESCE(SUM(success_count), 0) AS importedRowCount,
+           COALESCE(SUM(failure_count), 0) AS failedRowCount,
+           COALESCE(SUM(skipped_count), 0) AS skippedRowCount,
+           MAX(created_at) AS latestBatchAt
+         FROM import_batches`
+      ).get();
+      // 导入错误同样保持全量审计口径，不受能耗月份范围影响。
+      const importErrors = db.prepare(
+        `SELECT
+           COUNT(*) AS importErrorCount,
+           SUM(CASE WHEN severity = 'error' THEN 1 ELSE 0 END) AS blockingErrorCount,
+           SUM(CASE WHEN severity = 'warning' THEN 1 ELSE 0 END) AS warningCount
+         FROM import_errors`
+      ).get();
+      imports = {
+        authorized: true,
+        status: Number(batches.batchCount || 0) > 0 ? 'available' : 'empty',
         ...batches,
         completedBatchCount: Number(batches.completedBatchCount || 0),
         completedWithErrorsBatchCount: Number(batches.completedWithErrorsBatchCount || 0),
         failedBatchCount: Number(batches.failedBatchCount || 0),
         importedRowCount: Number(batches.importedRowCount || 0),
         failedRowCount: Number(batches.failedRowCount || 0),
-        skippedRowCount: Number(batches.skippedRowCount || 0)
-      },
-      errors: {
-        ...errors,
-        blockingErrorCount: Number(errors.blockingErrorCount || 0),
-        warningCount: Number(errors.warningCount || 0)
-      },
+        skippedRowCount: Number(batches.skippedRowCount || 0),
+        scope: 'all-import-audit-history'
+      };
+      errors = {
+        authorized: true,
+        status: Number(importErrors.importErrorCount || 0) > 0 ? 'available' : 'empty',
+        ...importErrors,
+        blockingErrorCount: Number(importErrors.blockingErrorCount || 0),
+        warningCount: Number(importErrors.warningCount || 0),
+        scope: 'all-import-audit-history'
+      };
+    }
+
+    // 时间口径提示只描述当前账号已获授权的领域，避免把未授权数据伪装成空数据。
+    const timeScopeNotices = [];
+    if (energyAuthorized) {
+      timeScopeNotices.push(range.filteredByMonth
+        ? `驾驶舱能耗摘要仅统计 ${range.normalizedMonthStart} 至 ${range.normalizedMonthEnd} 的 active 能耗记录。`
+        : '驾驶舱能耗摘要统计全部月份的 active 能耗记录。');
+    }
+    if (importsAuthorized) {
+      timeScopeNotices.push(range.filteredByMonth
+        ? '导入批次与导入错误为当前全量审计摘要，不随该月份范围过滤。'
+        : '导入批次与导入错误为当前全量审计摘要。');
+    }
+
+    return {
+      scope: 'energy-records-and-imports-only',
+      excludes: ['carbon-accounting', 'prediction', 'energy-budget', 'meter-ledger'],
+      energy,
+      imports,
+      errors,
       notices: [
-        '工作台摘要仅基于能耗明细、导入批次和导入错误数量生成。',
-        '本接口不包含碳核算结果、预测结果或伪造图表数据。'
+        ...timeScopeNotices,
+        ...(energyAuthorized ? ['energy.totals 按能源类型和标准化单位分组，是驾驶舱能耗合计的权威字段；totalNormalizedValue 仅为旧契约兼容字段，不用于混合单位展示。'] : []),
+        '本接口不包含碳核算、预测、用能预算、计量器具聚合或伪造图表数据。'
       ]
     };
   } finally {

@@ -31,9 +31,22 @@ function featurePending(featureName, details = {}) {
   });
 }
 
+/** 判断错误是否为 Express JSON 解析器报告的正文超限。 */
+function isPayloadTooLargeError(error) {
+  return error?.type === 'entity.too.large'
+    || Number(error?.statusCode || error?.status) === 413;
+}
+
+/** 将框架和领域错误规范化为稳定、无敏感信息的应用错误。 */
 function normalizeError(error) {
   if (error instanceof AppError) {
     return error;
+  }
+  if (isPayloadTooLargeError(error)) {
+    return new AppError('PAYLOAD_TOO_LARGE', '请求正文超过允许大小。', {
+      statusCode: 413,
+      details: null
+    });
   }
 
   return new AppError('INTERNAL_ERROR', '服务内部错误', {
@@ -47,6 +60,7 @@ module.exports = {
   badRequest,
   featurePending,
   invalidBackup,
+  isPayloadTooLargeError,
   normalizeError,
   notFound
 };
