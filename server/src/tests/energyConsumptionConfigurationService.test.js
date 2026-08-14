@@ -116,17 +116,28 @@ function testShiftConfigurationLifecycle(actorUserId) {
   }, createOptions(actorUserId));
   assert.strictEqual(created.shiftCode, 'SHIFT-DAY');
   assert.strictEqual(created.status, 'active');
+  assert.strictEqual(created.effectiveStartUtc, EFFECTIVE_START_UTC, '首版本必须接受前端 API 边界的 .000Z 时间。');
+  assert.strictEqual(created.effectiveEndUtc, EFFECTIVE_END_UTC);
   assert.strictEqual(created.audit.atomic, true);
 
+  // 新版本载荷与前端 buildEnergyAnalysisConfigPayload(hasSource=true) 保持一致，不重复提交冻结编码。
   const versioned = createShiftDefinitionVersion(created.id, {
     shiftName: '白班调整版',
+    startMinute: 480,
     endMinute: 1080,
+    crossesMidnight: false,
+    sourceTimeZone: SOURCE_TIME_ZONE,
+    source: 'manual-config-test',
     version: 'shift-day:v2',
+    effectiveStartUtc: EFFECTIVE_START_UTC,
+    effectiveEndUtc: EFFECTIVE_END_UTC,
     status: 'active'
   }, createOptions(actorUserId));
   assert.strictEqual(versioned.id > created.id, true);
   assert.strictEqual(versioned.version, 'shift-day:v2');
   assert.strictEqual(versioned.endMinute, 1080);
+  assert.strictEqual(versioned.effectiveStartUtc, EFFECTIVE_START_UTC, '新版本必须接受前端 API 边界的 .000Z 时间。');
+  assert.strictEqual(versioned.effectiveEndUtc, EFFECTIVE_END_UTC);
 
   const versions = listShiftDefinitions({ code: 'SHIFT-DAY' });
   assert.strictEqual(versions.items.length, 2);

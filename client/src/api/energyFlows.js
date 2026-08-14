@@ -1,4 +1,4 @@
-import { query, request } from '@/api/http';
+import { download, query, request } from '@/api/http';
 import { collectEnergyFlowPaginatedRows } from '@/utils/energyFlow';
 
 // 能流模型与分析 API 根路径。
@@ -53,7 +53,27 @@ export const getEnergyFlowTopology = (modelId, params = {}) => get(`${ENERGY_FLO
 export const analyzeEnergyFlow = (modelId, payload) => request({ method: 'post', url: `${ENERGY_FLOW_BASE_URL}/models/${modelId}/analysis`, data: payload });
 
 // 能流导入预演与执行 API 模块。
+export const previewEnergyFlowModelImport = (file) => request({ method: 'post', url: `${ENERGY_FLOW_IMPORT_BASE_URL}/models/preview`, data: fileForm(file) });
+export const executeEnergyFlowModelImport = (payload) => request({ method: 'post', url: `${ENERGY_FLOW_IMPORT_BASE_URL}/models/execute`, data: payload });
 export const previewEnergyFlowNodeImport = (file) => request({ method: 'post', url: `${ENERGY_FLOW_IMPORT_BASE_URL}/nodes/preview`, data: fileForm(file) });
 export const executeEnergyFlowNodeImport = (payload) => request({ method: 'post', url: `${ENERGY_FLOW_IMPORT_BASE_URL}/nodes/execute`, data: payload });
 export const previewEnergyFlowBundleImport = (file) => request({ method: 'post', url: `${ENERGY_FLOW_IMPORT_BASE_URL}/bundle/preview`, data: fileForm(file) });
 export const executeEnergyFlowBundleImport = (payload) => request({ method: 'post', url: `${ENERGY_FLOW_IMPORT_BASE_URL}/bundle/execute`, data: payload });
+
+/** 下载能流冻结空白模板。 */
+export function downloadEnergyFlowImportTemplate(templateType, extension = 'xlsx') {
+  const safeExtension = extension === 'csv' ? 'csv' : 'xlsx';
+  return download(
+    { url: `/templates/${encodeURIComponent(templateType)}.${safeExtension}` },
+    `能流导入模板.${safeExtension}`
+  );
+}
+
+/** 下载青岚园区能流示例文件。 */
+export function downloadEnergyFlowDemoArtifact(artifactKey, extension = 'xlsx') {
+  const safeExtension = extension === 'csv' ? 'csv' : 'xlsx';
+  return download(
+    { url: `/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}` },
+    `青岚园区能流示例.${safeExtension}`
+  );
+}

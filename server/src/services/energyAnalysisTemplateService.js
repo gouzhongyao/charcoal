@@ -19,8 +19,12 @@ const XLSX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.spreadshee
 // CSV 模板使用的标准 MIME 类型。
 const CSV_MIME_TYPE = 'text/csv; charset=utf-8';
 
-// 模板 8 固定要求的两个工作表名称。
+// 能流边模板固定要求的两个工作表名称。
 const ENERGY_FLOW_EDGE_SHEET_NAMES = Object.freeze(['能流边', '显式边值']);
+// TOU 方案模板固定要求的两个工作表名称。
+const TOU_SCHEME_SHEET_NAMES = Object.freeze(['TOU方案', '时段规则']);
+// 能效平衡配置模板固定要求的两个工作表名称。
+const ENERGY_BALANCE_CONFIG_SHEET_NAMES = Object.freeze(['平衡边界', '九角色项目']);
 
 // XLSX 解析资源上限统一冻结，避免超大文件、压缩炸弹和异常稀疏工作表耗尽本机资源。
 const ENERGY_ANALYSIS_TEMPLATE_LIMITS = Object.freeze({
@@ -47,6 +51,16 @@ const NUMBER_COLUMN_KEYS = new Set([
   'upperBound',
   'frozenValue',
   'sampleCount',
+  'startMinute',
+  'endMinute',
+  'dayOfWeek',
+  'thresholdValue',
+  'thresholdMin',
+  'thresholdMax',
+  'reductionRate',
+  'minimumCoverageRate',
+  'maxEvidenceItems',
+  'explicitBalanceValue',
   'x',
   'y'
 ]);
@@ -121,7 +135,7 @@ function createSheet(name, columns) {
   });
 }
 
-// 八类能源分析模板定义使用无原型对象，避免特殊原型键被误识别为模板。
+// 十三类能源分析与配置模板定义使用无原型对象，避免特殊原型键被误识别为模板。
 const ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS = Object.freeze(Object.assign(Object.create(null), {
   'energy-timeseries': Object.freeze({
     id: 'energy-timeseries',
@@ -142,6 +156,88 @@ const ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS = Object.freeze(Object.assign(Object.
         createColumn('原始值', 'originalValue', ['数值', '用量', '能耗值', 'value', 'sourceValue', 'source_value'], true, '填写该区间的原始能耗值。', 25.5),
         createColumn('来源标识', 'sourceReference', ['来源引用', '数据来源标识', 'reference', 'sourceRef', 'source_ref'], true, '填写可追溯且稳定的来源标识。', 'upload:timeseries:001', ['来源标只', 'sourcereferenc']),
         createColumn('数据来源', 'dataSource', ['来源类型', '录入来源', 'data_source', 'sourceType', 'source_type'], false, '填写 manual、upload 或 calculation 等来源标记。', 'upload')
+      ])
+    ])
+  }),
+  'shift-definitions': Object.freeze({
+    id: 'shift-definitions',
+    name: '班次定义导入模板',
+    baseFileName: '班次定义导入模板',
+    asciiBaseFileName: 'banci-dingyi-template',
+    formats: Object.freeze(['xlsx', 'csv']),
+    sheets: Object.freeze([
+      createSheet('班次定义', [
+        createColumn('班次编码', 'shiftCode', ['班别编码', 'shift_code'], true, '填写稳定且唯一的班次业务编码。', 'QL-SHIFT-DAY'),
+        createColumn('班次名称', 'shiftName', ['班别名称', 'shift_name'], true, '填写班次中文名称。', '青岚白班'),
+        createColumn('开始分钟', 'startMinute', ['班次开始分钟', 'start_minute'], true, '填写来源时区本地自然日内开始分钟，范围 0 至 1439。', 480),
+        createColumn('结束分钟', 'endMinute', ['班次结束分钟', 'end_minute'], true, '填写来源时区本地自然日内结束分钟，范围 0 至 1439。', 1200),
+        createColumn('是否跨日', 'crossesMidnight', ['跨日', 'crosses_midnight'], true, '填写 0/1 或等价布尔值，并与起止分钟保持一致。', 0),
+        createColumn('来源时区', 'sourceTimeZone', ['IANA时区', 'source_timezone'], true, '填写有效 IANA 来源时区；班次分钟按该时区的墙钟语义解释。', 'Asia/Shanghai'),
+        createColumn('来源', 'source', ['定义来源'], true, '填写班次制度来源。', '青岚园区排班制度'),
+        createColumn('版本', 'version', ['定义版本'], true, '填写不可混淆的班次版本。', 'QL-SHIFT:v1'),
+        createColumn('生效开始时间（UTC）', 'effectiveStartUtc', ['有效开始时间', 'effective_start_utc'], true, '填写严格 UTC 秒精度时间，尾部必须为 Z。', '2025-01-01T00:00:00Z'),
+        createColumn('生效结束时间（UTC）', 'effectiveEndUtc', ['有效结束时间', 'effective_end_utc'], true, '填写严格 UTC 秒精度时间，尾部必须为 Z。', '2027-01-01T00:00:00Z'),
+        createColumn('状态', 'status', ['启用状态'], false, '填写 active 或 inactive。', 'active')
+      ])
+    ])
+  }),
+  'tou-schemes': Object.freeze({
+    id: 'tou-schemes',
+    name: 'TOU 方案与时段导入模板',
+    baseFileName: 'TOU方案与时段导入模板',
+    asciiBaseFileName: 'tou-fangan-shiduan-template',
+    formats: Object.freeze(['xlsx']),
+    sheets: Object.freeze([
+      createSheet('TOU方案', [
+        createColumn('方案编码', 'schemeCode', ['TOU方案编码', 'scheme_code'], true, '填写稳定且唯一的 TOU 方案编码。', 'QL-TOU-2026'),
+        createColumn('方案名称', 'schemeName', ['TOU方案名称', 'scheme_name'], true, '填写 TOU 方案中文名称。', '青岚园区峰平谷方案'),
+        createColumn('来源时区', 'sourceTimeZone', ['IANA时区', 'source_timezone'], true, '填写有效 IANA 来源时区；时段分钟按该时区墙钟语义解释。', 'Asia/Shanghai'),
+        createColumn('来源', 'source', ['方案来源'], true, '填写方案业务来源。', '青岚园区用电制度'),
+        createColumn('文号', 'documentNo', ['来源文号', 'document_no'], false, '可填写方案来源文号。', 'QL-TOU-2026-01'),
+        createColumn('版本', 'version', ['方案版本'], true, '填写不可混淆的方案版本。', 'QL-TOU:v1'),
+        createColumn('生效开始时间（UTC）', 'effectiveStartUtc', ['有效开始时间', 'effective_start_utc'], true, '填写严格 UTC 秒精度时间，尾部必须为 Z。', '2025-01-01T00:00:00Z'),
+        createColumn('生效结束时间（UTC）', 'effectiveEndUtc', ['有效结束时间', 'effective_end_utc'], true, '填写严格 UTC 秒精度时间，尾部必须为 Z。', '2027-01-01T00:00:00Z'),
+        createColumn('状态', 'status', ['启用状态'], false, '填写 active 或 inactive。', 'active')
+      ]),
+      createSheet('时段规则', [
+        createColumn('方案编码', 'schemeCode', ['TOU方案编码', 'scheme_code'], true, '填写“TOU方案”工作表中对应的方案编码。', 'QL-TOU-2026'),
+        createColumn('方案版本', 'schemeVersion', ['版本', 'scheme_version'], true, '填写“TOU方案”工作表中对应的版本。', 'QL-TOU:v1'),
+        createColumn('星期序号', 'dayOfWeek', ['星期', 'day_of_week'], true, '填写 1 至 7 的整数。', 1),
+        createColumn('时段类型', 'periodType', ['峰平谷类型', 'period_type'], true, '填写 peak、flat 或 valley。', 'valley'),
+        createColumn('开始分钟', 'startMinute', ['start_minute'], true, '填写本地自然日内开始分钟，范围 0 至 1439。', 0),
+        createColumn('结束分钟', 'endMinute', ['end_minute'], true, '填写结束分钟，范围 1 至 1440；每天规则必须完整覆盖 0 至 1440。', 480)
+      ])
+    ])
+  }),
+  'strategy-rules': Object.freeze({
+    id: 'strategy-rules',
+    name: '策略规则导入模板',
+    baseFileName: '策略规则导入模板',
+    asciiBaseFileName: 'celue-guize-template',
+    formats: Object.freeze(['xlsx', 'csv']),
+    sheets: Object.freeze([
+      createSheet('策略规则', [
+        createColumn('规则编码', 'ruleCode', ['strategyRuleCode', 'rule_code'], true, '填写稳定且唯一的规则编码。', 'QL-STRATEGY-PEAK'),
+        createColumn('规则名称', 'ruleName', ['rule_name'], true, '填写规则中文名称。', '峰段能耗偏高提醒'),
+        createColumn('规则版本', 'ruleVersion', ['rule_version'], true, '填写规则版本。', 'QL-STRATEGY:v1'),
+        createColumn('公式版本', 'formulaVersion', ['formula_version'], true, '填写当前服务支持的固定公式版本。', 'load-analysis:v1'),
+        createColumn('指标编码', 'metricCode', ['metric_code'], true, '填写 load_rate 或 peak_interval_energy。', 'peak_interval_energy'),
+        createColumn('阈值操作符', 'thresholdOperator', ['operator', 'threshold_operator'], true, '填写 gt、gte、lt、lte 或 between。', 'gt'),
+        createColumn('阈值', 'thresholdValue', ['threshold_value'], false, '非 between 操作符填写单一阈值。', 1000),
+        createColumn('阈值下限', 'thresholdMin', ['threshold_min'], false, 'between 操作符填写下限。', ''),
+        createColumn('阈值上限', 'thresholdMax', ['threshold_max'], false, 'between 操作符填写上限。', ''),
+        createColumn('阈值单位', 'thresholdUnit', ['threshold_unit'], true, '填写指标阈值单位。', 'kWh'),
+        createColumn('预计降幅', 'reductionRate', ['reduction_rate'], false, '可填写大于 0 且不超过 1 的比例。', 0.08),
+        createColumn('优先级', 'priority', ['rule_priority'], true, '填写 low、medium 或 high。', 'high'),
+        createColumn('最低覆盖率', 'minimumCoverageRate', ['minimum_coverage_rate'], false, '受控证据字段，填写 0 至 1 的覆盖率。', 0.95),
+        createColumn('最大证据数', 'maxEvidenceItems', ['max_evidence_items'], false, '受控证据字段，填写有限正整数。', 10),
+        createColumn('节省依据', 'savingBasis', ['saving_basis'], false, '受控证据字段，只允许填写 window_total_energy 或留空。', 'window_total_energy'),
+        createColumn('建议内容', 'recommendationText', ['recommendation', 'recommendation_text'], true, '填写需人工复核的建议内容，不得宣称自动控制设备。', '建议复核峰段设备错峰安排。'),
+        createColumn('来源', 'source', ['规则来源'], true, '填写规则来源。', '青岚园区能源制度'),
+        createColumn('生效开始时间（UTC）', 'effectiveStartUtc', ['effective_start_utc'], true, '填写严格 UTC 秒精度时间。', '2025-01-01T00:00:00Z'),
+        createColumn('生效结束时间（UTC）', 'effectiveEndUtc', ['effective_end_utc'], true, '填写严格 UTC 秒精度时间。', '2027-01-01T00:00:00Z'),
+        createColumn('来源时区', 'sourceTimeZone', ['IANA时区', 'source_timezone'], true, '填写有效 IANA 来源时区。', 'Asia/Shanghai'),
+        createColumn('状态', 'status', ['启用状态'], false, '填写 active 或 inactive。', 'active')
       ])
     ])
   }),
@@ -270,6 +366,65 @@ const ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS = Object.freeze(Object.assign(Object.
       ])
     ])
   }),
+  'energy-flow-models': Object.freeze({
+    id: 'energy-flow-models',
+    name: '能流模型导入模板',
+    baseFileName: '能流模型导入模板',
+    asciiBaseFileName: 'nengliu-moxing-template',
+    formats: Object.freeze(['xlsx', 'csv']),
+    sheets: Object.freeze([
+      createSheet('能流模型', [
+        createColumn('模型编码', 'modelCode', ['能流模型编码', 'model_code'], true, '填写稳定且唯一的能流模型编码。', 'QL-FLOW-PARK'),
+        createColumn('模型名称', 'modelName', ['能流模型名称', 'model_name'], true, '填写模型中文名称。', '青岚园区综合能流模型'),
+        createColumn('来源', 'source', ['模型来源'], true, '填写模型业务来源。', '青岚园区能源审计'),
+        createColumn('文号', 'documentNo', ['模型文号', 'document_no'], false, '可填写模型来源文号。', 'QL-FLOW-2026-01'),
+        createColumn('版本', 'version', ['模型版本'], true, '填写不可混淆的模型版本。', 'QL-FLOW:v1'),
+        createColumn('生效开始时间（UTC）', 'effectiveStartUtc', ['effective_start_utc'], true, '填写严格 UTC 秒精度时间，尾部必须为 Z。', '2025-01-01T00:00:00Z'),
+        createColumn('生效结束时间（UTC）', 'effectiveEndUtc', ['effective_end_utc'], true, '填写严格 UTC 秒精度时间，尾部必须为 Z。', '2027-01-01T00:00:00Z'),
+        createColumn('来源时区', 'sourceTimeZone', ['IANA时区', 'source_timezone'], true, '填写有效 IANA 来源时区。', 'Asia/Shanghai'),
+        createColumn('状态', 'status', ['启用状态'], false, '填写 active 或 inactive。', 'active')
+      ])
+    ])
+  }),
+  'energy-balance-configs': Object.freeze({
+    id: 'energy-balance-configs',
+    name: '能效平衡配置导入模板',
+    baseFileName: '能效平衡配置导入模板',
+    asciiBaseFileName: 'nengxiao-pingheng-peizhi-template',
+    formats: Object.freeze(['xlsx']),
+    sheets: Object.freeze([
+      createSheet('平衡边界', [
+        createColumn('边界编码', 'boundaryCode', ['balanceBoundaryCode', 'boundary_code'], true, '填写稳定且唯一的平衡边界编码。', 'QL-BAL-PARK'),
+        createColumn('边界名称', 'boundaryName', ['boundary_name'], true, '填写边界中文名称。', '青岚园区综合能效平衡边界'),
+        createColumn('组织编码', 'organizationUnitCode', ['用能单元编码', 'organization_unit_code'], false, '可填写已维护的组织业务编码，不填写数据库 ID。', 'QL-PARK'),
+        createColumn('来源', 'source', ['边界来源'], true, '填写边界业务来源。', '青岚园区能源审计'),
+        createColumn('文号', 'documentNo', ['来源文号', 'document_no'], false, '可填写来源文号。', 'QL-BAL-2026-01'),
+        createColumn('版本', 'version', ['边界版本'], true, '填写不可混淆的边界版本。', 'QL-BAL:v1'),
+        createColumn('生效开始时间（UTC）', 'effectiveStartUtc', ['effective_start_utc'], true, '填写严格 UTC 秒精度时间。', '2025-01-01T00:00:00Z'),
+        createColumn('生效结束时间（UTC）', 'effectiveEndUtc', ['effective_end_utc'], true, '填写严格 UTC 秒精度时间。', '2027-01-01T00:00:00Z'),
+        createColumn('来源时区', 'sourceTimeZone', ['IANA时区', 'source_timezone'], true, '填写有效 IANA 来源时区。', 'Asia/Shanghai'),
+        createColumn('发电边界确认', 'generationBoundaryConfirmed', ['generation_boundary_confirmed'], true, '填写 0/1 或等价布尔值，明确发电防重复计入口。', 1),
+        createColumn('状态', 'status', ['启用状态'], false, '填写 active 或 inactive。', 'active')
+      ]),
+      createSheet('九角色项目', [
+        createColumn('边界编码', 'boundaryCode', ['boundary_code'], true, '填写“平衡边界”工作表中的边界编码。', 'QL-BAL-PARK'),
+        createColumn('边界版本', 'boundaryVersion', ['boundary_version'], true, '填写“平衡边界”工作表中的版本。', 'QL-BAL:v1'),
+        createColumn('项目编码', 'itemCode', ['balanceItemCode', 'item_code'], true, '填写边界内唯一项目编码。', 'QL-BAL-INPUT-E'),
+        createColumn('项目名称', 'itemName', ['item_name'], true, '填写项目中文名称。', '园区外购电输入'),
+        createColumn('角色', 'role', ['balanceRole'], true, '填写九角色之一。', 'input'),
+        createColumn('能源类型编码', 'energyTypeCode', ['energy_type_code'], true, '填写平台能源类型业务编码。', 'electricity'),
+        createColumn('原始单位', 'originalUnit', ['单位', 'original_unit'], true, '填写与能源类型匹配的原始单位。', 'kWh'),
+        createColumn('来源类型', 'sourceType', ['source_type'], true, '填写 timeseries、monthly_energy、generation、explicit_edge_value 或 explicit_balance_value。', 'monthly_energy'),
+        createColumn('来源引用', 'sourceReference', ['sourceMappingReference', 'source_reference'], true, '填写后续导入服务可解析的业务定位 reference。', 'monthly-energy:QL-PARK:electricity'),
+        createColumn('来源记录定位', 'sourceRecordLocator', ['recordLocator', 'source_record_locator'], false, '可填写逗号分隔业务定位值；不得填写 SQLite 自增 ID。', 'organization=QL-PARK;month=2026-07'),
+        createColumn('时序来源标识', 'timeseriesSourceReference', ['timeseries_source_reference'], false, 'timeseries 来源可填写稳定来源标识。', ''),
+        createColumn('发电数值字段', 'generationValueField', ['valueField', 'generation_value_field'], false, 'generation 来源按角色填写 self_use_value_kwh 或 grid_export_value_kwh。', ''),
+        createColumn('显式平衡值', 'explicitBalanceValue', ['explicit_balance_value'], false, 'explicit_balance_value 来源可填写非负数值。', ''),
+        createColumn('发电防重复键', 'generationAntiDoubleCountKey', ['generation_anti_double_count_key'], false, 'generation 来源必须填写同边界唯一防重复键。', ''),
+        createColumn('状态', 'status', ['启用状态'], false, '填写 active 或 inactive。', 'active')
+      ])
+    ])
+  }),
   'energy-flow-nodes': Object.freeze({
     id: 'energy-flow-nodes',
     name: '能流节点导入模板',
@@ -376,7 +531,7 @@ function getEnergyAnalysisTemplateDefinition(templateId) {
 }
 
 /**
- * 列出八类能源分析模板元数据。
+ * 列出十三类能源分析与配置模板元数据。
  * @returns {object[]} 模板元数据列表。
  */
 function listEnergyAnalysisTemplates() {
@@ -904,11 +1059,13 @@ function escapeCsvCell(value) {
  * @param {object} sheet 工作表定义。
  * @returns {Buffer} CSV Buffer。
  */
-function renderCsvBuffer(sheet) {
-  // 示例行直接按冻结列顺序读取 example。
-  const exampleRow = sheet.columns.map((column) => column.example);
+function renderCsvBuffer(sheet, rows = null) {
+  // 未传入业务数据时继续使用冻结示例行；演示目录可注入多行数据但不得改变标题契约。
+  const dataRows = Array.isArray(rows)
+    ? rows
+    : [sheet.columns.map((column) => column.example)];
   // CSV 尾部固定保留单个换行，避免尾随空格。
-  const csv = [sheet.headers, exampleRow]
+  const csv = [sheet.headers, ...dataRows]
     .map((row) => row.map(escapeCsvCell).join(','))
     .join('\n');
   return Buffer.from(`${UTF8_BOM}${csv}\n`, 'utf8');
@@ -919,9 +1076,17 @@ function renderCsvBuffer(sheet) {
  * @param {object} sheet 工作表定义。
  * @returns {object[]} Excel 列宽配置。
  */
-function buildColumnWidths(sheet) {
-  return sheet.columns.map((column) => ({
-    wch: Math.min(Math.max(String(column.name).length + 4, String(column.example ?? '').length + 4, 12), 40)
+function buildColumnWidths(sheet, rows = null) {
+  // 演示目录注入多行数据时也按真实单元格宽度计算，但仍限制最大列宽。
+  const dataRows = Array.isArray(rows)
+    ? rows
+    : [sheet.columns.map((column) => column.example)];
+  return sheet.columns.map((column, columnIndex) => ({
+    wch: Math.min(Math.max(
+      String(column.name).length + 4,
+      ...dataRows.map((row) => String(row[columnIndex] ?? '').length + 4),
+      12
+    ), 40)
   }));
 }
 
@@ -930,14 +1095,16 @@ function buildColumnWidths(sheet) {
  * @param {object} template 模板定义。
  * @returns {Buffer} Excel Buffer。
  */
-function renderXlsxBuffer(template) {
-  // 新建工作簿并逐张追加，模板 8 不会退化为只写第一张表。
+function renderXlsxBuffer(template, workbookRows = null) {
+  // 新建工作簿并逐张追加，多工作表模板不得退化为只写第一张表或增加说明表。
   const workbook = XLSX.utils.book_new();
   template.sheets.forEach((sheet) => {
-    // 用户可见首行只使用中文标题。
-    const exampleRow = sheet.columns.map((column) => column.example);
-    const worksheet = XLSX.utils.aoa_to_sheet([sheet.headers, exampleRow]);
-    worksheet['!cols'] = buildColumnWidths(sheet);
+    // 用户可见首行只使用中文标题；演示目录可按工作表名称注入多行数据。
+    const rows = workbookRows && Array.isArray(workbookRows[sheet.name])
+      ? workbookRows[sheet.name]
+      : [sheet.columns.map((column) => column.example)];
+    const worksheet = XLSX.utils.aoa_to_sheet([sheet.headers, ...rows]);
+    worksheet['!cols'] = buildColumnWidths(sheet, rows);
     XLSX.utils.book_append_sheet(workbook, worksheet, sheet.name);
   });
   return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
@@ -949,7 +1116,7 @@ function renderXlsxBuffer(template) {
  * @param {*} format 文件格式。
  * @returns {object} 模板文件结果。
  */
-function generateEnergyAnalysisTemplate(templateId, format = 'xlsx') {
+function generateEnergyAnalysisTemplate(templateId, format = 'xlsx', options = {}) {
   // 模板必须已登记。
   const template = getEnergyAnalysisTemplateDefinition(templateId);
   if (!template) {
@@ -973,10 +1140,17 @@ function generateEnergyAnalysisTemplate(templateId, format = 'xlsx') {
     });
   }
 
-  // 文件体按目标格式生成 Buffer。
+  // 文件体按目标格式生成 Buffer；自定义行只用于内存生成演示文件，不改变冻结模板定义。
+  const customRows = Array.isArray(options.rows) ? options.rows : null;
+  const customWorkbookRows = options.workbooks && typeof options.workbooks === 'object'
+    ? options.workbooks
+    : null;
   const buffer = normalizedFormat === 'csv'
-    ? renderCsvBuffer(template.sheets[0])
-    : renderXlsxBuffer(template);
+    ? renderCsvBuffer(template.sheets[0], customRows)
+    : renderXlsxBuffer(
+      template,
+      customWorkbookRows || (customRows ? { [template.sheets[0].name]: customRows } : null)
+    );
   // 中文文件名用于 filename*，ASCII 文件名用于旧客户端 fallback。
   const fileName = `${template.baseFileName}.${normalizedFormat}`;
   const asciiFileName = `${template.asciiBaseFileName}.${normalizedFormat}`;
@@ -985,7 +1159,9 @@ function generateEnergyAnalysisTemplate(templateId, format = 'xlsx') {
     name: sheet.name,
     headers: [...sheet.headers],
     columnCount: sheet.columns.length,
-    exampleRowCount: 1
+    exampleRowCount: customWorkbookRows && Array.isArray(customWorkbookRows[sheet.name])
+      ? customWorkbookRows[sheet.name].length
+      : (customRows && template.sheets.length === 1 ? customRows.length : 1)
   }));
   // 单工作表兼容字段保留现有调用模型所需的 sheetName 与 headers。
   const singleSheet = template.sheets.length === 1 ? template.sheets[0] : null;
@@ -1577,7 +1753,9 @@ module.exports = {
   CSV_MIME_TYPE,
   ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS,
   ENERGY_ANALYSIS_TEMPLATE_LIMITS,
+  ENERGY_BALANCE_CONFIG_SHEET_NAMES,
   ENERGY_FLOW_EDGE_SHEET_NAMES,
+  TOU_SCHEME_SHEET_NAMES,
   UTF8_BOM,
   XLSX_MIME_TYPE,
   generateEnergyAnalysisTemplate,
@@ -1596,6 +1774,8 @@ module.exports = {
   parseEnergyAnalysisTemplateCsv,
   parseEnergyAnalysisTemplateWorkbook,
   parseTemplateWorkbook: parseEnergyAnalysisTemplateWorkbook,
+  renderCsvBuffer,
+  renderXlsxBuffer,
   resolveTemplateCells,
   resolveTemplateRow,
   validateSheetCollection: validateTemplateSheetCollection,

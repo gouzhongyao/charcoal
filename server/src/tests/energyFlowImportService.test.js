@@ -38,8 +38,10 @@ const {
   ENERGY_FLOW_RECORD_BATCH_CONTRACT,
   buildEnergyFlowBundleImportPreview,
   executeEnergyFlowBundleImport,
+  executeEnergyFlowModelImport,
   executeEnergyFlowNodeImport,
   previewEnergyFlowBundleImport,
+  previewEnergyFlowModelImport,
   previewEnergyFlowNodeImport
 } = require('../services/energyFlowImportService');
 
@@ -204,6 +206,20 @@ function buildExecuteBody(preview, ids) {
 }
 
 /**
+ * 创建模型和节点使用的客户端最小 execute 请求体。
+ * @param {object} preview 单批次 preview 响应。
+ * @returns {object} 最小 execute 请求体。
+ */
+function buildSingleBatchExecuteBody(preview) {
+  return {
+    batchId: preview.batchId,
+    confirmText: preview.confirmText,
+    requireBackup: true,
+    acknowledgeSkippedRisks: true
+  };
+}
+
+/**
  * 创建不会访问真实备份文件的备份桩。
  * @param {object} counter 可变计数器。
  * @returns {Function} 备份函数。
@@ -261,6 +277,26 @@ function seedFlowMasterData() {
   } finally {
     db.close();
   }
+}
+
+/**
+ * 构造合法节点模板行。
+ * @param {object} overrides 覆盖字段。
+ * @returns {object} 节点模板行。
+ */
+function createModelRow(overrides = {}) {
+  return {
+    modelCode: 'FLOW-MODEL-IMPORT',
+    modelName: '批量导入模型',
+    source: '隔离测试导入',
+    documentNo: 'FLOW-MODEL-DOC-2026',
+    version: 'v1',
+    effectiveStartUtc: '2026-01-01T00:00:00Z',
+    effectiveEndUtc: '2027-01-01T00:00:00Z',
+    sourceTimeZone: 'Asia/Shanghai',
+    status: 'active',
+    ...overrides
+  };
 }
 
 /**
@@ -469,6 +505,127 @@ async function testLockedBundleBackupEpoch() {
 async function run() {
   initDatabase();
   testHardCodedFlowContracts();
+
+  // 空库中节点必须因模型缺失而阻断；模型 preview 零写入，execute 后节点可正常 preview。
+  const importedModelRow = createModelRow();
+  const dependentNodeRow = createNodeRow({
+    modelCode: importedModelRow.modelCode,
+    modelName: importedModelRow.modelName,
+    modelSource: importedModelRow.source,
+    modelDocumentNo: importedModelRow.documentNo,
+    modelVersion: importedModelRow.version,
+    modelEffectiveStartUtc: importedModelRow.effectiveStartUtc,
+    modelEffectiveEndUtc: importedModelRow.effectiveEndUtc,
+    sourceTimeZone: importedModelRow.sourceTimeZone,
+    nodeCode: 'MODEL-DEPENDENT-NODE',
+    organizationUnitCode: ''
+  });
+  const dependentNodeFile = createWorkbookUpload('energy-flow-node-before-model.xlsx', [{
+    templateType: 'energy-flow-nodes',
+    sheetName: '能流节点',
+    rows: [dependentNodeRow]
+  }]);
+  const missingModelNodePreview = previewEnergyFlowNodeImport(dependentNodeFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(missingModelNodePreview.summary.blocked, 1);
+  assert(missingModelNodePreview.items[0].issues.some((issue) => issue.code === 'ENERGY_FLOW_MODEL_NOT_FOUND'));
+
+  const modelFile = createWorkbookUpload('energy-flow-models-valid.xlsx', [{
+    templateType: 'energy-flow-models',
+    sheetName: '能流模型',
+    rows: [importedModelRow]
+  }]);
+  const initialModelCount = countRows('energy_flow_models');
+  const modelPreview = previewEnergyFlowModelImport(modelFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(modelPreview.confirmText, '确认导入能流模型');
+  assert.strictEqual(modelPreview.expectedWouldImport, 1);
+  assert.strictEqual(countRows('energy_flow_models'), initialModelCount, '模型 preview 不得写业务表。');
+  const actorDb = openDatabase();
+  let actorUserId;
+  try {
+    actorUserId = Number(actorDb.prepare('SELECT id FROM sys_users ORDER BY id LIMIT 1').get().id);
+  } finally {
+    actorDb.close();
+  }
+  const modelBackupCounter = { count: 0 };
+  const modelExecute = await executeEnergyFlowModelImport(
+    buildSingleBatchExecuteBody(modelPreview),
+    {
+      uploadsDir: temporaryUploadsDir,
+      actorUserId,
+      actorIp: '127.0.0.1',
+      createBackup: createBackupStub(modelBackupCounter)
+    }
+  );
+  assert.strictEqual(modelExecute.imported, 1);
+  assert.strictEqual(modelBackupCounter.count, 1);
+  assert.strictEqual(countRows('energy_flow_models'), initialModelCount + 1);
+
+  // 备份前原文件摘要失败不得污染 preview 批次；恢复原文件后同一批次必须可重试成功。
+  const retryModelFile = createWorkbookUpload('energy-flow-models-retry.xlsx', [{
+    templateType: 'energy-flow-models',
+    sheetName: '能流模型',
+    rows: [createModelRow({ modelCode: 'FLOW-MODEL-RETRY', modelName: '原文件恢复重试模型' })]
+  }]);
+  const retryModelPreview = previewEnergyFlowModelImport(retryModelFile, { uploadsDir: temporaryUploadsDir });
+  const originalRetryModelBuffer = fs.readFileSync(retryModelFile.path);
+  fs.writeFileSync(retryModelFile.path, Buffer.alloc(originalRetryModelBuffer.length, 0x78));
+  const retryBackupCounter = { count: 0 };
+  await assertRejectsWithCode(
+    () => executeEnergyFlowModelImport(
+      buildSingleBatchExecuteBody(retryModelPreview),
+      {
+        uploadsDir: temporaryUploadsDir,
+        actorUserId,
+        actorIp: '127.0.0.1',
+        createBackup: createBackupStub(retryBackupCounter)
+      }
+    ),
+    'ENERGY_ANALYSIS_IMPORT_CURRENT_FILE_SHA256_MISMATCH'
+  );
+  assert.strictEqual(retryBackupCounter.count, 0, '原文件摘要失败不得进入备份。');
+  const retryPreviewDb = openDatabase();
+  try {
+    const batch = retryPreviewDb.prepare(
+      'SELECT audit_phase AS auditPhase, status FROM import_batches WHERE id = ?'
+    ).get(retryModelPreview.batchId);
+    assert.strictEqual(batch.auditPhase, 'preview');
+    assert(['completed', 'completed_with_errors'].includes(batch.status));
+  } finally {
+    retryPreviewDb.close();
+  }
+  fs.writeFileSync(retryModelFile.path, originalRetryModelBuffer);
+  const retryModelExecute = await executeEnergyFlowModelImport(
+    buildSingleBatchExecuteBody(retryModelPreview),
+    {
+      uploadsDir: temporaryUploadsDir,
+      actorUserId,
+      actorIp: '127.0.0.1',
+      createBackup: createBackupStub(retryBackupCounter)
+    }
+  );
+  assert.strictEqual(retryModelExecute.imported, 1);
+  assert.strictEqual(retryBackupCounter.count, 1);
+
+  const dependentNodePreview = previewEnergyFlowNodeImport(dependentNodeFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(dependentNodePreview.expectedWouldImport, 1);
+  const duplicateModelPreview = previewEnergyFlowModelImport(modelFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(duplicateModelPreview.expectedWouldImport, 0);
+  assert.strictEqual(duplicateModelPreview.summary.skipped, 1);
+  const conflictingModelFile = createWorkbookUpload('energy-flow-models-conflict.xlsx', [{
+    templateType: 'energy-flow-models',
+    sheetName: '能流模型',
+    rows: [createModelRow({ modelName: '冲突名称' })]
+  }]);
+  const conflictingModelPreview = previewEnergyFlowModelImport(conflictingModelFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(conflictingModelPreview.summary.blocked, 1);
+  assert(conflictingModelPreview.items[0].issues.some((issue) => issue.code === 'CONFLICTING_ENERGY_FLOW_MODEL_VERSION'));
+  const modelAuditDb = openDatabase();
+  try {
+    assert.strictEqual(modelAuditDb.prepare("SELECT COUNT(*) AS total FROM sys_operation_logs WHERE operation = 'energy-flow-model-import'").get().total, 2);
+  } finally {
+    modelAuditDb.close();
+  }
+
   const master = seedFlowMasterData();
 
   // 节点 preview 必须零业务写、保留 XLSX 空白物理行，execute 保存来源批次与行号。
@@ -484,7 +641,7 @@ async function run() {
   assert.strictEqual(countRows('energy_flow_nodes'), initialNodeCount);
   const nodeBackupCounter = { count: 0 };
   const nodeExecute = await executeEnergyFlowNodeImport(
-    buildExecuteBody(nodePreview, { batchId: nodePreview.batchId }),
+    buildSingleBatchExecuteBody(nodePreview),
     { uploadsDir: temporaryUploadsDir, createBackup: createBackupStub(nodeBackupCounter) }
   );
   assert.strictEqual(nodeExecute.imported, 1);

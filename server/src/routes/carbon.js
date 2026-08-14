@@ -4,6 +4,7 @@ const { authenticate } = require('../middleware/auth');
 const { requireAnyPermission, requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
+const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
 const {
   buildCarbonEmissionStats,
   calculateCarbonEmissions,
@@ -47,7 +48,7 @@ router.get('/factors/export', authenticate, requirePermission('carbon:factors:ex
   res.status(200).send(result.body);
 }));
 
-router.post('/factors/import/preview', authenticate, requirePermission('carbon:factor:import'), requireWritable('carbon:factor-import-preview'), (req, res, next) => {
+router.post('/factors/import/preview', authenticate, requirePermission('carbon:factor:import'), requireWritable('carbon:factor-import-preview'), rejectUnconnectedDemoContext, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {
@@ -65,7 +66,7 @@ router.post('/factors/import/preview', authenticate, requirePermission('carbon:f
   });
 });
 
-router.post('/factors/import/execute', authenticate, requirePermission('carbon:factor:import'), requireWritable('carbon:factor-import-execute'), asyncHandler(async (req, res) => {
+router.post('/factors/import/execute', authenticate, requirePermission('carbon:factor:import'), requireWritable('carbon:factor-import-execute'), rejectUnconnectedDemoContext, asyncHandler(async (req, res) => {
   sendSuccess(res, await executeCarbonFactorImport(req.body || {}));
 }));
 

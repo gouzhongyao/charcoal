@@ -1,4 +1,4 @@
-const { AppError } = require('../utils/errors');
+const { AppError, DatabaseAvailabilityError } = require('../utils/errors');
 const { requireSession } = require('../services/sessionService');
 
 function extractBearerToken(req) {
@@ -14,6 +14,10 @@ function authenticate(req, res, next) {
     req.user = { id: session.userId, username: session.username, displayName: session.displayName };
     next();
   } catch (error) {
+    if (error instanceof DatabaseAvailabilityError) {
+      next(error);
+      return;
+    }
     next(error instanceof AppError ? error : new AppError('UNAUTHENTICATED', '登录状态无效。', { statusCode: 401 }));
   }
 }

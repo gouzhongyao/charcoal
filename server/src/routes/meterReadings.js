@@ -5,6 +5,7 @@ const { requireAnyPermission, requirePermission } = require('../middleware/permi
 const { requireWritable } = require('../middleware/maintenance');
 const { assertWritableAllowed } = require('../services/maintenanceState');
 const { normalizeUploadError, uploadImportFile } = require('../middleware/upload');
+const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
 const { getMeterReadingContract } = require('../services/contractService');
 const {
   createMeterReading,
@@ -68,7 +69,7 @@ router.post('/energy-record-generation/execute', authenticate, requirePermission
   sendSuccess(res, audit);
 }));
 
-router.post('/import', authenticate, requirePermission('ledger:readings:import'), requireWritable('meter-readings:import'), (req, res, next) => {
+router.post('/import', authenticate, requirePermission('ledger:readings:import'), requireWritable('meter-readings:import'), rejectUnconnectedDemoContext, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {

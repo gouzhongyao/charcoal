@@ -31,7 +31,7 @@ const expectedPermissions = [
   'ledger:generation:view', 'imports:view', 'dashboard:view', 'system:backup:view',
   'system:user:view', 'system:role:view', 'system:menu:view'
 ];
-// 四个能源页面及其按钮共用的二十六个权限契约。
+// 四个能源页面及其按钮共用的三十个权限契约。
 const energyModulePermissions = [
   'energy:analysis:view',
   'energy:analysis:config:view',
@@ -45,6 +45,8 @@ const energyModulePermissions = [
   'energy:analysis:timeseries:execute',
   'energy:analysis:operations:preview',
   'energy:analysis:operations:execute',
+  'energy:analysis:config:import:preview',
+  'energy:analysis:config:import:execute',
   'energy:benchmarks:view',
   'energy:benchmarks:manage',
   'energy:benchmarks:analyze',
@@ -58,7 +60,9 @@ const energyModulePermissions = [
   'energy:balance:view',
   'energy:balance:manage',
   'energy:balance:calculate',
-  'energy:balance:suggestion:review'
+  'energy:balance:suggestion:review',
+  'energy:balance:import:preview',
+  'energy:balance:import:execute'
 ];
 // 四个页面菜单冻结的路由与组件映射。
 const energyPageContracts = [

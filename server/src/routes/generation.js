@@ -4,6 +4,7 @@ const { authenticate } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
+const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
 const {
   buildGenerationMeta,
   createGenerationRecord,
@@ -49,7 +50,7 @@ router.get('/records/export', authenticate, requirePermission('ledger:generation
   res.status(200).send(result.body);
 }));
 
-router.post('/records/import/preview', authenticate, requirePermission('ledger:generation:preview'), requireWritable('generation:records-import-preview'), (req, res, next) => {
+router.post('/records/import/preview', authenticate, requirePermission('ledger:generation:preview'), requireWritable('generation:records-import-preview'), rejectUnconnectedDemoContext, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {
@@ -70,7 +71,7 @@ router.post('/records/import/preview', authenticate, requirePermission('ledger:g
   });
 });
 
-router.post('/records/import/execute', authenticate, requirePermission('ledger:generation:execute'), requireWritable('generation:records-import-execute'), asyncHandler(async (req, res) => {
+router.post('/records/import/execute', authenticate, requirePermission('ledger:generation:execute'), requireWritable('generation:records-import-execute'), rejectUnconnectedDemoContext, asyncHandler(async (req, res) => {
   const audit = await executeGenerationRecordImport(req.body || {});
   sendSuccess(res, audit);
 }));

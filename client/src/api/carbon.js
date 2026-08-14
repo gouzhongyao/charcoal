@@ -31,6 +31,11 @@ export function downloadCarbonFactorTemplate(format = 'xlsx') {
   return download({ url: `/templates/carbon-factors.${safeFormat}` }, `碳因子导入模板.${safeFormat}`);
 }
 
+/** 下载碳因子青岚园区示例，不触发碳排放计算。 */
+export function downloadCarbonFactorDemoParkExample() {
+  return download({ url: '/templates/demo-park/11-carbon-factors.xlsx' }, '青岚园区示例-碳因子.xlsx');
+}
+
 /** 上传文件并创建碳因子导入预演。 */
 export function previewCarbonFactorImport(file) {
   const data = new FormData();

@@ -4,6 +4,7 @@ const { authenticate } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
+const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
 const {
   buildEnergyBudgetStats,
   createEnergyBudgetImportPreviewFromUpload,
@@ -48,7 +49,7 @@ router.get('/export', authenticate, requirePermission('energy:budget:export'), a
   res.status(200).send(result.body);
 }));
 
-router.post('/import/preview', authenticate, requirePermission('energy:budget:import'), requireWritable('energy:budget:import-preview'), (req, res, next) => {
+router.post('/import/preview', authenticate, requirePermission('energy:budget:import'), requireWritable('energy:budget:import-preview'), rejectUnconnectedDemoContext, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {
@@ -66,7 +67,7 @@ router.post('/import/preview', authenticate, requirePermission('energy:budget:im
   });
 });
 
-router.post('/import/execute', authenticate, requirePermission('energy:budget:import'), requireWritable('energy:budget:import-execute'), asyncHandler(async (req, res) => {
+router.post('/import/execute', authenticate, requirePermission('energy:budget:import'), requireWritable('energy:budget:import-execute'), rejectUnconnectedDemoContext, asyncHandler(async (req, res) => {
   sendSuccess(res, await executeEnergyBudgetImport(req.body || {}));
 }));
 

@@ -38,11 +38,20 @@ export function resolveApiBase() {
   return normalizeApiBase(candidate);
 }
 
+/** 判断请求 URL 是否为可信 API base 下的相对请求。 */
+export function isTrustedRelativeApiRequest(config, baseURL) {
+  const requestUrl = String(config?.url || '');
+  const isRelativeRequest = requestUrl.startsWith('/')
+    && !requestUrl.startsWith('//')
+    && !requestUrl.includes('\\')
+    && !/^[a-z][a-z\d+.-]*:/i.test(requestUrl);
+  return isTrustedApiBase(baseURL) && isRelativeRequest;
+}
+
 /** Applies a bearer token only to a verified local API base. */
 export function applyTrustedAuthorization(config, baseURL, token) {
   const headers = config.headers || (config.headers = {});
-  const isRelativeRequest = !/^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(String(config.url || ''));
-  if (token && isTrustedApiBase(baseURL) && isRelativeRequest) {
+  if (token && isTrustedRelativeApiRequest(config, baseURL)) {
     headers.Authorization = `Bearer ${token}`;
   } else {
     headers.delete?.('Authorization');
@@ -50,6 +59,26 @@ export function applyTrustedAuthorization(config, baseURL, token) {
     delete headers.Authorization;
     delete headers.authorization;
   }
+  return config;
+}
+
+/** 仅在可信相对 API 且请求显式声明 artifact/handler/token 时附加演示 context。 */
+export function applyTrustedDemoContext(config, baseURL) {
+  const headers = config.headers || (config.headers = {});
+  const demo = config.demoContext;
+  const validDeclaration = demo
+    && typeof demo.artifactKey === 'string' && demo.artifactKey.trim()
+    && typeof demo.handlerKey === 'string' && demo.handlerKey.trim()
+    && typeof demo.token === 'string' && /^[A-Za-z0-9_-]{43}$/.test(demo.token);
+  if (validDeclaration && isTrustedRelativeApiRequest(config, baseURL)) {
+    headers['X-Demo-Context'] = demo.token;
+  } else {
+    headers.delete?.('X-Demo-Context');
+    headers.delete?.('x-demo-context');
+    delete headers['X-Demo-Context'];
+    delete headers['x-demo-context'];
+  }
+  delete config.demoContext;
   return config;
 }
 

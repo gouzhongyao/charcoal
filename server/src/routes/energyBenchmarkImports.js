@@ -7,6 +7,9 @@ const { requireWritable } = require('../middleware/maintenance');
 const { requirePermission } = require('../middleware/permission');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
 const {
+  demoContextPreflight
+} = require('../middleware/demoContext');
+const {
   ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
   ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY
 } = require('../services/energyAnalysisImportCore');
@@ -95,9 +98,17 @@ function createPreviewHandler(previewService) {
         return;
       }
 
+      const serviceOptions = req.demoContext ? { demoContext: {
+        token: req.demoContext.token,
+        userId: req.user.id,
+        artifactKey: req.demoContext.artifactKey,
+        handlerKey: req.demoContext.handlerKey
+      } } : {};
       Promise.resolve()
-        .then(() => previewService(req.file))
-        .then((preview) => sendSuccess(res, preview))
+        .then(() => previewService(req.file, serviceOptions))
+        .then((preview) => {
+          sendSuccess(res, preview);
+        })
         .catch((error) => {
           cleanupUploadedImportFile(req.file);
           next(normalizeBenchmarkPreviewError(error));
@@ -148,8 +159,20 @@ function buildTrustedExecuteBody(requestBody) {
 function createExecuteHandler(executeService) {
   return asyncHandler(async (req, res) => {
     const trustedBody = buildTrustedExecuteBody(req.body || {});
-    sendSuccess(res, await executeService(trustedBody));
+    const serviceOptions = req.demoContext ? { demoContext: {
+      token: req.demoContext.token,
+      userId: req.user.id,
+      artifactKey: req.demoContext.artifactKey,
+      handlerKey: req.demoContext.handlerKey
+    } } : {};
+    const result = await executeService(trustedBody, serviceOptions);
+    sendSuccess(res, result);
   });
+}
+
+/** 创建显式 artifact/handler 的 demo-aware preflight。 */
+function demoAware(artifactKey, handlerKey, phase) {
+  return demoContextPreflight({ artifactKey, handlerKey, phase, allowFormal: true });
 }
 
 // 能源折标系数预演与执行。
@@ -158,6 +181,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_BENCHMARK_IMPORT_PERMISSIONS.preview),
   requireWritable('energy-benchmarks:conversion-factors-import-preview'),
+  demoAware('19-conversion-factors', 'energy-conversion-factors-import', 'preview'),
   createPreviewHandler(previewEnergyConversionFactorImport)
 );
 router.post(
@@ -165,6 +189,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_BENCHMARK_IMPORT_PERMISSIONS.execute),
   requireWritable('energy-benchmarks:conversion-factors-import-execute'),
+  demoAware('19-conversion-factors', 'energy-conversion-factors-import', 'execute'),
   parseExecuteJsonBody,
   createExecuteHandler(executeEnergyConversionFactorImport)
 );
@@ -175,6 +200,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_BENCHMARK_IMPORT_PERMISSIONS.preview),
   requireWritable('energy-benchmarks:definitions-import-preview'),
+  demoAware('20-benchmark-definitions', 'energy-benchmark-definitions-import', 'preview'),
   createPreviewHandler(previewEnergyBenchmarkDefinitionImport)
 );
 router.post(
@@ -182,6 +208,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_BENCHMARK_IMPORT_PERMISSIONS.execute),
   requireWritable('energy-benchmarks:definitions-import-execute'),
+  demoAware('20-benchmark-definitions', 'energy-benchmark-definitions-import', 'execute'),
   parseExecuteJsonBody,
   createExecuteHandler(executeEnergyBenchmarkDefinitionImport)
 );
@@ -192,6 +219,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_BENCHMARK_IMPORT_PERMISSIONS.preview),
   requireWritable('energy-benchmarks:targets-import-preview'),
+  demoAware('21-benchmark-targets', 'energy-benchmark-targets-import', 'preview'),
   createPreviewHandler(previewEnergyBenchmarkTargetImport)
 );
 router.post(
@@ -199,6 +227,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_BENCHMARK_IMPORT_PERMISSIONS.execute),
   requireWritable('energy-benchmarks:targets-import-execute'),
+  demoAware('21-benchmark-targets', 'energy-benchmark-targets-import', 'execute'),
   parseExecuteJsonBody,
   createExecuteHandler(executeEnergyBenchmarkTargetImport)
 );

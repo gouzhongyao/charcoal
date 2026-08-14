@@ -22,19 +22,42 @@ const { listMenus } = require('../services/menuService');
 const { assignRoleMenus, createRole } = require('../services/roleService');
 const { assignUserRoles } = require('../services/userService');
 const { runWithMaintenance } = require('../services/maintenanceState');
+const { toggleDemoRuntime } = require('../services/demoRuntimeService');
 const { parseEnergyAnalysisTemplateWorkbook } = require('../services/energyAnalysisTemplateService');
 
-// 八类能源分析模板的用户可见下载契约独立硬编码，避免从生产列表反向生成预期。
+// 十三类能源分析与配置模板的下载契约独立硬编码，避免从生产列表反向生成预期。
 const ENERGY_ANALYSIS_TEMPLATE_CONTRACTS = Object.freeze([
-  Object.freeze({ id: 'energy-timeseries', baseFileName: '能耗时序数据导入模板', asciiBaseFileName: 'nenghao-shixu-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['能耗时序']) }),
-  Object.freeze({ id: 'shift-schedules', baseFileName: '排班计划导入模板', asciiBaseFileName: 'paiban-jihua-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['排班计划']) }),
-  Object.freeze({ id: 'device-states', baseFileName: '设备状态导入模板', asciiBaseFileName: 'shebei-zhuangtai-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['设备状态']) }),
-  Object.freeze({ id: 'energy-conversion-factors', baseFileName: '能源折标系数导入模板', asciiBaseFileName: 'nengyuan-zhebiao-xishu-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['能源折标系数']) }),
-  Object.freeze({ id: 'energy-benchmark-definitions', baseFileName: '能效对标定义导入模板', asciiBaseFileName: 'nengxiao-duibiao-dingyi-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['对标定义']) }),
-  Object.freeze({ id: 'energy-benchmark-targets', baseFileName: '能效对标目标导入模板', asciiBaseFileName: 'nengxiao-duibiao-mubiao-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['对标目标']) }),
-  Object.freeze({ id: 'energy-flow-nodes', baseFileName: '能流节点导入模板', asciiBaseFileName: 'nengliu-jiedian-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['能流节点']) }),
-  Object.freeze({ id: 'energy-flow-edges', baseFileName: '能流边及显式边值导入模板', asciiBaseFileName: 'nengliu-bian-xianshi-bianzhi-template', formats: Object.freeze(['xlsx']), sheetNames: Object.freeze(['能流边', '显式边值']) })
+  Object.freeze({ id: 'energy-timeseries', permission: 'energy:analysis:timeseries:preview', baseFileName: '能耗时序数据导入模板', asciiBaseFileName: 'nenghao-shixu-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['能耗时序']) }),
+  Object.freeze({ id: 'shift-definitions', permission: 'energy:analysis:config:import:preview', baseFileName: '班次定义导入模板', asciiBaseFileName: 'banci-dingyi-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['班次定义']) }),
+  Object.freeze({ id: 'tou-schemes', permission: 'energy:analysis:config:import:preview', baseFileName: 'TOU方案与时段导入模板', asciiBaseFileName: 'tou-fangan-shiduan-template', formats: Object.freeze(['xlsx']), sheetNames: Object.freeze(['TOU方案', '时段规则']) }),
+  Object.freeze({ id: 'strategy-rules', permission: 'energy:analysis:config:import:preview', baseFileName: '策略规则导入模板', asciiBaseFileName: 'celue-guize-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['策略规则']) }),
+  Object.freeze({ id: 'shift-schedules', permission: 'energy:analysis:operations:preview', baseFileName: '排班计划导入模板', asciiBaseFileName: 'paiban-jihua-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['排班计划']) }),
+  Object.freeze({ id: 'device-states', permission: 'energy:analysis:operations:preview', baseFileName: '设备状态导入模板', asciiBaseFileName: 'shebei-zhuangtai-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['设备状态']) }),
+  Object.freeze({ id: 'energy-conversion-factors', permission: 'energy:benchmarks:import:preview', baseFileName: '能源折标系数导入模板', asciiBaseFileName: 'nengyuan-zhebiao-xishu-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['能源折标系数']) }),
+  Object.freeze({ id: 'energy-benchmark-definitions', permission: 'energy:benchmarks:import:preview', baseFileName: '能效对标定义导入模板', asciiBaseFileName: 'nengxiao-duibiao-dingyi-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['对标定义']) }),
+  Object.freeze({ id: 'energy-benchmark-targets', permission: 'energy:benchmarks:import:preview', baseFileName: '能效对标目标导入模板', asciiBaseFileName: 'nengxiao-duibiao-mubiao-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['对标目标']) }),
+  Object.freeze({ id: 'energy-flow-models', permission: 'energy:flows:import:preview', baseFileName: '能流模型导入模板', asciiBaseFileName: 'nengliu-moxing-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['能流模型']) }),
+  Object.freeze({ id: 'energy-balance-configs', permission: 'energy:balance:import:preview', baseFileName: '能效平衡配置导入模板', asciiBaseFileName: 'nengxiao-pingheng-peizhi-template', formats: Object.freeze(['xlsx']), sheetNames: Object.freeze(['平衡边界', '九角色项目']) }),
+  Object.freeze({ id: 'energy-flow-nodes', permission: 'energy:flows:import:preview', baseFileName: '能流节点导入模板', asciiBaseFileName: 'nengliu-jiedian-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['能流节点']) }),
+  Object.freeze({ id: 'energy-flow-edges', permission: 'energy:flows:import:preview', baseFileName: '能流边及显式边值导入模板', asciiBaseFileName: 'nengliu-bian-xianshi-bianzhi-template', formats: Object.freeze(['xlsx']), sheetNames: Object.freeze(['能流边', '显式边值']) })
 ]);
+
+// 中央模板列表必须精确披露当前已经开放的真实预演与执行路由。
+const ENERGY_ANALYSIS_TEMPLATE_IMPORT_ROUTES = Object.freeze({
+  'energy-timeseries': 'POST /api/energy-analysis/imports/timeseries/preview -> POST /api/energy-analysis/imports/timeseries/execute',
+  'shift-definitions': 'POST /api/energy-analysis/imports/shift-definitions/preview -> POST /api/energy-analysis/imports/shift-definitions/execute',
+  'tou-schemes': 'POST /api/energy-analysis/imports/tou-schemes/preview -> POST /api/energy-analysis/imports/tou-schemes/execute',
+  'strategy-rules': 'POST /api/energy-analysis/imports/strategy-rules/preview -> POST /api/energy-analysis/imports/strategy-rules/execute',
+  'shift-schedules': 'POST /api/energy-analysis/imports/shift-schedules/preview -> POST /api/energy-analysis/imports/shift-schedules/execute',
+  'device-states': 'POST /api/energy-analysis/imports/device-states/preview -> POST /api/energy-analysis/imports/device-states/execute',
+  'energy-conversion-factors': 'POST /api/energy-benchmarks/imports/conversion-factors/preview -> POST /api/energy-benchmarks/imports/conversion-factors/execute',
+  'energy-benchmark-definitions': 'POST /api/energy-benchmarks/imports/definitions/preview -> POST /api/energy-benchmarks/imports/definitions/execute',
+  'energy-benchmark-targets': 'POST /api/energy-benchmarks/imports/targets/preview -> POST /api/energy-benchmarks/imports/targets/execute',
+  'energy-flow-models': 'POST /api/energy-flow-imports/models/preview -> POST /api/energy-flow-imports/models/execute',
+  'energy-flow-nodes': 'POST /api/energy-flow-imports/nodes/preview -> POST /api/energy-flow-imports/nodes/execute',
+  'energy-flow-edges': 'POST /api/energy-flow-imports/bundle/preview -> POST /api/energy-flow-imports/bundle/execute',
+  'energy-balance-configs': 'POST /api/energy-balance-imports/bundle/preview -> POST /api/energy-balance-imports/bundle/execute'
+});
 
 // 接入前已存在的十一类中央模板 ID，用于防止历史列表或下载行为回归。
 const HISTORICAL_TEMPLATE_IDS = Object.freeze([
@@ -210,17 +233,27 @@ function assertSuccessfulTemplateDownload(response, contract, format, observedAs
   try {
     initDatabase();
 
-    // 创建一个无权限账号和一个仅具 imports:view 的账号，验证真实 RBAC 边界而非仅依赖超级管理员兜底。
+    // 创建无权限账号与拥有全部领域 preview 权限的账号，验证模板不再统一依赖 imports:view。
     register({ username: 'analysis-denied', password: 'Password123!' });
     const allowedUser = register({ username: 'analysis-allowed', password: 'Password123!' });
-    const importsMenu = listMenus().rows.find((menu) => menu.permissionCode === 'imports:view');
-    assert(importsMenu, '测试数据库必须包含 imports:view 菜单权限。');
+    const requiredPermissions = [...new Set([
+      'system:demo:download',
+      ...ENERGY_ANALYSIS_TEMPLATE_CONTRACTS.map((contract) => contract.permission)
+    ])];
+    const menusByPermission = new Map(listMenus().rows.map((menu) => [menu.permissionCode, menu]));
+    const permissionMenus = requiredPermissions.map((permission) => {
+      const menu = menusByPermission.get(permission);
+      assert(menu, `测试数据库必须包含 ${permission} 菜单权限。`);
+      return menu;
+    });
     const templateRole = createRole({
       roleCode: 'analysis_template_reader',
       roleName: '能源分析模板读取'
     });
-    assignRoleMenus(templateRole.id, [importsMenu.id]);
+    assignRoleMenus(templateRole.id, permissionMenus.map((menu) => menu.id));
     assignUserRoles(allowedUser.id, [templateRole.id]);
+    // 隔离测试显式开启演示运行期，避免依赖默认关闭状态。
+    toggleDemoRuntime({ enabled: true, actorUserId: allowedUser.id });
 
     const { app } = require('../index');
     server = await new Promise((resolve) => {
@@ -229,7 +262,7 @@ function assertSuccessfulTemplateDownload(response, contract, format, observedAs
     const deniedToken = await login(server, 'analysis-denied', 'Password123!');
     const allowedToken = await login(server, 'analysis-allowed', 'Password123!');
 
-    // 中央列表必须保留十一类历史模板，并正式增加八类能源分析模板及其格式元数据。
+    // 中央列表必须保留十一类历史模板，并正式增加十三类能源分析与配置模板及其格式元数据。
     const listResponse = await request(server, 'GET', '/api/templates');
     assert.strictEqual(listResponse.status, 200);
     const listedTemplates = listResponse.body.data;
@@ -248,7 +281,12 @@ function assertSuccessfulTemplateDownload(response, contract, format, observedAs
       assert.strictEqual(listed.fileName, `${contract.baseFileName}.xlsx`);
       assert.strictEqual(listed.asciiFileName, `${contract.asciiBaseFileName}.xlsx`);
       assert.strictEqual(listed.recommendedFormat, 'xlsx');
-      assert.strictEqual(listed.contractRoute, null, '本次接入不得伪造领域 preview/execute 路由。');
+      assert.strictEqual(listed.requiredPermission, contract.permission);
+      assert.strictEqual(
+        listed.contractRoute,
+        ENERGY_ANALYSIS_TEMPLATE_IMPORT_ROUTES[contract.id],
+        `${contract.id} 必须指向真实 preview/execute 路由。`
+      );
       if (contract.formats.includes('csv')) {
         assert.strictEqual(listed.csvRoute, `/api/templates/${contract.id}.csv`);
         assert.strictEqual(listed.csvFileName, `${contract.baseFileName}.csv`);
@@ -263,7 +301,7 @@ function assertSuccessfulTemplateDownload(response, contract, format, observedAs
       }
     });
 
-    // 新模板下载必须先认证，再校验 imports:view 权限。
+    // 新模板下载必须先认证，再校验对应领域 preview 权限。
     const protectedPath = '/api/templates/energy-timeseries.xlsx';
     const anonymous = await request(server, 'GET', protectedPath);
     assert.strictEqual(anonymous.status, 401);
@@ -271,7 +309,7 @@ function assertSuccessfulTemplateDownload(response, contract, format, observedAs
     const forbidden = await request(server, 'GET', protectedPath, undefined, deniedToken);
     assert.strictEqual(forbidden.status, 403);
     assert.strictEqual(forbidden.body.error.code, 'FORBIDDEN');
-    assert.deepStrictEqual(forbidden.body.error.details.requiredPermissions, ['imports:view']);
+    assert.deepStrictEqual(forbidden.body.error.details.requiredPermissions, ['energy:analysis:timeseries:preview']);
 
     // 点号和额外扩展名必须在认证前统一拒绝，不能因权限判断与服务层规范化不一致而绕过下载保护。
     const doubleExtensionPaths = [
@@ -298,20 +336,45 @@ function assertSuccessfulTemplateDownload(response, contract, format, observedAs
         assertSuccessfulTemplateDownload(response, contract, format, observedAsciiNames);
       }
     }
-    assert.strictEqual(observedAsciiNames.size, 15, '七类双格式加一类 XLSX 的 ASCII fallback 必须全部唯一。');
+    assert.strictEqual(
+      observedAsciiNames.size,
+      ENERGY_ANALYSIS_TEMPLATE_CONTRACTS.reduce((total, contract) => total + contract.formats.length, 0),
+      '全部已声明格式的 ASCII fallback 必须唯一。'
+    );
 
-    // 能流边 Excel 必须精确保留两张工作表，CSV 必须返回稳定领域错误而不是静默降级。
-    const edgeXlsx = await request(server, 'GET', '/api/templates/energy-flow-edges.xlsx', undefined, allowedToken);
-    const edgeWorkbook = XLSX.read(edgeXlsx.body, { type: 'buffer' });
-    assert.deepStrictEqual(edgeWorkbook.SheetNames, ['能流边', '显式边值']);
-    const edgeCsv = await request(server, 'GET', '/api/templates/energy-flow-edges.csv', undefined, allowedToken);
-    assert.strictEqual(edgeCsv.status, 400);
-    assert.strictEqual(edgeCsv.body.error.code, 'TEMPLATE_FORMAT_UNSUPPORTED');
-    assert.deepStrictEqual(edgeCsv.body.error.details, {
-      templateId: 'energy-flow-edges',
-      format: 'csv',
-      supportedFormats: ['xlsx']
-    });
+    // 三类多工作表模板必须精确保留两张工作表，CSV 必须返回稳定领域错误而不是静默降级。
+    for (const contract of ENERGY_ANALYSIS_TEMPLATE_CONTRACTS.filter((item) => item.formats.length === 1)) {
+      const xlsxResponse = await request(server, 'GET', `/api/templates/${contract.id}.xlsx`, undefined, allowedToken);
+      const workbook = XLSX.read(xlsxResponse.body, { type: 'buffer' });
+      assert.deepStrictEqual(workbook.SheetNames, contract.sheetNames);
+      const csvResponse = await request(server, 'GET', `/api/templates/${contract.id}.csv`, undefined, allowedToken);
+      assert.strictEqual(csvResponse.status, 400);
+      assert.strictEqual(csvResponse.body.error.code, 'TEMPLATE_FORMAT_UNSUPPORTED');
+      assert.deepStrictEqual(csvResponse.body.error.details, {
+        templateId: contract.id,
+        format: 'csv',
+        supportedFormats: ['xlsx']
+      });
+    }
+
+    // 青岚园区 manifest 按当前账号权限过滤，并能下载精确多表演示文件。
+    const manifestResponse = await request(server, 'GET', '/api/templates/demo-park/manifest', undefined, allowedToken);
+    assert.strictEqual(manifestResponse.status, 200);
+    assert.strictEqual(manifestResponse.body.data.parkCode, 'QL-PARK');
+    assert.strictEqual(manifestResponse.body.data.artifactCount, manifestResponse.body.data.artifacts.length);
+    assert.deepStrictEqual(
+      manifestResponse.body.data.artifacts.map((artifact) => artifact.templateType).sort(),
+      ENERGY_ANALYSIS_TEMPLATE_CONTRACTS.map((contract) => contract.id).sort(),
+      '仅领域 preview 权限账号应精确看到对应能源分析模板的演示条目。'
+    );
+    assert(manifestResponse.body.data.artifacts.every((artifact) => requiredPermissions.includes(artifact.requiredPermission)));
+    const demoTou = await request(server, 'GET', '/api/templates/demo-park/17-tou-schemes.xlsx', undefined, allowedToken);
+    assert.strictEqual(demoTou.status, 200);
+    assert.strictEqual(demoTou.headers['x-demo-artifact-key'], '17-tou-schemes');
+    assert.deepStrictEqual(XLSX.read(demoTou.body, { type: 'buffer' }).SheetNames, ['TOU方案', '时段规则']);
+    const demoTouCsv = await request(server, 'GET', '/api/templates/demo-park/17-tou-schemes.csv', undefined, allowedToken);
+    assert.strictEqual(demoTouCsv.status, 400);
+    assert.strictEqual(demoTouCsv.body.error.code, 'DEMO_ARTIFACT_FORMAT_UNSUPPORTED');
 
     // 旧 standards ID、未知模板和非法扩展名必须稳定拒绝。
     for (const pathname of [

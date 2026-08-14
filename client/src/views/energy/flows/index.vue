@@ -64,6 +64,48 @@
         </template>
       </article>
 
+      <article class="page-card import-workspace">
+        <header class="section-heading"><div><h2>能流模型与拓扑导入</h2><span>依赖顺序：1 模型 → 2 节点 → 3 边 → 4 显式边值</span></div></header>
+        <el-alert v-if="!canImportPreview" type="info" :closable="false" show-icon title="当前账号没有 energy:flows:import:preview 权限。" />
+        <template v-else>
+          <div class="import-dependency-list">
+            <div v-for="definition in flowImportDownloads" :key="definition.key" class="import-dependency-row">
+              <span><strong>{{ definition.order }}. {{ definition.label }}</strong>：{{ definition.description }}</span>
+              <div class="action-row"><el-button @click="downloadFlowTemplate(definition)">空白模板</el-button><el-button @click="downloadFlowDemo(definition)">青岚示例</el-button></div>
+            </div>
+          </div>
+          <section class="import-grid">
+            <article class="page-card import-card">
+              <header class="section-heading"><div><h2>模型导入</h2><span>XLSX 或 CSV；空库可直接预演</span></div></header>
+              <p>模型身份固定为模型编码 + 版本；完全重复按 skip，身份冲突阻断，active 新版本会在 execute 事务内切换。</p>
+              <el-upload :auto-upload="false" :limit="1" accept=".xlsx,.csv" :disabled="importExecuteLoading" :file-list="modelImportFileList" :on-change="(file) => selectImportFile('model', file)" :on-remove="() => clearImportSelection('model')"><el-button :disabled="importExecuteLoading">选择模型文件</el-button></el-upload>
+              <el-button type="primary" :disabled="!modelImportFile || importExecuteLoading" :loading="modelImportLoading" @click="previewModelImport">运行模型预演</el-button>
+              <ImportPreviewTable v-if="modelImportPreview" :preview="modelImportPreview" />
+              <el-button v-if="canImportExecute" type="danger" :disabled="!canExecuteModelPreview" @click="openImportExecute('model')">执行模型导入</el-button>
+            </article>
+
+            <article class="page-card import-card">
+              <header class="section-heading"><div><h2>节点导入</h2><span>XLSX 或 CSV；只绑定已存在 active 模型</span></div></header>
+              <p>preview 不写节点；execute 使用预演签名、候选行、固定确认文本、跳过风险确认和自动备份。</p>
+              <el-upload :auto-upload="false" :limit="1" accept=".xlsx,.csv" :disabled="importExecuteLoading" :file-list="nodeImportFileList" :on-change="(file) => selectImportFile('node', file)" :on-remove="() => clearImportSelection('node')"><el-button :disabled="importExecuteLoading">选择节点文件</el-button></el-upload>
+              <el-button type="primary" :disabled="!nodeImportFile || importExecuteLoading" :loading="nodeImportLoading" @click="previewNodeImport">运行节点预演</el-button>
+              <ImportPreviewTable v-if="nodeImportPreview" :preview="nodeImportPreview" />
+              <el-button v-if="canImportExecute" type="danger" :disabled="!canExecuteNodePreview" @click="openImportExecute('node')">执行节点导入</el-button>
+            </article>
+
+            <article class="page-card import-card">
+              <header class="section-heading"><div><h2>边与显式边值导入</h2><span>必须使用包含“能流边”和“显式边值”的 XLSX</span></div></header>
+              <p>双工作表预演分别创建边批次和边值批次；执行只提交批次 ID 和确认字段，候选与签名由服务端恢复。</p>
+              <el-upload :auto-upload="false" :limit="1" accept=".xlsx" :disabled="importExecuteLoading" :file-list="bundleImportFileList" :on-change="(file) => selectImportFile('bundle', file)" :on-remove="() => clearImportSelection('bundle')"><el-button :disabled="importExecuteLoading">选择双工作表文件</el-button></el-upload>
+              <el-button type="primary" :disabled="!bundleImportFile || importExecuteLoading" :loading="bundleImportLoading" @click="previewBundleImport">运行边与边值预演</el-button>
+              <template v-if="bundleImportPreview"><ImportPreviewTable title="能流边预演" :preview="bundleImportPreview.edgePreview" /><ImportPreviewTable title="显式边值预演" :preview="bundleImportPreview.recordPreview" /></template>
+              <el-button v-if="canImportExecute" type="danger" :disabled="!canExecuteBundlePreview" @click="openImportExecute('bundle')">执行边与显式边值导入</el-button>
+            </article>
+          </section>
+          <el-alert v-if="importError" type="error" :closable="false" show-icon :title="importError" />
+        </template>
+      </article>
+
       <template v-if="selectedModel">
         <PageState v-if="modelSelectionLoading" loading description="正在读取所选模型详情、完整拓扑及全部节点和边。" />
         <div v-else-if="modelSelectionError" class="state-error">
@@ -120,12 +162,12 @@
               <el-form class="analysis-filters" label-position="top">
                 <el-form-item label="统计期类型"><el-radio-group v-model="analysisFilters.rangeMode"><el-radio-button label="month">月份</el-radio-button><el-radio-button label="utc">UTC 区间</el-radio-button></el-radio-group></el-form-item>
                 <template v-if="analysisFilters.rangeMode === 'month'">
-                  <el-form-item label="开始月份"><el-date-picker v-model="analysisFilters.startMonth" type="month" value-format="YYYY-MM" /></el-form-item>
-                  <el-form-item label="结束月份"><el-date-picker v-model="analysisFilters.endMonth" type="month" value-format="YYYY-MM" /></el-form-item>
+                  <el-form-item label="开始月份"><el-date-picker v-model="analysisFilters.startMonth" type="month" value-format="YYYY-MM" format="YYYY-MM" :editable="true" /></el-form-item>
+                  <el-form-item label="结束月份"><el-date-picker v-model="analysisFilters.endMonth" type="month" value-format="YYYY-MM" format="YYYY-MM" :editable="true" /></el-form-item>
                 </template>
                 <template v-else>
-                  <el-form-item label="开始 UTC"><el-input v-model.trim="analysisFilters.startUtc" placeholder="2026-01-01T00:00:00Z" /></el-form-item>
-                  <el-form-item label="结束 UTC"><el-input v-model.trim="analysisFilters.endUtc" placeholder="2026-02-01T00:00:00Z" /></el-form-item>
+                  <el-form-item label="开始 UTC"><StrictUtcDateTimeInput v-model="analysisFilters.startUtc" placeholder="2026-01-01T00:00:00Z" /></el-form-item>
+                  <el-form-item label="结束 UTC"><StrictUtcDateTimeInput v-model="analysisFilters.endUtc" placeholder="2026-02-01T00:00:00Z" /></el-form-item>
                 </template>
                 <el-form-item label="来源时区"><el-input :model-value="selectedModel.sourceTimeZone" disabled /></el-form-item>
                 <el-form-item label="展示视图"><el-radio-group v-model="analysisFilters.standardCoalView"><el-radio-button label="original">原单位</el-radio-button><el-radio-button label="kgce">kgce</el-radio-button><el-radio-button label="tce">tce</el-radio-button></el-radio-group></el-form-item>
@@ -219,29 +261,6 @@
             <PageState v-else description="分析请求已完成，但服务端未返回可展示结果；请重试或检查模型统计期。" />
           </el-tab-pane>
 
-          <el-tab-pane label="节点 / 边值导入" name="imports">
-            <el-alert v-if="!canImportPreview" type="info" :closable="false" show-icon title="当前账号没有 energy:flows:import:preview 权限。" />
-            <section v-else class="import-grid">
-              <article class="page-card import-card">
-                <header class="section-heading"><div><h2>节点导入</h2><span>XLSX 或 CSV；只绑定已存在 active 模型</span></div></header>
-                <p>preview 不写节点；execute 使用预演签名、候选行、固定确认文本、跳过风险确认和自动备份。</p>
-                <el-upload :auto-upload="false" :limit="1" accept=".xlsx,.csv" :file-list="nodeImportFileList" :on-change="(file) => selectImportFile('node', file)" :on-remove="() => clearImportSelection('node')"><el-button>选择节点文件</el-button></el-upload>
-                <el-button type="primary" :disabled="!nodeImportFile" :loading="nodeImportLoading" @click="previewNodeImport">运行节点预演</el-button>
-                <ImportPreviewTable v-if="nodeImportPreview" :preview="nodeImportPreview" />
-                <el-button v-if="canImportExecute" type="danger" :disabled="!canExecuteNodePreview" @click="openImportExecute('node')">执行节点导入</el-button>
-              </article>
-
-              <article class="page-card import-card">
-                <header class="section-heading"><div><h2>边与显式边值导入</h2><span>必须使用包含“能流边”和“显式边值”的 XLSX</span></div></header>
-                <p>双工作表预演分别创建边批次和边值批次；执行只提交批次 ID 和确认字段，候选与签名由服务端恢复。</p>
-                <el-upload :auto-upload="false" :limit="1" accept=".xlsx" :file-list="bundleImportFileList" :on-change="(file) => selectImportFile('bundle', file)" :on-remove="() => clearImportSelection('bundle')"><el-button>选择双工作表文件</el-button></el-upload>
-                <el-button type="primary" :disabled="!bundleImportFile" :loading="bundleImportLoading" @click="previewBundleImport">运行边与边值预演</el-button>
-                <template v-if="bundleImportPreview"><ImportPreviewTable title="能流边预演" :preview="bundleImportPreview.edgePreview" /><ImportPreviewTable title="显式边值预演" :preview="bundleImportPreview.recordPreview" /></template>
-                <el-button v-if="canImportExecute" type="danger" :disabled="!canExecuteBundlePreview" @click="openImportExecute('bundle')">执行边与显式边值导入</el-button>
-              </article>
-            </section>
-            <el-alert v-if="importError" type="error" :closable="false" show-icon :title="importError" />
-          </el-tab-pane>
         </el-tabs>
         </template>
       </template>
@@ -257,9 +276,9 @@
         <el-form-item label="版本" prop="version"><el-input v-model.trim="modelForm.version" :disabled="Boolean(modelEditing)" placeholder="例如 v1" /></el-form-item>
         <el-form-item label="来源" prop="source"><el-input v-model.trim="modelForm.source" :disabled="Boolean(modelEditing)" /></el-form-item>
         <el-form-item label="文号 / 文件号"><el-input v-model.trim="modelForm.documentNo" :disabled="Boolean(modelEditing)" /></el-form-item>
-        <el-form-item label="生效开始 UTC" prop="effectiveStartUtc"><el-input v-model.trim="modelForm.effectiveStartUtc" :disabled="Boolean(modelEditing)" placeholder="2026-01-01T00:00:00Z" /></el-form-item>
-        <el-form-item label="生效结束 UTC" prop="effectiveEndUtc"><el-input v-model.trim="modelForm.effectiveEndUtc" :disabled="Boolean(modelEditing)" placeholder="2027-01-01T00:00:00Z" /></el-form-item>
-        <el-form-item label="来源时区" prop="sourceTimeZone"><el-input v-model.trim="modelForm.sourceTimeZone" :disabled="Boolean(modelEditing)" placeholder="Asia/Shanghai" /></el-form-item>
+        <el-form-item label="生效开始 UTC" prop="effectiveStartUtc"><StrictUtcDateTimeInput v-model="modelForm.effectiveStartUtc" :disabled="Boolean(modelEditing)" placeholder="2026-01-01T00:00:00Z" /></el-form-item>
+        <el-form-item label="生效结束 UTC" prop="effectiveEndUtc"><StrictUtcDateTimeInput v-model="modelForm.effectiveEndUtc" :disabled="Boolean(modelEditing)" placeholder="2027-01-01T00:00:00Z" /></el-form-item>
+        <el-form-item label="来源时区" prop="sourceTimeZone"><IanaTimeZoneSelect v-model="modelForm.sourceTimeZone" :disabled="Boolean(modelEditing)" placeholder="请选择或搜索来源时区" /></el-form-item>
         <el-form-item label="状态"><el-select v-model="modelForm.status"><el-option label="启用" value="active" /><el-option label="停用" value="inactive" /></el-select></el-form-item>
       </el-form>
     </ManagementDrawer>
@@ -291,13 +310,13 @@
         <el-form-item v-if="edgeForm.sourceType !== 'explicit_edge_value'" label="记录 ID（可选，逗号分隔）"><el-input v-model.trim="edgeForm.recordIds" :disabled="edgeBindingFrozen" /></el-form-item>
         <el-form-item v-if="['timeseries','monthly_energy'].includes(edgeForm.sourceType)" label="计量器具 ID（可选）"><el-input-number v-model="edgeForm.meterDeviceId" :disabled="edgeBindingFrozen" :min="1" controls-position="right" /></el-form-item>
         <el-form-item v-if="['monthly_energy','generation'].includes(edgeForm.sourceType)" label="用能单元（显式选择器）"><el-select v-model="edgeForm.organizationUnitId" :disabled="edgeBindingFrozen" clearable filterable><el-option v-for="item in organizationUnits" :key="item.id" :label="`${item.unitPath || item.unitName}（${item.unitCode}）`" :value="item.id" /></el-select></el-form-item>
-        <el-form-item v-if="['timeseries','monthly_energy'].includes(edgeForm.sourceType)" label="来源时区（可选）"><el-input v-model.trim="edgeForm.sourceTimeZone" :disabled="edgeBindingFrozen" placeholder="Asia/Shanghai" /></el-form-item>
+        <el-form-item v-if="['timeseries','monthly_energy'].includes(edgeForm.sourceType)" label="来源时区（可选）"><IanaTimeZoneSelect v-model="edgeForm.sourceTimeZone" :disabled="edgeBindingFrozen" placeholder="请选择或搜索来源时区" /></el-form-item>
         <el-form-item v-if="edgeForm.sourceType === 'generation'" label="发电字段" prop="valueField"><el-select v-model="edgeForm.valueField" :disabled="edgeBindingFrozen"><el-option v-for="item in generationFields" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
         <el-form-item label="状态"><el-select v-model="edgeForm.status"><el-option label="启用" value="active" /><el-option label="停用" value="inactive" /></el-select></el-form-item>
       </el-form>
     </ManagementDrawer>
 
-    <ManagementDrawer v-model="importExecuteDrawer" title="确认执行能流导入" confirm-label="确认执行" :loading="importExecuteLoading" :confirm-disabled="!activeImportCanExecute || confirmText !== activeImportPreview?.confirmText" @save="executeImport">
+    <ManagementDrawer :model-value="importExecuteDrawer" title="确认执行能流导入" confirm-label="确认执行" :loading="importExecuteLoading" :confirm-disabled="!activeImportCanExecute || confirmText !== activeImportPreview?.confirmText" @update:model-value="updateImportExecuteDrawer" @save="executeImport">
       <p class="drawer-notice">执行将由后端复核最新预演、固定确认文本、候选、原文件、跳过风险和自动备份。维护态会阻断执行。</p>
       <el-form-item :label="`请输入固定确认文本：${activeImportPreview?.confirmText || ''}`"><el-input v-model="confirmText" /></el-form-item>
       <el-alert v-if="importError" type="error" :closable="false" show-icon :title="importError" />
@@ -312,9 +331,11 @@ import ManagementPage from '@/components/ManagementPage.vue';
 import ManagementToolbar from '@/components/ManagementToolbar.vue';
 import ManagementDrawer from '@/components/ManagementDrawer.vue';
 import HelpIcon from '@/components/HelpIcon.vue';
+import IanaTimeZoneSelect from '@/components/IanaTimeZoneSelect.vue';
 import PageState from '@/components/PageState.vue';
 import StatCard from '@/components/StatCard.vue';
 import StatusTag from '@/components/StatusTag.vue';
+import StrictUtcDateTimeInput from '@/components/StrictUtcDateTimeInput.vue';
 import EnergyFlowTopology from './EnergyFlowTopology.vue';
 import { getEnergyTypes } from '@/api/energy';
 import { ledgerApi } from '@/api/ledger';
@@ -323,7 +344,10 @@ import {
   createEnergyFlowEdge,
   createEnergyFlowModel,
   createEnergyFlowNode,
+  downloadEnergyFlowDemoArtifact,
+  downloadEnergyFlowImportTemplate,
   executeEnergyFlowBundleImport,
+  executeEnergyFlowModelImport,
   executeEnergyFlowNodeImport,
   getEnergyFlowModel,
   getEnergyFlowTopology,
@@ -331,6 +355,7 @@ import {
   listAllEnergyFlowNodes,
   listEnergyFlowModels,
   previewEnergyFlowBundleImport,
+  previewEnergyFlowModelImport,
   previewEnergyFlowNodeImport,
   updateEnergyFlowEdge,
   updateEnergyFlowEdgeStatus,
@@ -340,25 +365,33 @@ import {
   updateEnergyFlowNodeStatus
 } from '@/api/energyFlows';
 import { hasPermi } from '@/utils/permission';
+import { parseStrictUtcDateTime } from '@/utils/dateTimeFields';
+import { isIanaTimeZone } from '@/utils/ianaTimeZones';
 import {
   ENERGY_FLOW_NODE_TYPES,
   ENERGY_FLOW_SOURCE_TYPES,
   GENERATION_VALUE_FIELDS,
   buildEnergyFlowBundleImportExecutePayload,
+  buildEnergyFlowModelImportExecutePayload,
   buildEnergyFlowNodeImportExecutePayload,
   buildEnergyFlowSourceMapping,
   canCommitEnergyFlowAnalysisResponse,
+  canCommitEnergyFlowImportExecuteResponse,
   canExecuteEnergyFlowBundleImport,
+  canExecuteEnergyFlowModelImport,
   canExecuteEnergyFlowNodeImport,
   collectEnergyFlowPaginatedRows,
   createEnergyFlowAnalysisInputFingerprint,
   createEnergyFlowAnalysisRequestSnapshot,
+  createEnergyFlowImportExecuteSnapshot,
   createEnergyFlowImportFileFingerprint,
   createEnergyFlowLatestResponseGuard,
   energyFlowReasonText,
   energyFlowRequestErrorMessage,
   energyFlowSourceSummary,
-  formatEnergyFlowValue
+  formatEnergyFlowValue,
+  normalizeEnergyFlowAnalysisUtcFields,
+  normalizeEnergyFlowModelUtcFields
 } from '@/utils/energyFlow';
 
 // 权限模块。
@@ -414,6 +447,8 @@ const analysisResult = ref(null);
 const analysisLoading = ref(false);
 const analysisHasRun = ref(false);
 const analysisError = ref('');
+// UTC 初始化诊断模块：非法原文不留在父模型，仅保留可见错误供提交兜底使用。
+const analysisUtcDiagnostic = ref('');
 const analysisRequestSnapshot = ref(null);
 // 分析请求 latest-response 守卫模块。
 const analysisRequestGuard = createEnergyFlowLatestResponseGuard();
@@ -447,6 +482,8 @@ const analysisReasons = computed(() => {
 // 抽屉表单状态模块。
 const saving = ref(false);
 const formError = ref('');
+// 模型 UTC 回显诊断模块：非法原文仅保留在错误文本，不进入可提交表单字段。
+const modelUtcDiagnostic = ref('');
 const modelDrawer = ref(false);
 const modelEditing = ref(null);
 const modelFormRef = ref(null);
@@ -461,16 +498,28 @@ const edgeFormRef = ref(null);
 const edgeForm = ref({});
 const edgeBindingFrozen = computed(() => Number(edgeEditing.value?.recordCount || 0) > 0);
 
+// 能流模板和青岚示例依赖顺序模块；边与显式边值共享同一双工作表文件。
+const flowImportDownloads = Object.freeze([
+  Object.freeze({ key: 'model', order: 1, label: '模型', description: '先建立模型编码和版本。', templateType: 'energy-flow-models', demoArtifactKey: '22-energy-flow-models' }),
+  Object.freeze({ key: 'node', order: 2, label: '节点', description: '依赖已存在的 active 模型。', templateType: 'energy-flow-nodes', demoArtifactKey: '23-energy-flow-nodes' }),
+  Object.freeze({ key: 'edge', order: 3, label: '边', description: '依赖模型内已存在的节点。', templateType: 'energy-flow-edges', demoArtifactKey: '24-energy-flow-edges' }),
+  Object.freeze({ key: 'record', order: 4, label: '显式边值', description: '与边共用双工作表 XLSX，不改变半开时间重叠契约。', templateType: 'energy-flow-edges', demoArtifactKey: '24-energy-flow-edges' })
+]);
 // 导入状态模块。
+const modelImportFile = ref(null);
+const modelImportFileList = ref([]);
 const nodeImportFile = ref(null);
 const nodeImportFileList = ref([]);
 const bundleImportFile = ref(null);
 const bundleImportFileList = ref([]);
+const modelImportPreview = ref(null);
 const nodeImportPreview = ref(null);
 const bundleImportPreview = ref(null);
 // 预演结果绑定模块，保存生成该结果的文件指纹和请求票据。
+const modelImportPreviewBinding = ref(null);
 const nodeImportPreviewBinding = ref(null);
 const bundleImportPreviewBinding = ref(null);
+const modelImportLoading = ref(false);
 const nodeImportLoading = ref(false);
 const bundleImportLoading = ref(false);
 const importError = ref('');
@@ -479,11 +528,22 @@ const importExecuteLoading = ref(false);
 const importExecuteKind = ref('');
 const confirmText = ref('');
 // 上传预演 latest-response 守卫模块，文件移除后旧预演不可恢复可执行状态。
+const modelImportRequestGuard = createEnergyFlowLatestResponseGuard();
 const nodeImportRequestGuard = createEnergyFlowLatestResponseGuard();
 const bundleImportRequestGuard = createEnergyFlowLatestResponseGuard();
-const activeImportPreview = computed(() => importExecuteKind.value === 'node'
-  ? nodeImportPreview.value
-  : importExecuteKind.value === 'bundle' ? bundleImportPreview.value : null);
+// 导入执行 latest-response 守卫模块，确保旧 execute 响应不能提交到新的导入上下文。
+const importExecuteRequestGuard = createEnergyFlowLatestResponseGuard();
+const activeImportPreview = computed(() => importExecuteKind.value === 'model'
+  ? modelImportPreview.value
+  : importExecuteKind.value === 'node'
+    ? nodeImportPreview.value
+    : importExecuteKind.value === 'bundle' ? bundleImportPreview.value : null);
+const canExecuteModelPreview = computed(() => canExecuteEnergyFlowModelImport(modelImportPreview.value, {
+  loading: modelImportLoading.value,
+  currentFileFingerprint: createEnergyFlowImportFileFingerprint(modelImportFile.value),
+  previewFileFingerprint: modelImportPreviewBinding.value?.fileFingerprint,
+  isLatest: modelImportRequestGuard.isCurrent(modelImportPreviewBinding.value?.ticket)
+}));
 const canExecuteNodePreview = computed(() => canExecuteEnergyFlowNodeImport(nodeImportPreview.value, {
   loading: nodeImportLoading.value,
   currentFileFingerprint: createEnergyFlowImportFileFingerprint(nodeImportFile.value),
@@ -496,15 +556,35 @@ const canExecuteBundlePreview = computed(() => canExecuteEnergyFlowBundleImport(
   previewFileFingerprint: bundleImportPreviewBinding.value?.fileFingerprint,
   isLatest: bundleImportRequestGuard.isCurrent(bundleImportPreviewBinding.value?.ticket)
 }));
-const activeImportCanExecute = computed(() => importExecuteKind.value === 'node'
-  ? canExecuteNodePreview.value
-  : importExecuteKind.value === 'bundle' && canExecuteBundlePreview.value);
+const activeImportCanExecute = computed(() => importExecuteKind.value === 'model'
+  ? canExecuteModelPreview.value
+  : importExecuteKind.value === 'node'
+    ? canExecuteNodePreview.value
+    : importExecuteKind.value === 'bundle' && canExecuteBundlePreview.value);
 
 // 表单校验模块。
 const required = (message) => ({ required: true, message, trigger: ['blur', 'change'] });
-const modelRules = { modelCode: [required('请填写模型编码')], modelName: [required('请填写模型名称')], version: [required('请填写版本')], source: [required('请填写来源')], effectiveStartUtc: [required('请填写生效开始 UTC')], effectiveEndUtc: [required('请填写生效结束 UTC')], sourceTimeZone: [required('请填写来源时区')] };
+/** 校验严格 UTC 字段，拒绝隐藏的非零毫秒或非法日历日期。 */
+const strictUtcRule = (label) => ({
+  validator: (_rule, value, callback) => {
+    if (value === '' || value === null || value === undefined) return callback();
+    const result = parseStrictUtcDateTime(value);
+    return result.valid ? callback() : callback(new Error(`${label}：${result.message}`));
+  },
+  trigger: ['change', 'blur']
+});
+/** 校验来源时区同时符合 IANA 字符串形态并可由当前 Intl 运行时识别。 */
+const ianaTimeZoneRule = (requiredValue = false) => ({
+  validator: (_rule, value, callback) => {
+    const sourceTimeZone = String(value || '').trim();
+    if (!sourceTimeZone) return requiredValue ? callback(new Error('请选择来源时区')) : callback();
+    return isIanaTimeZone(sourceTimeZone) ? callback() : callback(new Error('请选择当前运行时可识别的 IANA 来源时区'));
+  },
+  trigger: ['change', 'blur']
+});
+const modelRules = { modelCode: [required('请填写模型编码')], modelName: [required('请填写模型名称')], version: [required('请填写版本')], source: [required('请填写来源')], effectiveStartUtc: [required('请填写生效开始 UTC'), strictUtcRule('生效开始 UTC')], effectiveEndUtc: [required('请填写生效结束 UTC'), strictUtcRule('生效结束 UTC')], sourceTimeZone: [ianaTimeZoneRule(true)] };
 const nodeRules = { nodeCode: [required('请填写节点编码')], nodeName: [required('请填写节点名称')], nodeType: [required('请选择节点类型')], x: [required('请填写 X 坐标')], y: [required('请填写 Y 坐标')] };
-const edgeRules = { edgeCode: [required('请填写边编码')], fromNodeId: [required('请选择起点')], toNodeId: [required('请选择终点')], energyTypeCode: [required('请选择能源类型')], unit: [required('请填写单位')], sourceType: [required('请选择来源类型')], sourceReference: [required('请填写来源标识')], valueField: [{ validator: (_rule, value, callback) => edgeForm.value.sourceType !== 'generation' || value ? callback() : callback(new Error('发电来源必须显式选择 generation、self_use 或 grid_export')), trigger: 'change' }] };
+const edgeRules = { edgeCode: [required('请填写边编码')], fromNodeId: [required('请选择起点')], toNodeId: [required('请选择终点')], energyTypeCode: [required('请选择能源类型')], unit: [required('请填写单位')], sourceType: [required('请选择来源类型')], sourceReference: [required('请填写来源标识')], sourceTimeZone: [ianaTimeZoneRule(false)], valueField: [{ validator: (_rule, value, callback) => edgeForm.value.sourceType !== 'generation' || value ? callback() : callback(new Error('发电来源必须显式选择 generation、self_use 或 grid_export')), trigger: 'change' }] };
 
 // 导入预演表格局部组件模块。
 const ImportPreviewTable = defineComponent({
@@ -636,6 +716,7 @@ async function selectModel(row) {
   analysisLoading.value = false;
   analysisHasRun.value = false;
   analysisError.value = '';
+  analysisUtcDiagnostic.value = '';
   const [detailResult, topologyResult, nodeResult, edgeResult] = await Promise.all([
     safeRequest(() => getEnergyFlowModel(modelId)),
     safeRequest(() => getEnergyFlowTopology(modelId, { includeInactive: true })),
@@ -665,13 +746,28 @@ async function selectModel(row) {
 /** 重试当前模型完整读取。 */
 function retrySelectedModel() { if (selectedModel.value) selectModel(selectedModel.value); }
 
-/** 根据模型有效期初始化统计月份。 */
+/** 根据模型有效期初始化统计月份和严格 UTC 输入，非法毫秒明确阻断 UTC 分析。 */
 function initializeAnalysisRange() {
+  const modelUtcNormalization = normalizeEnergyFlowModelUtcFields(selectedModel.value || {});
+  selectedModel.value = modelUtcNormalization.value;
   const start = String(selectedModel.value?.effectiveStartUtc || '').slice(0, 7);
   const endDate = new Date(selectedModel.value?.effectiveEndUtc || '');
   if (Number.isFinite(endDate.getTime())) endDate.setUTCMonth(endDate.getUTCMonth() - 1);
   const end = Number.isFinite(endDate.getTime()) ? endDate.toISOString().slice(0, 7) : start;
-  analysisFilters.value = { ...analysisFilters.value, startMonth: start, endMonth: end, startUtc: selectedModel.value?.effectiveStartUtc || '', endUtc: selectedModel.value?.effectiveEndUtc || '' };
+  const analysisUtcNormalization = normalizeEnergyFlowAnalysisUtcFields({
+    rangeMode: 'utc',
+    startUtc: selectedModel.value?.effectiveStartUtc || '',
+    endUtc: selectedModel.value?.effectiveEndUtc || ''
+  });
+  analysisFilters.value = {
+    ...analysisFilters.value,
+    startMonth: start,
+    endMonth: end,
+    startUtc: analysisUtcNormalization.value.startUtc,
+    endUtc: analysisUtcNormalization.value.endUtc
+  };
+  analysisUtcDiagnostic.value = analysisUtcNormalization.message || modelUtcNormalization.message;
+  analysisError.value = analysisUtcDiagnostic.value;
 }
 
 /** 应用模型筛选。 */
@@ -683,17 +779,29 @@ function changeModelPageSize() { modelPage.value = 1; loadModels(); }
 
 /** 返回空模型表单。 */
 function blankModelForm() { return { modelCode: '', modelName: '', source: '', documentNo: '', version: 'v1', effectiveStartUtc: '', effectiveEndUtc: '', sourceTimeZone: 'Asia/Shanghai', status: 'active' }; }
+/** 将模型回显值规范为共享组件可见的严格 UTC，并返回不能隐藏提交的错误。 */
+function prepareModelForm(source, overrides = {}) {
+  const normalization = normalizeEnergyFlowModelUtcFields({ ...blankModelForm(), ...source, ...overrides });
+  modelForm.value = normalization.value;
+  modelUtcDiagnostic.value = normalization.message;
+  formError.value = modelUtcDiagnostic.value;
+}
 /** 打开模型新增。 */
-function openModelCreate() { modelEditing.value = null; modelForm.value = blankModelForm(); formError.value = ''; modelDrawer.value = true; }
+function openModelCreate() { modelEditing.value = null; modelForm.value = blankModelForm(); modelUtcDiagnostic.value = ''; formError.value = ''; modelDrawer.value = true; }
 /** 打开模型修改。 */
-function openModelEdit(row) { modelEditing.value = row; modelForm.value = { ...blankModelForm(), ...row }; formError.value = ''; modelDrawer.value = true; }
+function openModelEdit(row) { modelEditing.value = row; prepareModelForm(row); modelDrawer.value = true; }
 /** 基于旧模型打开新版本表单。 */
-function openNewVersion(row) { modelEditing.value = null; modelForm.value = { ...blankModelForm(), ...row, id: undefined, version: '', status: 'active' }; formError.value = ''; modelDrawer.value = true; }
+function openNewVersion(row) { modelEditing.value = null; prepareModelForm(row, { id: undefined, version: '', status: 'active' }); modelDrawer.value = true; }
 
-/** 保存模型或新版本。 */
+/** 保存模型或新版本，并在调用 API 前再次阻断非法或非零毫秒 UTC。 */
 async function saveModel() {
   const valid = await modelFormRef.value?.validate().catch(() => false);
+  const utcNormalization = normalizeEnergyFlowModelUtcFields(modelForm.value);
+  if (!utcNormalization.valid) { formError.value = modelUtcDiagnostic.value || utcNormalization.message; return; }
   if (!valid) return;
+  if (!modelEditing.value && !isIanaTimeZone(utcNormalization.value.sourceTimeZone)) { formError.value = '请选择当前运行时可识别的 IANA 来源时区。'; return; }
+  modelUtcDiagnostic.value = '';
+  modelForm.value = utcNormalization.value;
   saving.value = true; formError.value = '';
   const payload = modelEditing.value ? { modelName: modelForm.value.modelName, status: modelForm.value.status } : { ...modelForm.value };
   const result = await safeRequest(() => modelEditing.value ? updateEnergyFlowModel(modelEditing.value.id, payload) : createEnergyFlowModel(payload));
@@ -755,6 +863,8 @@ function resetSourceMapping() { const reference = edgeForm.value.sourceReference
 async function saveEdge() {
   const valid = await edgeFormRef.value?.validate().catch(() => false); if (!valid) return;
   if (Number(edgeForm.value.fromNodeId) === Number(edgeForm.value.toNodeId)) { formError.value = '起点和终点不能相同。'; return; }
+  const edgeSourceTimeZone = String(edgeForm.value.sourceTimeZone || '').trim();
+  if (edgeSourceTimeZone && !isIanaTimeZone(edgeSourceTimeZone)) { formError.value = '请选择当前运行时可识别的 IANA 来源时区。'; return; }
   const sourceMapping = buildEnergyFlowSourceMapping(edgeForm.value.sourceType, { reference: edgeForm.value.sourceReference, recordIds: edgeForm.value.recordIds, meterDeviceId: edgeForm.value.meterDeviceId, organizationUnitId: edgeForm.value.organizationUnitId, sourceTimeZone: edgeForm.value.sourceTimeZone, valueField: edgeForm.value.valueField });
   const hasSelector = {
     explicit_edge_value: true,
@@ -802,9 +912,16 @@ function storageChangeValidationMessage() {
 }
 /** 运行只读能流分析，并只接受仍绑定当前输入的最新请求响应。 */
 async function runAnalysis() {
-  const filters = analysisFilters.value;
+  let filters = analysisFilters.value;
   if (filters.rangeMode === 'month' && (!filters.startMonth || !filters.endMonth)) { analysisError.value = '请选择完整开始和结束月份。'; return; }
-  if (filters.rangeMode === 'utc' && (!filters.startUtc || !filters.endUtc)) { analysisError.value = '请填写完整 UTC 区间。'; return; }
+  if (filters.rangeMode === 'utc' && (!filters.startUtc || !filters.endUtc)) { analysisError.value = analysisUtcDiagnostic.value || '请填写完整 UTC 区间。'; return; }
+  if (filters.rangeMode === 'utc') {
+    const utcNormalization = normalizeEnergyFlowAnalysisUtcFields(filters);
+    if (!utcNormalization.valid) { analysisError.value = analysisUtcDiagnostic.value || utcNormalization.message; return; }
+    analysisUtcDiagnostic.value = '';
+    analysisFilters.value = utcNormalization.value;
+    filters = analysisFilters.value;
+  }
   const storageValidationError = storageChangeValidationMessage();
   if (storageValidationError) { analysisError.value = storageValidationError; return; }
   const requestSnapshot = createEnergyFlowAnalysisRequestSnapshot(selectedModel.value.id, filters, storageChanges.value);
@@ -839,13 +956,29 @@ async function runAnalysis() {
 
 /** 清空导入执行抽屉、确认文本和当前执行种类。 */
 function resetImportExecutionContext() {
+  if (importExecuteLoading.value) return;
+  importExecuteRequestGuard.invalidate();
   importExecuteDrawer.value = false;
   importExecuteKind.value = '';
   confirmText.value = '';
 }
+/** 在 execute loading 期间拒绝抽屉关闭，避免冻结快照对应的上下文被用户改写。 */
+function updateImportExecuteDrawer(open) {
+  if (importExecuteLoading.value && !open) return;
+  importExecuteDrawer.value = Boolean(open);
+  if (!open) resetImportExecutionContext();
+}
 /** 清空指定上传选择、预演签名和执行状态，保持控件与实际提交一致。 */
 function clearImportSelection(kind) {
-  if (kind === 'node') {
+  if (importExecuteLoading.value) return;
+  if (kind === 'model') {
+    modelImportRequestGuard.invalidate();
+    modelImportFile.value = null;
+    modelImportFileList.value = [];
+    modelImportPreview.value = null;
+    modelImportPreviewBinding.value = null;
+    modelImportLoading.value = false;
+  } else if (kind === 'node') {
     nodeImportRequestGuard.invalidate();
     nodeImportFile.value = null;
     nodeImportFileList.value = [];
@@ -865,8 +998,12 @@ function clearImportSelection(kind) {
 }
 /** 选择导入文件并清空旧预演。 */
 function selectImportFile(kind, upload) {
+  if (importExecuteLoading.value) return;
   clearImportSelection(kind);
-  if (kind === 'node') {
+  if (kind === 'model') {
+    modelImportFile.value = upload.raw || null;
+    modelImportFileList.value = modelImportFile.value ? [upload] : [];
+  } else if (kind === 'node') {
     nodeImportFile.value = upload.raw || null;
     nodeImportFileList.value = nodeImportFile.value ? [upload] : [];
   } else {
@@ -876,8 +1013,12 @@ function selectImportFile(kind, upload) {
 }
 /** 开始新的预演前立即清空旧预演和全部执行上下文。 */
 function prepareImportPreview(kind) {
+  if (importExecuteLoading.value) return false;
   resetImportExecutionContext();
-  if (kind === 'node') {
+  if (kind === 'model') {
+    modelImportPreview.value = null;
+    modelImportPreviewBinding.value = null;
+  } else if (kind === 'node') {
     nodeImportPreview.value = null;
     nodeImportPreviewBinding.value = null;
   } else {
@@ -885,13 +1026,44 @@ function prepareImportPreview(kind) {
     bundleImportPreviewBinding.value = null;
   }
   importError.value = '';
+  return true;
+}
+/** 下载能流依赖阶段的空白模板。 */
+async function downloadFlowTemplate(definition) {
+  const result = await safeRequest(() => downloadEnergyFlowImportTemplate(definition.templateType, 'xlsx'));
+  if (!result.ok) importError.value = requestMessage(result, '能流空白模板下载失败。', '当前导入文件选择和预演状态保持不变。');
+}
+/** 下载能流依赖阶段的青岚示例。 */
+async function downloadFlowDemo(definition) {
+  const result = await safeRequest(() => downloadEnergyFlowDemoArtifact(definition.demoArtifactKey, 'xlsx'));
+  if (!result.ok) importError.value = requestMessage(result, '青岚能流示例下载失败。', '当前导入文件选择和预演状态保持不变。');
+}
+/** 执行模型导入预演，并丢弃文件被替换或移除前的旧响应。 */
+async function previewModelImport() {
+  if (importExecuteLoading.value) return;
+  if (!modelImportFile.value) { importError.value = '请先选择模型导入文件。'; return; }
+  const fileFingerprint = createEnergyFlowImportFileFingerprint(modelImportFile.value);
+  const requestTicket = modelImportRequestGuard.begin({ file: modelImportFile.value, fileFingerprint });
+  if (!prepareImportPreview('model')) return;
+  modelImportLoading.value = true;
+  const result = await safeRequest(() => previewEnergyFlowModelImport(requestTicket.snapshot.file));
+  if (!modelImportRequestGuard.isCurrent(requestTicket)) return;
+  modelImportLoading.value = false;
+  if (createEnergyFlowImportFileFingerprint(modelImportFile.value) !== requestTicket.snapshot.fileFingerprint) return;
+  if (!result.ok) {
+    importError.value = requestMessage(result, '模型导入预演失败。', '预演签名和执行入口均不可用。');
+    return;
+  }
+  modelImportPreview.value = result.value.data || null;
+  modelImportPreviewBinding.value = Object.freeze({ fileFingerprint: requestTicket.snapshot.fileFingerprint, ticket: requestTicket });
 }
 /** 执行节点导入预演，并丢弃文件被替换或移除前的旧响应。 */
 async function previewNodeImport() {
+  if (importExecuteLoading.value) return;
   if (!nodeImportFile.value) { importError.value = '请先选择节点导入文件。'; return; }
   const fileFingerprint = createEnergyFlowImportFileFingerprint(nodeImportFile.value);
   const requestTicket = nodeImportRequestGuard.begin({ file: nodeImportFile.value, fileFingerprint });
-  prepareImportPreview('node');
+  if (!prepareImportPreview('node')) return;
   nodeImportLoading.value = true;
   const result = await safeRequest(() => previewEnergyFlowNodeImport(requestTicket.snapshot.file));
   if (!nodeImportRequestGuard.isCurrent(requestTicket)) return;
@@ -906,10 +1078,11 @@ async function previewNodeImport() {
 }
 /** 执行边和显式边值预演，并丢弃文件被替换或移除前的旧响应。 */
 async function previewBundleImport() {
+  if (importExecuteLoading.value) return;
   if (!bundleImportFile.value) { importError.value = '请先选择双工作表文件。'; return; }
   const fileFingerprint = createEnergyFlowImportFileFingerprint(bundleImportFile.value);
   const requestTicket = bundleImportRequestGuard.begin({ file: bundleImportFile.value, fileFingerprint });
-  prepareImportPreview('bundle');
+  if (!prepareImportPreview('bundle')) return;
   bundleImportLoading.value = true;
   const result = await safeRequest(() => previewEnergyFlowBundleImport(requestTicket.snapshot.file));
   if (!bundleImportRequestGuard.isCurrent(requestTicket)) return;
@@ -924,25 +1097,52 @@ async function previewBundleImport() {
 }
 /** 打开导入二次确认；无当前文件和最新预演绑定时拒绝打开。 */
 function openImportExecute(kind) {
-  const canExecute = kind === 'node' ? canExecuteNodePreview.value : canExecuteBundlePreview.value;
+  const canExecute = kind === 'model'
+    ? canExecuteModelPreview.value
+    : kind === 'node' ? canExecuteNodePreview.value : canExecuteBundlePreview.value;
   if (!canExecute) return;
   importExecuteKind.value = kind;
   confirmText.value = '';
   importError.value = '';
   importExecuteDrawer.value = true;
 }
-/** 执行受控节点或双工作表导入。 */
+/** 按导入种类构造并发送受控执行请求。 */
+function submitEnergyFlowImport(kind, preview) {
+  if (kind === 'model') return executeEnergyFlowModelImport(buildEnergyFlowModelImportExecutePayload(preview));
+  if (kind === 'node') return executeEnergyFlowNodeImport(buildEnergyFlowNodeImportExecutePayload(preview));
+  return executeEnergyFlowBundleImport(buildEnergyFlowBundleImportExecutePayload(preview));
+}
+/** 返回指定导入种类的当前文件指纹。 */
+function currentImportFingerprint(kind) {
+  if (kind === 'model') return createEnergyFlowImportFileFingerprint(modelImportFile.value);
+  if (kind === 'node') return createEnergyFlowImportFileFingerprint(nodeImportFile.value);
+  return createEnergyFlowImportFileFingerprint(bundleImportFile.value);
+}
+/** 执行受控模型、节点或双工作表导入，并只提交冻结快照对应的最新响应。 */
 async function executeImport() {
+  const kind = importExecuteKind.value;
   const preview = activeImportPreview.value;
   if (!activeImportCanExecute.value || !preview || confirmText.value !== preview.confirmText) return;
+  const executeSnapshot = createEnergyFlowImportExecuteSnapshot(kind, preview, currentImportFingerprint(kind));
+  const requestTicket = importExecuteRequestGuard.begin(executeSnapshot);
   importExecuteLoading.value = true; importError.value = '';
-  const result = await safeRequest(() => importExecuteKind.value === 'node' ? executeEnergyFlowNodeImport(buildEnergyFlowNodeImportExecutePayload(preview)) : executeEnergyFlowBundleImport(buildEnergyFlowBundleImportExecutePayload(preview)));
+  const result = await safeRequest(() => submitEnergyFlowImport(executeSnapshot.kind, executeSnapshot.preview));
+  const canCommit = canCommitEnergyFlowImportExecuteResponse({
+    isLatest: importExecuteRequestGuard.isCurrent(requestTicket),
+    snapshot: executeSnapshot,
+    currentKind: importExecuteKind.value,
+    currentFingerprint: currentImportFingerprint(executeSnapshot.kind)
+  });
+  if (!canCommit) {
+    if (importExecuteRequestGuard.isCurrent(requestTicket)) importExecuteLoading.value = false;
+    return;
+  }
   importExecuteLoading.value = false;
   if (!result.ok) { importError.value = requestMessage(result, '能流导入执行失败。', '没有写入本次预演候选，请按页面提示处理后重试。'); return; }
-  const completedKind = importExecuteKind.value;
   importExecuteDrawer.value = false; ElMessage.success('能流导入执行完成，后端审计与备份已保留。');
-  clearImportSelection(completedKind);
-  await loadModels(); if (selectedModel.value) await selectModel(selectedModel.value);
+  clearImportSelection(executeSnapshot.kind);
+  await loadModels();
+  if (executeSnapshot.kind !== 'model' && selectedModel.value) await selectModel(selectedModel.value);
 }
 
 // 页面初始化模块。
@@ -950,5 +1150,5 @@ onMounted(async () => { if (!canView.value) return; await Promise.all([loadDepen
 </script>
 
 <style scoped>
-.section-alert{margin-top:12px}.dependency-error,.state-error{display:flex;align-items:center;gap:10px;margin-top:12px}.dependency-error :deep(.el-alert),.state-error :deep(.el-alert){flex:1}.page-card{min-width:0}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}.section-heading h2{margin:0;color:#123b79;font-size:16px}.section-heading span{display:block;margin-top:5px;color:#7385a2;font-size:12px}.table-scroll{max-width:100%;overflow-x:auto}.pagination{display:flex;justify-content:flex-end;margin-top:16px}.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.flow-tabs{min-width:0}.maintenance-grid,.import-grid,.analysis-detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:16px}.maintenance-card,.import-card{min-width:0}.analysis-card{display:grid;gap:12px}.analysis-filters{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:10px 14px}.analysis-filters :deep(.el-form-item){margin-bottom:0}.coordinate-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.reason-card{display:grid;gap:9px}.reason-card .section-heading{margin-bottom:2px}.import-card{display:flex;flex-direction:column;align-items:flex-start;gap:12px}.import-card>p{margin:0;color:#516170;font-size:13px;line-height:1.7}.import-preview{width:100%;padding-top:10px;border-top:1px solid #e1e8f2}.import-preview>p{margin:6px 0;color:#516170;font-size:13px}.drawer-notice{margin:0 0 16px;color:#516170;line-height:1.7}@media(max-width:1180px){.analysis-filters{grid-template-columns:repeat(3,minmax(150px,1fr))}.maintenance-grid,.import-grid,.analysis-detail-grid{grid-template-columns:1fr}.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:720px){.stat-grid,.analysis-filters,.coordinate-grid{grid-template-columns:1fr}.section-heading{flex-direction:column}}
+.section-alert{margin-top:12px}.import-workspace{margin-top:16px}.import-dependency-list{display:grid;gap:8px}.import-dependency-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:1px solid #e1e8f2;border-radius:8px;color:#516170;font-size:13px}.action-row{display:flex;flex-wrap:wrap;gap:8px}.dependency-error,.state-error{display:flex;align-items:center;gap:10px;margin-top:12px}.dependency-error :deep(.el-alert),.state-error :deep(.el-alert){flex:1}.page-card{min-width:0}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}.section-heading h2{margin:0;color:#123b79;font-size:16px}.section-heading span{display:block;margin-top:5px;color:#7385a2;font-size:12px}.table-scroll{max-width:100%;overflow-x:auto}.pagination{display:flex;justify-content:flex-end;margin-top:16px}.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.flow-tabs{min-width:0}.maintenance-grid,.import-grid,.analysis-detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:16px}.maintenance-card,.import-card{min-width:0}.analysis-card{display:grid;gap:12px}.analysis-filters{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:10px 14px}.analysis-filters :deep(.el-form-item){margin-bottom:0}.coordinate-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.reason-card{display:grid;gap:9px}.reason-card .section-heading{margin-bottom:2px}.import-card{display:flex;flex-direction:column;align-items:flex-start;gap:12px}.import-card>p{margin:0;color:#516170;font-size:13px;line-height:1.7}.import-preview{width:100%;padding-top:10px;border-top:1px solid #e1e8f2}.import-preview>p{margin:6px 0;color:#516170;font-size:13px}.drawer-notice{margin:0 0 16px;color:#516170;line-height:1.7}@media(max-width:1180px){.analysis-filters{grid-template-columns:repeat(3,minmax(150px,1fr))}.maintenance-grid,.import-grid,.analysis-detail-grid{grid-template-columns:1fr}.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:720px){.stat-grid,.analysis-filters,.coordinate-grid{grid-template-columns:1fr}.section-heading,.import-dependency-row{align-items:flex-start;flex-direction:column}}
 </style>

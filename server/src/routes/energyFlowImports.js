@@ -8,6 +8,9 @@ const { requireWritable } = require('../middleware/maintenance');
 const { requirePermission } = require('../middleware/permission');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
 const {
+  demoContextPreflight
+} = require('../middleware/demoContext');
+const {
   ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
   ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY,
   readSafeUploadFile,
@@ -16,10 +19,13 @@ const {
 const {
   buildEnergyFlowBundleImportPreview,
   executeEnergyFlowBundleImport,
+  executeEnergyFlowModelImport,
   executeEnergyFlowNodeImport,
   parseEnergyFlowBundleRows,
+  parseEnergyFlowModelRows,
   parseEnergyFlowNodeRows,
   previewEnergyFlowBundleImport,
+  previewEnergyFlowModelImport,
   previewEnergyFlowNodeImport
 } = require('../services/energyFlowImportService');
 const { getImportAuditBatchDetail } = require('../services/importAuditService');
@@ -164,6 +170,25 @@ function preflightNodePreviewUpload(file) {
 }
 
 /**
+ * 对 XLSX 模型上传执行无数据库写入的工作表结构预检；CSV 沿用服务契约直接解析。
+ * @param {object} file Multer 已落盘文件。
+ */
+function preflightModelPreviewUpload(file) {
+  if (!file || String(file.originalname || '').split('.').pop().toLowerCase() !== 'xlsx') return;
+  const safeFile = readSafeUploadFile(uploadsDir, file.filename, {
+    expectedSizeBytes: Number.isSafeInteger(file.size) ? file.size : undefined
+  });
+  const parsed = parseEnergyFlowModelRows(safeFile.buffer, file.originalname);
+  const structureErrors = (parsed.globalIssues || []).filter((issue) => issue.severity !== 'warning');
+  if (structureErrors.some((issue) => issue.code === 'MISSING_TEMPLATE_SHEET' || issue.code === 'UNEXPECTED_TEMPLATE_SHEET')) {
+    throw badRequest('能流模型模板工作表结构不完整。', {
+      code: 'ENERGY_FLOW_MODEL_WORKBOOK_STRUCTURE_INVALID',
+      issueCodes: [...new Set(structureErrors.map((issue) => issue.code).filter(Boolean))]
+    });
+  }
+}
+
+/**
  * 创建上传预演处理器：成功保留原文件，任何上传、结构或领域失败均清理本次文件。
  * @param {Function} previewService 能流预演服务。
  * @param {Function} preflightUpload 无副作用上传预检。
@@ -179,10 +204,18 @@ function createPreviewHandler(previewService, preflightUpload) {
         return;
       }
 
+      const serviceOptions = req.demoContext ? { demoContext: {
+        token: req.demoContext.token,
+        userId: req.user.id,
+        artifactKey: req.demoContext.artifactKey,
+        handlerKey: req.demoContext.handlerKey
+      } } : {};
       Promise.resolve()
         .then(() => preflightUpload(req.file))
-        .then(() => previewService(req.file))
-        .then((preview) => sendSuccess(res, preview))
+        .then(() => previewService(req.file, serviceOptions))
+        .then((preview) => {
+          sendSuccess(res, preview);
+        })
         .catch((error) => {
           cleanupUploadedImportFile(req.file);
           next(error);
@@ -263,12 +296,57 @@ function preflightBundleExecute(edgeBatch, recordBatch) {
   }
 }
 
+/** 创建显式 artifact/handler 的 demo-aware preflight。 */
+function demoAware(artifactKey, handlerKey, phase) {
+  return demoContextPreflight({ artifactKey, handlerKey, phase, allowFormal: true });
+}
+
+/** 将请求中的 context 只投影为服务端领域事务所需绑定。 */
+function buildDemoServiceContext(req) {
+  if (!req.demoContext) return null;
+  return {
+    token: req.demoContext.token,
+    userId: req.user.id,
+    artifactKey: req.demoContext.artifactKey,
+    handlerKey: req.demoContext.handlerKey
+  };
+}
+
+// 能流模型单批次预演；空库中不依赖已选择模型即可使用。
+router.post(
+  '/models/preview',
+  authenticate,
+  requirePermission(ENERGY_FLOW_IMPORT_PERMISSIONS.preview),
+  requireWritable('energy-flows:models-import-preview'),
+  demoAware('22-energy-flow-models', 'energy-flow-models-import', 'preview'),
+  createPreviewHandler(previewEnergyFlowModelImport, preflightModelPreviewUpload)
+);
+
+// 能流模型单批次执行，操作者和 IP 只从服务端认证请求注入。
+router.post(
+  '/models/execute',
+  authenticate,
+  requirePermission(ENERGY_FLOW_IMPORT_PERMISSIONS.execute),
+  requireWritable('energy-flows:models-import-execute'),
+  demoAware('22-energy-flow-models', 'energy-flow-models-import', 'execute'),
+  parseExecuteJsonBody,
+  asyncHandler(async (req, res) => {
+    const result = await executeEnergyFlowModelImport(req.body || {}, {
+      actorUserId: req.user.id,
+      actorIp: req.ip,
+      demoContext: buildDemoServiceContext(req)
+    });
+    sendSuccess(res, result);
+  })
+);
+
 // 能流节点单批次预演。
 router.post(
   '/nodes/preview',
   authenticate,
   requirePermission(ENERGY_FLOW_IMPORT_PERMISSIONS.preview),
   requireWritable('energy-flows:nodes-import-preview'),
+  demoAware('23-energy-flow-nodes', 'energy-flow-nodes-import', 'preview'),
   createPreviewHandler(previewEnergyFlowNodeImport, preflightNodePreviewUpload)
 );
 
@@ -278,9 +356,13 @@ router.post(
   authenticate,
   requirePermission(ENERGY_FLOW_IMPORT_PERMISSIONS.execute),
   requireWritable('energy-flows:nodes-import-execute'),
+  demoAware('23-energy-flow-nodes', 'energy-flow-nodes-import', 'execute'),
   parseExecuteJsonBody,
   asyncHandler(async (req, res) => {
-    sendSuccess(res, await executeEnergyFlowNodeImport(req.body || {}));
+    const result = await executeEnergyFlowNodeImport(req.body || {}, {
+      demoContext: buildDemoServiceContext(req)
+    });
+    sendSuccess(res, result);
   })
 );
 
@@ -290,6 +372,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_FLOW_IMPORT_PERMISSIONS.preview),
   requireWritable('energy-flows:bundle-import-preview'),
+  demoAware('24-energy-flow-edges', 'energy-flow-bundle-import', 'preview'),
   createPreviewHandler(previewEnergyFlowBundleImport, preflightBundlePreviewUpload)
 );
 
@@ -299,6 +382,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_FLOW_IMPORT_PERMISSIONS.execute),
   requireWritable('energy-flows:bundle-import-execute'),
+  demoAware('24-energy-flow-edges', 'energy-flow-bundle-import', 'execute'),
   parseExecuteJsonBody,
   asyncHandler(async (req, res) => {
     const requestBody = req.body || {};
@@ -307,7 +391,10 @@ router.post(
     const recordBatch = getImportAuditBatchDetail(requestBody.recordBatchId, { includeIssues: false });
     preflightBundleExecute(edgeBatch, recordBatch);
     const trustedBody = buildTrustedBundleExecuteBody(requestBody, edgeBatch);
-    sendSuccess(res, await executeEnergyFlowBundleImport(trustedBody));
+    const result = await executeEnergyFlowBundleImport(trustedBody, {
+      demoContext: buildDemoServiceContext(req)
+    });
+    sendSuccess(res, result);
   })
 );
 

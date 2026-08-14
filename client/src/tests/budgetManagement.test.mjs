@@ -69,10 +69,22 @@ assert.equal(
 
 // 页面静态契约保证图表和完整状态明细使用不同数据集。
 const budgetPageSource = readFileSync(new URL('../views/energy/BudgetManagement.vue', import.meta.url), 'utf8');
+const budgetApiSource = readFileSync(new URL('../api/budgets.js', import.meta.url), 'utf8');
+assert.match(budgetApiSource, /\/templates\/demo-park\/10-energy-budgets\.xlsx/);
+assert.match(budgetPageSource, /v-if="canImport" :loading="demoExampleLoading" @click="downloadDemoExample">下载青岚园区示例/);
+assert.match(budgetPageSource, /hasPermi\('energy:budget:import'\)/);
+assert.match(budgetPageSource, /青岚园区示例下载失败/);
 assert.match(budgetPageSource, /v-for="row in comparisonChartRows"/);
 assert.match(budgetPageSource, /:data="comparisonTableRows"/);
 assert.match(budgetPageSource, /budgetComparisonBudgetUnit\(row\)/);
 assert.match(budgetPageSource, /budgetComparisonActualUnit\(row\)/);
 assert.match(budgetPageSource, /单位不一致，已保留在明细中并标记为不可比较/);
+for (const fieldName of ['draftFilters.monthStart', 'draftFilters.monthEnd', 'budgetForm.periodMonth']) {
+  assert.match(
+    budgetPageSource,
+    new RegExp(`<el-date-picker(?=[^>]*v-model="${fieldName.replace('.', '\\.')}"(?:\\s|/|>))(?=[^>]*type="month")(?=[^>]*value-format="YYYY-MM")(?=[^>]*format="YYYY-MM")(?=[^>]*:editable="true")[^>]*>`),
+    `${fieldName} 必须使用可下拉、可键盘输入的 YYYY-MM 月份控件。`
+  );
+}
 
 console.log('budgetManagement.test.mjs passed');

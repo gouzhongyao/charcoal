@@ -29,6 +29,49 @@ const ENERGY_ANALYSIS_TEMPLATE_TYPES = new Set(
   listEnergyAnalysisTemplates().map((template) => template.id)
 );
 
+// 中央模板下载权限必须与各领域现有预演权限一致；新增配置和平衡导入使用独立 preview 权限。
+const TEMPLATE_REQUIRED_PERMISSIONS = Object.freeze({
+  'organization-units': 'ledger:units:import',
+  meters: 'ledger:meters:import',
+  'meter-readings': 'ledger:readings:import',
+  'production-units': 'ledger:production:import',
+  'production-outputs': 'ledger:production:preview',
+  'generation-records': 'ledger:generation:preview',
+  'energy-budgets': 'energy:budget:import',
+  'carbon-factors': 'carbon:factor:import',
+  'prediction-configs': 'prediction:config:import',
+  'energy-timeseries': 'energy:analysis:timeseries:preview',
+  'shift-definitions': 'energy:analysis:config:import:preview',
+  'tou-schemes': 'energy:analysis:config:import:preview',
+  'strategy-rules': 'energy:analysis:config:import:preview',
+  'shift-schedules': 'energy:analysis:operations:preview',
+  'device-states': 'energy:analysis:operations:preview',
+  'energy-conversion-factors': 'energy:benchmarks:import:preview',
+  'energy-benchmark-definitions': 'energy:benchmarks:import:preview',
+  'energy-benchmark-targets': 'energy:benchmarks:import:preview',
+  'energy-flow-models': 'energy:flows:import:preview',
+  'energy-flow-nodes': 'energy:flows:import:preview',
+  'energy-flow-edges': 'energy:flows:import:preview',
+  'energy-balance-configs': 'energy:balance:import:preview'
+});
+
+// 能源分析模板元数据必须指向各领域已经开放的真实预演与执行路由。
+const ENERGY_ANALYSIS_TEMPLATE_CONTRACT_ROUTES = Object.freeze({
+  'energy-timeseries': 'POST /api/energy-analysis/imports/timeseries/preview -> POST /api/energy-analysis/imports/timeseries/execute',
+  'shift-definitions': 'POST /api/energy-analysis/imports/shift-definitions/preview -> POST /api/energy-analysis/imports/shift-definitions/execute',
+  'tou-schemes': 'POST /api/energy-analysis/imports/tou-schemes/preview -> POST /api/energy-analysis/imports/tou-schemes/execute',
+  'strategy-rules': 'POST /api/energy-analysis/imports/strategy-rules/preview -> POST /api/energy-analysis/imports/strategy-rules/execute',
+  'shift-schedules': 'POST /api/energy-analysis/imports/shift-schedules/preview -> POST /api/energy-analysis/imports/shift-schedules/execute',
+  'device-states': 'POST /api/energy-analysis/imports/device-states/preview -> POST /api/energy-analysis/imports/device-states/execute',
+  'energy-conversion-factors': 'POST /api/energy-benchmarks/imports/conversion-factors/preview -> POST /api/energy-benchmarks/imports/conversion-factors/execute',
+  'energy-benchmark-definitions': 'POST /api/energy-benchmarks/imports/definitions/preview -> POST /api/energy-benchmarks/imports/definitions/execute',
+  'energy-benchmark-targets': 'POST /api/energy-benchmarks/imports/targets/preview -> POST /api/energy-benchmarks/imports/targets/execute',
+  'energy-flow-models': 'POST /api/energy-flow-imports/models/preview -> POST /api/energy-flow-imports/models/execute',
+  'energy-flow-nodes': 'POST /api/energy-flow-imports/nodes/preview -> POST /api/energy-flow-imports/nodes/execute',
+  'energy-flow-edges': 'POST /api/energy-flow-imports/bundle/preview -> POST /api/energy-flow-imports/bundle/execute',
+  'energy-balance-configs': 'POST /api/energy-balance-imports/bundle/preview -> POST /api/energy-balance-imports/bundle/execute'
+});
+
 const TEMPLATE_DEFINITIONS = {
   [ENERGY_BUDGET_IMPORT_TEMPLATE_ID]: {
     type: ENERGY_BUDGET_IMPORT_TEMPLATE_ID,
@@ -281,8 +324,11 @@ function buildEnergyAnalysisTemplateDefinition(templateType) {
     recommendedFormat: 'xlsx',
     formats: [...definition.formats],
     appliesTo: ['能源分析'],
-    contractRoute: null,
-    description: `用于下载${definition.name}；当前仅接入中央模板服务，不代表领域预演或执行接口已开放。`,
+    contractRoute: ENERGY_ANALYSIS_TEMPLATE_CONTRACT_ROUTES[definition.id] || null,
+    requiredPermission: TEMPLATE_REQUIRED_PERMISSIONS[definition.id] || null,
+    description: ENERGY_ANALYSIS_TEMPLATE_CONTRACT_ROUTES[definition.id]
+      ? `用于按冻结字段和工作表契约预演并受控导入${definition.name.replace(/导入模板$/, '')}。`
+      : `用于建立${definition.name}的冻结下载契约；本节点不开放该领域的预演或执行写入接口。`,
     headers: definition.headers ? [...definition.headers] : null,
     rows: definition.rows,
     sheetNames: definition.sheets.map((sheet) => sheet.name),
@@ -338,6 +384,10 @@ function listTemplates() {
     contractRoute: template.contractRoute,
     reusableTemplateType: template.reusableTemplateType || null,
     description: template.description,
+    requiredPermission: TEMPLATE_REQUIRED_PERMISSIONS[template.type] || null,
+    formats: ['xlsx', 'csv'],
+    sheetNames: [template.sheetName],
+    sheets: [{ name: template.sheetName, headers: [...template.headers] }],
     headers: template.headers
   }));
   const energyAnalysisTemplates = listEnergyAnalysisTemplates().map((listedTemplate) => {
@@ -360,6 +410,7 @@ function listTemplates() {
       contractRoute: template.contractRoute,
       reusableTemplateType: null,
       description: template.description,
+      requiredPermission: template.requiredPermission,
       headers: template.headers,
       sheetNames: [...template.sheetNames],
       sheets: template.sheets.map((sheet) => ({
@@ -416,6 +467,8 @@ function getTemplateXlsx(templateType) {
 }
 
 module.exports = {
+  ENERGY_ANALYSIS_TEMPLATE_CONTRACT_ROUTES,
+  TEMPLATE_REQUIRED_PERMISSIONS,
   getTemplateCsv,
   getTemplateDefinition,
   getTemplateXlsx,

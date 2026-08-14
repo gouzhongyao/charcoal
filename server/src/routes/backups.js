@@ -32,6 +32,10 @@ function toPublicRestoreResult(result = {}) {
   return {
     restoredFrom: toPublicBackupMetadata(result.restoredFrom),
     preRestoreBackup: toPublicBackupMetadata(result.preRestoreBackup),
+    demoRuntimeSafetyReset: result.demoRuntimeSafetyReset,
+    cleanupWarnings: Array.isArray(result.cleanupWarnings)
+      ? result.cleanupWarnings.filter((warning) => warning === 'RESTORE_SWITCH_CLEANUP_PENDING')
+      : [],
     note: result.note
   };
 }
@@ -61,7 +65,12 @@ router.get('/:backupName/download', authenticate, requirePermission('system:back
 }));
 
 router.post('/:backupName/restore', authenticate, requirePermission('system:backup:restore'), requireWritable('backups:restore'), asyncHandler(async (req, res) => {
-  const result = await restoreBackup(req.params.backupName);
+  const result = await restoreBackup(req.params.backupName, {
+    userId: req.user.id,
+    username: req.user.username,
+    displayName: req.user.displayName,
+    ip: req.ip
+  });
   sendSuccess(res, toPublicRestoreResult(result));
 }));
 
@@ -76,3 +85,4 @@ router.delete('/:backupName', authenticate, requirePermission('system:backup:del
 }));
 
 module.exports = router;
+module.exports.toPublicRestoreResult = toPublicRestoreResult;

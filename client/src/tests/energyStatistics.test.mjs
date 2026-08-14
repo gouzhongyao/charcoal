@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { aggregateMonthlyTrend, buildEnergyFilters, ENERGY_TYPE_COLORS, fixedEnergyTypeBreakdown } from '../utils/energyStatistics.js';
 import { hasPermission } from '../utils/permissionCore.js';
 
@@ -29,5 +30,16 @@ assert.equal(hasPermission('energy:records:export', [], { roles: [{ roleCode: 's
 assert.equal(hasPermission(['energy:records:view', 'energy-records:view'], ['energy-records:view'], { roleCode: 'user' }), true);
 assert.equal(hasPermission(['energy:records:export', 'energy-records:export'], ['energy-records:export'], { roleCode: 'user' }), true);
 assert.equal(hasPermission('energy:records:ledger-backfill:execute', ['energy:records:view'], { roleCode: 'user' }), false);
+
+// 能耗统计月份筛选契约：保持 YYYY-MM 字符串 model，并同时支持下拉和键盘输入。
+const statisticsPageSource = readFileSync(new URL('../views/energy/EnergyStatistics.vue', import.meta.url), 'utf8');
+for (const fieldName of ['draftFilters.normalizedMonthStart', 'draftFilters.normalizedMonthEnd']) {
+  const escapedFieldName = fieldName.replace('.', '\\.');
+  assert.match(
+    statisticsPageSource,
+    new RegExp(`<el-date-picker(?=[^>]*v-model="${escapedFieldName}")(?=[^>]*type="month")(?=[^>]*value-format="YYYY-MM")(?=[^>]*format="YYYY-MM")(?=[^>]*:editable="true")[^>]*>`),
+    `${fieldName} 必须使用可编辑的 YYYY-MM 月份控件。`
+  );
+}
 
 console.log('energyStatistics.test.mjs passed');

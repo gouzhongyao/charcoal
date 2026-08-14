@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   PREDICTION_CATEGORY_COLORS,
   PREDICTION_CONFIG_IMPORT_CONFIRM_TEXT,
@@ -46,5 +47,31 @@ assert.deepEqual(buildPredictionTrendRows(mixedUnits, 'kWh'), [
   { energyTypeCode: 'electricity', energyTypeName: '电力', targetMonth: '2026-05', predictedUnit: 'kWh', predictedValue: 120, resultCount: 1 }
 ]);
 assert.deepEqual(PREDICTION_CATEGORY_COLORS, ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948'], '预测图表必须使用固定、已验证的实体色顺序。');
+
+// 预测运行、结果和配置月份字段必须统一使用可编辑的 YYYY-MM 月份控件。
+const predictionPageSource = readFileSync(new URL('../views/predictions/PredictionManagement.vue', import.meta.url), 'utf8');
+const predictionApiSource = readFileSync(new URL('../api/predictions.js', import.meta.url), 'utf8');
+assert.match(predictionApiSource, /\/templates\/demo-park\/12-prediction-configs\.xlsx/);
+assert.match(predictionPageSource, /v-if="canConfigImport" :loading="demoExampleLoading" @click="downloadDemoExample">下载青岚园区示例/);
+assert.match(predictionPageSource, /hasPermi\('prediction:config:import'\)/);
+assert.match(predictionPageSource, /历史能耗复用数据导入页文件/);
+assert.match(predictionPageSource, /不会自动运行预测/);
+assert.match(predictionPageSource, /青岚园区示例下载失败/);
+for (const fieldName of [
+  'runDraftFilters.targetMonth',
+  'resultDraftFilters.targetMonthStart',
+  'resultDraftFilters.targetMonthEnd',
+  'configForm.trainStartMonth',
+  'configForm.trainEndMonth',
+  'configForm.predictStartMonth',
+  'configForm.predictEndMonth'
+]) {
+  const escapedFieldName = fieldName.replace('.', '\\.');
+  assert.match(
+    predictionPageSource,
+    new RegExp(`<el-date-picker(?=[^>]*v-model="${escapedFieldName}")(?=[^>]*type="month")(?=[^>]*value-format="YYYY-MM")(?=[^>]*format="YYYY-MM")(?=[^>]*:editable="true")[^>]*>`),
+    `${fieldName} 必须使用可编辑的 YYYY-MM 月份控件。`
+  );
+}
 
 console.log('predictionManagement.test.mjs passed');

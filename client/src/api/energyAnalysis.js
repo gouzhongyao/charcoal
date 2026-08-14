@@ -1,4 +1,4 @@
-import { query, request } from '@/api/http';
+import { download, query, request } from '@/api/http';
 
 // 能源消费分析统一 API 根路径。
 const ANALYSIS_ROOT = '/energy-analysis';
@@ -62,6 +62,24 @@ export const createStrategyRule = (data) => post(`${ANALYSIS_ROOT}/config/strate
 export const createStrategyRuleVersion = (id, data) => post(`${ANALYSIS_ROOT}/config/strategy-rules/${id}/versions`, data);
 /** 启用或停用策略规则版本。 */
 export const setStrategyRuleStatus = (id, status) => patch(`${ANALYSIS_ROOT}/config/strategy-rules/${id}/status`, { status });
+
+/** 下载服务端生成的能源分析空白模板。 */
+export function downloadEnergyAnalysisImportTemplate(templateType, extension = 'xlsx') {
+  const safeExtension = extension === 'csv' ? 'csv' : 'xlsx';
+  return download(
+    { url: `/templates/${encodeURIComponent(templateType)}.${safeExtension}` },
+    `能源分析导入模板.${safeExtension}`
+  );
+}
+
+/** 下载受领域权限保护的青岚园区能源分析示例。 */
+export function downloadEnergyAnalysisDemoArtifact(artifactKey, extension = 'xlsx') {
+  const safeExtension = extension === 'csv' ? 'csv' : 'xlsx';
+  return download(
+    { url: `/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}` },
+    `青岚园区能源分析示例.${safeExtension}`
+  );
+}
 
 /** 上传文件并创建服务端受控预演批次；会保存文件与导入审计、不写目标领域记录，且受维护态限制。 */
 export function previewEnergyAnalysisImport(type, file) {

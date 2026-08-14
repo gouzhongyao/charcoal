@@ -15,11 +15,17 @@ const AUDIT_IMPORT_TYPES = Object.freeze([
   'energy_timeseries',
   'shift_schedule',
   'device_state',
+  'shift_definition',
+  'tou_scheme',
+  'strategy_rule',
   'energy_conversion_factor',
   'energy_benchmark',
+  'energy_flow_model',
   'energy_flow_node',
   'energy_flow_edge',
-  'energy_flow_record'
+  'energy_flow_record',
+  'energy_balance_boundary',
+  'energy_balance_item'
 ]);
 // 由领域服务维护生命周期和追溯的批次禁止走通用删除入口。
 const GENERIC_DELETE_FORBIDDEN_IMPORT_TYPES = Object.freeze([...AUDIT_IMPORT_TYPES, 'meter_reading']);
@@ -433,33 +439,37 @@ function recordPreviewAuditBatch(input = {}, options = {}) {
   });
 }
 
-function replaceImportAuditIssues(batchId, issues = [], options = {}) {
+/** 使用调用者提供的 SQLite 连接替换审计问题，不创建嵌套事务或第二写连接。 */
+function replaceImportAuditIssuesWithDatabase(db, batchId, issues = []) {
+  if (!db) throw new Error('replaceImportAuditIssuesWithDatabase 必须提供 SQLite 连接。');
   const numericBatchId = parsePositiveInteger(batchId, 'batchId');
   if (!Array.isArray(issues)) {
     throw badRequest('导入审计明细必须是数组。', { code: 'IMPORT_AUDIT_ISSUES_MUST_BE_ARRAY' });
   }
+  ensureImportAuditBatchExists(db, numericBatchId);
+  db.prepare('DELETE FROM import_errors WHERE batch_id = ?').run(numericBatchId);
+  const insertIssue = db.prepare(
+    `INSERT INTO import_errors (
+       batch_id,
+       row_number,
+       field_name,
+       raw_value,
+       error_code,
+       error_reason,
+       severity
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  );
+  issues.map(mapImportAuditIssue).forEach((issue) => {
+    insertIssue.run(numericBatchId, issue.rowNumber, issue.fieldName, issue.rawValue, issue.errorCode, issue.errorReason, issue.severity);
+  });
+  db.prepare("UPDATE import_batches SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").run(numericBatchId);
+  return getImportAuditBatchDetail(numericBatchId, { db });
+}
+
+function replaceImportAuditIssues(batchId, issues = [], options = {}) {
   return withAuditDatabase(options, (db) => {
-    ensureImportAuditBatchExists(db, numericBatchId);
-    const transaction = db.transaction(() => {
-      db.prepare('DELETE FROM import_errors WHERE batch_id = ?').run(numericBatchId);
-      const insertIssue = db.prepare(
-        `INSERT INTO import_errors (
-           batch_id,
-           row_number,
-           field_name,
-           raw_value,
-           error_code,
-           error_reason,
-           severity
-         ) VALUES (?, ?, ?, ?, ?, ?, ?)`
-      );
-      issues.map(mapImportAuditIssue).forEach((issue) => {
-        insertIssue.run(numericBatchId, issue.rowNumber, issue.fieldName, issue.rawValue, issue.errorCode, issue.errorReason, issue.severity);
-      });
-      db.prepare("UPDATE import_batches SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").run(numericBatchId);
-      return getImportAuditBatchDetail(numericBatchId, { db });
-    });
-    return transaction();
+    if (db.inTransaction) return replaceImportAuditIssuesWithDatabase(db, batchId, issues);
+    return db.transaction(() => replaceImportAuditIssuesWithDatabase(db, batchId, issues))();
   });
 }
 
@@ -646,6 +656,7 @@ module.exports = {
   parseStoredAuditJson,
   recordPreviewAuditBatch,
   replaceImportAuditIssues,
+  replaceImportAuditIssuesWithDatabase,
   serializeAuditJson,
   updateExecuteAuditResult
 };

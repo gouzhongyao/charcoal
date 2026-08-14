@@ -5,6 +5,7 @@ const { requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { assertWritableAllowed } = require('../services/maintenanceState');
 const { normalizeUploadError, uploadImportFile } = require('../middleware/upload');
+const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
 const { getImportContract } = require('../services/contractService');
 const { createImportBatchFromUpload, deleteImportBatch, getImportBatchFileDownload, getImportBatchQueryDetail, listImportBatches, listImportErrors } = require('../services/importService');
 const { sendSuccess } = require('../utils/response');
@@ -38,7 +39,7 @@ router.get('/batches', authenticate, requirePermission('imports:view'), asyncHan
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination } });
 }));
 
-router.post('/batches', authenticate, requirePermission('imports:create'), requireWritable('imports:create-batch'), (req, res, next) => {
+router.post('/batches', authenticate, requirePermission('imports:create'), requireWritable('imports:create-batch'), rejectUnconnectedDemoContext, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {

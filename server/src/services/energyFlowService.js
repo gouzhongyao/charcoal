@@ -828,6 +828,13 @@ function createEnergyFlowModel(input = {}, options = {}) {
     return executeBusinessWrite(databaseContext.db, options, () => {
       const duplicate = databaseContext.db.prepare('SELECT id FROM energy_flow_models WHERE model_code = ? AND version = ?').get(payload.modelCode, payload.version);
       if (duplicate) throw badRequest('相同模型编码和版本已存在。', { code: 'DUPLICATE_ENERGY_FLOW_MODEL_VERSION' });
+      if (payload.status === 'active') {
+        databaseContext.db.prepare(
+          `UPDATE energy_flow_models
+           SET status = 'inactive', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+           WHERE model_code = ? AND status = 'active'`
+        ).run(payload.modelCode);
+      }
       const result = databaseContext.db.prepare(
         `INSERT INTO energy_flow_models (
            model_code, model_name, source, document_no, version,
@@ -857,6 +864,13 @@ function updateEnergyFlowModel(modelId, input = {}, options = {}) {
     return executeBusinessWrite(databaseContext.db, options, () => {
       const existing = requireModel(databaseContext.db, modelId);
       const payload = normalizeModelPayload(input, existing);
+      if (payload.status === 'active') {
+        databaseContext.db.prepare(
+          `UPDATE energy_flow_models
+           SET status = 'inactive', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+           WHERE model_code = ? AND id <> ? AND status = 'active'`
+        ).run(existing.modelCode, existing.id);
+      }
       databaseContext.db.prepare(
         `UPDATE energy_flow_models
          SET model_name = ?, source = ?, document_no = ?, effective_start_utc = ?,
@@ -2350,6 +2364,7 @@ module.exports = {
   listEnergyFlowModels,
   listEnergyFlowNodes,
   normalizeAnalysisRange,
+  normalizeModelPayload,
   resolveEnergyFlowEdgeValue,
   resolveSourceMapping,
   setEnergyFlowEdgeStatus,

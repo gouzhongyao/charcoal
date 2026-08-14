@@ -18,7 +18,16 @@ const pageContracts = Object.freeze([
     component: 'energy/analysis/index',
     permission: 'energy:analysis:view',
     apiRoot: "const ANALYSIS_ROOT = '/energy-analysis';",
-    pagePermissionMarker: 'ENERGY_ANALYSIS_PERMISSIONS.view'
+    pagePermissionMarker: 'ENERGY_ANALYSIS_PERMISSIONS.view',
+    strictUtcInputCount: 2,
+    strictUtcFields: ['configForm.effectiveStartUtc', 'configForm.effectiveEndUtc'],
+    timeOfDayFields: ['configForm.startMinute', 'configForm.endMinute'],
+    monthFields: ['draftFilters.startMonth', 'draftFilters.endMonth'],
+    wallClockDateTimeFields: ['draftFilters.startUtc', 'draftFilters.endUtc'],
+    ianaTimeZoneFields: ['draftFilters.sourceTimeZone', 'configForm.sourceTimeZone'],
+    safeConfigurationHydration: true,
+    autoLoadsAnalysis: true,
+    separatedMonthlyTimeseriesFacts: true
   },
   {
     importName: 'EnergyBenchmarks',
@@ -29,7 +38,8 @@ const pageContracts = Object.freeze([
     component: 'energy/benchmarks/index',
     permission: 'energy:benchmarks:view',
     apiRoot: "const ENERGY_BENCHMARK_BASE_URL = '/energy-benchmarks';",
-    pagePermissionMarker: 'ENERGY_BENCHMARK_PERMISSIONS.view'
+    pagePermissionMarker: 'ENERGY_BENCHMARK_PERMISSIONS.view',
+    ianaTimeZoneFields: ['definitionForm.sourceTimeZone', 'internalForm.definition.sourceTimeZone']
   },
   {
     importName: 'EnergyFlows',
@@ -40,7 +50,10 @@ const pageContracts = Object.freeze([
     component: 'energy/flows/index',
     permission: 'energy:flows:view',
     apiRoot: "const ENERGY_FLOW_BASE_URL = '/energy-flows';",
-    pagePermissionMarker: "hasPermi('energy:flows:view')"
+    pagePermissionMarker: "hasPermi('energy:flows:view')",
+    strictUtcInputCount: 4,
+    strictUtcFields: ['analysisFilters.startUtc', 'analysisFilters.endUtc', 'modelForm.effectiveStartUtc', 'modelForm.effectiveEndUtc'],
+    ianaTimeZoneFields: ['modelForm.sourceTimeZone', 'edgeForm.sourceTimeZone']
   },
   {
     importName: 'EnergyBalances',
@@ -51,7 +64,10 @@ const pageContracts = Object.freeze([
     component: 'energy/balances/index',
     permission: 'energy:balance:view',
     apiRoot: "const BASE_URL = '/energy-balances';",
-    pagePermissionMarker: 'ENERGY_BALANCE_PERMISSIONS.view'
+    pagePermissionMarker: 'ENERGY_BALANCE_PERMISSIONS.view',
+    strictUtcInputCount: 2,
+    strictUtcFields: ['boundaryForm.effectiveStartUtc', 'boundaryForm.effectiveEndUtc'],
+    ianaTimeZoneFields: ['boundaryForm.sourceTimeZone']
   }
 ]);
 
@@ -113,6 +129,79 @@ for (const contract of pageContracts) {
     /MigrationPlaceholder|Math\.random|\b(?:mockData|demoData|fakeData)\b|演示数据|随机数据|模拟数据/i,
     `${contract.component} 页面不得包含迁移占位、演示数据或随机数据。`
   );
+  if (contract.strictUtcInputCount) {
+    assert.ok(pageSource.includes("import StrictUtcDateTimeInput from '@/components/StrictUtcDateTimeInput.vue';"), `${contract.component} 必须引入共享严格 UTC 输入组件。`);
+    assert.equal((pageSource.match(/<StrictUtcDateTimeInput\b/g) || []).length, contract.strictUtcInputCount, `${contract.component} 严格 UTC 组件数量不一致。`);
+    for (const fieldName of contract.strictUtcFields) {
+      assert.ok(pageSource.includes(`v-model="${fieldName}"`), `${contract.component} 必须保持严格 UTC 字段 ${fieldName}。`);
+    }
+  }
+  if (contract.timeOfDayFields) {
+    assert.ok(pageSource.includes("import TimeOfDayInput from '@/components/TimeOfDayInput.vue';"), `${contract.component} 必须引入共享日内时间输入组件。`);
+    assert.equal((pageSource.match(/<TimeOfDayInput\b/g) || []).length, contract.timeOfDayFields.length, `${contract.component} 日内时间组件数量不一致。`);
+    for (const fieldName of contract.timeOfDayFields) {
+      assert.ok(pageSource.includes(`v-model="${fieldName}"`), `${contract.component} 必须保持分钟模型字段 ${fieldName}。`);
+    }
+  }
+  if (contract.ianaTimeZoneFields) {
+    assert.ok(pageSource.includes("import IanaTimeZoneSelect from '@/components/IanaTimeZoneSelect.vue';"), `${contract.component} 必须引入共享 IANA 时区选择组件。`);
+    assert.equal((pageSource.match(/<IanaTimeZoneSelect\b/g) || []).length, contract.ianaTimeZoneFields.length, `${contract.component} 可编辑来源时区组件数量不一致。`);
+    for (const fieldName of contract.ianaTimeZoneFields) {
+      assert.ok(pageSource.includes(`<IanaTimeZoneSelect v-model="${fieldName}"`), `${contract.component} 必须保持来源时区字段 ${fieldName}。`);
+      assert.equal(new RegExp(`<el-input[^>]+v-model(?:\\.trim)?="${escapeRegExp(fieldName)}"`).test(pageSource), false, `${contract.component} 来源时区字段 ${fieldName} 不得继续使用普通输入框。`);
+    }
+  }
+  if (contract.safeConfigurationHydration) {
+    assert.ok(pageSource.includes(':confirm-disabled="configFormHydrationBlocked"'), `${contract.component} 回显失败时必须禁用配置保存。`);
+    assert.match(pageSource, /try \{\s*Object\.assign\(configForm, createEnergyAnalysisConfigForm\(kind, source\)\);\s*\} catch \(error\) \{[\s\S]*?configFormHydrationBlocked\.value = true;[\s\S]*?configFormError\.value = `配置回显失败：\$\{error\.message\}`;[\s\S]*?\}\s*configDrawerOpen\.value = true;/, `${contract.component} 必须捕获配置回显异常、展示可见错误并安全打开抽屉。`);
+    assert.match(pageSource, /async function saveConfig\(\) \{ if \(configFormHydrationBlocked\.value\) \{[\s\S]*?return; \}/, `${contract.component} 回显失败后不得继续构造或提交 payload。`);
+  }
+  if (contract.autoLoadsAnalysis) {
+    assert.match(pageSource, /const defaultFilters = createDefaultEnergyAnalysisFilters\(\);[\s\S]*?const draftFilters = ref\(\{ \.\.\.defaultFilters \}\);[\s\S]*?const appliedFilters = ref\(createEnergyAnalysisSnapshot\(defaultFilters\)\);/, `${contract.component} 初始化默认筛选只能生成一次。`);
+    assert.match(pageSource, /onMounted\(async \(\) => \{ if \(!canView\.value\) return; await Promise\.all\(\[loadMasterData\(\), loadConfigurations\(\), loadAnalysis\(\)\]\); \}\);/, `${contract.component} 首次挂载必须并行加载主数据、配置和分析。`);
+  }
+  if (contract.separatedMonthlyTimeseriesFacts) {
+    assert.match(pageSource, /label="月度累计消费"[\s\S]*?selectedMonthlyFacetData\?\.totals\?\.value/, `${contract.component} 月度累计 KPI 必须读取月度分面 totals。`);
+    assert.ok(pageSource.includes('label="时序窗口总能耗"'), `${contract.component} 时序总能耗必须使用分域标签。`);
+    assert.ok(pageSource.includes('普通能耗导入只进入月度分析'), `${contract.component} 必须说明普通月度事实边界。`);
+    assert.match(pageSource, /未写入(?:可分析事实|\$\{definition\.resultNoun\})/, `${contract.component} execute 零写入不得宣称成功。`);
+    assert.ok(pageSource.includes('validateEnergyAnalysisLoadCurveGrid(filters)'), `${contract.component} 必须在请求前校验固定 UTC 曲线网格。`);
+  }
+  if (contract.monthFields) {
+    for (const fieldName of contract.monthFields) {
+      assert.match(
+        pageSource,
+        new RegExp(`<el-date-picker(?=[^>]*v-model="${escapeRegExp(fieldName)}")(?=[^>]*type="month")(?=[^>]*value-format="YYYY-MM")(?=[^>]*format="YYYY-MM")(?=[^>]*:editable="true")[^>]*>`),
+        `${contract.component} 月份字段 ${fieldName} 必须使用可编辑的 YYYY-MM 月份控件。`
+      );
+    }
+  }
+  if (contract.component === 'energy/analysis/index') {
+    assert.match(utilitySource, /const sourceTimeZone = requiredConfigurationText\(form\.sourceTimeZone, '来源时区'\);\s*if \(!isIanaTimeZone\(sourceTimeZone\)\) throw new Error\('请选择当前运行时可识别的 IANA 来源时区。'\);[\s\S]*?sourceTimeZone,/, '能源分析配置载荷必须在 API 前执行运行时 IANA 校验。');
+    assert.equal((utilitySource.match(/key: '(?:timeseries|shift-schedules|device-states|shift-definitions|tou-schemes|strategy-rules)'/g) || []).length, 6, '能源分析页必须声明六类真实受控导入。');
+    assert.ok(utilitySource.includes("configurationImportPreview: 'energy:analysis:config:import:preview'"), '配置导入预演必须使用统一细分权限。');
+    assert.ok(utilitySource.includes("configurationImportExecute: 'energy:analysis:config:import:execute'"), '配置导入执行必须使用统一细分权限。');
+    assert.ok(utilitySource.includes("key: 'tou-schemes', label: 'TOU 方案与时段', accept: '.xlsx'"), 'TOU 导入必须只接受 XLSX。');
+    assert.equal(utilitySource.includes("accept: '.xlsx,.xls,.csv'"), false, '新式能源分析导入不得继续接受 XLS。');
+    assert.ok(pageSource.includes(':accept="definition.accept"'), '上传控件必须按导入定义应用 accept。');
+    assert.ok(pageSource.includes('downloadEnergyAnalysisImportTemplate(definition.templateType'), '页面必须提供服务端空白模板下载。');
+    assert.ok(pageSource.includes('downloadEnergyAnalysisDemoArtifact(definition.demoArtifactKey'), '页面必须提供青岚示例下载。');
+    assert.ok(pageSource.includes('await refreshImportedConfiguration(definition.refreshTarget)'), '配置 execute 成功后必须刷新对应配置列表。');
+    assert.ok(apiSource.includes("import { download, query, request } from '@/api/http';"), '模板与示例下载必须复用共享 download。');
+    assert.ok(apiSource.includes('/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}'), '青岚示例必须走受权限保护的模板下载路由。');
+    assert.doesNotMatch(apiSource, /axios|Axios/, '能源分析 API 不得新建 Axios 实例。');
+  }
+  if (contract.wallClockDateTimeFields) {
+    for (const fieldName of contract.wallClockDateTimeFields) {
+      assert.match(
+        pageSource,
+        new RegExp(`<el-date-picker(?=[^>]*v-model="${escapeRegExp(fieldName)}")(?=[^>]*type="datetime")(?=[^>]*value-format="YYYY-MM-DDTHH:mm")(?=[^>]*format="YYYY-MM-DD HH:mm")(?=[^>]*:editable="true")[^>]*>`),
+        `${contract.component} 来源时区墙钟字段 ${fieldName} 必须继续使用可输入 datetime 选择器。`
+      );
+    }
+    assert.ok(utilitySource.includes('toUtcIso(filters.startUtc, filters.sourceTimeZone)'), `${contract.component} 开始墙钟时间必须按来源时区转换。`);
+    assert.ok(utilitySource.includes('toUtcIso(filters.endUtc, filters.sourceTimeZone)'), `${contract.component} 结束墙钟时间必须按来源时区转换。`);
+  }
 }
 
 console.log('energyAnalysisPagesContract.test.mjs passed');

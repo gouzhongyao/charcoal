@@ -61,7 +61,7 @@ function deepFreeze(value) {
   return Object.freeze(value);
 }
 
-// 八个能源分析模板及其受控导入安全契约。
+// 能源分析模板及其受控导入安全契约。
 const ENERGY_ANALYSIS_IMPORT_TEMPLATES = deepFreeze([
   {
     id: 'energy-timeseries',
@@ -97,6 +97,39 @@ const ENERGY_ANALYSIS_IMPORT_TEMPLATES = deepFreeze([
     targetTables: ['device_state_records']
   },
   {
+    id: 'shift-definitions',
+    templateType: 'shift-definitions',
+    operation: 'shift-definition-import',
+    recordKind: 'shift_definition',
+    importTypes: ['shift_definition'],
+    confirmText: '确认导入班次定义',
+    backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+    xlsxOnly: false,
+    targetTables: ['shift_definitions']
+  },
+  {
+    id: 'tou-schemes',
+    templateType: 'tou-schemes',
+    operation: 'tou-scheme-import',
+    recordKind: 'tou_scheme',
+    importTypes: ['tou_scheme'],
+    confirmText: '确认导入TOU方案与时段',
+    backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+    xlsxOnly: true,
+    targetTables: ['tou_schemes', 'tou_period_rules']
+  },
+  {
+    id: 'strategy-rules',
+    templateType: 'strategy-rules',
+    operation: 'strategy-rule-import',
+    recordKind: 'strategy_rule',
+    importTypes: ['strategy_rule'],
+    confirmText: '确认导入策略规则',
+    backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+    xlsxOnly: false,
+    targetTables: ['strategy_rules']
+  },
+  {
     id: 'energy-conversion-factors',
     templateType: 'energy-conversion-factors',
     operation: 'energy-conversion-factor-import',
@@ -130,6 +163,17 @@ const ENERGY_ANALYSIS_IMPORT_TEMPLATES = deepFreeze([
     targetTables: ['benchmark_targets']
   },
   {
+    id: 'energy-flow-models',
+    templateType: 'energy-flow-models',
+    operation: 'energy-flow-model-import',
+    recordKind: 'energy_flow_model',
+    importTypes: ['energy_flow_model'],
+    confirmText: '确认导入能流模型',
+    backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+    xlsxOnly: false,
+    targetTables: ['energy_flow_models']
+  },
+  {
     id: 'energy-flow-nodes',
     templateType: 'energy-flow-nodes',
     operation: 'energy-flow-node-import',
@@ -150,6 +194,17 @@ const ENERGY_ANALYSIS_IMPORT_TEMPLATES = deepFreeze([
     backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
     xlsxOnly: true,
     targetTables: ['energy_flow_edges', 'energy_flow_records']
+  },
+  {
+    id: 'energy-balance-configs',
+    templateType: 'energy-balance-configs',
+    operation: 'energy-balance-config-bundle-import',
+    recordKind: 'energy_balance_config_bundle',
+    importTypes: ['energy_balance_boundary', 'energy_balance_item'],
+    confirmText: '确认导入平衡边界及九角色项目',
+    backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+    xlsxOnly: true,
+    targetTables: ['energy_balance_boundaries', 'energy_balance_items']
   }
 ]);
 
@@ -998,9 +1053,17 @@ function authorizeEnergyAnalysisImportExecute(input = {}, serverContext = {}) {
         ...verifiedContext,
         expectedBatchId: input.expectedBatchId
       }).errors);
-    } else {
+    } else if (typeof serverContext.validateBundleMetadata === 'function') {
+      const bundleValidation = serverContext.validateBundleMetadata(input.bundle, verifiedContext);
+      errors.push(...(Array.isArray(bundleValidation?.errors) ? bundleValidation.errors : []));
+    } else if (template.templateType === 'energy-flow-edges') {
       const bundleValidation = validateEnergyFlowBundleMetadata(input.bundle, verifiedContext);
       errors.push(...bundleValidation.errors);
+    } else {
+      errors.push(createValidationError(
+        'ENERGY_ANALYSIS_IMPORT_BUNDLE_VALIDATOR_REQUIRED',
+        '多批次导入必须提供领域 bundle 元数据校验器。'
+      ));
     }
   }
 

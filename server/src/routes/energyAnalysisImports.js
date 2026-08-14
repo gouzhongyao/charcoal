@@ -7,6 +7,17 @@ const { requireWritable } = require('../middleware/maintenance');
 const { requirePermission } = require('../middleware/permission');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
 const {
+  demoContextPreflight
+} = require('../middleware/demoContext');
+const {
+  executeShiftDefinitionImport,
+  executeStrategyRuleImport,
+  executeTouSchemeImport,
+  previewShiftDefinitionImport,
+  previewStrategyRuleImport,
+  previewTouSchemeImport
+} = require('../services/energyAnalysisConfigurationImportService');
+const {
   executeDeviceStateImport,
   executeShiftScheduleImport,
   previewDeviceStateImport,
@@ -29,6 +40,12 @@ const ENERGY_ANALYSIS_TIMESERIES_PERMISSIONS = Object.freeze({
 const ENERGY_ANALYSIS_OPERATIONS_PERMISSIONS = Object.freeze({
   preview: 'energy:analysis:operations:preview',
   execute: 'energy:analysis:operations:execute'
+});
+
+// 班次、TOU 和策略规则配置导入共用独立预演与执行权限。
+const ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS = Object.freeze({
+  preview: 'energy:analysis:config:import:preview',
+  execute: 'energy:analysis:config:import:execute'
 });
 
 // execute JSON 体积与现有全局解析上限保持一致，但必须在认证、权限和维护态之后解析。
@@ -58,8 +75,14 @@ function createPreviewHandler(previewService) {
         return;
       }
 
+      const serviceOptions = req.demoContext ? { demoContext: {
+        token: req.demoContext.token,
+        userId: req.user.id,
+        artifactKey: req.demoContext.artifactKey,
+        handlerKey: req.demoContext.handlerKey
+      } } : {};
       Promise.resolve()
-        .then(() => previewService(req.file))
+        .then(() => previewService(req.file, serviceOptions))
         .then((preview) => {
           sendSuccess(res, preview);
         })
@@ -113,11 +136,27 @@ function parseEnergyAnalysisExecuteJson(req, res, next) {
  * @param {Function} executeService 对应领域的执行服务。
  * @returns {Function} Express 异步路由处理器。
  */
-function createExecuteHandler(executeService) {
+function createExecuteHandler(executeService, options = {}) {
   return asyncHandler(async (req, res) => {
-    const result = await executeService(req.body || {});
+    const serviceOptions = options.withAuditActor === true
+      ? { actorUserId: req.user.id, actorIp: req.ip }
+      : {};
+    if (req.demoContext) {
+      serviceOptions.demoContext = {
+        token: req.demoContext.token,
+        userId: req.user.id,
+        artifactKey: req.demoContext.artifactKey,
+        handlerKey: req.demoContext.handlerKey
+      };
+    }
+    const result = await executeService(req.body || {}, serviceOptions);
     sendSuccess(res, result);
   });
+}
+
+/** 构造显式 artifact/handler 的 demo-aware preflight；无 context 时保持正式导入行为。 */
+function demoAware(artifactKey, handlerKey, phase) {
+  return demoContextPreflight({ artifactKey, handlerKey, phase, allowFormal: true });
 }
 
 router.post(
@@ -125,6 +164,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_ANALYSIS_TIMESERIES_PERMISSIONS.preview),
   requireWritable('energy-analysis:timeseries-import-preview'),
+  demoAware('15-energy-timeseries', 'energy-timeseries-import', 'preview'),
   createPreviewHandler(previewEnergyTimeseriesImport)
 );
 
@@ -133,6 +173,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_ANALYSIS_TIMESERIES_PERMISSIONS.execute),
   requireWritable('energy-analysis:timeseries-import-execute'),
+  demoAware('15-energy-timeseries', 'energy-timeseries-import', 'execute'),
   parseEnergyAnalysisExecuteJson,
   createExecuteHandler(executeEnergyTimeseriesImport)
 );
@@ -142,6 +183,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_ANALYSIS_OPERATIONS_PERMISSIONS.preview),
   requireWritable('energy-analysis:shift-schedule-import-preview'),
+  demoAware('14-shift-schedules', 'shift-schedules-import', 'preview'),
   createPreviewHandler(previewShiftScheduleImport)
 );
 
@@ -150,6 +192,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_ANALYSIS_OPERATIONS_PERMISSIONS.execute),
   requireWritable('energy-analysis:shift-schedule-import-execute'),
+  demoAware('14-shift-schedules', 'shift-schedules-import', 'execute'),
   parseEnergyAnalysisExecuteJson,
   createExecuteHandler(executeShiftScheduleImport)
 );
@@ -159,6 +202,7 @@ router.post(
   authenticate,
   requirePermission(ENERGY_ANALYSIS_OPERATIONS_PERMISSIONS.preview),
   requireWritable('energy-analysis:device-state-import-preview'),
+  demoAware('16-device-states', 'device-states-import', 'preview'),
   createPreviewHandler(previewDeviceStateImport)
 );
 
@@ -167,11 +211,70 @@ router.post(
   authenticate,
   requirePermission(ENERGY_ANALYSIS_OPERATIONS_PERMISSIONS.execute),
   requireWritable('energy-analysis:device-state-import-execute'),
+  demoAware('16-device-states', 'device-states-import', 'execute'),
   parseEnergyAnalysisExecuteJson,
   createExecuteHandler(executeDeviceStateImport)
 );
 
+router.post(
+  '/shift-definitions/preview',
+  authenticate,
+  requirePermission(ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS.preview),
+  requireWritable('energy-analysis:shift-definition-import-preview'),
+  demoAware('13-shift-definitions', 'shift-definitions-import', 'preview'),
+  createPreviewHandler(previewShiftDefinitionImport)
+);
+
+router.post(
+  '/shift-definitions/execute',
+  authenticate,
+  requirePermission(ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS.execute),
+  requireWritable('energy-analysis:shift-definition-import-execute'),
+  demoAware('13-shift-definitions', 'shift-definitions-import', 'execute'),
+  parseEnergyAnalysisExecuteJson,
+  createExecuteHandler(executeShiftDefinitionImport, { withAuditActor: true })
+);
+
+router.post(
+  '/tou-schemes/preview',
+  authenticate,
+  requirePermission(ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS.preview),
+  requireWritable('energy-analysis:tou-scheme-import-preview'),
+  demoAware('17-tou-schemes', 'tou-schemes-import', 'preview'),
+  createPreviewHandler(previewTouSchemeImport)
+);
+
+router.post(
+  '/tou-schemes/execute',
+  authenticate,
+  requirePermission(ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS.execute),
+  requireWritable('energy-analysis:tou-scheme-import-execute'),
+  demoAware('17-tou-schemes', 'tou-schemes-import', 'execute'),
+  parseEnergyAnalysisExecuteJson,
+  createExecuteHandler(executeTouSchemeImport, { withAuditActor: true })
+);
+
+router.post(
+  '/strategy-rules/preview',
+  authenticate,
+  requirePermission(ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS.preview),
+  requireWritable('energy-analysis:strategy-rule-import-preview'),
+  demoAware('18-strategy-rules', 'strategy-rules-import', 'preview'),
+  createPreviewHandler(previewStrategyRuleImport)
+);
+
+router.post(
+  '/strategy-rules/execute',
+  authenticate,
+  requirePermission(ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS.execute),
+  requireWritable('energy-analysis:strategy-rule-import-execute'),
+  demoAware('18-strategy-rules', 'strategy-rules-import', 'execute'),
+  parseEnergyAnalysisExecuteJson,
+  createExecuteHandler(executeStrategyRuleImport, { withAuditActor: true })
+);
+
 module.exports = router;
+module.exports.ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS = ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS;
 module.exports.ENERGY_ANALYSIS_EXECUTE_JSON_LIMIT = ENERGY_ANALYSIS_EXECUTE_JSON_LIMIT;
 module.exports.ENERGY_ANALYSIS_IMPORT_ROUTER_MOUNT_REQUIREMENT = ENERGY_ANALYSIS_IMPORT_ROUTER_MOUNT_REQUIREMENT;
 module.exports.ENERGY_ANALYSIS_OPERATIONS_PERMISSIONS = ENERGY_ANALYSIS_OPERATIONS_PERMISSIONS;

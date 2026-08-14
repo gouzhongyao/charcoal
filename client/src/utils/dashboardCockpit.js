@@ -234,3 +234,35 @@ export function projectBudgetWarningStatus(rows = []) {
       .sort((left, right) => BUDGET_WARNING_PRIORITY[right.dashboardWarningLevel] - BUDGET_WARNING_PRIORITY[left.dashboardWarningLevel])
   };
 }
+
+/** 将五个真实面板状态聚合为园区业务示意状态，不掩盖局部失败或无权限。 */
+export function projectDashboardSceneState(panelStates = []) {
+  const statuses = (Array.isArray(panelStates) ? panelStates : [])
+    .map((panel) => String(panel?.status || panel || DASHBOARD_PANEL_STATUS.IDLE))
+    .filter(Boolean);
+  const counts = statuses.reduce((result, status) => {
+    result[status] = (result[status] || 0) + 1;
+    return result;
+  }, {});
+  const total = statuses.length;
+  if (total === 0 || counts.idle || counts.loading) {
+    return { status: 'loading', description: '正在汇总已授权的真实业务面板状态。' };
+  }
+  if (counts.forbidden === total) {
+    return { status: 'forbidden', description: '当前账号没有可用于园区业务示意的领域数据权限。' };
+  }
+  if (counts.error === total) {
+    return { status: 'error', description: '全部业务面板读取失败，请分别使用面板重试入口。' };
+  }
+  if (counts.empty === total) {
+    return { status: 'empty', description: '已完成读取，但当前范围内五个业务面板均暂无数据。' };
+  }
+  if (counts.error || counts.forbidden) {
+    const unavailableCount = (counts.error || 0) + (counts.forbidden || 0);
+    return { status: 'partial', description: `已汇总部分真实业务数据，另有 ${unavailableCount} 个面板读取失败或无权限。` };
+  }
+  return {
+    status: 'success',
+    description: counts.empty ? '真实业务面板已完成汇总，部分领域当前暂无数据。' : '五个真实业务面板已完成汇总。'
+  };
+}

@@ -9,11 +9,11 @@
     </template>
     <template v-else>
       <ManagementToolbar :loading="analysisLoading" @search="applyFilters" @reset="resetFilters">
-        <el-form-item label="统计月起"><el-date-picker v-model="draftFilters.startMonth" type="month" value-format="YYYY-MM" format="YYYY-MM" placeholder="开始月份" /></el-form-item>
-        <el-form-item label="统计月止"><el-date-picker v-model="draftFilters.endMonth" type="month" value-format="YYYY-MM" format="YYYY-MM" placeholder="结束月份" /></el-form-item>
-        <el-form-item label="时序开始"><el-date-picker v-model="draftFilters.startUtc" type="datetime" value-format="YYYY-MM-DDTHH:mm" format="YYYY-MM-DD HH:mm" placeholder="开始时间" /></el-form-item>
-        <el-form-item label="时序结束"><el-date-picker v-model="draftFilters.endUtc" type="datetime" value-format="YYYY-MM-DDTHH:mm" format="YYYY-MM-DD HH:mm" placeholder="结束时间" /></el-form-item>
-        <el-form-item label="来源时区"><el-input v-model.trim="draftFilters.sourceTimeZone" placeholder="Asia/Shanghai" /></el-form-item>
+        <el-form-item label="统计月起"><el-date-picker v-model="draftFilters.startMonth" type="month" value-format="YYYY-MM" format="YYYY-MM" :editable="true" placeholder="开始月份" /></el-form-item>
+        <el-form-item label="统计月止"><el-date-picker v-model="draftFilters.endMonth" type="month" value-format="YYYY-MM" format="YYYY-MM" :editable="true" placeholder="结束月份" /></el-form-item>
+        <el-form-item label="时序开始"><el-date-picker v-model="draftFilters.startUtc" type="datetime" value-format="YYYY-MM-DDTHH:mm" format="YYYY-MM-DD HH:mm" :editable="true" placeholder="开始时间" /></el-form-item>
+        <el-form-item label="时序结束"><el-date-picker v-model="draftFilters.endUtc" type="datetime" value-format="YYYY-MM-DDTHH:mm" format="YYYY-MM-DD HH:mm" :editable="true" placeholder="结束时间" /></el-form-item>
+        <el-form-item label="来源时区"><IanaTimeZoneSelect v-model="draftFilters.sourceTimeZone" placeholder="请选择或搜索来源时区" /></el-form-item>
         <el-form-item label="组织"><el-select v-model="draftFilters.organizationUnitId" clearable filterable placeholder="精确组织范围"><el-option v-for="item in organizations" :key="organizationId(item)" :label="organizationLabel(item)" :value="organizationId(item)" /></el-select></el-form-item>
         <el-form-item label="产能单元"><el-select v-model="draftFilters.productionUnitId" clearable filterable placeholder="强度分母范围"><el-option v-for="item in productionUnits" :key="productionUnitId(item)" :label="productionUnitLabel(item)" :value="productionUnitId(item)" /></el-select></el-form-item>
         <el-form-item label="表计"><el-select v-model="draftFilters.meterDeviceId" clearable filterable placeholder="单表计时序范围"><el-option v-for="item in meters" :key="meterId(item)" :label="meterLabel(item)" :value="meterId(item)" /></el-select></el-form-item>
@@ -21,21 +21,22 @@
         <el-form-item label="单位"><el-input v-model.trim="draftFilters.unit" placeholder="如 kWh" /></el-form-item>
         <el-form-item label="时序粒度"><el-select v-model="draftFilters.outputIntervalMinutes"><el-option :value="15" label="15 分钟" /><el-option :value="30" label="30 分钟" /><el-option :value="60" label="60 分钟" /></el-select></el-form-item>
         <el-form-item label="TOU 方案"><el-select v-model="draftFilters.touSchemeId" clearable filterable allow-create placeholder="显式选择或输入方案 ID"><el-option v-for="item in touSchemes" :key="item.id" :label="`${item.schemeName}（${item.schemeCode}/${item.version}）`" :value="item.id" /></el-select></el-form-item>
-        <el-form-item label="最低覆盖率"><el-input-number v-model="draftFilters.minimumCoverageRate" :min="0" :max="1" :step="0.05" :precision="2" /></el-form-item>
-        <template #actions><span class="applied-note">输入变化不会自动请求，点击查询后应用</span></template>
+        <el-form-item label="最低覆盖率"><el-input-number v-model="draftFilters.minimumCoverageRate" :min="1" :max="1" :precision="2" disabled /><div class="field-help">只读口径：负荷摘要固定要求 100% 覆盖率。</div></el-form-item>
+        <template #actions><span class="applied-note">首次进入自动查询月度事实；后续输入变化点击查询后应用</span></template>
       </ManagementToolbar>
 
       <el-alert v-if="masterDataError" type="warning" :closable="false" show-icon :title="masterDataError" />
       <el-tabs v-model="activeTab" class="analysis-tabs">
         <el-tab-pane label="消费分析" name="analysis">
           <div class="tab-stack">
-            <el-alert type="info" :closable="false" show-icon title="月度消费、强度、时序负荷分别按各自事实源计算；不同单位不会直接相加，也不使用双轴图掩盖不可比。" />
+            <el-alert type="info" :closable="false" show-icon title="普通能耗导入只进入月度分析；时序卡片与曲线只读取受控 execute 实际写入的单表计时序事实。两类事实不会跨表复制或估算，不同单位不会直接相加。" />
             <PageState v-if="analysisInitialLoading" loading />
             <div v-else v-loading="analysisRefreshing" element-loading-text="正在按新筛选刷新分析结果" class="analysis-results">
               <el-alert v-if="analysisRefreshing" type="info" :closable="false" show-icon title="正在查询新筛选；刷新完成前仍展示上一次已提交查询快照，图表、表格和条件提示均按该旧快照解释。" />
               <el-alert v-if="analysisError" type="error" :closable="false" show-icon :title="analysisError" />
               <section class="stat-grid" aria-label="消费量、强度和负荷摘要">
-                <StatCard label="窗口总能耗" :value="formatAnalysisValue(loadSummary.metrics?.totalEnergy, { unit: loadSummary.metrics?.energyUnit, calculable: loadSummary.metrics?.totalEnergyComplete !== false })" :note="qualityStatusText(loadSummary.quality)" />
+                <StatCard label="月度累计消费" :value="formatAnalysisValue(selectedMonthlyFacetData?.totals?.value, { unit: selectedMonthlyFacetData?.unit })" :note="monthlyTotalNote" />
+                <StatCard label="时序窗口总能耗" :value="formatAnalysisValue(loadSummary.metrics?.totalEnergy, { unit: loadSummary.metrics?.energyUnit, calculable: loadSummary.metrics?.totalEnergyComplete !== false })" :note="qualityStatusText(loadSummary.quality)" />
                 <StatCard label="平均负荷" :value="formatAnalysisValue(loadSummary.metrics?.averageLoad, { unit: loadSummary.metrics?.loadUnit })" :note="reasonCodesText(loadSummary.quality?.reasonCodes)" />
                 <StatCard label="最大负荷" :value="formatAnalysisValue(loadSummary.metrics?.maxLoad, { unit: loadSummary.metrics?.loadUnit })" :note="loadSummary.maxLoadInterval?.startUtc || '缺少可计算区间'" />
                 <StatCard label="负载率" :value="formatAnalysisValue(loadSummary.metrics?.loadRatePercent, { unit: '%', calculable: loadSummary.metrics?.loadRateCalculable !== false })" :note="loadSummary.metrics?.loadRateReason || '平均负荷 / 最大负荷'" />
@@ -45,8 +46,8 @@
 
               <article class="page-card chart-panel">
                 <header class="panel-heading"><div><h2>固定 UTC 负荷曲线</h2><span>单轴 · 2px 折线 · 缺失桶断线 · 真实零值落在基线</span></div><div class="quality-tags"><StatusTag :status="loadSummary.quality?.status || 'unknown'" :label="`摘要：${qualityStatusText(loadSummary.quality)}`" /><StatusTag :status="loadCurve.quality?.status || 'unknown'" :label="`曲线：${qualityStatusText(loadCurve.quality)}`" /></div></header>
-                <PageState v-if="!timeseriesReady" description="请选择表计、能源类型、单位、来源时区和完整时序范围后点击查询。" />
-                <PageState v-else-if="!curveRows.length" :description="`暂无曲线数据。${reasonCodesText(loadCurve.quality?.reasonCodes)}`" />
+                <PageState v-if="!timeseriesReady" description="时序卡片和曲线不会由普通能耗导入填充。请完成时序 preview + execute 且实际写入大于 0，再选择精确表计、能源类型、标准化单位、来源时区和相交时间范围。" />
+                <PageState v-else-if="!curveRows.length" :description="`暂无时序曲线数据。成功 0、失败 1 或仅完成 preview 都不会产生可分析事实。${reasonCodesText(loadCurve.quality?.reasonCodes)}`" />
                 <template v-else>
                   <div class="wide-scroll">
                     <svg class="line-chart" viewBox="0 0 720 260" role="img" aria-labelledby="energy-load-curve-title energy-load-curve-desc" @mouseleave="curveTooltip = null">
@@ -70,7 +71,7 @@
               <section class="two-column-grid">
                 <article class="page-card chart-panel">
                   <header class="panel-heading"><div><h2>月度消费量与同环比</h2><span>缺月为“缺失”，有记录且为零显示 0</span></div></header>
-                  <PageState v-if="!monthlyFacets.length" description="暂无月度分面；请检查月份、能源类型和组织筛选。" />
+                  <PageState v-if="!monthlyFacets.length" :description="monthlyEmptyDescription" />
                   <template v-else>
                     <el-select v-model="selectedMonthlyFacet" placeholder="选择能源与单位分面"><el-option v-for="(facet, index) in monthlyFacets" :key="monthlyFacetKey(facet)" :label="`${facet.energyType?.name || facet.energyType?.code || facet.energyTypeCode} / ${facet.unit}`" :value="index" /></el-select>
                     <div class="wide-scroll"><el-table :data="selectedMonthlyTrend" size="small" max-height="360"><el-table-column prop="month" label="月份" width="90" /><el-table-column label="消费量" min-width="130"><template #default="{ row }">{{ formatAnalysisValue(row.value, { unit: selectedMonthlyFacetData?.unit }) }}</template></el-table-column><el-table-column label="环比" min-width="150"><template #default="{ row }">{{ monthlyComparisonText(row.periodOverPeriod) }}</template></el-table-column><el-table-column label="同比" min-width="150"><template #default="{ row }">{{ monthlyComparisonText(row.yearOverYear) }}</template></el-table-column><el-table-column prop="recordCount" label="记录数" width="88" /></el-table></div>
@@ -142,10 +143,11 @@
                 <header class="panel-heading"><div><h2>{{ definition.label }}导入</h2><span>preview / execute</span></div></header>
                 <el-alert v-if="!hasPermissionCode(definition.previewPermission)" type="warning" :closable="false" show-icon title="当前账号没有该类导入预演权限。" />
                 <template v-else>
-                  <el-upload :auto-upload="false" :limit="1" :file-list="importStates[definition.key].files" :on-change="(file) => selectImportFile(definition.key, file)" :on-remove="() => clearImport(definition.key)" accept=".xlsx,.xls,.csv"><el-button>选择导入文件</el-button><template #tip><div class="el-upload__tip">文件大小由服务端限制；HTTP 413 会明确区分文件与 execute 正文超限。</div></template></el-upload>
+                  <div class="action-row import-downloads"><el-button @click="downloadImportTemplate(definition)">空白模板</el-button><el-button @click="downloadImportDemo(definition)">青岚示例</el-button></div>
+                  <el-upload :auto-upload="false" :limit="1" :file-list="importStates[definition.key].files" :on-change="(file) => selectImportFile(definition.key, file)" :on-remove="() => clearImport(definition.key)" :accept="definition.accept"><el-button>选择导入文件</el-button><template #tip><div class="el-upload__tip">仅接受 {{ definition.accept }}；文件大小由服务端限制，HTTP 413 会明确区分文件与 execute 正文超限。</div></template></el-upload>
                   <div class="action-row"><el-button :loading="importStates[definition.key].loading" :disabled="!importStates[definition.key].file" @click="previewImport(definition)">服务端预演</el-button><el-button v-if="hasPermissionCode(definition.executePermission)" type="primary" :disabled="!canExecuteEnergyAnalysisImport(importStates[definition.key].preview)" @click="openImportExecute(definition)">受控执行</el-button></div>
                   <el-alert v-if="importStates[definition.key].error" type="error" :closable="false" show-icon :title="importStates[definition.key].error" />
-                  <dl v-if="importStates[definition.key].preview" class="preview-facts"><div><dt>批次</dt><dd>{{ importStates[definition.key].preview.batchId }}</dd></div><div><dt>可导入</dt><dd>{{ importStates[definition.key].preview.summary?.wouldImport ?? importStates[definition.key].preview.expectedWouldImport ?? 0 }}</dd></div><div><dt>跳过</dt><dd>{{ importStates[definition.key].preview.summary?.wouldSkip ?? 0 }}</dd></div><div><dt>阻断</dt><dd>{{ importStates[definition.key].preview.summary?.blocked ?? importStates[definition.key].preview.summary?.wouldBlock ?? 0 }}</dd></div></dl>
+                  <dl v-if="importStates[definition.key].preview" class="preview-facts"><div><dt>状态</dt><dd>预演完成，未写业务事实</dd></div><div><dt>批次</dt><dd>{{ importStates[definition.key].preview.batchId }}</dd></div><div><dt>可导入</dt><dd>{{ importStates[definition.key].preview.summary?.wouldImport ?? importStates[definition.key].preview.expectedWouldImport ?? 0 }}</dd></div><div><dt>跳过</dt><dd>{{ importStates[definition.key].preview.summary?.skipped ?? importStates[definition.key].preview.summary?.wouldSkip ?? 0 }}</dd></div><div><dt>阻断</dt><dd>{{ importStates[definition.key].preview.summary?.blocked ?? importStates[definition.key].preview.summary?.wouldBlock ?? 0 }}</dd></div><div><dt>错误</dt><dd>{{ importStates[definition.key].preview.summary?.errors ?? 0 }}</dd></div></dl>
                 </template>
               </article>
             </section>
@@ -158,13 +160,13 @@
       <el-form label-position="top"><el-form-item label="目标状态"><el-select v-model="reviewForm.manualStatus"><el-option v-for="status in allowedStrategyStatuses(reviewTarget?.manualStatus)" :key="status" :label="STRATEGY_STATUS_LABELS[status]" :value="status" /></el-select></el-form-item><el-form-item label="人工复核备注"><el-input v-model="reviewForm.reviewNote" type="textarea" :rows="5" maxlength="1000" show-word-limit placeholder="拒绝或解决时必填；接受时建议记录判断依据" /></el-form-item></el-form><el-alert v-if="!reviewValidation.valid" type="warning" :closable="false" :title="reviewValidation.message" />
     </ManagementDrawer>
 
-    <ManagementDrawer v-model="configDrawerOpen" :title="configDrawerTitle" confirm-label="保存版本" :loading="configSaving" @save="saveConfig">
+    <ManagementDrawer v-model="configDrawerOpen" :title="configDrawerTitle" confirm-label="保存版本" :loading="configSaving" :confirm-disabled="configFormHydrationBlocked" @save="saveConfig">
       <el-alert type="info" :closable="false" show-icon title="新配置不会预选状态；班次、周期、阈值、有效期和启停状态都必须核对后显式填写。" class="panel-alert" />
       <el-form label-position="top" class="drawer-form">
-        <template v-if="configKind === 'shift'"><el-form-item v-if="!configSource" label="排班编码"><el-input v-model.trim="configForm.shiftCode" placeholder="必填，请输入稳定业务编码" /></el-form-item><el-form-item label="排班名称"><el-input v-model.trim="configForm.shiftName" placeholder="必填" /></el-form-item><div class="form-grid"><el-form-item label="开始分钟"><el-input-number v-model="configForm.startMinute" :min="0" :max="1439" placeholder="0-1439" /></el-form-item><el-form-item label="结束分钟"><el-input-number v-model="configForm.endMinute" :min="0" :max="1439" placeholder="0-1439" /></el-form-item></div><el-form-item label="是否跨日"><el-radio-group v-model="configForm.crossesMidnight"><el-radio :label="false">否</el-radio><el-radio :label="true">是</el-radio></el-radio-group><div class="field-help">必须显式选择；页面不会根据起止分钟自动推断。</div></el-form-item><el-form-item label="版本"><el-input v-model.trim="configForm.version" placeholder="必填，请显式填写新版本" /></el-form-item></template>
+        <template v-if="configKind === 'shift'"><el-form-item v-if="!configSource" label="排班编码"><el-input v-model.trim="configForm.shiftCode" placeholder="必填，请输入稳定业务编码" /></el-form-item><el-form-item label="排班名称"><el-input v-model.trim="configForm.shiftName" placeholder="必填" /></el-form-item><div class="form-grid"><el-form-item label="开始时间"><TimeOfDayInput v-model="configForm.startMinute" placeholder="请选择或输入开始时间" /></el-form-item><el-form-item label="结束时间"><TimeOfDayInput v-model="configForm.endMinute" placeholder="请选择或输入结束时间" /></el-form-item></div><el-form-item label="是否跨日"><el-radio-group v-model="configForm.crossesMidnight"><el-radio :label="false">否</el-radio><el-radio :label="true">是</el-radio></el-radio-group><div class="field-help">必须显式选择；页面不会根据起止分钟自动推断。</div></el-form-item><el-form-item label="版本"><el-input v-model.trim="configForm.version" placeholder="必填，请显式填写新版本" /></el-form-item></template>
         <template v-else-if="configKind === 'tou'"><el-form-item v-if="!configSource" label="方案编码"><el-input v-model.trim="configForm.schemeCode" /></el-form-item><el-form-item label="方案名称"><el-input v-model.trim="configForm.schemeName" /></el-form-item><el-form-item label="文号"><el-input v-model.trim="configForm.documentNo" /></el-form-item><el-form-item label="版本"><el-input v-model.trim="configForm.version" /></el-form-item><el-form-item label="完整周期规则 JSON"><el-input v-model="configForm.periodRulesText" type="textarea" :rows="10" /><div class="field-help">数组字段：dayOfWeek(1-7)、periodType(peak/flat/valley)、startMinute、endMinute；每天必须无缺口覆盖 0-1440。</div></el-form-item></template>
         <template v-else><el-form-item v-if="!configSource" label="规则编码"><el-input v-model.trim="configForm.ruleCode" /></el-form-item><el-form-item label="规则名称"><el-input v-model.trim="configForm.ruleName" /></el-form-item><div class="form-grid"><el-form-item label="规则版本"><el-input v-model.trim="configForm.ruleVersion" /></el-form-item><el-form-item label="公式版本"><el-select v-model="configForm.formulaVersion" placeholder="请选择固定公式版本"><el-option v-for="version in ENERGY_ANALYSIS_CONFIGURATION_CONTRACT.strategyFormulaVersions" :key="version" :label="`负荷分析 v1（${version}）`" :value="version" /></el-select></el-form-item></div><el-form-item label="指标"><el-select v-model="configForm.metricCode"><el-option v-for="metricCode in ENERGY_ANALYSIS_CONFIGURATION_CONTRACT.strategyMetricCodes" :key="metricCode" :label="strategyMetricLabel(metricCode)" :value="metricCode" /></el-select></el-form-item><div class="form-grid"><el-form-item label="阈值运算符"><el-select v-model="configForm.thresholdOperator"><el-option v-for="operator in ENERGY_ANALYSIS_CONFIGURATION_CONTRACT.strategyThresholdOperators" :key="operator" :value="operator" :label="operator" /></el-select></el-form-item><el-form-item label="阈值单位"><el-input v-model.trim="configForm.thresholdUnit" /></el-form-item></div><div class="form-grid"><el-form-item label="阈值"><el-input-number v-model="configForm.thresholdValue" /></el-form-item><el-form-item label="阈值下限"><el-input-number v-model="configForm.thresholdMin" /></el-form-item><el-form-item label="阈值上限"><el-input-number v-model="configForm.thresholdMax" /></el-form-item></div><div class="form-grid"><el-form-item label="可削减比例"><el-input-number v-model="configForm.reductionRate" :min="0" :max="1" :step="0.05" /></el-form-item><el-form-item label="优先级"><el-select v-model="configForm.priority"><el-option v-for="priority in ENERGY_ANALYSIS_CONFIGURATION_CONTRACT.strategyPriorities" :key="priority" :label="strategyPriorityLabel(priority)" :value="priority" /></el-select></el-form-item></div><el-form-item label="证据要求 JSON"><el-input v-model="configForm.evidenceRequirementsText" type="textarea" :rows="5" /></el-form-item><el-form-item label="建议文本"><el-input v-model="configForm.recommendationText" type="textarea" :rows="4" /></el-form-item></template>
-        <el-form-item label="来源"><el-input v-model.trim="configForm.source" placeholder="必填，如制度文件或维护工单" /></el-form-item><el-form-item label="来源时区"><el-input v-model.trim="configForm.sourceTimeZone" placeholder="必填，如 Asia/Shanghai" /></el-form-item><div class="form-grid"><el-form-item label="生效开始 UTC"><el-date-picker v-model="configForm.effectiveStartUtc" type="datetime" value-format="YYYY-MM-DDTHH:mm" placeholder="必须显式选择 UTC 时间" /></el-form-item><el-form-item label="生效结束 UTC"><el-date-picker v-model="configForm.effectiveEndUtc" type="datetime" value-format="YYYY-MM-DDTHH:mm" placeholder="必须显式选择 UTC 时间" /></el-form-item></div><el-form-item label="状态"><el-radio-group v-model="configForm.status"><el-radio v-for="status in ENERGY_ANALYSIS_CONFIGURATION_CONTRACT.statuses" :key="status" :label="status">{{ configurationStatusLabel(status) }}</el-radio></el-radio-group><div class="field-help">必须显式选择启用或停用；建议先停用保存，复核后再从列表启用。</div></el-form-item>
+        <el-form-item label="来源"><el-input v-model.trim="configForm.source" placeholder="必填，如制度文件或维护工单" /></el-form-item><el-form-item label="来源时区"><IanaTimeZoneSelect v-model="configForm.sourceTimeZone" placeholder="请选择或搜索来源时区" /></el-form-item><div class="form-grid"><el-form-item label="生效开始 UTC"><StrictUtcDateTimeInput v-model="configForm.effectiveStartUtc" placeholder="必须显式选择或输入 UTC 时间" /></el-form-item><el-form-item label="生效结束 UTC"><StrictUtcDateTimeInput v-model="configForm.effectiveEndUtc" placeholder="必须显式选择或输入 UTC 时间" /></el-form-item></div><el-form-item label="状态"><el-radio-group v-model="configForm.status"><el-radio v-for="status in ENERGY_ANALYSIS_CONFIGURATION_CONTRACT.statuses" :key="status" :label="status">{{ configurationStatusLabel(status) }}</el-radio></el-radio-group><div class="field-help">必须显式选择启用或停用；建议先停用保存，复核后再从列表启用。</div></el-form-item>
       </el-form>
       <el-alert v-if="configFormError" type="error" :closable="false" show-icon :title="configFormError" />
     </ManagementDrawer>
@@ -180,16 +182,20 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import HelpIcon from '@/components/HelpIcon.vue';
+import IanaTimeZoneSelect from '@/components/IanaTimeZoneSelect.vue';
 import ManagementDrawer from '@/components/ManagementDrawer.vue';
 import ManagementPage from '@/components/ManagementPage.vue';
 import ManagementToolbar from '@/components/ManagementToolbar.vue';
 import PageState from '@/components/PageState.vue';
 import StatCard from '@/components/StatCard.vue';
 import StatusTag from '@/components/StatusTag.vue';
+import StrictUtcDateTimeInput from '@/components/StrictUtcDateTimeInput.vue';
+import TimeOfDayInput from '@/components/TimeOfDayInput.vue';
 import { ledgerApi } from '@/api/ledger';
 import {
   createShiftDefinition, createShiftDefinitionVersion, createStrategyRule, createStrategyRuleVersion,
-  createTouScheme, createTouSchemeVersion, evaluateEnergyStrategies, executeEnergyAnalysisImport,
+  createTouScheme, createTouSchemeVersion, downloadEnergyAnalysisDemoArtifact,
+  downloadEnergyAnalysisImportTemplate, evaluateEnergyStrategies, executeEnergyAnalysisImport,
   getDeviceStateConsumptionAnalysis, getEnergyIntensityAnalysis, getEnergyLoadCurve, getEnergyLoadSummary,
   getMonthlyConsumptionAnalysis, getPeakContributionAnalysis, getShiftConsumptionAnalysis, getTimeOfUseAnalysis,
   listShiftDefinitions, listStrategyRules, listTouSchemes, previewEnergyAnalysisImport, reviewEnergyStrategyHit,
@@ -207,15 +213,17 @@ import {
   createEnergyAnalysisConfigForm, createEnergyAnalysisSnapshot, createLatestEnergyAnalysisRequestGate,
   energyAnalysisBarPercentage, energyAnalysisErrorText, formatAnalysisValue, formatCoverageRate, masterDataItems,
   monthlyComparisonText, normalizeLoadCurveRows, qualityStatusText, reasonCodesText,
-  replaceEnergyAnalysisStrategyHit, responseItems, startEnergyAnalysisResultTransition, touPresentation,
+  replaceEnergyAnalysisStrategyHit, responseItems, startEnergyAnalysisResultTransition,
+  summarizeEnergyAnalysisImportExecuteResult, touPresentation, validateEnergyAnalysisLoadCurveGrid,
   validateStrategyReview
 } from '@/utils/energyAnalysis';
 
 // 页面筛选、标签和主数据模块变量。
 const activeTab = ref('analysis');
 const configTab = ref('shifts');
-const draftFilters = ref(createDefaultEnergyAnalysisFilters());
-const appliedFilters = ref(createEnergyAnalysisSnapshot(createDefaultEnergyAnalysisFilters()));
+const defaultFilters = createDefaultEnergyAnalysisFilters();
+const draftFilters = ref({ ...defaultFilters });
+const appliedFilters = ref(createEnergyAnalysisSnapshot(defaultFilters));
 const organizations = ref([]);
 const meters = ref([]);
 const productionUnits = ref([]);
@@ -249,6 +257,7 @@ const configLoading = ref(false);
 const configSaving = ref(false);
 const configError = ref('');
 const configFormError = ref('');
+const configFormHydrationBlocked = ref(false);
 const shiftDefinitions = ref([]);
 const touSchemes = ref([]);
 const strategyRules = ref([]);
@@ -257,7 +266,7 @@ const configKind = ref('shift');
 const configSource = ref(null);
 const configForm = reactive({});
 
-// 三类导入的文件、预演和执行模块变量。
+// 六类导入的文件、预演和执行模块变量。
 const importStates = reactive(Object.fromEntries(importDefinitions.map((definition) => [definition.key, { file: null, files: [], preview: null, loading: false, error: '' }])));
 const importDrawerOpen = ref(false);
 const importExecuteLoading = ref(false);
@@ -303,6 +312,13 @@ const curveChartDescription = computed(() => {
 const monthlyFacets = computed(() => monthlyAnalysis.value.facets || []);
 const selectedMonthlyFacetData = computed(() => monthlyFacets.value[selectedMonthlyFacet.value] || monthlyFacets.value[0] || null);
 const selectedMonthlyTrend = computed(() => selectedMonthlyFacetData.value?.trend || []);
+const monthlyTotalNote = computed(() => selectedMonthlyFacetData.value
+  ? `${selectedMonthlyFacetData.value.totals?.recordCount ?? 0} 条月度事实，${selectedMonthlyFacetData.value.totals?.observedMonthCount ?? 0}/${selectedMonthlyFacetData.value.totals?.rangeMonthCount ?? 0} 个月有记录`
+  : '普通能耗导入只填充月度分析；请选择已有分面');
+const monthlyEmptyDescription = computed(() => {
+  const filters = analysisDisplayFilters.value;
+  return `暂无月度分面。已应用月份 ${filters.startMonth || '未选择'} 至 ${filters.endMonth || '未选择'}；组织 ${filters.organizationUnitId || '全部'}；能源类型 ${filters.energyTypeCode || '全部'}；单位 ${filters.unit || '全部'}。普通能耗导入会进入此区域；组织弱关联未命中、月份不相交或原始单位标准化后与精确单位筛选不一致时可能为空。`;
+});
 const intensityFacets = computed(() => intensityAnalysis.value.facets || []);
 const touPeriods = computed(() => touAnalysis.value.periods || []);
 const touMax = computed(() => Math.max(...touPeriods.value.map((row) => Number(row.observed) || 0), 1));
@@ -410,8 +426,10 @@ async function loadAnalysis() {
   addRequest('monthlyAnalysis', '月度消费分析', () => getMonthlyConsumptionAnalysis(buildMonthlyAnalysisParams(filters)));
   if (filters.productionUnitId) addRequest('intensityAnalysis', '消费强度', () => getEnergyIntensityAnalysis(buildIntensityParams(filters)));
   if (isTimeseriesReady(filters)) {
+    const loadCurveGridValidation = validateEnergyAnalysisLoadCurveGrid(filters);
     addRequest('loadSummary', '负荷摘要', () => getEnergyLoadSummary(buildLoadSummaryParams(filters)));
-    addRequest('loadCurve', '负荷曲线', () => getEnergyLoadCurve(buildLoadCurveParams(filters)));
+    if (loadCurveGridValidation.valid) addRequest('loadCurve', '负荷曲线', () => getEnergyLoadCurve(buildLoadCurveParams(filters)));
+    else requests.push(Promise.resolve({ key: 'loadCurve', label: '负荷曲线', ok: false, validationMessage: loadCurveGridValidation.message }));
     addRequest('shiftAnalysis', '班次分析', () => getShiftConsumptionAnalysis(buildTimeseriesAnalysisParams(filters)));
     addRequest('deviceStateAnalysis', '设备状态', () => getDeviceStateConsumptionAnalysis(buildTimeseriesAnalysisParams(filters)));
     if (filters.touSchemeId) addRequest('touAnalysis', '峰平谷分析', () => getTimeOfUseAnalysis(buildTouParams(filters)));
@@ -425,8 +443,8 @@ async function loadAnalysis() {
   settled.forEach((result) => {
     if (result.ok) nextResult[result.key] = createEnergyAnalysisSnapshot(responseData(result.response));
     else {
-      const message = energyAnalysisErrorText(result.error, '接口请求失败。', { suppressGlobalHandledStatus: true });
-      if (message) failures.push(`${result.label}：${message}`);
+      const message = result.validationMessage || energyAnalysisErrorText(result.error, '接口请求失败。', { suppressGlobalHandledStatus: true });
+      if (message) failures.push(result.validationMessage ? message : `${result.label}：${message}`);
     }
   });
   analysisResultState.value = completeEnergyAnalysisResultTransition(analysisResultState.value, run, nextResult);
@@ -509,40 +527,101 @@ async function submitReview() {
 
 /** 加载三类版本化配置列表。 */
 async function loadConfigurations() { if (!canViewConfig.value) return; configLoading.value = true; configError.value = ''; const results = await Promise.all([safeRequest(() => listShiftDefinitions()), safeRequest(() => listTouSchemes()), safeRequest(() => listStrategyRules())]); configLoading.value = false; shiftDefinitions.value = results[0].ok ? responseItems(results[0].response) : []; touSchemes.value = results[1].ok ? responseItems(results[1].response) : []; strategyRules.value = results[2].ok ? responseItems(results[2].response) : []; const failures = results.filter((result) => !result.ok).map((result) => energyAnalysisErrorText(result.error, '请求失败。', { suppressGlobalHandledStatus: true })).filter(Boolean); configError.value = failures.join('；'); }
+/** 配置导入成功后只刷新对应配置列表，避免无关列表失败掩盖本次写入结果。 */
+async function refreshImportedConfiguration(refreshTarget) {
+  const refreshContract = {
+    'shift-config': { request: listShiftDefinitions, target: shiftDefinitions },
+    'tou-config': { request: listTouSchemes, target: touSchemes },
+    'strategy-config': { request: listStrategyRules, target: strategyRules }
+  }[refreshTarget];
+  if (!refreshContract || !canViewConfig.value) return;
+  const result = await safeRequest(() => refreshContract.request());
+  if (result.ok) refreshContract.target.value = responseItems(result.response);
+  else configError.value = energyAnalysisErrorText(result.error, '配置列表刷新失败。', { suppressGlobalHandledStatus: true });
+}
+/** 按导入定义刷新受影响的分析或配置列表。 */
+async function refreshAfterImport(definition) {
+  if (definition.refreshTarget === 'shift-analysis') await Promise.all([loadConfigurations(), loadAnalysis()]);
+  else if (definition.refreshTarget.endsWith('-config')) await refreshImportedConfiguration(definition.refreshTarget);
+  else await loadAnalysis();
+}
 /** 打开首版本或新版本配置抽屉；新版本只复制已有事实并保持默认停用。 */
 function openConfig(kind, source = null) {
   configKind.value = kind;
   configSource.value = source;
-  Object.keys(configForm).forEach((key) => delete configForm[key]);
-  Object.assign(configForm, createEnergyAnalysisConfigForm(kind, source));
   configFormError.value = '';
+  configFormHydrationBlocked.value = false;
+  Object.keys(configForm).forEach((key) => delete configForm[key]);
+  try {
+    Object.assign(configForm, createEnergyAnalysisConfigForm(kind, source));
+  } catch (error) {
+    configFormHydrationBlocked.value = true;
+    configFormError.value = `配置回显失败：${error.message}`;
+  }
   configDrawerOpen.value = true;
 }
 /** 构造严格配置请求正文，未确认完整的业务字段不得进入载荷。 */
 function buildConfigPayload() { return buildEnergyAnalysisConfigPayload(configKind.value, configForm, Boolean(configSource.value)); }
 /** 保存首版本或新版本配置。 */
-async function saveConfig() { configSaving.value = true; configFormError.value = ''; let payload; try { payload = buildConfigPayload(); } catch (error) { configSaving.value = false; configFormError.value = `配置未通过校验：${error.message}`; return; } const task = configKind.value === 'shift' ? (configSource.value ? () => createShiftDefinitionVersion(configSource.value.id, payload) : () => createShiftDefinition(payload)) : configKind.value === 'tou' ? (configSource.value ? () => createTouSchemeVersion(configSource.value.id, payload) : () => createTouScheme(payload)) : (configSource.value ? () => createStrategyRuleVersion(configSource.value.id, payload) : () => createStrategyRule(payload)); const result = await safeRequest(task); configSaving.value = false; if (!result.ok) { configFormError.value = energyAnalysisErrorText(result.error, '请求失败。', { suppressGlobalHandledStatus: true }); return; } configDrawerOpen.value = false; ElMessage.success('配置版本已保存。'); await loadConfigurations(); }
+async function saveConfig() { if (configFormHydrationBlocked.value) { configFormError.value ||= '配置回显失败，当前数据不能保存。'; return; } configSaving.value = true; configFormError.value = ''; let payload; try { payload = buildConfigPayload(); } catch (error) { configSaving.value = false; configFormError.value = `配置未通过校验：${error.message}`; return; } const task = configKind.value === 'shift' ? (configSource.value ? () => createShiftDefinitionVersion(configSource.value.id, payload) : () => createShiftDefinition(payload)) : configKind.value === 'tou' ? (configSource.value ? () => createTouSchemeVersion(configSource.value.id, payload) : () => createTouScheme(payload)) : (configSource.value ? () => createStrategyRuleVersion(configSource.value.id, payload) : () => createStrategyRule(payload)); const result = await safeRequest(task); configSaving.value = false; if (!result.ok) { configFormError.value = energyAnalysisErrorText(result.error, '请求失败。', { suppressGlobalHandledStatus: true }); return; } configDrawerOpen.value = false; ElMessage.success('配置版本已保存。'); await loadConfigurations(); }
 /** 启用或停用单个配置版本。 */
 async function toggleConfigStatus(kind, row) { const target = row.status === 'active' ? 'inactive' : 'active'; try { await ElMessageBox.confirm(`确认${target === 'active' ? '启用' : '停用'}该版本？后端会保留历史记录。`, '配置状态确认', { type: 'warning' }); } catch { return; } const task = kind === 'shift' ? () => setShiftDefinitionStatus(row.id, target) : kind === 'tou' ? () => setTouSchemeStatus(row.id, target) : () => setStrategyRuleStatus(row.id, target); const result = await safeRequest(task); if (!result.ok) { configError.value = energyAnalysisErrorText(result.error, '请求失败。', { suppressGlobalHandledStatus: true }); return; } ElMessage.success('配置状态已更新。'); await loadConfigurations(); }
 
+/** 下载当前导入类型的 XLSX 空白模板。 */
+async function downloadImportTemplate(definition) {
+  const result = await safeRequest(() => downloadEnergyAnalysisImportTemplate(definition.templateType, 'xlsx'));
+  if (!result.ok) importStates[definition.key].error = energyAnalysisErrorText(result.error, '空白模板下载失败。', { suppressGlobalHandledStatus: true });
+}
+/** 下载当前导入类型的 XLSX 青岚示例。 */
+async function downloadImportDemo(definition) {
+  const result = await safeRequest(() => downloadEnergyAnalysisDemoArtifact(definition.demoArtifactKey, 'xlsx'));
+  if (!result.ok) importStates[definition.key].error = energyAnalysisErrorText(result.error, '青岚示例下载失败。', { suppressGlobalHandledStatus: true });
+}
 /** 选择导入文件并清理旧预演见证。 */
 function selectImportFile(key, uploadFile) { const state = importStates[key]; state.file = uploadFile.raw; state.files = [uploadFile]; state.preview = null; state.error = ''; }
 /** 清空单类导入文件和预演。 */
 function clearImport(key) { Object.assign(importStates[key], { file: null, files: [], preview: null, error: '' }); }
-/** 调用服务端生成签名、候选和固定确认文本。 */
-async function previewImport(definition) { const state = importStates[definition.key]; if (!state.file) return; state.loading = true; state.error = ''; const result = await safeRequest(() => previewEnergyAnalysisImport(definition.key, state.file)); state.loading = false; if (!result.ok) { state.preview = null; state.error = energyAnalysisErrorText(result.error, '请求失败。', { suppressGlobalHandledStatus: true }); return; } state.preview = responseData(result.response); ElMessage.success(`${definition.label}预演完成，尚未写入业务记录。`); }
+/** 调用服务端生成签名、候选和固定确认文本；预演不刷新分析且不写业务事实。 */
+async function previewImport(definition) { const state = importStates[definition.key]; if (!state.file) return; state.loading = true; state.error = ''; const result = await safeRequest(() => previewEnergyAnalysisImport(definition.key, state.file)); state.loading = false; if (!result.ok) { state.preview = null; state.error = energyAnalysisErrorText(result.error, '请求失败。', { suppressGlobalHandledStatus: true }); return; } state.preview = responseData(result.response); const summary = state.preview.summary || {}; ElMessage.success(`${definition.label}预演完成，未写业务事实：可导入 ${summary.wouldImport ?? state.preview.expectedWouldImport ?? 0}，跳过 ${summary.skipped ?? summary.wouldSkip ?? 0}，阻断 ${summary.blocked ?? summary.wouldBlock ?? 0}，错误 ${summary.errors ?? 0}。`); }
 /** 打开导入 execute 固定确认抽屉。 */
 function openImportExecute(definition) { const preview = importStates[definition.key].preview; if (!canExecuteEnergyAnalysisImport(preview)) return; activeImportDefinition.value = definition; activeImportPreview.value = preview; importConfirmText.value = ''; importDrawerOpen.value = true; }
-/** 提交完整服务端见证并按真实响应报告执行结果。 */
-async function executeImport() { if (!activeImportDefinition.value || importConfirmText.value !== activeImportPreview.value?.confirmText) return; importExecuteLoading.value = true; const definition = activeImportDefinition.value; const result = await safeRequest(() => executeEnergyAnalysisImport(definition.key, buildImportExecutePayload(activeImportPreview.value))); importExecuteLoading.value = false; if (!result.ok) { importStates[definition.key].error = energyAnalysisErrorText(result.error, '导入执行失败。', { suppressGlobalHandledStatus: true }); return; } importDrawerOpen.value = false; ElMessage.success(`${definition.label}导入已由服务端完成并返回成功。`); clearImport(definition.key); }
+/** 提交完整服务端见证，并按真实写入、跳过、阻断和错误数量分类反馈与刷新。 */
+async function executeImport() {
+  if (!activeImportDefinition.value || importConfirmText.value !== activeImportPreview.value?.confirmText) return;
+  importExecuteLoading.value = true;
+  const definition = activeImportDefinition.value;
+  const state = importStates[definition.key];
+  state.error = '';
+  const result = await safeRequest(() => executeEnergyAnalysisImport(definition.key, buildImportExecutePayload(activeImportPreview.value)));
+  importExecuteLoading.value = false;
+  if (!result.ok) {
+    state.error = energyAnalysisErrorText(result.error, '导入执行失败。', { suppressGlobalHandledStatus: true });
+    return;
+  }
+  const executeSummary = summarizeEnergyAnalysisImportExecuteResult(responseData(result.response));
+  const { imported, skipped, blocked, errors, warnings } = executeSummary;
+  if (executeSummary.status === 'zero') {
+    state.error = `${definition.label}执行完成但未写入${definition.resultNoun}：写入 ${imported}，跳过 ${skipped}，阻断 ${blocked}，错误 ${errors}。请保留当前文件和预演上下文并检查原因。`;
+    ElMessage.warning(state.error);
+    return;
+  }
+  importDrawerOpen.value = false;
+  if (executeSummary.status === 'partial') {
+    ElMessage.warning(`${definition.label}部分写入：写入 ${imported}，跳过 ${skipped}，阻断 ${blocked}，错误 ${errors}，警告 ${warnings}。页面只刷新本类导入影响的数据。`);
+  } else {
+    ElMessage.success(`${definition.label}完整写入 ${imported} 条${definition.resultNoun}。页面只刷新本类导入影响的数据。`);
+  }
+  clearImport(definition.key);
+  await refreshAfterImport(definition);
+}
 
 // 筛选草稿或规则选择变化时，旧策略快照立即失效，避免后续操作沿用旧上下文。
 watch(draftFilters, () => clearStrategyResults('筛选输入已变化，旧策略结果已清空，请应用筛选后重新运行。'), { deep: true });
 watch(selectedRuleCodes, () => clearStrategyResults('规则选择已变化，旧策略结果已清空，请重新运行。'), { deep: true });
 
-onMounted(async () => { await Promise.all([loadMasterData(), loadConfigurations()]); });
+onMounted(async () => { if (!canView.value) return; await Promise.all([loadMasterData(), loadConfigurations(), loadAnalysis()]); });
 </script>
 
 <style scoped>
-.analysis-tabs{min-width:0}.tab-stack,.analysis-results{display:grid;gap:16px;min-width:0}.applied-note{align-self:center;color:#7385a2;font-size:12px}.stat-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.two-column-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.three-column-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.chart-panel,.compact-panel{min-width:0}.panel-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.panel-heading h2{margin:0;color:#123b79;font-size:16px}.panel-heading span{color:#7385a2;font-size:12px}.quality-tags{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px}.wide-scroll{max-width:100%;overflow-x:auto}.line-chart{width:100%;min-width:680px;min-height:260px;background:#fcfcfb;border:1px solid #dce9fb;border-radius:10px}.grid-line{stroke:#e1e7ef;stroke-width:1}.curve-line{fill:none;stroke:#1769e0;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.point-hit{fill:transparent}.point-dot{fill:#1769e0;stroke:#fcfcfb;stroke-width:2}g:hover .point-dot{r:6}.axis-text{fill:#728199;font-size:10px}.chart-tooltip{margin:8px 0;padding:8px 10px;color:#183153;background:#edf5ff;border:1px solid #c9dcf5;border-radius:8px;font-size:13px}.legend{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px;color:#516170;font-size:12px}.legend span{display:flex;align-items:center;gap:6px}.legend i{width:12px;height:12px;border:1px solid #fff;border-radius:3px;box-shadow:0 0 0 1px #c8d5e7}.metric-bar{display:grid;grid-template-columns:34px minmax(100px,1fr) minmax(92px,auto);align-items:center;gap:10px;width:100%;padding:7px 0;color:#183153;background:transparent;border:0;text-align:left}.metric-track{height:14px;background:#e7f1ff;border-radius:999px;overflow:hidden}.metric-track i{display:block;height:100%;border-radius:999px}.metric-bar strong{font-size:12px}.boundary-note{margin-bottom:10px;padding:9px;color:#516170;background:#f6f9fd;border-left:3px solid #1769e0;font-size:12px;line-height:1.6}.quality-line{color:#516170;font-size:12px}.peak-summary{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:12px;padding:12px;background:#f6f9fd;border-radius:8px}.subheading{margin:18px 0 8px;color:#183153;font-size:14px}.panel-alert{margin:12px 0}.config-actions{display:flex;justify-content:flex-end;gap:8px;margin-bottom:12px}.import-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.import-card{display:grid;align-content:start;gap:12px;min-width:0}.preview-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:0}.preview-facts div{padding:8px;background:#f6f9fd;border-radius:8px}.preview-facts dt{color:#7385a2;font-size:12px}.preview-facts dd{margin:4px 0 0;color:#183153;font-weight:600;overflow-wrap:anywhere}.drawer-form{padding-right:4px}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.field-help{margin-top:6px;color:#7385a2;font-size:12px;line-height:1.5}@media (max-width:1200px){.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.three-column-grid,.import-grid{grid-template-columns:1fr}}@media (max-width:900px){.two-column-grid{grid-template-columns:1fr}}@media (max-width:680px){.stat-grid,.form-grid{grid-template-columns:1fr}.panel-heading{align-items:stretch;flex-direction:column}.peak-summary{flex-direction:column}.import-grid{grid-template-columns:minmax(0,1fr)}}
+.analysis-tabs{min-width:0}.tab-stack,.analysis-results{display:grid;gap:16px;min-width:0}.applied-note{align-self:center;color:#7385a2;font-size:12px}.stat-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.two-column-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.three-column-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.chart-panel,.compact-panel{min-width:0}.panel-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.panel-heading h2{margin:0;color:#123b79;font-size:16px}.panel-heading span{color:#7385a2;font-size:12px}.quality-tags{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px}.wide-scroll{max-width:100%;overflow-x:auto}.line-chart{width:100%;min-width:680px;min-height:260px;background:#fcfcfb;border:1px solid #dce9fb;border-radius:10px}.grid-line{stroke:#e1e7ef;stroke-width:1}.curve-line{fill:none;stroke:#1769e0;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.point-hit{fill:transparent}.point-dot{fill:#1769e0;stroke:#fcfcfb;stroke-width:2}g:hover .point-dot{r:6}.axis-text{fill:#728199;font-size:10px}.chart-tooltip{margin:8px 0;padding:8px 10px;color:#183153;background:#edf5ff;border:1px solid #c9dcf5;border-radius:8px;font-size:13px}.legend{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px;color:#516170;font-size:12px}.legend span{display:flex;align-items:center;gap:6px}.legend i{width:12px;height:12px;border:1px solid #fff;border-radius:3px;box-shadow:0 0 0 1px #c8d5e7}.metric-bar{display:grid;grid-template-columns:34px minmax(100px,1fr) minmax(92px,auto);align-items:center;gap:10px;width:100%;padding:7px 0;color:#183153;background:transparent;border:0;text-align:left}.metric-track{height:14px;background:#e7f1ff;border-radius:999px;overflow:hidden}.metric-track i{display:block;height:100%;border-radius:999px}.metric-bar strong{font-size:12px}.boundary-note{margin-bottom:10px;padding:9px;color:#516170;background:#f6f9fd;border-left:3px solid #1769e0;font-size:12px;line-height:1.6}.quality-line{color:#516170;font-size:12px}.peak-summary{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:12px;padding:12px;background:#f6f9fd;border-radius:8px}.subheading{margin:18px 0 8px;color:#183153;font-size:14px}.panel-alert{margin:12px 0}.config-actions{display:flex;justify-content:flex-end;gap:8px;margin-bottom:12px}.import-downloads{flex-wrap:wrap}.import-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.import-card{display:grid;align-content:start;gap:12px;min-width:0}.preview-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:0}.preview-facts div{padding:8px;background:#f6f9fd;border-radius:8px}.preview-facts dt{color:#7385a2;font-size:12px}.preview-facts dd{margin:4px 0 0;color:#183153;font-weight:600;overflow-wrap:anywhere}.drawer-form{padding-right:4px}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.field-help{margin-top:6px;color:#7385a2;font-size:12px;line-height:1.5}@media (max-width:1200px){.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.three-column-grid,.import-grid{grid-template-columns:1fr}}@media (max-width:900px){.two-column-grid{grid-template-columns:1fr}}@media (max-width:680px){.stat-grid,.form-grid{grid-template-columns:1fr}.panel-heading{align-items:stretch;flex-direction:column}.peak-summary{flex-direction:column}.import-grid{grid-template-columns:minmax(0,1fr)}}
 </style>

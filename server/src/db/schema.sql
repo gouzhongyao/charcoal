@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS app_meta (
 
 CREATE TABLE IF NOT EXISTS import_batches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_unit', 'production_output', 'generation_record', 'energy_budget', 'carbon_factor', 'prediction_config', 'energy_timeseries', 'shift_schedule', 'device_state', 'energy_conversion_factor', 'energy_benchmark', 'energy_flow_node', 'energy_flow_edge', 'energy_flow_record')),
+  import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN ('energy_record', 'meter_reading', 'organization_unit', 'meter_device', 'production_unit', 'production_output', 'generation_record', 'energy_budget', 'carbon_factor', 'prediction_config', 'energy_timeseries', 'shift_schedule', 'device_state', 'energy_conversion_factor', 'energy_benchmark', 'energy_flow_node', 'energy_flow_edge', 'energy_flow_record', 'shift_definition', 'tou_scheme', 'strategy_rule', 'energy_flow_model', 'energy_balance_boundary', 'energy_balance_item')),
   original_filename TEXT NOT NULL,
   stored_filename TEXT,
   file_type TEXT NOT NULL CHECK (file_type IN ('xlsx', 'xls', 'csv')),
@@ -1454,3 +1454,275 @@ CREATE INDEX IF NOT EXISTS idx_sys_sessions_token_active ON sys_sessions(token_h
 CREATE INDEX IF NOT EXISTS idx_sys_sessions_user_active ON sys_sessions(user_id, expires_at, revoked_at);
 CREATE INDEX IF NOT EXISTS idx_sys_login_logs_username_created ON sys_login_logs(username, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sys_operation_logs_user_created ON sys_operation_logs(user_id, created_at DESC);
+
+-- DEMO_GOVERNANCE_SCHEMA_START
+-- 演示运行期开关保持单行持久化；普通初始化仅补默认行，不覆盖已保存状态。
+CREATE TABLE IF NOT EXISTS demo_runtime_settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+  runtime_epoch INTEGER NOT NULL DEFAULT 1 CHECK (runtime_epoch >= 1),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+  updated_by INTEGER,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  change_reason TEXT NOT NULL DEFAULT 'schema_default' CHECK (length(trim(change_reason)) BETWEEN 1 AND 500),
+  FOREIGN KEY (updated_by) REFERENCES sys_users(id) ON DELETE SET NULL
+);
+
+INSERT OR IGNORE INTO demo_runtime_settings
+  (id, enabled, runtime_epoch, revision, updated_by, change_reason)
+VALUES (1, 0, 1, 1, NULL, 'schema_default');
+
+-- 演示数据集运行只保存治理状态，不在本阶段创建或推进实际运行。
+CREATE TABLE IF NOT EXISTS demo_dataset_runs (
+  run_id TEXT PRIMARY KEY,
+  dataset_id TEXT NOT NULL,
+  manifest_version TEXT NOT NULL,
+  manifest_digest TEXT NOT NULL CHECK (
+    length(manifest_digest) = 64
+    AND manifest_digest NOT GLOB '*[^a-f0-9]*'
+  ),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'cleanup_pending', 'cleaning', 'cleaned', 'failed')),
+  created_by INTEGER,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  completed_at TEXT,
+  cleanup_started_at TEXT,
+  cleaned_at TEXT,
+  failure_reason TEXT,
+  FOREIGN KEY (created_by) REFERENCES sys_users(id) ON DELETE SET NULL,
+  CHECK (length(trim(run_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(dataset_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(manifest_version)) BETWEEN 1 AND 64),
+  CHECK ((status = 'cleaned' AND cleaned_at IS NOT NULL)
+    OR (status <> 'cleaned' AND cleaned_at IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_demo_dataset_runs_active_dataset
+  ON demo_dataset_runs(dataset_id)
+  WHERE status IN ('active', 'completed', 'cleanup_pending', 'cleaning');
+CREATE INDEX IF NOT EXISTS idx_demo_dataset_runs_status_created
+  ON demo_dataset_runs(status, created_at DESC);
+
+-- 演示导入上下文 v4 只保存令牌哈希，并冻结独立摘要、完整预演摘要、重新关联谱系及全部授权绑定。
+CREATE TABLE IF NOT EXISTS demo_import_contexts (
+  context_id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE CHECK (
+    length(token_hash) = 64
+    AND token_hash NOT GLOB '*[^a-f0-9]*'
+  ),
+  run_id TEXT NOT NULL,
+  dataset_id TEXT NOT NULL,
+  manifest_version TEXT NOT NULL,
+  manifest_digest TEXT NOT NULL CHECK (
+    length(manifest_digest) = 64
+    AND manifest_digest NOT GLOB '*[^a-f0-9]*'
+  ),
+  artifact_key TEXT NOT NULL,
+  handler_key TEXT NOT NULL,
+  artifact_file_sha256 TEXT NOT NULL CHECK (
+    length(artifact_file_sha256) = 64
+    AND artifact_file_sha256 NOT GLOB '*[^a-f0-9]*'
+  ),
+  issued_to_user_id INTEGER NOT NULL,
+  runtime_epoch INTEGER NOT NULL CHECK (runtime_epoch >= 1),
+  status TEXT NOT NULL DEFAULT 'issued' CHECK (status IN ('issued', 'previewed', 'executed', 'revoked', 'expired')),
+  issued_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (is_strict_utc_iso(issued_at) = 1),
+  expires_at TEXT NOT NULL CHECK (is_strict_utc_iso(expires_at) = 1),
+  upload_file_sha256 TEXT CHECK (
+    upload_file_sha256 IS NULL OR (
+      length(upload_file_sha256) = 64
+      AND upload_file_sha256 NOT GLOB '*[^a-f0-9]*'
+    )
+  ),
+  preview_digest TEXT CHECK (
+    preview_digest IS NULL OR (
+      length(preview_digest) = 85
+      AND preview_digest GLOB 'hmac-sha256:v1:audit:[a-f0-9]*'
+      AND length(replace(preview_digest, 'hmac-sha256:v1:audit:', '')) = 64
+      AND replace(preview_digest, 'hmac-sha256:v1:audit:', '') NOT GLOB '*[^a-f0-9]*'
+    )
+  ),
+  previewed_at TEXT CHECK (previewed_at IS NULL OR is_strict_utc_iso(previewed_at) = 1),
+  executed_at TEXT CHECK (executed_at IS NULL OR is_strict_utc_iso(executed_at) = 1),
+  revoked_at TEXT CHECK (revoked_at IS NULL OR is_strict_utc_iso(revoked_at) = 1),
+  revoke_reason TEXT CHECK (revoke_reason IS NULL OR length(trim(revoke_reason)) BETWEEN 1 AND 128),
+  reassociated_from_context_id TEXT,
+  replacement_context_id TEXT,
+  reassociated_at TEXT CHECK (reassociated_at IS NULL OR is_strict_utc_iso(reassociated_at) = 1),
+  FOREIGN KEY (run_id) REFERENCES demo_dataset_runs(run_id) ON DELETE RESTRICT,
+  FOREIGN KEY (issued_to_user_id) REFERENCES sys_users(id) ON DELETE RESTRICT,
+  FOREIGN KEY (reassociated_from_context_id) REFERENCES demo_import_contexts(context_id) ON DELETE RESTRICT,
+  FOREIGN KEY (replacement_context_id) REFERENCES demo_import_contexts(context_id) ON DELETE RESTRICT,
+  UNIQUE (context_id, run_id, artifact_key),
+  CHECK (length(trim(context_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(dataset_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(manifest_version)) BETWEEN 1 AND 64),
+  CHECK (length(trim(artifact_key)) BETWEEN 1 AND 128),
+  CHECK (length(trim(handler_key)) BETWEEN 1 AND 128),
+  CHECK (unixepoch(issued_at) < unixepoch(expires_at)),
+  CHECK ((status = 'previewed' AND previewed_at IS NOT NULL AND upload_file_sha256 IS NOT NULL AND preview_digest IS NOT NULL)
+    OR status <> 'previewed'),
+  CHECK ((status = 'executed' AND executed_at IS NOT NULL) OR status <> 'executed'),
+  CHECK ((status IN ('revoked', 'expired') AND revoked_at IS NOT NULL AND revoke_reason IS NOT NULL)
+    OR (status NOT IN ('revoked', 'expired') AND revoked_at IS NULL AND revoke_reason IS NULL)),
+  CHECK ((revoke_reason = 'reassociated' AND replacement_context_id IS NOT NULL AND reassociated_at IS NOT NULL)
+    OR revoke_reason <> 'reassociated' OR revoke_reason IS NULL),
+  CHECK ((reassociated_from_context_id IS NOT NULL AND reassociated_at IS NOT NULL)
+    OR reassociated_from_context_id IS NULL)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_demo_import_contexts_reassociated_from
+  ON demo_import_contexts(reassociated_from_context_id)
+  WHERE reassociated_from_context_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_demo_import_contexts_replacement
+  ON demo_import_contexts(replacement_context_id)
+  WHERE replacement_context_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_demo_import_contexts_run_artifact
+  ON demo_import_contexts(run_id, artifact_key, status);
+CREATE INDEX IF NOT EXISTS idx_demo_import_contexts_user_expiry
+  ON demo_import_contexts(issued_to_user_id, expires_at, status);
+CREATE INDEX IF NOT EXISTS idx_demo_import_contexts_handler_status
+  ON demo_import_contexts(handler_key, status, expires_at);
+
+-- 历史纳管运行仅预留强证据、锁内计划和执行审计所需字段。
+CREATE TABLE IF NOT EXISTS demo_legacy_claim_runs (
+  claim_run_id TEXT PRIMARY KEY,
+  dataset_id TEXT NOT NULL,
+  evidence_digest TEXT NOT NULL CHECK (length(evidence_digest) = 64),
+  plan_digest TEXT NOT NULL CHECK (length(plan_digest) = 64),
+  preview_expires_at TEXT NOT NULL,
+  candidate_count INTEGER NOT NULL DEFAULT 0 CHECK (candidate_count >= 0),
+  blocker_count INTEGER NOT NULL DEFAULT 0 CHECK (blocker_count >= 0),
+  blocker_summary_json TEXT,
+  confirmation_text TEXT,
+  requested_by INTEGER,
+  status TEXT NOT NULL DEFAULT 'previewed' CHECK (status IN ('previewed', 'executing', 'succeeded', 'blocked', 'failed', 'expired')),
+  claimed_count INTEGER NOT NULL DEFAULT 0 CHECK (claimed_count >= 0),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  executed_at TEXT,
+  failure_reason TEXT,
+  FOREIGN KEY (requested_by) REFERENCES sys_users(id) ON DELETE SET NULL,
+  CHECK (length(trim(claim_run_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(dataset_id)) BETWEEN 1 AND 128)
+);
+
+CREATE INDEX IF NOT EXISTS idx_demo_legacy_claim_runs_status_created
+  ON demo_legacy_claim_runs(status, created_at DESC);
+
+-- 清理运行保留预演防陈旧、幂等请求、备份白名单元数据和最终结果。
+CREATE TABLE IF NOT EXISTS demo_cleanup_runs (
+  cleanup_run_id TEXT PRIMARY KEY,
+  client_request_id TEXT NOT NULL UNIQUE,
+  preview_digest TEXT NOT NULL CHECK (length(preview_digest) = 64),
+  preview_expires_at TEXT NOT NULL,
+  runtime_revision INTEGER NOT NULL CHECK (runtime_revision >= 1),
+  registry_watermark TEXT NOT NULL,
+  candidate_count INTEGER NOT NULL DEFAULT 0 CHECK (candidate_count >= 0),
+  blocker_count INTEGER NOT NULL DEFAULT 0 CHECK (blocker_count >= 0),
+  summary_json TEXT,
+  confirmation_text TEXT,
+  requested_by INTEGER,
+  status TEXT NOT NULL DEFAULT 'previewed' CHECK (status IN ('previewed', 'executing', 'succeeded', 'blocked', 'failed', 'expired', 'noop')),
+  backup_metadata_json TEXT,
+  deleted_count INTEGER NOT NULL DEFAULT 0 CHECK (deleted_count >= 0),
+  already_missing_count INTEGER NOT NULL DEFAULT 0 CHECK (already_missing_count >= 0),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  started_at TEXT,
+  completed_at TEXT,
+  failure_reason TEXT,
+  FOREIGN KEY (requested_by) REFERENCES sys_users(id) ON DELETE SET NULL,
+  CHECK (length(trim(cleanup_run_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(client_request_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(registry_watermark)) BETWEEN 1 AND 256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_demo_cleanup_runs_status_created
+  ON demo_cleanup_runs(status, created_at DESC);
+
+-- 所有权注册表只允许服务端白名单实体写入；部分唯一索引防止多个未清理 run 接管同一业务记录。
+CREATE TABLE IF NOT EXISTS demo_data_registry (
+  registry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  artifact_key TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_pk TEXT NOT NULL,
+  ownership_kind TEXT NOT NULL CHECK (ownership_kind IN ('imported', 'derived', 'legacy_claimed')),
+  identity_digest TEXT NOT NULL CHECK (length(identity_digest) = 64),
+  snapshot_digest TEXT NOT NULL CHECK (length(snapshot_digest) = 64),
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  legacy_claim_run_id TEXT,
+  registered_by INTEGER,
+  registered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  cleaned_at TEXT,
+  cleanup_run_id TEXT,
+  cleanup_result TEXT CHECK (cleanup_result IS NULL OR cleanup_result IN ('deleted', 'already_missing')),
+  FOREIGN KEY (run_id) REFERENCES demo_dataset_runs(run_id) ON DELETE RESTRICT,
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (legacy_claim_run_id) REFERENCES demo_legacy_claim_runs(claim_run_id) ON DELETE RESTRICT,
+  FOREIGN KEY (registered_by) REFERENCES sys_users(id) ON DELETE SET NULL,
+  FOREIGN KEY (cleanup_run_id) REFERENCES demo_cleanup_runs(cleanup_run_id) ON DELETE RESTRICT,
+  UNIQUE (registry_id, run_id),
+  CHECK (length(trim(artifact_key)) BETWEEN 1 AND 128),
+  CHECK (length(trim(entity_type)) BETWEEN 1 AND 128),
+  CHECK (length(trim(entity_pk)) BETWEEN 1 AND 256),
+  CHECK ((cleaned_at IS NULL AND cleanup_run_id IS NULL AND cleanup_result IS NULL)
+    OR (cleaned_at IS NOT NULL AND cleanup_run_id IS NOT NULL AND cleanup_result IS NOT NULL)),
+  CHECK ((ownership_kind = 'legacy_claimed' AND legacy_claim_run_id IS NOT NULL)
+    OR (ownership_kind <> 'legacy_claimed' AND legacy_claim_run_id IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_demo_data_registry_active_entity
+  ON demo_data_registry(entity_type, entity_pk)
+  WHERE cleaned_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_demo_data_registry_run_artifact
+  ON demo_data_registry(run_id, artifact_key, cleaned_at);
+CREATE INDEX IF NOT EXISTS idx_demo_data_registry_batch
+  ON demo_data_registry(source_batch_id);
+CREATE INDEX IF NOT EXISTS idx_demo_data_registry_cleanup
+  ON demo_data_registry(cleanup_run_id, cleanup_result);
+
+-- 注册表关系使用受控类型表达来源和配置依赖，后续阶段不得由客户端传入动态 SQL。
+CREATE TABLE IF NOT EXISTS demo_data_relations (
+  relation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  from_registry_id INTEGER NOT NULL,
+  to_registry_id INTEGER NOT NULL,
+  relation_type TEXT NOT NULL CHECK (relation_type IN ('contains', 'generated_from', 'uses_config', 'uses_factor')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (run_id) REFERENCES demo_dataset_runs(run_id) ON DELETE RESTRICT,
+  FOREIGN KEY (from_registry_id, run_id) REFERENCES demo_data_registry(registry_id, run_id) ON DELETE RESTRICT,
+  FOREIGN KEY (to_registry_id, run_id) REFERENCES demo_data_registry(registry_id, run_id) ON DELETE RESTRICT,
+  UNIQUE (from_registry_id, to_registry_id, relation_type),
+  CHECK (from_registry_id <> to_registry_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_demo_data_relations_run_type
+  ON demo_data_relations(run_id, relation_type);
+CREATE INDEX IF NOT EXISTS idx_demo_data_relations_target
+  ON demo_data_relations(to_registry_id, relation_type);
+
+-- 运行、artifact、上下文与真实导入批次保持多批次可追溯关系，不改变原导入审计生命周期。
+CREATE TABLE IF NOT EXISTS demo_run_import_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  artifact_key TEXT NOT NULL,
+  context_id TEXT NOT NULL,
+  import_batch_id INTEGER NOT NULL,
+  batch_role TEXT NOT NULL DEFAULT 'primary',
+  linked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (run_id) REFERENCES demo_dataset_runs(run_id) ON DELETE RESTRICT,
+  FOREIGN KEY (context_id, run_id, artifact_key) REFERENCES demo_import_contexts(context_id, run_id, artifact_key) ON DELETE RESTRICT,
+  FOREIGN KEY (import_batch_id) REFERENCES import_batches(id) ON DELETE RESTRICT,
+  UNIQUE (run_id, artifact_key, context_id, batch_role, import_batch_id),
+  CHECK (length(trim(artifact_key)) BETWEEN 1 AND 128),
+  CHECK (length(trim(batch_role)) BETWEEN 1 AND 64)
+);
+
+CREATE INDEX IF NOT EXISTS idx_demo_run_import_batches_batch
+  ON demo_run_import_batches(import_batch_id);
+CREATE INDEX IF NOT EXISTS idx_demo_run_import_batches_run_artifact
+  ON demo_run_import_batches(run_id, artifact_key, batch_role);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_demo_run_import_batches_primary_context
+  ON demo_run_import_batches(context_id)
+  WHERE batch_role = 'primary';
+-- DEMO_GOVERNANCE_SCHEMA_END

@@ -12,6 +12,7 @@ process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
 const {
+  IMPORT_BATCH_TYPES,
   buildImportBatchesImportTypeMigrationSql,
   getDatabaseInfo,
   getTableColumns,
@@ -33,6 +34,18 @@ function getIndexNames(db, tableName) {
 try {
   initDatabase();
   assert.strictEqual(getDatabaseInfo().databasePath, process.env.SQLITE_PATH, 'Schema 迁移测试必须使用隔离 SQLite 文件。');
+
+  const expectedConfigurationImportTypes = Object.freeze([
+    'shift_definition',
+    'tou_scheme',
+    'strategy_rule',
+    'energy_flow_model',
+    'energy_balance_boundary',
+    'energy_balance_item'
+  ]);
+  expectedConfigurationImportTypes.forEach((importType) => {
+    assert(IMPORT_BATCH_TYPES.includes(importType), `统一 import type 白名单缺少 ${importType}。`);
+  });
 
   const newDb = openDatabase();
   let productionUnitId;
@@ -57,6 +70,15 @@ try {
 
     newDb.prepare("INSERT INTO import_batches (import_type, original_filename, file_type, status, audit_phase, preview_signature, preview_audit_digest, audit_context_json, execute_result_json, backup_json, total_rows, success_count, failure_count, skipped_count) VALUES ('production_output', 'production.xlsx', 'xlsx', 'completed', 'execute', 'sig', 'digest', '{\"phase\":\"preview\"}', '{\"imported\":1}', '{\"backupName\":\"b1\"}', 1, 1, 0, 0)").run();
     newDb.prepare("INSERT INTO import_batches (import_type, original_filename, file_type, status, audit_phase, total_rows, success_count, failure_count, skipped_count) VALUES ('generation_record', 'generation.csv', 'csv', 'completed_with_errors', 'preview', 2, 1, 0, 1)").run();
+    expectedConfigurationImportTypes.forEach((importType) => {
+      newDb.prepare('INSERT INTO import_batches (import_type, original_filename, file_type) VALUES (?, ?, ?)')
+        .run(importType, `${importType}.xlsx`, 'xlsx');
+    });
+    assert.strictEqual(
+      newDb.prepare(`SELECT COUNT(*) AS total FROM import_batches WHERE import_type IN (${expectedConfigurationImportTypes.map(() => '?').join(', ')})`).get(...expectedConfigurationImportTypes).total,
+      expectedConfigurationImportTypes.length,
+      '新库 CHECK 必须允许六类配置导入批次。'
+    );
     assert.throws(
       () => newDb.prepare("INSERT INTO import_batches (import_type, original_filename, file_type) VALUES ('bad_type', 'bad.csv', 'csv')").run(),
       /CHECK constraint failed/,
@@ -212,6 +234,16 @@ try {
     assert.strictEqual(retainedLegacyError.severity, 'warning');
     const productionBatchId = upgradedDb.prepare("INSERT INTO import_batches (import_type, original_filename, file_type, status, audit_phase, total_rows, success_count, failure_count, skipped_count) VALUES ('production_output', 'legacy-production.csv', 'csv', 'completed', 'execute', 1, 1, 0, 0)").run().lastInsertRowid;
     const generationBatchId = upgradedDb.prepare("INSERT INTO import_batches (import_type, original_filename, file_type, status, audit_phase, total_rows, success_count, failure_count, skipped_count) VALUES ('generation_record', 'legacy-generation.csv', 'csv', 'completed', 'execute', 1, 1, 0, 0)").run().lastInsertRowid;
+    expectedConfigurationImportTypes.forEach((importType) => {
+      upgradedDb.prepare('INSERT INTO import_batches (import_type, original_filename, file_type) VALUES (?, ?, ?)')
+        .run(importType, `legacy-${importType}.xlsx`, 'xlsx');
+    });
+    assert.strictEqual(
+      upgradedDb.prepare(`SELECT COUNT(*) AS total FROM import_batches WHERE import_type IN (${expectedConfigurationImportTypes.map(() => '?').join(', ')})`).get(...expectedConfigurationImportTypes).total,
+      expectedConfigurationImportTypes.length,
+      '旧库迁移后 CHECK 必须允许六类配置导入批次。'
+    );
+    assert.strictEqual(migrateImportBatchesImportTypeCheck(upgradedDb), false, '升级完成后再次执行 import type 迁移必须幂等。');
     assert(getTableColumns(upgradedDb, 'production_units').includes('source_batch_id'), '旧 production_units 应补充 source_batch_id。');
     assert(getTableColumns(upgradedDb, 'production_units').includes('source_row_number'), '旧 production_units 应补充 source_row_number。');
     assert.strictEqual(upgradedDb.prepare("SELECT COUNT(*) AS total FROM production_units WHERE remark = '旧产能单元保留' AND source_batch_id IS NULL AND source_row_number IS NULL").get().total, 1, '旧 production_units 数据应保留且 source 默认 NULL。');
@@ -230,6 +262,12 @@ try {
 
   assert(buildImportBatchesImportTypeMigrationSql().some((sql) => sql.includes("'production_output'")), '旧库迁移 SQL 应扩展 production_output。');
   assert(buildImportBatchesImportTypeMigrationSql().some((sql) => sql.includes("'generation_record'")), '旧库迁移 SQL 应扩展 generation_record。');
+  expectedConfigurationImportTypes.forEach((importType) => {
+    assert(
+      buildImportBatchesImportTypeMigrationSql().some((sql) => sql.includes(`'${importType}'`)),
+      `旧库迁移 SQL 应扩展 ${importType}。`
+    );
+  });
 
   const rollbackDbPath = path.join(tmpDir, 'rollback-check.sqlite');
   const rollbackDb = new Database(rollbackDbPath);

@@ -40,7 +40,7 @@ const EXPECTED_TABLES = [
   'energy_balance_suggestions'
 ];
 
-// import_batches 保留十类历史值并新增八类阶段 3 预留值。
+// import_batches 保留十类历史值、八类阶段 3 值，并新增六类配置导入值。
 const EXPECTED_IMPORT_TYPES = [
   'energy_record',
   'meter_reading',
@@ -59,7 +59,13 @@ const EXPECTED_IMPORT_TYPES = [
   'energy_benchmark',
   'energy_flow_node',
   'energy_flow_edge',
-  'energy_flow_record'
+  'energy_flow_record',
+  'shift_definition',
+  'tou_scheme',
+  'strategy_rule',
+  'energy_flow_model',
+  'energy_balance_boundary',
+  'energy_balance_item'
 ];
 
 // 关键候选查询索引覆盖重叠事务校验、来源追溯和结果查询。
@@ -110,6 +116,116 @@ function getIndexNames(db) {
   return db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'")
     .all()
     .map((row) => row.name);
+}
+
+/**
+ * 将治理运行表替换为字段完整但摘要 CHECK 较弱的旧表，并可替换指定运行摘要。
+ * @param {object} db SQLite 连接。
+ * @param {string} runId 待替换摘要的运行 ID。
+ * @param {string} weakManifestDigest 不可信旧摘要。
+ */
+function weakenDemoDatasetRunsSha256Contract(db, runId, weakManifestDigest) {
+  db.pragma('foreign_keys = OFF');
+  db.exec(`DROP INDEX IF EXISTS ux_demo_dataset_runs_active_dataset;
+    DROP INDEX IF EXISTS idx_demo_dataset_runs_status_created;
+    DROP TABLE IF EXISTS demo_dataset_runs_sha256_weak;
+    CREATE TABLE demo_dataset_runs_sha256_weak (
+      run_id TEXT PRIMARY KEY,
+      dataset_id TEXT NOT NULL,
+      manifest_version TEXT NOT NULL,
+      manifest_digest TEXT NOT NULL CHECK (length(manifest_digest) = 64),
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'cleanup_pending', 'cleaning', 'cleaned', 'failed')),
+      created_by INTEGER,
+      created_at TEXT NOT NULL,
+      completed_at TEXT,
+      cleanup_started_at TEXT,
+      cleaned_at TEXT,
+      failure_reason TEXT,
+      FOREIGN KEY (created_by) REFERENCES sys_users(id) ON DELETE SET NULL,
+      CHECK (length(trim(run_id)) BETWEEN 1 AND 128),
+      CHECK (length(trim(dataset_id)) BETWEEN 1 AND 128),
+      CHECK (length(trim(manifest_version)) BETWEEN 1 AND 64),
+      CHECK ((status = 'cleaned' AND cleaned_at IS NOT NULL)
+        OR (status <> 'cleaned' AND cleaned_at IS NULL))
+    );
+    INSERT INTO demo_dataset_runs_sha256_weak
+      (run_id, dataset_id, manifest_version, manifest_digest, status, created_by, created_at,
+       completed_at, cleanup_started_at, cleaned_at, failure_reason)
+    SELECT run_id, dataset_id, manifest_version,
+      CASE WHEN run_id = '${runId}' THEN '${weakManifestDigest}' ELSE manifest_digest END,
+      status, created_by, created_at, completed_at, cleanup_started_at, cleaned_at, failure_reason
+    FROM demo_dataset_runs;
+    DROP TABLE demo_dataset_runs;
+    ALTER TABLE demo_dataset_runs_sha256_weak RENAME TO demo_dataset_runs;
+    CREATE UNIQUE INDEX ux_demo_dataset_runs_active_dataset
+      ON demo_dataset_runs(dataset_id)
+      WHERE status IN ('active', 'completed', 'cleanup_pending', 'cleaning');
+    CREATE INDEX idx_demo_dataset_runs_status_created
+      ON demo_dataset_runs(status, created_at DESC);`);
+  db.pragma('foreign_keys = ON');
+}
+
+/**
+ * 将 context 表替换为字段完整但 SHA CHECK 较弱的旧表。
+ * @param {object} db SQLite 连接。
+ */
+function weakenDemoImportContextsSha256Contract(db) {
+  db.pragma('foreign_keys = OFF');
+  db.exec(`DROP TABLE IF EXISTS demo_run_import_batches;
+    DROP TABLE demo_import_contexts;
+    CREATE TABLE demo_import_contexts (
+      context_id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
+      run_id TEXT NOT NULL,
+      dataset_id TEXT NOT NULL,
+      manifest_version TEXT NOT NULL,
+      manifest_digest TEXT NOT NULL CHECK (length(manifest_digest) = 64),
+      artifact_key TEXT NOT NULL,
+      handler_key TEXT NOT NULL,
+      artifact_file_sha256 TEXT NOT NULL CHECK (length(artifact_file_sha256) = 64),
+      issued_to_user_id INTEGER NOT NULL,
+      runtime_epoch INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      issued_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      upload_file_sha256 TEXT,
+      preview_digest TEXT,
+      previewed_at TEXT,
+      executed_at TEXT,
+      revoked_at TEXT,
+      revoke_reason TEXT,
+      reassociated_from_context_id TEXT,
+      replacement_context_id TEXT,
+      reassociated_at TEXT,
+      FOREIGN KEY (run_id) REFERENCES demo_dataset_runs(run_id) ON DELETE RESTRICT,
+      FOREIGN KEY (issued_to_user_id) REFERENCES sys_users(id) ON DELETE RESTRICT,
+      UNIQUE (context_id, run_id, artifact_key)
+    );`);
+  db.pragma('foreign_keys = ON');
+}
+
+/**
+ * 写入可验证迁移行为的运行和预演 context。
+ * @param {object} db SQLite 连接。
+ * @param {object} input 测试身份与摘要。
+ */
+function seedDemoSha256MigrationContext(db, input) {
+  const admin = db.prepare("SELECT id FROM sys_users WHERE username = 'admin'").get();
+  assert(admin, 'SHA 迁移测试需要隔离库内置管理员。');
+  db.prepare(`INSERT INTO demo_dataset_runs
+    (run_id, dataset_id, manifest_version, manifest_digest, status, created_by, created_at)
+    VALUES (?, ?, '1.0.0', ?, 'failed', ?, '2026-08-13T00:00:00.000Z')`)
+    .run(input.runId, input.datasetId, input.runManifestDigest, admin.id);
+  db.prepare(`INSERT INTO demo_import_contexts
+    (context_id, token_hash, run_id, dataset_id, manifest_version, manifest_digest,
+     artifact_key, handler_key, artifact_file_sha256, issued_to_user_id, runtime_epoch,
+     status, issued_at, expires_at, upload_file_sha256, preview_digest, previewed_at)
+    VALUES (?, ?, ?, ?, '1.0.0', ?, ?, 'energy-analysis:shift-definition', ?, ?, 1,
+      'previewed', '2026-08-13T00:00:00.000Z', '2026-08-13T01:00:00.000Z', ?,
+      ?, '2026-08-13T00:10:00.000Z')`)
+    .run(input.contextId, input.tokenHash, input.runId, input.datasetId,
+      input.contextManifestDigest, input.artifactKey, input.artifactFileSha256,
+      admin.id, input.uploadFileSha256, `hmac-sha256:v1:audit:${'f'.repeat(64)}`);
 }
 
 /**
@@ -406,7 +522,7 @@ try {
   const newDatabaseModule = loadDatabaseModule(newDatabasePath);
   newDatabaseModule.initDatabase();
   assert.strictEqual(newDatabaseModule.getDatabaseInfo().databasePath, newDatabasePath, '新库测试必须使用隔离 SQLite。');
-  assert.deepStrictEqual(newDatabaseModule.IMPORT_BATCH_TYPES, EXPECTED_IMPORT_TYPES, '导入类型白名单必须精确匹配历史十类与新增八类。');
+  assert.deepStrictEqual(newDatabaseModule.IMPORT_BATCH_TYPES, EXPECTED_IMPORT_TYPES, '导入类型白名单必须精确匹配历史十类、阶段 3 八类与新增六类配置导入类型。');
 
   const newDb = newDatabaseModule.openDatabase();
   try {
@@ -415,8 +531,8 @@ try {
     const indexNames = new Set(getIndexNames(newDb));
     EXPECTED_INDEXES.forEach((indexName) => assert(indexNames.has(indexName), `新库缺少 ${indexName}。`));
 
-    assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_stage'").get().value, 'energy-analysis-foundation');
-    assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value, '2026-08-06-energy-analysis-foundation');
+    assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_stage'").get().value, 'demo-context-foundation');
+    assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value, '2026-08-13-demo-context-v4');
 
     const importBatchSql = getCreateSql(newDb, 'import_batches');
     EXPECTED_IMPORT_TYPES.forEach((importType) => {
@@ -914,6 +1030,135 @@ try {
     assert.deepStrictEqual(reinitializedDb.prepare('PRAGMA foreign_key_check').all(), [], '二次初始化后外键检查必须通过。');
   } finally {
     reinitializedDb.close();
+  }
+
+  // 字段完整但 SHA CHECK 较弱的旧治理表必须替换不可信摘要、撤销 context、清绑定并保持幂等。
+  const weakShaDatabasePath = path.join(dataDir, 'demo-sha256-weak-contract.sqlite');
+  const weakShaDatabaseModule = loadDatabaseModule(weakShaDatabasePath);
+  weakShaDatabaseModule.initDatabase();
+  const weakShaDb = weakShaDatabaseModule.openDatabase();
+  const weakRunManifestDigest = 'A'.repeat(64);
+  const weakTokenHash = 'B'.repeat(64);
+  const weakArtifactSha = `${'c'.repeat(63)}Z`;
+  const weakUploadSha = `${'d'.repeat(63)}!`;
+  try {
+    weakenDemoImportContextsSha256Contract(weakShaDb);
+    seedDemoSha256MigrationContext(weakShaDb, {
+      runId: 'sha-weak-run',
+      datasetId: 'sha-weak-dataset',
+      runManifestDigest: 'a'.repeat(64),
+      contextId: 'sha-weak-context',
+      tokenHash: weakTokenHash,
+      contextManifestDigest: weakRunManifestDigest,
+      artifactKey: '13-shift-definitions',
+      artifactFileSha256: weakArtifactSha,
+      uploadFileSha256: weakUploadSha
+    });
+    weakenDemoDatasetRunsSha256Contract(weakShaDb, 'sha-weak-run', weakRunManifestDigest);
+  } finally {
+    weakShaDb.close();
+  }
+  weakShaDatabaseModule.initDatabase();
+  let migratedWeakShaSnapshot;
+  const migratedWeakShaDb = weakShaDatabaseModule.openDatabase();
+  try {
+    const migratedRun = migratedWeakShaDb.prepare(`SELECT manifest_digest AS manifestDigest
+      FROM demo_dataset_runs WHERE run_id = 'sha-weak-run'`).get();
+    const migratedContext = migratedWeakShaDb.prepare(`SELECT token_hash AS tokenHash,
+        manifest_digest AS manifestDigest, artifact_file_sha256 AS artifactFileSha256,
+        status, upload_file_sha256 AS uploadFileSha256, preview_digest AS previewDigest,
+        previewed_at AS previewedAt, revoked_at AS revokedAt, revoke_reason AS revokeReason
+      FROM demo_import_contexts WHERE context_id = 'sha-weak-context'`).get();
+    assert.match(migratedRun.manifestDigest, /^[a-f0-9]{64}$/);
+    assert.notStrictEqual(migratedRun.manifestDigest, weakRunManifestDigest,
+      '不可信 run manifest 不得作为有效绑定继续保留。');
+    assert.match(migratedContext.tokenHash, /^[a-f0-9]{64}$/);
+    assert.notStrictEqual(migratedContext.tokenHash, weakTokenHash,
+      '不可信旧 token hash 必须替换为不可逆 canonical 安全摘要。');
+    assert.strictEqual(migratedWeakShaDb.prepare('SELECT COUNT(*) AS total FROM demo_import_contexts WHERE token_hash = ?')
+      .get(weakTokenHash).total, 0, '原不可信 token hash 不得继续命中 context。');
+    assert.match(migratedContext.artifactFileSha256, /^[a-f0-9]{64}$/);
+    assert.notStrictEqual(migratedContext.artifactFileSha256, weakArtifactSha,
+      '不可信 artifact 摘要必须替换为 canonical 安全摘要。');
+    assert.strictEqual(migratedContext.manifestDigest, migratedRun.manifestDigest,
+      'context 必须改绑到迁移后的 canonical run manifest。');
+    assert.strictEqual(migratedContext.status, 'revoked');
+    assert.strictEqual(migratedContext.uploadFileSha256, null);
+    assert.strictEqual(migratedContext.previewDigest, null);
+    assert.strictEqual(migratedContext.previewedAt, null);
+    assert.match(migratedContext.revokedAt, /^\d{4}-\d{2}-\d{2}T/);
+    assert.strictEqual(migratedContext.revokeReason, 'invalid_sha256_migration');
+    assert.match(getCreateSql(migratedWeakShaDb, 'demo_dataset_runs'), /NOT GLOB '\*\[\^a-f0-9\]\*'/i);
+    assert.match(getCreateSql(migratedWeakShaDb, 'demo_import_contexts'), /NOT GLOB '\*\[\^a-f0-9\]\*'/i);
+    migratedWeakShaSnapshot = { run: migratedRun, context: migratedContext };
+  } finally {
+    migratedWeakShaDb.close();
+  }
+  weakShaDatabaseModule.initDatabase();
+  const idempotentWeakShaDb = weakShaDatabaseModule.openDatabase();
+  try {
+    assert.deepStrictEqual(
+      idempotentWeakShaDb.prepare(`SELECT manifest_digest AS manifestDigest
+        FROM demo_dataset_runs WHERE run_id = 'sha-weak-run'`).get(),
+      migratedWeakShaSnapshot.run,
+      '重复初始化不得再次替换已 canonical 的 run 摘要。'
+    );
+    assert.deepStrictEqual(
+      idempotentWeakShaDb.prepare(`SELECT token_hash AS tokenHash,
+          manifest_digest AS manifestDigest, artifact_file_sha256 AS artifactFileSha256,
+          status, upload_file_sha256 AS uploadFileSha256, preview_digest AS previewDigest,
+          previewed_at AS previewedAt, revoked_at AS revokedAt, revoke_reason AS revokeReason
+        FROM demo_import_contexts WHERE context_id = 'sha-weak-context'`).get(),
+      migratedWeakShaSnapshot.context,
+      '重复初始化不得再次改写已撤销 context 或迁移时间。'
+    );
+  } finally {
+    idempotentWeakShaDb.close();
+  }
+
+  // run 摘要弱化时，即使 context 表自身已 canonical，也必须强制撤销关联 context 并清绑定。
+  const canonicalContextUnsafeRunPath = path.join(dataDir, 'demo-sha256-canonical-context.sqlite');
+  const canonicalContextUnsafeRunModule = loadDatabaseModule(canonicalContextUnsafeRunPath);
+  canonicalContextUnsafeRunModule.initDatabase();
+  const canonicalContextUnsafeRunDb = canonicalContextUnsafeRunModule.openDatabase();
+  try {
+    seedDemoSha256MigrationContext(canonicalContextUnsafeRunDb, {
+      runId: 'sha-canonical-context-run',
+      datasetId: 'sha-canonical-context-dataset',
+      runManifestDigest: '1'.repeat(64),
+      contextId: 'sha-canonical-context',
+      tokenHash: '2'.repeat(64),
+      contextManifestDigest: '1'.repeat(64),
+      artifactKey: '13-shift-definitions',
+      artifactFileSha256: '3'.repeat(64),
+      uploadFileSha256: '4'.repeat(64)
+    });
+    weakenDemoDatasetRunsSha256Contract(
+      canonicalContextUnsafeRunDb,
+      'sha-canonical-context-run',
+      'E'.repeat(64)
+    );
+  } finally {
+    canonicalContextUnsafeRunDb.close();
+  }
+  canonicalContextUnsafeRunModule.initDatabase();
+  const migratedCanonicalContextDb = canonicalContextUnsafeRunModule.openDatabase();
+  try {
+    const run = migratedCanonicalContextDb.prepare(`SELECT manifest_digest AS manifestDigest
+      FROM demo_dataset_runs WHERE run_id = 'sha-canonical-context-run'`).get();
+    const context = migratedCanonicalContextDb.prepare(`SELECT manifest_digest AS manifestDigest,
+        status, upload_file_sha256 AS uploadFileSha256, preview_digest AS previewDigest,
+        previewed_at AS previewedAt, revoke_reason AS revokeReason
+      FROM demo_import_contexts WHERE context_id = 'sha-canonical-context'`).get();
+    assert.match(run.manifestDigest, /^[a-f0-9]{64}$/);
+    assert.strictEqual(context.manifestDigest, run.manifestDigest);
+    assert.strictEqual(context.status, 'revoked');
+    assert.strictEqual(context.uploadFileSha256, null);
+    assert.strictEqual(context.previewDigest, null);
+    assert.strictEqual(context.previewedAt, null);
+    assert.strictEqual(context.revokeReason, 'invalid_sha256_migration');
+  } finally {
+    migratedCanonicalContextDb.close();
   }
 
   // 旧库升级必须安全重建 import_batches，保留历史批次和 import_errors 外键。
@@ -1557,6 +1802,85 @@ try {
     schemaRollbackDb.close();
   }
 
+  // SHA 治理迁移完成后若 RBAC 后段失败，弱表、旧摘要和有效绑定必须随初始化事务整体回滚。
+  const shaRollbackPath = path.join(dataDir, 'demo-sha256-init-rollback.sqlite');
+  const shaRollbackModule = loadDatabaseModule(shaRollbackPath);
+  shaRollbackModule.initDatabase();
+  const shaRollbackSeedDb = shaRollbackModule.openDatabase();
+  try {
+    weakenDemoImportContextsSha256Contract(shaRollbackSeedDb);
+    seedDemoSha256MigrationContext(shaRollbackSeedDb, {
+      runId: 'sha-rollback-run',
+      datasetId: 'sha-rollback-dataset',
+      runManifestDigest: 'f'.repeat(64),
+      contextId: 'sha-rollback-context',
+      tokenHash: 'a'.repeat(64),
+      contextManifestDigest: 'f'.repeat(64),
+      artifactKey: '13-shift-definitions',
+      artifactFileSha256: 'b'.repeat(64),
+      uploadFileSha256: 'c'.repeat(64)
+    });
+    weakenDemoDatasetRunsSha256Contract(
+      shaRollbackSeedDb,
+      'sha-rollback-run',
+      'F'.repeat(64)
+    );
+    shaRollbackSeedDb.prepare(`UPDATE demo_import_contexts
+      SET token_hash = ?, manifest_digest = ?, artifact_file_sha256 = ?, upload_file_sha256 = ?
+      WHERE context_id = 'sha-rollback-context'`)
+      .run('A'.repeat(64), 'F'.repeat(64), 'B'.repeat(64), 'C'.repeat(64));
+    shaRollbackSeedDb.prepare("UPDATE sys_users SET status = 'inactive' WHERE username = 'admin'").run();
+  } finally {
+    shaRollbackSeedDb.close();
+  }
+  const shaRollbackBeforeDb = new Database(shaRollbackPath, { readonly: true });
+  const shaRollbackBefore = {
+    runSql: getCreateSql(shaRollbackBeforeDb, 'demo_dataset_runs'),
+    contextSql: getCreateSql(shaRollbackBeforeDb, 'demo_import_contexts'),
+    run: shaRollbackBeforeDb.prepare(`SELECT * FROM demo_dataset_runs
+      WHERE run_id = 'sha-rollback-run'`).get(),
+    context: shaRollbackBeforeDb.prepare(`SELECT * FROM demo_import_contexts
+      WHERE context_id = 'sha-rollback-context'`).get()
+  };
+  shaRollbackBeforeDb.close();
+  const configuredShaRollbackAdminPassword = process.env.CHARCOAL_ADMIN_PASSWORD;
+  delete process.env.CHARCOAL_ADMIN_PASSWORD;
+  try {
+    assert.throws(
+      () => shaRollbackModule.initDatabase(),
+      /缺少 CHARCOAL_ADMIN_PASSWORD/,
+      'SHA 治理迁移后的 RBAC 失败必须向调用方抛出错误。'
+    );
+  } finally {
+    process.env.CHARCOAL_ADMIN_PASSWORD = configuredShaRollbackAdminPassword;
+  }
+  const shaRollbackAfterDb = new Database(shaRollbackPath, { readonly: true });
+  try {
+    assert.strictEqual(getCreateSql(shaRollbackAfterDb, 'demo_dataset_runs'), shaRollbackBefore.runSql,
+      '初始化后段失败必须恢复弱 run 表结构。');
+    assert.strictEqual(getCreateSql(shaRollbackAfterDb, 'demo_import_contexts'), shaRollbackBefore.contextSql,
+      '初始化后段失败必须恢复弱 context 表结构。');
+    assert.deepStrictEqual(
+      shaRollbackAfterDb.prepare(`SELECT * FROM demo_dataset_runs
+        WHERE run_id = 'sha-rollback-run'`).get(),
+      shaRollbackBefore.run,
+      '初始化后段失败不得保留 run 安全替代摘要。'
+    );
+    assert.deepStrictEqual(
+      shaRollbackAfterDb.prepare(`SELECT * FROM demo_import_contexts
+        WHERE context_id = 'sha-rollback-context'`).get(),
+      shaRollbackBefore.context,
+      '初始化后段失败不得提前撤销 context 或清除 preview/upload 绑定。'
+    );
+    assert.strictEqual(
+      shaRollbackAfterDb.prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE name LIKE '%sha256_%'").get().total,
+      0,
+      '初始化后段失败不得残留 SHA 迁移临时表或索引。'
+    );
+  } finally {
+    shaRollbackAfterDb.close();
+  }
+
   // 管理员初始化失败时不得提前写入能源分析完成标记。
   const noAdminDatabasePath = path.join(dataDir, 'energy-analysis-no-admin.sqlite');
   const configuredAdminPassword = process.env.CHARCOAL_ADMIN_PASSWORD;
@@ -1573,13 +1897,48 @@ try {
   }
   const noAdminDb = new Database(noAdminDatabasePath, { readonly: true });
   try {
-    const completionMarkerCount = noAdminDb.prepare(`SELECT COUNT(*) AS total
-      FROM app_meta
-      WHERE (key = 'schema_stage' AND value = 'energy-analysis-foundation')
-         OR (key = 'schema_version' AND value = '2026-08-06-energy-analysis-foundation')`).get().total;
-    assert.strictEqual(completionMarkerCount, 0, '初始化失败后不得存在任何能源分析完成标记。');
+    const schemaObjects = noAdminDb.prepare(`SELECT type, name, tbl_name AS tableName, sql
+      FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`).all();
+    assert.deepStrictEqual(schemaObjects, [], 'RBAC 后段失败时初始化前空库结构必须整体不变。');
+    assert.strictEqual(noAdminDb.pragma('user_version', { simple: true }), 0);
   } finally {
     noAdminDb.close();
+  }
+
+  // 既有库初始化后段失败时，原有结构与数据也必须逐字节语义不变。
+  const existingNoAdminDatabasePath = path.join(dataDir, 'energy-analysis-existing-no-admin.sqlite');
+  const existingNoAdminDb = new Database(existingNoAdminDatabasePath);
+  try {
+    existingNoAdminDb.exec(`CREATE TABLE preserved_probe (
+      id INTEGER PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    CREATE INDEX idx_preserved_probe_value ON preserved_probe(value);
+    INSERT INTO preserved_probe (id, value) VALUES (1, 'preserved');`);
+  } finally {
+    existingNoAdminDb.close();
+  }
+  const beforeFailedInitDb = new Database(existingNoAdminDatabasePath, { readonly: true });
+  const beforeFailedInitSnapshot = beforeFailedInitDb.prepare(`SELECT type, name, tbl_name AS tableName, sql
+    FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`).all();
+  const beforeFailedInitData = beforeFailedInitDb.prepare('SELECT id, value FROM preserved_probe ORDER BY id').all();
+  beforeFailedInitDb.close();
+  delete process.env.CHARCOAL_ADMIN_PASSWORD;
+  const existingNoAdminModule = loadDatabaseModule(existingNoAdminDatabasePath);
+  try {
+    assert.throws(() => existingNoAdminModule.initDatabase(), /缺少 CHARCOAL_ADMIN_PASSWORD/);
+  } finally {
+    process.env.CHARCOAL_ADMIN_PASSWORD = configuredAdminPassword;
+  }
+  const afterFailedInitDb = new Database(existingNoAdminDatabasePath, { readonly: true });
+  try {
+    assert.deepStrictEqual(afterFailedInitDb.prepare(`SELECT type, name, tbl_name AS tableName, sql
+      FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`).all(), beforeFailedInitSnapshot,
+    'RBAC 后段失败时既有库结构必须整体不变。');
+    assert.deepStrictEqual(afterFailedInitDb.prepare('SELECT id, value FROM preserved_probe ORDER BY id').all(), beforeFailedInitData,
+      'RBAC 后段失败时既有数据必须整体不变。');
+  } finally {
+    afterFailedInitDb.close();
   }
 
   console.log('energy analysis schema migration tests passed');

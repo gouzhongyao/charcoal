@@ -7,12 +7,14 @@ import {
   ENERGY_BENCHMARK_ORGANIZATION_LEVELS,
   ENERGY_BENCHMARK_ORGANIZATION_VIEW_PERMISSIONS,
   ENERGY_BENCHMARK_PERMISSIONS,
+  ENERGY_BENCHMARK_PRODUCTION_VIEW_PERMISSIONS,
   applyEnergyBenchmarkOrganizationSelection,
   assignEnergyBenchmarkCompetitionRanks,
   buildEnergyBenchmarkAnalysisSnapshot,
   buildEnergyBenchmarkCapabilityMatrix,
   buildEnergyBenchmarkCsv,
   buildEnergyBenchmarkDefinitionFilters,
+  buildEnergyBenchmarkDefinitionPayload,
   buildEnergyBenchmarkGroupPayload,
   buildEnergyBenchmarkImportExecutePayload,
   buildEnergyBenchmarkInternalHistoryPayload,
@@ -27,18 +29,24 @@ import {
   formatEnergyBenchmarkQualificationRate,
   formatEnergyBenchmarkRatio,
   formatEnergyBenchmarkReasons,
+  formatEnergyBenchmarkScopeOptionLabel,
+  isEnergyBenchmarkStrictUtcRange,
   normalizeEnergyBenchmarkAnalysisFailureState,
   normalizeEnergyBenchmarkOrganizationAccessError,
+  normalizeEnergyBenchmarkProductionAccessError,
   normalizeEnergyBenchmarkRankingRows,
   projectEnergyBenchmarkMaintenance,
   projectEnergyBenchmarkRequestError,
   reduceEnergyBenchmarkPageErrors,
+  resetEnergyBenchmarkScopeSelection,
   resolveEnergyBenchmarkAnalysisInvalidation,
   resolveEnergyBenchmarkDefinitionObjectLevel,
   resolveEnergyBenchmarkErrorDestination,
+  resolveEnergyBenchmarkScopeOptionValue,
   selectEnergyBenchmarkPageError,
   transitionEnergyBenchmarkAnalysisState,
-  validateEnergyBenchmarkAnalysisContext
+  validateEnergyBenchmarkAnalysisContext,
+  validateEnergyBenchmarkScopeSelection
 } from '../utils/energyBenchmarkManagement.js';
 
 // 轻量测试注册与执行模块。
@@ -146,6 +154,32 @@ test('organization 定义只能映射为五种真实组织层级并选择 active
   assert.equal(validateEnergyBenchmarkAnalysisContext({ definition, target, actualRows: [selectedRow], organizationUnits: organizations }).ready, true);
   assert.equal(validateEnergyBenchmarkAnalysisContext({ definition, target, actualRows: [{ ...selectedRow, objectLevel: 'organization' }], organizationUnits: organizations }).ready, false);
   assert.equal(validateEnergyBenchmarkAnalysisContext({ definition, target, actualRows: [applyEnergyBenchmarkOrganizationSelection(selectedRow, organizations[2])], organizationUnits: organizations }).ready, false);
+});
+
+test('三类定义范围选择器使用真实编码并提供可读名称标签', () => {
+  const organization = { unitCode: 'OU-1', unitName: '一号车间', unitPath: '企业 / 一号车间' };
+  const energy = { code: 'electricity', name: '电力' };
+  const production = { id: 9, unitCode: 'PU-9', unitName: '一号产线', productName: '熟料' };
+  assert.equal(formatEnergyBenchmarkScopeOptionLabel('organization', organization), '企业 / 一号车间（OU-1）');
+  assert.equal(formatEnergyBenchmarkScopeOptionLabel('energy', energy), '电力（electricity）');
+  assert.equal(formatEnergyBenchmarkScopeOptionLabel('product', production), '熟料 / 一号产线（PU-9）');
+  assert.equal(resolveEnergyBenchmarkScopeOptionValue('organization', organization), 'OU-1');
+  assert.equal(resolveEnergyBenchmarkScopeOptionValue('energy', energy), 'electricity');
+  assert.equal(resolveEnergyBenchmarkScopeOptionValue('product', production), 'PU-9');
+});
+
+test('范围类型切换清空旧值且 active 主数据校验不接受自由输入或产品名别名', () => {
+  const sources = {
+    organizationUnits: [{ unitCode: 'OU-1' }],
+    energyTypes: [{ code: 'electricity' }],
+    productionUnits: [{ id: 9, unitCode: 'PU-9', productName: '熟料' }]
+  };
+  assert.deepEqual(resetEnergyBenchmarkScopeSelection({ scopeType: 'organization', scopeReference: 'OU-1', benchmarkCode: 'B' }, 'product'), { scopeType: 'product', scopeReference: '', benchmarkCode: 'B' });
+  assert.equal(validateEnergyBenchmarkScopeSelection('organization', 'OU-1', sources).valid, true);
+  assert.equal(validateEnergyBenchmarkScopeSelection('energy', 'electricity', sources).valid, true);
+  assert.equal(validateEnergyBenchmarkScopeSelection('product', 'PU-9', sources).valid, true);
+  assert.equal(validateEnergyBenchmarkScopeSelection('product', '熟料', sources).valid, false, '前端新增选择器必须提交 unitCode，不使用服务端历史 productName 兼容入口');
+  assert.equal(validateEnergyBenchmarkScopeSelection('energy', 'manual-input', sources).valid, false);
 });
 
 test('分析输入变化产生不同快照并让旧 latest-response 令牌失效', () => {
@@ -257,11 +291,13 @@ test('端到端能力矩阵要求导出 analyze 加 export 且导入执行 previ
   assert.equal(terminalOnly.exportWorkflow, false);
   assert.equal(terminalOnly.importExecutePermission, true);
   assert.equal(terminalOnly.importExecuteWorkflow, false);
-  const complete = buildEnergyBenchmarkCapabilityMatrix({ analyze: true, export: true, importPreview: true, importExecute: true, organizationView: true });
+  const complete = buildEnergyBenchmarkCapabilityMatrix({ analyze: true, export: true, importPreview: true, importExecute: true, organizationView: true, productionUnitView: true });
   assert.equal(complete.exportWorkflow, true);
   assert.equal(complete.importExecuteWorkflow, true);
   assert.equal(complete.organizationView, true);
+  assert.equal(complete.productionView, true);
   assert.equal(buildEnergyBenchmarkCapabilityMatrix({ organizationUnitsView: true }).organizationView, true);
+  assert.equal(buildEnergyBenchmarkCapabilityMatrix({ productionView: true }).productionView, true);
 });
 
 test('分析失效规则忽略管理筛选分页并仅在定义目标语义变化时重建颜色', () => {
@@ -274,11 +310,15 @@ test('分析失效规则忽略管理筛选分页并仅在定义目标语义变�
   assert.deepEqual(resolveEnergyBenchmarkAnalysisInvalidation('analysis-input', false), { invalidate: false, resetColors: false });
 });
 
-test('组织权限缺失和 403 归一化为组织范围专属错误', () => {
-  const expected = '组织范围分析需要组织台账查看权限（ledger:units:view 或 ledger:organization:view）。';
-  assert.equal(normalizeEnergyBenchmarkOrganizationAccessError(null, false), expected);
-  assert.equal(normalizeEnergyBenchmarkOrganizationAccessError({ response: { status: 403, data: { error: { code: 'FORBIDDEN' } } } }, true), expected);
-  assert.match(normalizeEnergyBenchmarkOrganizationAccessError({ response: { status: 500, data: { error: { code: 'INTERNAL_ERROR', message: '服务异常' } } } }, true), /读取组织实际对象失败/);
+test('组织和产能权限缺失或 403 归一化为对应范围专属错误', () => {
+  const organizationExpected = '组织范围需要组织台账查看权限（ledger:units:view 或 ledger:organization:view）。';
+  const productionExpected = '产品范围和内部历史计算范围需要产能单元查看权限（ledger:production-unit:view 或 ledger:production:view）。';
+  assert.equal(normalizeEnergyBenchmarkOrganizationAccessError(null, false), organizationExpected);
+  assert.equal(normalizeEnergyBenchmarkOrganizationAccessError({ response: { status: 403, data: { error: { code: 'FORBIDDEN' } } } }, true), organizationExpected);
+  assert.match(normalizeEnergyBenchmarkOrganizationAccessError({ response: { status: 500, data: { error: { code: 'INTERNAL_ERROR', message: '服务异常' } } } }, true), /读取组织主数据失败/);
+  assert.equal(normalizeEnergyBenchmarkProductionAccessError(null, false), productionExpected);
+  assert.equal(normalizeEnergyBenchmarkProductionAccessError({ response: { status: 403, data: { error: { code: 'FORBIDDEN' } } } }, true), productionExpected);
+  assert.match(normalizeEnergyBenchmarkProductionAccessError({ response: { status: 500, data: { error: { code: 'INTERNAL_ERROR', message: '服务异常' } } } }, true), /读取产能单元主数据失败/);
 });
 
 test('页面级状态和业务原因码统一投影且抑制重复 toast', () => {
@@ -300,6 +340,58 @@ test('页面级状态和业务原因码统一投影且抑制重复 toast', () =>
 });
 
 // 写载荷与查询白名单模块。
+test('严格 UTC 范围只接受 Z 结尾且开始早于不含结束时间', () => {
+  assert.equal(isEnergyBenchmarkStrictUtcRange('2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z'), true);
+  assert.equal(isEnergyBenchmarkStrictUtcRange('2026-01-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z'), true);
+  assert.equal(isEnergyBenchmarkStrictUtcRange('2026-01-01T00:00:00.001Z', '2027-01-01T00:00:00Z'), false);
+  assert.equal(isEnergyBenchmarkStrictUtcRange('2026-02-30T00:00:00Z', '2027-01-01T00:00:00Z'), false);
+  assert.equal(isEnergyBenchmarkStrictUtcRange('2026-01-01T08:00:00+08:00', '2027-01-01T08:00:00+08:00'), false);
+  assert.equal(isEnergyBenchmarkStrictUtcRange('2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), false);
+  assert.equal(isEnergyBenchmarkStrictUtcRange('2027-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), false);
+});
+
+test('定义、内部历史和实际值载荷保留八个 UTC 字段名与原始 Z 值', () => {
+  const definitionPayload = buildEnergyBenchmarkDefinitionPayload({ effectiveStartUtc: '2026-01-01T00:00:00Z', effectiveEndUtc: '2027-01-01T00:00:00Z', sourceTimeZone: 'Asia/Shanghai' });
+  const internalPayload = buildEnergyBenchmarkInternalHistoryPayload({
+    definition: { effectiveStartUtc: '2026-01-01T00:00:00Z', effectiveEndUtc: '2027-01-01T00:00:00Z', sourceTimeZone: 'Asia/Shanghai' },
+    referencePeriod: { startUtc: '2025-01-01T00:00:00Z', endUtc: '2026-01-01T00:00:00Z' }
+  });
+  const actualPayload = buildEnergyBenchmarkGroupPayload(1, 2, [{ periodStartUtc: '2026-01-01T00:00:00Z', periodEndUtc: '2026-02-01T00:00:00Z' }]);
+  assert.deepEqual(
+    { effectiveStartUtc: definitionPayload.effectiveStartUtc, effectiveEndUtc: definitionPayload.effectiveEndUtc },
+    { effectiveStartUtc: '2026-01-01T00:00:00Z', effectiveEndUtc: '2027-01-01T00:00:00Z' }
+  );
+  assert.deepEqual(
+    {
+      effectiveStartUtc: internalPayload.definition.effectiveStartUtc,
+      effectiveEndUtc: internalPayload.definition.effectiveEndUtc,
+      startUtc: internalPayload.referencePeriod.startUtc,
+      endUtc: internalPayload.referencePeriod.endUtc
+    },
+    {
+      effectiveStartUtc: '2026-01-01T00:00:00Z',
+      effectiveEndUtc: '2027-01-01T00:00:00Z',
+      startUtc: '2025-01-01T00:00:00Z',
+      endUtc: '2026-01-01T00:00:00Z'
+    }
+  );
+  assert.deepEqual(
+    { periodStartUtc: actualPayload.actuals[0].periodStartUtc, periodEndUtc: actualPayload.actuals[0].periodEndUtc },
+    { periodStartUtc: '2026-01-01T00:00:00Z', periodEndUtc: '2026-02-01T00:00:00Z' }
+  );
+});
+
+test('普通定义和内部历史写载荷统一拒绝空值及当前运行时未知时区', () => {
+  assert.throws(() => buildEnergyBenchmarkDefinitionPayload({}), /请选择来源时区/);
+  assert.throws(() => buildEnergyBenchmarkDefinitionPayload({ sourceTimeZone: 'UTC' }), /当前运行时可识别的 IANA 来源时区/);
+  assert.throws(() => buildEnergyBenchmarkDefinitionPayload({ sourceTimeZone: 'Mars/Olympus_Mons' }), /当前运行时可识别的 IANA 来源时区/);
+  assert.equal(buildEnergyBenchmarkDefinitionPayload({ sourceTimeZone: 'Asia/Shanghai' }).sourceTimeZone, 'Asia/Shanghai');
+  assert.throws(
+    () => buildEnergyBenchmarkInternalHistoryPayload({ definition: { sourceTimeZone: 'Legacy/Removed_Zone' } }),
+    /当前运行时可识别的 IANA 来源时区/
+  );
+});
+
 test('内部历史载荷只包含定义、参考期和显式计算范围', () => {
   const payload = buildEnergyBenchmarkInternalHistoryPayload({
     definition: {
@@ -365,6 +457,7 @@ test('权限编码和三类导入路径与后端严格对应', () => {
     view: 'energy:benchmarks:view', manage: 'energy:benchmarks:manage', analyze: 'energy:benchmarks:analyze', export: 'energy:benchmarks:export', importPreview: 'energy:benchmarks:import:preview', importExecute: 'energy:benchmarks:import:execute'
   });
   assert.deepEqual(ENERGY_BENCHMARK_ORGANIZATION_VIEW_PERMISSIONS, { units: 'ledger:units:view', organization: 'ledger:organization:view' });
+  assert.deepEqual(ENERGY_BENCHMARK_PRODUCTION_VIEW_PERMISSIONS, { unit: 'ledger:production-unit:view', legacy: 'ledger:production:view' });
   assert.deepEqual(ENERGY_BENCHMARK_IMPORT_TYPES.map((item) => item.value), ['conversion-factors', 'definitions', 'targets']);
 });
 

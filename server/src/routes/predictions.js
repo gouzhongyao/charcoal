@@ -4,6 +4,7 @@ const { authenticate } = require('../middleware/auth');
 const { requireAnyPermission, requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
+const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
 const { recordOperation } = require('../services/sessionService');
 const {
   buildPredictionStats,
@@ -56,7 +57,7 @@ router.get('/configs/export', authenticate, requirePermission('prediction:config
   res.status(200).send(result.body);
 }));
 
-router.post('/configs/import/preview', authenticate, requirePermission('prediction:config:import'), requireWritable('prediction:config:import-preview'), (req, res, next) => {
+router.post('/configs/import/preview', authenticate, requirePermission('prediction:config:import'), requireWritable('prediction:config:import-preview'), rejectUnconnectedDemoContext, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const error = normalizeUploadError(uploadError);
     if (error) { cleanupUploadedImportFile(req.file); next(error); return; }
@@ -67,7 +68,7 @@ router.post('/configs/import/preview', authenticate, requirePermission('predicti
   });
 });
 
-router.post('/configs/import/execute', authenticate, requirePermission('prediction:config:import'), requireWritable('prediction:config:import-execute'), asyncHandler(async (req, res) => {
+router.post('/configs/import/execute', authenticate, requirePermission('prediction:config:import'), requireWritable('prediction:config:import-execute'), rejectUnconnectedDemoContext, asyncHandler(async (req, res) => {
   const result = await executePredictionConfigImport(req.body || {});
   audit(req, 'prediction.config.import.execute', 'prediction_config_import', result.batchId, { imported: result.imported, writesPredictionRuns: false, writesPredictionResults: false });
   sendSuccess(res, result);

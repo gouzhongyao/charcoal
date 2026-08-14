@@ -5,7 +5,9 @@ const XLSX = require('xlsx');
 const {
   CSV_MIME_TYPE,
   ENERGY_ANALYSIS_TEMPLATE_LIMITS,
+  ENERGY_BALANCE_CONFIG_SHEET_NAMES,
   ENERGY_FLOW_EDGE_SHEET_NAMES,
+  TOU_SCHEME_SHEET_NAMES,
   XLSX_MIME_TYPE,
   generateEnergyAnalysisTemplate,
   getEnergyAnalysisTemplateCsv,
@@ -26,19 +28,24 @@ const {
   validateTemplateSheetCollection
 } = require('../services/energyAnalysisTemplateService');
 
-// 八类模板 ID 独立硬编码，避免测试从生产对象反向生成预期。
+// 十三类模板 ID 独立硬编码，避免测试从生产对象反向生成预期。
 const EXPECTED_TEMPLATE_IDS = Object.freeze([
   'energy-timeseries',
+  'shift-definitions',
+  'tou-schemes',
+  'strategy-rules',
   'shift-schedules',
   'device-states',
   'energy-conversion-factors',
   'energy-benchmark-definitions',
   'energy-benchmark-targets',
+  'energy-flow-models',
+  'energy-balance-configs',
   'energy-flow-nodes',
   'energy-flow-edges'
 ]);
 
-// 七类单工作表模板的中文文件名、ASCII fallback、工作表和表头均独立硬编码。
+// 十类单工作表模板的中文文件名、ASCII fallback、工作表和表头均独立硬编码。
 const EXPECTED_SINGLE_SHEET_TEMPLATES = Object.freeze({
   'energy-timeseries': Object.freeze({
     baseFileName: '能耗时序数据导入模板',
@@ -47,6 +54,25 @@ const EXPECTED_SINGLE_SHEET_TEMPLATES = Object.freeze({
     headers: Object.freeze([
       '能源类型编码', '用能单元编码', '计量器具编码', '开始时间（UTC）', '结束时间（UTC）', '来源时区',
       '粒度（分钟）', '原始单位', '原始值', '来源标识', '数据来源'
+    ])
+  }),
+  'shift-definitions': Object.freeze({
+    baseFileName: '班次定义导入模板',
+    asciiBaseFileName: 'banci-dingyi-template',
+    sheetName: '班次定义',
+    headers: Object.freeze([
+      '班次编码', '班次名称', '开始分钟', '结束分钟', '是否跨日', '来源时区', '来源', '版本',
+      '生效开始时间（UTC）', '生效结束时间（UTC）', '状态'
+    ])
+  }),
+  'strategy-rules': Object.freeze({
+    baseFileName: '策略规则导入模板',
+    asciiBaseFileName: 'celue-guize-template',
+    sheetName: '策略规则',
+    headers: Object.freeze([
+      '规则编码', '规则名称', '规则版本', '公式版本', '指标编码', '阈值操作符', '阈值', '阈值下限', '阈值上限',
+      '阈值单位', '预计降幅', '优先级', '最低覆盖率', '最大证据数', '节省依据', '建议内容', '来源',
+      '生效开始时间（UTC）', '生效结束时间（UTC）', '来源时区', '状态'
     ])
   }),
   'shift-schedules': Object.freeze({
@@ -94,6 +120,14 @@ const EXPECTED_SINGLE_SHEET_TEMPLATES = Object.freeze({
       '固化值', '固化时间（UTC）', '样本数量', '产量摘要 JSON', '来源数据摘要', '是否固化', '是否自动刷新', '目标版本', '状态'
     ])
   }),
+  'energy-flow-models': Object.freeze({
+    baseFileName: '能流模型导入模板',
+    asciiBaseFileName: 'nengliu-moxing-template',
+    sheetName: '能流模型',
+    headers: Object.freeze([
+      '模型编码', '模型名称', '来源', '文号', '版本', '生效开始时间（UTC）', '生效结束时间（UTC）', '来源时区', '状态'
+    ])
+  }),
   'energy-flow-nodes': Object.freeze({
     baseFileName: '能流节点导入模板',
     asciiBaseFileName: 'nengliu-jiedian-template',
@@ -105,21 +139,54 @@ const EXPECTED_SINGLE_SHEET_TEMPLATES = Object.freeze({
   })
 });
 
-// 模板 8 的中文文件名、ASCII fallback 和双工作表表头独立硬编码。
-const EXPECTED_ENERGY_FLOW_EDGE_TEMPLATE = Object.freeze({
-  baseFileName: '能流边及显式边值导入模板',
-  asciiBaseFileName: 'nengliu-bian-xianshi-bianzhi-template',
-  sheetNames: Object.freeze(['能流边', '显式边值']),
-  headersBySheet: Object.freeze({
-    能流边: Object.freeze([
-      '模型编码', '模型版本', '边编码', '起点节点编码', '终点节点编码', '能源类型编码', '单位', '来源类型', '来源标识', '状态'
-    ]),
-    显式边值: Object.freeze([
-      '模型编码', '模型版本', '边编码', '开始时间（UTC）', '结束时间（UTC）', '来源时区', '原始单位', '原始值',
-      '来源标识', '公式版本', '记录状态'
-    ])
+// 三类多工作表模板的中文文件名、ASCII fallback 和精确工作表表头独立硬编码。
+const EXPECTED_MULTI_SHEET_TEMPLATES = Object.freeze({
+  'tou-schemes': Object.freeze({
+    baseFileName: 'TOU方案与时段导入模板',
+    asciiBaseFileName: 'tou-fangan-shiduan-template',
+    sheetNames: Object.freeze(['TOU方案', '时段规则']),
+    headersBySheet: Object.freeze({
+      TOU方案: Object.freeze([
+        '方案编码', '方案名称', '来源时区', '来源', '文号', '版本', '生效开始时间（UTC）', '生效结束时间（UTC）', '状态'
+      ]),
+      时段规则: Object.freeze(['方案编码', '方案版本', '星期序号', '时段类型', '开始分钟', '结束分钟'])
+    })
+  }),
+  'energy-balance-configs': Object.freeze({
+    baseFileName: '能效平衡配置导入模板',
+    asciiBaseFileName: 'nengxiao-pingheng-peizhi-template',
+    sheetNames: Object.freeze(['平衡边界', '九角色项目']),
+    headersBySheet: Object.freeze({
+      平衡边界: Object.freeze([
+        '边界编码', '边界名称', '组织编码', '来源', '文号', '版本', '生效开始时间（UTC）', '生效结束时间（UTC）',
+        '来源时区', '发电边界确认', '状态'
+      ]),
+      九角色项目: Object.freeze([
+        '边界编码', '边界版本', '项目编码', '项目名称', '角色', '能源类型编码', '原始单位', '来源类型', '来源引用',
+        '来源记录定位', '时序来源标识', '发电数值字段', '显式平衡值', '发电防重复键', '状态'
+      ])
+    })
+  }),
+  'energy-flow-edges': Object.freeze({
+    baseFileName: '能流边及显式边值导入模板',
+    asciiBaseFileName: 'nengliu-bian-xianshi-bianzhi-template',
+    sheetNames: Object.freeze(['能流边', '显式边值']),
+    headersBySheet: Object.freeze({
+      能流边: Object.freeze([
+        '模型编码', '模型版本', '边编码', '起点节点编码', '终点节点编码', '能源类型编码', '单位', '来源类型', '来源标识', '状态'
+      ]),
+      显式边值: Object.freeze([
+        '模型编码', '模型版本', '边编码', '开始时间（UTC）', '结束时间（UTC）', '来源时区', '原始单位', '原始值',
+        '来源标识', '公式版本', '记录状态'
+      ])
+    })
   })
 });
+
+// 多工作表名称常量必须与独立契约一致。
+assert.deepStrictEqual(TOU_SCHEME_SHEET_NAMES, EXPECTED_MULTI_SHEET_TEMPLATES['tou-schemes'].sheetNames);
+assert.deepStrictEqual(ENERGY_BALANCE_CONFIG_SHEET_NAMES, EXPECTED_MULTI_SHEET_TEMPLATES['energy-balance-configs'].sheetNames);
+assert.deepStrictEqual(ENERGY_FLOW_EDGE_SHEET_NAMES, EXPECTED_MULTI_SHEET_TEMPLATES['energy-flow-edges'].sheetNames);
 
 /**
  * 读取 CSV 首行标题。
@@ -198,7 +265,7 @@ function findTestZipEocd(buffer) {
 // 模板列表必须精确覆盖八个已批准 ID，且顺序稳定。
 const listedTemplates = listEnergyAnalysisTemplates();
 assert.deepStrictEqual(listedTemplates.map((template) => template.id), EXPECTED_TEMPLATE_IDS);
-assert.strictEqual(new Set(listedTemplates.map((template) => template.id)).size, 8);
+assert.strictEqual(new Set(listedTemplates.map((template) => template.id)).size, 13);
 assert.deepStrictEqual(listTemplates().map((template) => template.id), EXPECTED_TEMPLATE_IDS, '通用列表别名必须保持兼容。');
 assert.strictEqual(getTemplateDefinition('energy-timeseries').id, 'energy-timeseries');
 assert.strictEqual(getTemplateCsv('energy-timeseries').format, 'csv');
@@ -258,7 +325,7 @@ EXPECTED_TEMPLATE_IDS.forEach((templateId) => {
   });
 });
 
-// 七类单工作表模板同时验证中文文件名、ASCII fallback、CSV 与 Excel 实体内容。
+// 十类单工作表模板同时验证中文文件名、ASCII fallback、CSV 与 Excel 实体内容。
 const observedAsciiNames = new Set();
 Object.entries(EXPECTED_SINGLE_SHEET_TEMPLATES).forEach(([templateId, expected]) => {
   // 定义层必须保持单工作表中文标题顺序。
@@ -323,49 +390,54 @@ Object.entries(EXPECTED_SINGLE_SHEET_TEMPLATES).forEach(([templateId, expected])
   assert.strictEqual(xlsxResult.sheetName, expected.sheetName);
   assert.deepStrictEqual(xlsxResult.headers, expected.headers);
 });
-assert.strictEqual(observedAsciiNames.size, 14, '七类模板的 CSV/XLSX ASCII fallback 必须全部唯一。');
+assert.strictEqual(observedAsciiNames.size, 20, '十类模板的 CSV/XLSX ASCII fallback 必须全部唯一。');
 
-// 模板 8 只支持 XLSX，必须精确包含“能流边”和“显式边值”两张中文工作表。
-const edgeDefinition = getEnergyAnalysisTemplateDefinition('energy-flow-edges');
-assert(edgeDefinition);
-assert.deepStrictEqual(edgeDefinition.formats, ['xlsx']);
-assert.deepStrictEqual(ENERGY_FLOW_EDGE_SHEET_NAMES, EXPECTED_ENERGY_FLOW_EDGE_TEMPLATE.sheetNames);
-assert.deepStrictEqual(edgeDefinition.sheets.map((sheet) => sheet.name), EXPECTED_ENERGY_FLOW_EDGE_TEMPLATE.sheetNames);
-edgeDefinition.sheets.forEach((sheet) => {
-  assert.deepStrictEqual(sheet.headers, EXPECTED_ENERGY_FLOW_EDGE_TEMPLATE.headersBySheet[sheet.name]);
-  assert.strictEqual(new Set(sheet.headers).size, sheet.headers.length);
-  sheet.columns.forEach((column) => {
-    assert(column.aliases.includes(column.name));
-    assert(column.aliases.includes(column.key));
-    assert(column.aliases.includes(toSnakeCase(column.key)));
+// 三类多工作表模板只支持 XLSX，必须精确包含各自冻结的两张中文工作表。
+Object.entries(EXPECTED_MULTI_SHEET_TEMPLATES).forEach(([templateId, expected]) => {
+  const definition = getEnergyAnalysisTemplateDefinition(templateId);
+  assert(definition);
+  assert.deepStrictEqual(definition.formats, ['xlsx']);
+  assert.deepStrictEqual(definition.sheets.map((sheet) => sheet.name), expected.sheetNames);
+  definition.sheets.forEach((sheet) => {
+    assert.deepStrictEqual(sheet.headers, expected.headersBySheet[sheet.name]);
+    assert.strictEqual(new Set(sheet.headers).size, sheet.headers.length);
+    sheet.columns.forEach((column) => {
+      assert(column.aliases.includes(column.name));
+      assert(column.aliases.includes(column.key));
+      assert(column.aliases.includes(toSnakeCase(column.key)));
+    });
+  });
+  assertNoInternalEnglishHeaders(definition);
+
+  // CSV 请求必须明确拒绝，不能静默退化为第一张表。
+  assert.throws(
+    () => getEnergyAnalysisTemplateCsv(templateId),
+    (error) => error.code === 'TEMPLATE_FORMAT_UNSUPPORTED'
+      && error.details.templateId === templateId
+      && error.details.format === 'csv'
+  );
+
+  // Excel 输出必须保持中文文件名、ASCII fallback、双工作表顺序与首行。
+  const xlsxResult = getEnergyAnalysisTemplateXlsx(templateId);
+  assert.strictEqual(xlsxResult.fileName, `${expected.baseFileName}.xlsx`);
+  assert.strictEqual(xlsxResult.asciiFileName, `${expected.asciiBaseFileName}.xlsx`);
+  assert.strictEqual(xlsxResult.sheetName, null, '多工作表模板不得伪装为单工作表。');
+  assert.strictEqual(xlsxResult.headers, null, '多工作表模板不得只暴露第一张表标题。');
+  assert.deepStrictEqual(xlsxResult.sheets.map((sheet) => sheet.name), expected.sheetNames);
+  const workbook = XLSX.read(xlsxResult.buffer, { type: 'buffer' });
+  assert.deepStrictEqual(workbook.SheetNames, expected.sheetNames);
+  expected.sheetNames.forEach((sheetName) => {
+    assert.deepStrictEqual(readXlsxHeaders(workbook, sheetName), expected.headersBySheet[sheetName]);
   });
 });
-assertNoInternalEnglishHeaders(edgeDefinition);
-
-// 模板 8 CSV 请求必须明确拒绝，不能静默退化为第一张表。
-assert.throws(
-  () => getEnergyAnalysisTemplateCsv('energy-flow-edges'),
-  (error) => error.code === 'TEMPLATE_FORMAT_UNSUPPORTED'
-    && error.details.templateId === 'energy-flow-edges'
-    && error.details.format === 'csv'
-);
 assert.throws(
   () => generateEnergyAnalysisTemplate('energy-flow-edges', '.CSV'),
   (error) => error.code === 'TEMPLATE_FORMAT_UNSUPPORTED'
 );
 
-// 模板 8 Excel 输出验证中文文件名、ASCII fallback、双工作表顺序与首行。
+// 后续能流多表解析测试复用规范能流边工作簿。
 const edgeXlsxResult = getEnergyAnalysisTemplateXlsx('energy-flow-edges');
-assert.strictEqual(edgeXlsxResult.fileName, `${EXPECTED_ENERGY_FLOW_EDGE_TEMPLATE.baseFileName}.xlsx`);
-assert.strictEqual(edgeXlsxResult.asciiFileName, `${EXPECTED_ENERGY_FLOW_EDGE_TEMPLATE.asciiBaseFileName}.xlsx`);
-assert.strictEqual(edgeXlsxResult.sheetName, null, '多工作表模板不得伪装为单工作表。');
-assert.strictEqual(edgeXlsxResult.headers, null, '多工作表模板不得只暴露第一张表标题。');
-assert.deepStrictEqual(edgeXlsxResult.sheets.map((sheet) => sheet.name), EXPECTED_ENERGY_FLOW_EDGE_TEMPLATE.sheetNames);
 const edgeWorkbook = XLSX.read(edgeXlsxResult.buffer, { type: 'buffer' });
-assert.deepStrictEqual(edgeWorkbook.SheetNames, EXPECTED_ENERGY_FLOW_EDGE_TEMPLATE.sheetNames);
-EXPECTED_ENERGY_FLOW_EDGE_TEMPLATE.sheetNames.forEach((sheetName) => {
-  assert.deepStrictEqual(readXlsxHeaders(edgeWorkbook, sheetName), EXPECTED_ENERGY_FLOW_EDGE_TEMPLATE.headersBySheet[sheetName]);
-});
 
 // 双工作表集合必须精确匹配；缺失、额外、重复均产生 blocking issue。
 assert.deepStrictEqual(

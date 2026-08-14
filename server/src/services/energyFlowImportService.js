@@ -4,13 +4,17 @@ const crypto = require('crypto');
 const { openDatabase: defaultOpenDatabase, uploadsDir: defaultUploadsDir } = require('../db/database');
 const { badRequest } = require('../utils/errors');
 const backupService = require('./backupService');
+const {
+  bindDemoContextPreviewInTransaction,
+  markDemoContextExecutedInTransaction
+} = require('./demoContextService');
 const { parseImportBuffer } = require('./import/parser');
 const { normalizeUnitAndValue } = require('./import/normalization');
 const {
   createPreviewAuditBatch,
   getImportAuditBatchDetail,
   getImportAuditSummary,
-  replaceImportAuditIssues,
+  replaceImportAuditIssuesWithDatabase,
   updateExecuteAuditResult
 } = require('./importAuditService');
 const {
@@ -32,6 +36,10 @@ const {
   isStrictUtcIso
 } = require('./energyAnalysisContracts');
 const {
+  createEnergyFlowModel,
+  normalizeModelPayload
+} = require('./energyFlowService');
+const {
   getEnergyAnalysisTemplateDefinition,
   parseEnergyAnalysisTemplateWorkbook,
   resolveTemplateRow
@@ -43,6 +51,8 @@ const {
   securePreviewResult
 } = require('./energyAnalysisSingleBatchImportService');
 
+// 能流模型单批次固定模板。
+const ENERGY_FLOW_MODEL_TEMPLATE_TYPE = 'energy-flow-models';
 // 能流节点单批次固定模板。
 const ENERGY_FLOW_NODE_TEMPLATE_TYPE = 'energy-flow-nodes';
 // 能流边与显式边值双批次固定模板。
@@ -107,6 +117,20 @@ function openServiceDatabase(options = {}) {
   if (options.db) return { db: options.db, shouldClose: false };
   const openDatabase = typeof options.openDatabase === 'function' ? options.openDatabase : defaultOpenDatabase;
   return { db: openDatabase(), shouldClose: true };
+}
+
+/** 使用当前连接执行 IMMEDIATE 写事务；已有外层事务时复用且不嵌套。 */
+function runImmediateWriteTransaction(db, operation) {
+  if (db.inTransaction) return operation();
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = operation();
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    if (db.inTransaction) db.exec('ROLLBACK');
+    throw error;
+  }
 }
 
 /**
@@ -240,24 +264,30 @@ function parseTemplateWorkbookSafely(templateType, buffer) {
 }
 
 /**
- * 解析节点模板并保留 XLSX/CSV 真实物理来源行号。
+ * 解析单工作表能流模板并保留 XLSX/CSV 真实物理来源行号。
+ * @param {string} templateType 模板类型。
+ * @param {string} sheetName 工作表名称。
  * @param {Buffer} buffer 安全文件 Buffer。
  * @param {string} originalFilename 原始文件名。
- * @returns {object} 节点模板解析结果。
+ * @returns {object} 单工作表解析结果。
  */
-function parseEnergyFlowNodeRows(buffer, originalFilename) {
+function parseEnergyFlowSingleSheetRows(templateType, sheetName, buffer, originalFilename) {
   const parsed = parseImportBuffer(buffer, originalFilename);
-  const definition = getEnergyAnalysisTemplateDefinition(ENERGY_FLOW_NODE_TEMPLATE_TYPE);
+  const definition = getEnergyAnalysisTemplateDefinition(templateType);
   if (!definition.formats.includes(parsed.fileType)) {
-    throw badRequest('能流节点模板仅支持 .xlsx 或 .csv 文件。', {
-      code: 'ENERGY_FLOW_NODE_FILE_TYPE_UNSUPPORTED',
+    const unsupportedCode = templateType === ENERGY_FLOW_NODE_TEMPLATE_TYPE
+      ? 'ENERGY_FLOW_NODE_FILE_TYPE_UNSUPPORTED'
+      : 'ENERGY_FLOW_MODEL_FILE_TYPE_UNSUPPORTED';
+    throw badRequest(`${definition.name}仅支持 ${definition.formats.map((format) => `.${format}`).join(' 或 ')} 文件。`, {
+      code: unsupportedCode,
+      templateType,
       fileType: parsed.fileType
     });
   }
   const fieldMapping = {};
   if (parsed.fileType === 'xlsx') {
-    const workbookResult = parseTemplateWorkbookSafely(ENERGY_FLOW_NODE_TEMPLATE_TYPE, buffer);
-    const sheet = workbookResult.sheetsByName?.['能流节点'] || null;
+    const workbookResult = parseTemplateWorkbookSafely(templateType, buffer);
+    const sheet = workbookResult.sheetsByName?.[sheetName] || null;
     const rows = (sheet?.resolvedRows || []).map((resolvedRow) => {
       mergeFieldMapping(fieldMapping, resolvedRow.fieldMapping);
       return {
@@ -276,7 +306,7 @@ function parseEnergyFlowNodeRows(buffer, originalFilename) {
   const physicalRowNumbers = getCsvPhysicalDataRowNumbers(buffer);
   const rows = parsed.rows.map((row, index) => {
     const sourceRowNumber = physicalRowNumbers.length === parsed.rows.length ? physicalRowNumbers[index] : index + 2;
-    const resolvedRow = resolveTemplateRow(ENERGY_FLOW_NODE_TEMPLATE_TYPE, row, { sourceRowNumber });
+    const resolvedRow = resolveTemplateRow(templateType, row, { sourceRowNumber });
     mergeFieldMapping(fieldMapping, resolvedRow.fieldMapping);
     return {
       sourceRowNumber,
@@ -285,6 +315,21 @@ function parseEnergyFlowNodeRows(buffer, originalFilename) {
     };
   });
   return { fileType: parsed.fileType, rows, globalIssues: [], fieldMapping };
+}
+
+/** 解析能流模型模板并保留真实物理来源行号。 */
+function parseEnergyFlowModelRows(buffer, originalFilename) {
+  return parseEnergyFlowSingleSheetRows(ENERGY_FLOW_MODEL_TEMPLATE_TYPE, '能流模型', buffer, originalFilename);
+}
+
+/**
+ * 解析节点模板并保留 XLSX/CSV 真实物理来源行号。
+ * @param {Buffer} buffer 安全文件 Buffer。
+ * @param {string} originalFilename 原始文件名。
+ * @returns {object} 节点模板解析结果。
+ */
+function parseEnergyFlowNodeRows(buffer, originalFilename) {
+  return parseEnergyFlowSingleSheetRows(ENERGY_FLOW_NODE_TEMPLATE_TYPE, '能流节点', buffer, originalFilename);
 }
 
 /**
@@ -374,6 +419,203 @@ function attachGlobalIssues(rows, globalIssues) {
  * @param {object} db SQLite 连接。
  * @returns {object} 主数据索引。
  */
+function captureModelNormalizerIssues(rowNumber, mapped) {
+  try {
+    return {
+      value: normalizeModelPayload({
+        modelCode: normalizeText(mapped.modelCode),
+        modelName: normalizeText(mapped.modelName),
+        source: normalizeText(mapped.source),
+        documentNo: normalizeNullableText(mapped.documentNo),
+        version: normalizeText(mapped.version),
+        effectiveStartUtc: normalizeText(mapped.effectiveStartUtc),
+        effectiveEndUtc: normalizeText(mapped.effectiveEndUtc),
+        sourceTimeZone: normalizeText(mapped.sourceTimeZone),
+        status: normalizeText(mapped.status) || 'active'
+      }),
+      issues: []
+    };
+  } catch (error) {
+    const detailCode = String(error?.details?.code || '').trim();
+    const issueCode = detailCode.startsWith('ENERGY_FLOW_')
+      ? detailCode
+      : `ENERGY_FLOW_${detailCode || 'MODEL_ROW_INVALID'}`;
+    return {
+      value: null,
+      issues: [createFlowIssue(
+        rowNumber,
+        error?.details?.fieldName || error?.details?.field || null,
+        mapped,
+        issueCode,
+        error?.message || '能流模型行不符合领域规则。'
+      )]
+    };
+  }
+}
+
+/** 将能流模型记录投影为不含导入见证字段的业务快照。 */
+function buildModelBusinessSnapshot(record) {
+  if (!record) return record;
+  const { sourceRowNumber: _sourceRowNumber, candidateRowId: _candidateRowId, ...snapshot } = record;
+  return snapshot;
+}
+
+/** 判断两个能流模型业务快照是否完全一致。 */
+function isExactModelFact(left, right) {
+  return stableSerialize(buildModelBusinessSnapshot(left)) === stableSerialize(buildModelBusinessSnapshot(right));
+}
+
+/** 从数据库读取同身份能流模型业务快照。 */
+function findExistingModel(db, record) {
+  return db.prepare(
+    `SELECT model_code AS modelCode, model_name AS modelName, source,
+            document_no AS documentNo, version, effective_start_utc AS effectiveStartUtc,
+            effective_end_utc AS effectiveEndUtc, source_timezone AS sourceTimeZone, status
+       FROM energy_flow_models WHERE model_code = ? AND version = ?`
+  ).get(record.modelCode, record.version) || null;
+}
+
+/** 标记同文件模型身份重复、冲突和多 active 版本。 */
+function markInputModelDuplicates(rows) {
+  const activeByCode = new Map();
+  const firstByIdentity = new Map();
+  rows.forEach((row) => {
+    if (!row.record || row.issues.some((issue) => issue.severity === 'error')) return;
+    if (row.record.status === 'active') {
+      activeByCode.set(row.record.modelCode, [...(activeByCode.get(row.record.modelCode) || []), row]);
+    }
+    const identity = `${row.record.modelCode}\0${row.record.version}`;
+    const first = firstByIdentity.get(identity);
+    if (!first) {
+      firstByIdentity.set(identity, row);
+      return;
+    }
+    if (isExactModelFact(first.record, row.record)) {
+      row.skipDuplicate = true;
+      appendUniqueIssue(row, createFlowIssue(row.rowNumber, 'modelCode', identity, 'DUPLICATE_ENERGY_FLOW_MODEL_SKIPPED', '文件内已存在完全相同模型版本，本行按 skip 策略跳过。', 'warning'));
+      return;
+    }
+    appendUniqueIssue(first, createFlowIssue(first.rowNumber, 'modelCode', identity, 'CONFLICTING_ENERGY_FLOW_MODEL_VERSION', '文件内相同模型编码和版本存在不同内容。'));
+    appendUniqueIssue(row, createFlowIssue(row.rowNumber, 'modelCode', identity, 'CONFLICTING_ENERGY_FLOW_MODEL_VERSION', '文件内相同模型编码和版本存在不同内容。'));
+  });
+  activeByCode.forEach((group, modelCode) => {
+    const versions = new Set(group.map((row) => row.record.version));
+    if (versions.size <= 1) return;
+    group.forEach((row) => appendUniqueIssue(row, createFlowIssue(row.rowNumber, 'status', { modelCode, versions: [...versions] }, 'MULTIPLE_ACTIVE_ENERGY_FLOW_MODEL_VERSIONS_IN_FILE', '同一文件内同一模型编码不能包含多个 active 版本。')));
+  });
+}
+
+/** 标记数据库模型身份完全重复或冲突。 */
+function markDatabaseModelDuplicates(db, rows) {
+  rows.forEach((row) => {
+    if (!row.record || row.skipDuplicate || row.issues.some((issue) => issue.severity === 'error')) return;
+    const existing = findExistingModel(db, row.record);
+    if (!existing) return;
+    if (isExactModelFact(existing, row.record)) {
+      row.skipDuplicate = true;
+      appendUniqueIssue(row, createFlowIssue(row.rowNumber, 'modelCode', `${row.record.modelCode}+${row.record.version}`, 'DUPLICATE_ENERGY_FLOW_MODEL_SKIPPED', '数据库已存在身份和内容完全相同的模型版本，本行按 skip 策略跳过。', 'warning'));
+      return;
+    }
+    appendUniqueIssue(row, createFlowIssue(row.rowNumber, 'modelCode', `${row.record.modelCode}+${row.record.version}`, 'CONFLICTING_ENERGY_FLOW_MODEL_VERSION', '数据库已存在相同模型编码和版本但内容不同，导入禁止覆盖。'));
+  });
+}
+
+/** 为能流模型候选生成稳定 ID。 */
+function buildModelCandidateRowId(record) {
+  const digest = crypto.createHash('sha256').update(stableSerialize(record)).digest('hex').slice(0, 20);
+  return `energy-flow-model:${record.sourceRowNumber}:${digest}`;
+}
+
+/** 构建能流模型单批次 preview。 */
+function buildEnergyFlowModelImportPreview(input) {
+  const parsedRows = parseEnergyFlowModelRows(input.buffer, input.originalFilename);
+  const rows = parsedRows.rows.map((row) => {
+    const mapped = row.mapped || {};
+    const issues = [...(row.issues || []), ...validateRequiredFields(ENERGY_FLOW_MODEL_TEMPLATE_TYPE, '能流模型', mapped, row.sourceRowNumber)];
+    const normalized = captureModelNormalizerIssues(row.sourceRowNumber, mapped);
+    issues.push(...normalized.issues);
+    return {
+      rowNumber: row.sourceRowNumber,
+      mapped,
+      issues,
+      record: normalized.value ? { sourceRowNumber: row.sourceRowNumber, ...normalized.value } : null
+    };
+  });
+  attachGlobalIssues(rows, parsedRows.globalIssues);
+  markInputModelDuplicates(rows);
+  markDatabaseModelDuplicates(input.db, rows);
+  const items = rows.map((row) => ({
+    rowNumber: row.rowNumber,
+    sourceRowNumber: row.rowNumber,
+    status: row.issues.some((issue) => issue.severity === 'error') ? 'blocked' : (row.skipDuplicate ? 'skipped' : 'wouldImport'),
+    issues: row.issues,
+    normalizedRecord: row.record,
+    structuralOnly: row.structuralOnly === true
+  }));
+  const candidateRows = rows
+    .filter((row) => row.record && !row.skipDuplicate && !row.issues.some((issue) => issue.severity === 'error'))
+    .map((row) => ({ candidateRowId: buildModelCandidateRowId(row.record), ...row.record }));
+  return {
+    fileType: parsedRows.fileType,
+    fieldMapping: parsedRows.fieldMapping,
+    items,
+    candidateRows,
+    summary: buildImportSummary(items),
+    auditIssues: items.flatMap((item) => item.issues || []),
+    notices: [
+      'preview 不写 energy_flow_models；完全重复按 skip，身份冲突阻断且不覆盖。',
+      'active 新版本只在 execute 的统一事务内停用同编码其他 active 版本；不会隐式创建节点、边或显式边值。'
+    ]
+  };
+}
+
+/** 校验模型导入执行必须携带服务端认证操作者。 */
+function requireModelImportAuditOptions(options = {}) {
+  if (!Number.isSafeInteger(options.actorUserId) || options.actorUserId <= 0) {
+    throw badRequest('能流模型导入执行必须携带服务端认证操作者。', { code: 'ENERGY_FLOW_MODEL_IMPORT_ACTOR_REQUIRED' });
+  }
+  return {
+    audit: {
+      userId: options.actorUserId,
+      operation: 'energy-flow-model-import',
+      targetType: 'energy_flow_model',
+      ip: options.actorIp || null
+    }
+  };
+}
+
+/** 在统一事务内通过能流领域服务插入模型候选和操作审计。 */
+function insertEnergyFlowModelCandidates(input) {
+  const auditOptions = requireModelImportAuditOptions(input.options);
+  const importedIds = [];
+  const importedItems = [];
+  input.candidateRows.forEach((candidate, index) => {
+    if (typeof input.options.beforeInsertCandidate === 'function') input.options.beforeInsertCandidate({ candidate, index, db: input.db });
+    const importedModel = createEnergyFlowModel(candidate, { db: input.db, ...auditOptions });
+    importedIds.push(importedModel.id);
+    importedItems.push({ id: importedModel.id, candidateRowId: candidate.candidateRowId, sourceRowNumber: candidate.sourceRowNumber });
+    if (typeof input.options.afterInsertCandidate === 'function') input.options.afterInsertCandidate({ candidate, index, importedId: importedModel.id, db: input.db });
+  });
+  return { imported: importedIds.length, importedIds, importedItems };
+}
+
+// 模型导入复用单批次底座的固定描述器。
+const ENERGY_FLOW_MODEL_IMPORT_DESCRIPTOR = Object.freeze({
+  templateType: ENERGY_FLOW_MODEL_TEMPLATE_TYPE,
+  buildPreview: buildEnergyFlowModelImportPreview,
+  insertCandidates: insertEnergyFlowModelCandidates
+});
+
+/** 创建能流模型 preview 审计批次。 */
+function previewEnergyFlowModelImport(file, options = {}) {
+  return createEnergyAnalysisSingleBatchPreview(file, ENERGY_FLOW_MODEL_IMPORT_DESCRIPTOR, options);
+}
+
+/** 执行能流模型单批次导入。 */
+async function executeEnergyFlowModelImport(body = {}, options = {}) {
+  return executeEnergyAnalysisSingleBatchImport(body, ENERGY_FLOW_MODEL_IMPORT_DESCRIPTOR, options);
+}
+
 function loadNodeMasterData(db) {
   const modelsByIdentity = new Map(db.prepare(
     `SELECT id, model_code AS modelCode, model_name AS modelName, source, document_no AS documentNo,
@@ -1310,7 +1552,7 @@ function previewEnergyFlowBundleImport(file, options = {}) {
     const securedPreview = securePreviewResult(domainPreview, { template, fileSha256: safeFile.fileSha256, secret });
     const uploadGroupId = createUploadGroupId(options);
     const context = { template, uploadGroupId, securedPreview, domainPreview };
-    const persistBatches = databaseContext.db.transaction(() => {
+    const persistBatches = () => runImmediateWriteTransaction(databaseContext.db, () => {
       const createRoleBatch = (contract, rolePreview) => {
         const summary = rolePreview.summary;
         const batch = createPreviewAuditBatch({
@@ -1335,13 +1577,25 @@ function previewEnergyFlowBundleImport(file, options = {}) {
           },
           errorSummary: buildPreviewErrorSummary(summary)
         }, { db: databaseContext.db });
-        replaceImportAuditIssues(batch.id, rolePreview.auditIssues || [], { db: databaseContext.db });
+        replaceImportAuditIssuesWithDatabase(databaseContext.db, batch.id, rolePreview.auditIssues || []);
         return getImportAuditSummary(batch.id, { db: databaseContext.db });
       };
       const edgeBatch = createRoleBatch(ENERGY_FLOW_EDGE_BATCH_CONTRACT, domainPreview.edgePreview);
       const recordBatch = createRoleBatch(ENERGY_FLOW_RECORD_BATCH_CONTRACT, domainPreview.recordPreview);
       if (Number(edgeBatch.id) === Number(recordBatch.id)) {
         throw badRequest('能流双批次 ID 必须不同。', { code: 'ENERGY_FLOW_BUNDLE_BATCH_IDS_MUST_DIFFER' });
+      }
+      if (options.demoContext) {
+        bindDemoContextPreviewInTransaction({
+          db: databaseContext.db,
+          ...options.demoContext,
+          uploadFileSha256: safeFile.fileSha256,
+          previewDigest: securedPreview.previewAuditDigest,
+          batchBindings: [
+            { batchId: edgeBatch.id, batchRole: 'edge' },
+            { batchId: recordBatch.id, batchRole: 'record' }
+          ]
+        });
       }
       return { edgeBatch, recordBatch };
     });
@@ -1897,6 +2151,18 @@ async function executeEnergyFlowBundleImport(body = {}, options = {}) {
           edgeBatch: getImportAuditSummary(edgeBatchId, { db: databaseContext.db }),
           recordBatch: getImportAuditSummary(recordBatchId, { db: databaseContext.db })
         };
+        if (options.demoContext) {
+          markDemoContextExecutedInTransaction({
+            db: databaseContext.db,
+            ...options.demoContext,
+            uploadFileSha256: safeFile.fileSha256,
+            previewDigest: latestSecuredPreview.previewAuditDigest,
+            batchBindings: [
+              { batchId: edgeBatchId, batchRole: 'edge' },
+              { batchId: recordBatchId, batchRole: 'record' }
+            ]
+          });
+        }
         databaseContext.db.exec('COMMIT');
         transactionActive = false;
         return result;
@@ -1925,18 +2191,25 @@ module.exports = {
   ENERGY_FLOW_BUNDLE_SERVICE_VERSION,
   ENERGY_FLOW_BUNDLE_TEMPLATE_TYPE,
   ENERGY_FLOW_EDGE_BATCH_CONTRACT,
+  ENERGY_FLOW_MODEL_IMPORT_DESCRIPTOR,
+  ENERGY_FLOW_MODEL_TEMPLATE_TYPE,
   ENERGY_FLOW_NODE_IMPORT_DESCRIPTOR,
   ENERGY_FLOW_NODE_TEMPLATE_TYPE,
   ENERGY_FLOW_RECORD_BATCH_CONTRACT,
   buildEnergyFlowBundleImportPreview,
+  buildEnergyFlowModelImportPreview,
   buildEnergyFlowNodeImportPreview,
   executeEnergyFlowBundleImport,
+  executeEnergyFlowModelImport,
   executeEnergyFlowNodeImport,
   insertEnergyFlowBundleCandidates,
+  insertEnergyFlowModelCandidates,
   insertEnergyFlowNodeCandidates,
   markEnergyFlowBundleFailure,
   parseEnergyFlowBundleRows,
+  parseEnergyFlowModelRows,
   parseEnergyFlowNodeRows,
   previewEnergyFlowBundleImport,
+  previewEnergyFlowModelImport,
   previewEnergyFlowNodeImport
 };

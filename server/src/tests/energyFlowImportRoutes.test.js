@@ -29,8 +29,7 @@ const { errorHandler, notFoundHandler } = require('../middleware/errorHandler');
 const energyFlowImportRouter = require('../routes/energyFlowImports');
 const backupService = require('../services/backupService');
 const {
-  ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
-  ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY
+  ENERGY_ANALYSIS_IMPORT_BACKUP_REASON
 } = require('../services/energyAnalysisImportCore');
 const { getEnergyAnalysisTemplateDefinition } = require('../services/energyAnalysisTemplateService');
 const { getImportAuditBatchDetail } = require('../services/importAuditService');
@@ -212,6 +211,22 @@ function createWorkbookBuffer(sheets) {
   return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
 }
 
+/** 构造合法能流模型导入记录。 */
+function createModelRow(overrides = {}) {
+  return {
+    modelCode: 'FLOW-ROUTE-IMPORTED',
+    modelName: '路由批量导入模型',
+    source: '隔离 API 测试导入',
+    documentNo: 'FLOW-ROUTE-IMPORT-2026',
+    version: 'v1',
+    effectiveStartUtc: '2026-01-01T00:00:00Z',
+    effectiveEndUtc: '2027-01-01T00:00:00Z',
+    sourceTimeZone: 'Asia/Shanghai',
+    status: 'active',
+    ...overrides
+  };
+}
+
 /**
  * 构造合法能流节点记录。
  * @param {object} overrides 覆盖字段。
@@ -341,7 +356,7 @@ function seedFlowMasterData() {
 }
 
 /**
- * 构造节点 execute 完整服务契约。
+ * 构造模型和节点 execute 客户端最小契约。
  * @param {object} preview 节点 preview。
  * @returns {object} execute 请求体。
  */
@@ -349,16 +364,8 @@ function buildNodeExecuteBody(preview) {
   return {
     batchId: preview.batchId,
     confirmText: preview.confirmText,
-    backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
-    duplicateStrategy: ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY,
     requireBackup: true,
-    acknowledgeSkippedRisks: true,
-    fileSha256: preview.fileSha256,
-    previewSignature: preview.previewSignature,
-    previewAuditDigest: preview.previewAuditDigest,
-    expectedWouldImport: preview.expectedWouldImport,
-    candidateRowIds: preview.candidateRowIds,
-    candidateRows: preview.candidateRows
+    acknowledgeSkippedRisks: true
   };
 }
 
@@ -444,7 +451,7 @@ async function createBundlePreview(server, token, filename, edgeCode, startUtc, 
 }
 
 /**
- * 验证 router 只暴露四个 POST 路由且权限常量稳定。
+ * 验证 router 只暴露六个 POST 路由且权限常量稳定。
  */
 function assertRouteContract() {
   assert.strictEqual(energyFlowImportRouter.ENERGY_FLOW_IMPORT_PREVIEW_PERMISSION, 'energy:flows:import:preview');
@@ -457,6 +464,8 @@ function assertRouteContract() {
     .filter((layer) => layer.route)
     .map((layer) => ({ path: layer.route.path, methods: Object.keys(layer.route.methods).sort() }));
   assert.deepStrictEqual(routeContracts, [
+    { path: '/models/preview', methods: ['post'] },
+    { path: '/models/execute', methods: ['post'] },
     { path: '/nodes/preview', methods: ['post'] },
     { path: '/nodes/execute', methods: ['post'] },
     { path: '/bundle/preview', methods: ['post'] },
@@ -499,7 +508,7 @@ async function run() {
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 
     // execute 的 JSON 解析必须位于认证、权限和维护态之后，且解析错误保持稳定脱敏。
-    const executePaths = [`${ROUTE_PREFIX}/nodes/execute`, `${ROUTE_PREFIX}/bundle/execute`];
+    const executePaths = [`${ROUTE_PREFIX}/models/execute`, `${ROUTE_PREFIX}/nodes/execute`, `${ROUTE_PREFIX}/bundle/execute`];
     const malformedMarker = 'route-parser-sensitive-malformed';
     const oversizedMarker = 'route-parser-sensitive-oversized';
     const malformedJson = `{"sensitive":"${malformedMarker}"`;
@@ -538,6 +547,62 @@ async function run() {
       assert(!authorizedOversized.text.includes('entity.too.large'));
       assert(!authorizedOversized.text.includes('stack'));
     }
+
+    const modelRows = Array.from({ length: 200 }, (_unused, index) => createModelRow({
+      modelCode: `FLOW-ROUTE-IMPORTED-${String(index + 1).padStart(3, '0')}`,
+      modelName: `路由批量导入模型 ${index + 1}`,
+      documentNo: `FLOW-ROUTE-IMPORT-2026-${String(index + 1).padStart(3, '0')}`
+    }));
+    const validModelXlsx = createWorkbookBuffer([{
+      templateType: 'energy-flow-models',
+      sheetName: '能流模型',
+      rows: modelRows
+    }]);
+    const anonymousModel = await requestMultipart(server, `${ROUTE_PREFIX}/models/preview`, {
+      filename: 'anonymous-model.xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      content: validModelXlsx
+    });
+    assert.strictEqual(anonymousModel.status, 401);
+    const forbiddenModel = await requestMultipart(server, `${ROUTE_PREFIX}/models/preview`, {
+      filename: 'forbidden-model.xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      content: validModelXlsx
+    }, ordinaryToken);
+    assert.strictEqual(forbiddenModel.status, 403);
+    assert.strictEqual(getUploadFiles().length, 0);
+    const modelPreviewResponse = await requestMultipart(server, `${ROUTE_PREFIX}/models/preview`, {
+      filename: 'energy-flow-models.xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      content: validModelXlsx
+    }, adminToken);
+    assert.strictEqual(modelPreviewResponse.status, 200, modelPreviewResponse.text);
+    const modelPreview = modelPreviewResponse.body.data;
+    assert.strictEqual(modelPreview.confirmText, '确认导入能流模型');
+    assert.strictEqual(modelPreview.auditBatch.importType, 'energy_flow_model');
+    assert.strictEqual(modelPreview.expectedWouldImport, 200);
+    const modelExecuteBody = buildNodeExecuteBody(modelPreview);
+    assert(Buffer.byteLength(JSON.stringify(modelExecuteBody), 'utf8') < 64 * 1024, '200 行模型 execute 请求体必须小于 64 KiB。');
+    assert(!Object.prototype.hasOwnProperty.call(modelExecuteBody, 'candidateRows'));
+    assert(!Object.prototype.hasOwnProperty.call(modelExecuteBody, 'candidateRowIds'));
+    const forbiddenModelExecute = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models/execute`, modelExecuteBody, ordinaryToken);
+    assert.strictEqual(forbiddenModelExecute.status, 403);
+    await runWithMaintenance('energy-flow-model-execute-maintenance', async () => {
+      const blockedModelExecute = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models/execute`, modelExecuteBody, adminToken);
+      assert.strictEqual(blockedModelExecute.status, 423);
+    });
+    const modelExecute = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models/execute`, modelExecuteBody, adminToken);
+    assert.strictEqual(modelExecute.status, 200, modelExecute.text);
+    assert.strictEqual(modelExecute.body.data.imported, 200);
+    const modelAuditDatabase = openDatabase();
+    try {
+      const audit = modelAuditDatabase.prepare("SELECT user_id AS userId, operation, ip FROM sys_operation_logs WHERE operation = 'energy-flow-model-import' ORDER BY id DESC LIMIT 1").get();
+      assert(Number.isSafeInteger(audit.userId) && audit.userId > 0, '模型导入 actor 必须来自认证用户。');
+      assert.strictEqual(audit.operation, 'energy-flow-model-import');
+    } finally {
+      modelAuditDatabase.close();
+    }
+    getUploadFiles().forEach((filename) => fs.unlinkSync(path.join(uploadsDir, filename)));
 
     const validNodeXlsx = createWorkbookBuffer([{
       templateType: 'energy-flow-nodes',

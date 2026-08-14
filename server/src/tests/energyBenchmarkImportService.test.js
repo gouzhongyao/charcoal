@@ -614,7 +614,8 @@ async function testRollbackBoundaries(db, baseOptions) {
   fs.unlinkSync(path.join(process.env.UPLOADS_DIR, missingFile.filename));
   await captureError(() => executeEnergyConversionFactorImport(createExecuteBody(missingFilePreview), baseOptions));
   const missingFileAudit = getImportAuditBatchDetail(missingFilePreview.batchId, { db });
-  assert.strictEqual(missingFileAudit.status, 'failed', '完整匹配 descriptor 且持有合法 preview 见证的文件失败必须标记批次失败。');
+  assert.strictEqual(missingFileAudit.auditPhase, 'preview', '原文件恢复前的重读失败不得改变 preview 阶段。');
+  assert(['completed', 'completed_with_errors'].includes(missingFileAudit.status), '备份前原文件失败必须保留同批次重试资格。');
   assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code = 'TRUSTED-FILE-MISSING'").get().total, 0);
 
   const backupPreview = previewEnergyConversionFactorImport(writeCsvUpload('backup-failure.csv', FACTOR_HEADERS, [createFactorRow({

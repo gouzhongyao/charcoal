@@ -95,6 +95,18 @@ async function run() {
     const localProxyResponse = await requestCorsPreflight(server, 'http://127.0.0.1:7777');
     assert.strictEqual(localProxyResponse.statusCode, 204, '本地 Vite 代理 Origin 应通过 CORS 预检。');
     assert.strictEqual(localProxyResponse.headers['access-control-allow-origin'], 'http://127.0.0.1:7777');
+    const exposedHeaders = new Set(String(localProxyResponse.headers['access-control-expose-headers'] || '')
+      .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
+    [
+      'x-demo-dataset-id',
+      'x-demo-run-id',
+      'x-demo-artifact-key',
+      'x-demo-handler-key',
+      'x-demo-manifest-version',
+      'x-demo-manifest-digest',
+      'x-demo-artifact-sha256',
+      'x-demo-context'
+    ].forEach((headerName) => assert(exposedHeaders.has(headerName), `CORS 必须暴露 ${headerName}。`));
 
     const exactOriginResponse = await requestCorsPreflight(server, 'https://demo.trycloudflare.com');
     assert.strictEqual(exactOriginResponse.statusCode, 204, '精确配置的额外 Origin 应通过 CORS 预检。');

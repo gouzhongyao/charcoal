@@ -7,20 +7,26 @@ import {
   buildEnergyFlowAnalysisPayload,
   buildEnergyFlowBundleImportExecutePayload,
   buildEnergyFlowEdgePresentation,
+  buildEnergyFlowModelImportExecutePayload,
   buildEnergyFlowNodeImportExecutePayload,
   buildEnergyFlowSourceMapping,
   buildStableEnergyFlowColorRegistry,
   canCommitEnergyFlowAnalysisResponse,
+  canCommitEnergyFlowImportExecuteResponse,
   canExecuteEnergyFlowBundleImport,
+  canExecuteEnergyFlowModelImport,
   canExecuteEnergyFlowNodeImport,
   collectEnergyFlowPaginatedRows,
   createEnergyFlowAnalysisInputFingerprint,
   createEnergyFlowAnalysisRequestSnapshot,
+  createEnergyFlowImportExecuteSnapshot,
   createEnergyFlowImportFileFingerprint,
   createEnergyFlowLatestResponseGuard,
   energyFlowReasonText,
   energyFlowRequestErrorMessage,
   formatEnergyFlowValue,
+  normalizeEnergyFlowAnalysisUtcFields,
+  normalizeEnergyFlowModelUtcFields,
   normalizeEnergyFlowStorageChanges
 } from '../utils/energyFlow.js';
 
@@ -99,11 +105,49 @@ assert.deepStrictEqual(buildEnergyFlowAnalysisPayload({
   endMonth: '2026-03',
   storageChanges: [{ nodeId: 9, energyTypeCode: 'electricity', unit: 'kWh', value: 0, sourceMapping: { reference: 'inventory:9' } }]
 });
-assert.deepStrictEqual(buildEnergyFlowAnalysisPayload({ rangeMode: 'utc', startUtc: '2026-01-01T00:00:00Z', endUtc: '2026-02-01T00:00:00Z', startMonth: 'forged' }), {
+assert.deepStrictEqual(buildEnergyFlowAnalysisPayload({ rangeMode: 'utc', startUtc: '2026-01-01T00:00:00Z', endUtc: '2026-02-01T00:00:00Z', startMonth: 'forged', sourceTimeZone: 'Asia/Shanghai' }), {
   startUtc: '2026-01-01T00:00:00Z',
   endUtc: '2026-02-01T00:00:00Z',
   storageChanges: []
 });
+
+// 回显和提交兜底必须规范零毫秒，并拒绝不能无损隐藏的非零毫秒。
+const normalizedModelUtc = normalizeEnergyFlowModelUtcFields({
+  effectiveStartUtc: '2026-01-01T00:00:00.000Z',
+  effectiveEndUtc: '2027-01-01T00:00:00.000Z',
+  sourceTimeZone: 'Asia/Shanghai'
+});
+assert.equal(normalizedModelUtc.valid, true);
+assert.equal(normalizedModelUtc.value.effectiveStartUtc, '2026-01-01T00:00:00Z');
+assert.equal(normalizedModelUtc.value.effectiveEndUtc, '2027-01-01T00:00:00Z');
+assert.equal(normalizedModelUtc.value.sourceTimeZone, 'Asia/Shanghai');
+const rejectedModelUtc = normalizeEnergyFlowModelUtcFields({
+  effectiveStartUtc: '2026-01-01T00:00:00.001Z',
+  effectiveEndUtc: '2027-01-01T00:00:00Z'
+});
+assert.equal(rejectedModelUtc.valid, false);
+assert.equal(rejectedModelUtc.value.effectiveStartUtc, '');
+assert.match(rejectedModelUtc.message, /模型有效期开始 UTC.*非零毫秒不能被截断.*原值：2026-01-01T00:00:00\.001Z/);
+const normalizedAnalysisUtc = normalizeEnergyFlowAnalysisUtcFields({ rangeMode: 'utc', startUtc: '2026-01-01T00:00:00.000Z', endUtc: '2026-02-01T00:00:00.000Z', sourceTimeZone: 'Asia/Shanghai' });
+assert.equal(normalizedAnalysisUtc.valid, true);
+assert.deepStrictEqual(normalizedAnalysisUtc.value, { rangeMode: 'utc', startUtc: '2026-01-01T00:00:00Z', endUtc: '2026-02-01T00:00:00Z', sourceTimeZone: 'Asia/Shanghai' });
+const rejectedAnalysisUtc = normalizeEnergyFlowAnalysisUtcFields({ rangeMode: 'utc', startUtc: '2026-01-01T00:00:00.001Z', endUtc: '2026-02-01T00:00:00Z' });
+assert.equal(rejectedAnalysisUtc.valid, false);
+assert.equal(rejectedAnalysisUtc.value.startUtc, '');
+assert.equal(rejectedAnalysisUtc.value.endUtc, '2026-02-01T00:00:00Z');
+assert.match(rejectedAnalysisUtc.message, /分析开始 UTC.*非零毫秒不能被截断.*原值：2026-01-01T00:00:00\.001Z/);
+assert.equal(normalizeEnergyFlowAnalysisUtcFields({ rangeMode: 'month', startMonth: '2026-01', endMonth: '2026-02', startUtc: 'hidden.001Z' }).valid, true);
+
+const mutableUtcFilters = { rangeMode: 'utc', startUtc: '2026-01-01T00:00:00Z', endUtc: '2026-02-01T00:00:00Z', sourceTimeZone: 'Asia/Shanghai' };
+const utcSnapshot = createEnergyFlowAnalysisRequestSnapshot(9, mutableUtcFilters, []);
+mutableUtcFilters.startUtc = '2025-01-01T00:00:00Z';
+assert.deepStrictEqual(utcSnapshot.payload, {
+  startUtc: '2026-01-01T00:00:00Z',
+  endUtc: '2026-02-01T00:00:00Z',
+  storageChanges: []
+});
+assert.equal(utcSnapshot.filters.sourceTimeZone, 'Asia/Shanghai');
+assert(Object.isFrozen(utcSnapshot.filters) && Object.isFrozen(utcSnapshot.payload));
 
 // 未填写储能变化不得被当作真实零提交，用户显式输入的 0 必须保留。
 const storageInputs = [
@@ -308,7 +352,7 @@ assert(structuredReasonMessage.includes('SOURCE_MAPPING_REFERENCE_MISSING：来�
 assert(structuredReasonMessage.includes('TIMESERIES_SELECTOR_MISSING：时序来源缺少记录 ID 或计量器具选择器。'));
 assert(structuredReasonMessage.includes('原因码 CUSTOM_ENERGY_FLOW_SCOPE_DENIED'));
 
-// 节点 execute 使用完整预演上下文，双工作表 execute 只提交后端允许的最小正文。
+// 模型、节点和双工作表 execute 均只提交后端允许的最小正文。
 const nodePreview = {
   batchId: 11,
   confirmText: '确认导入能流节点',
@@ -333,7 +377,18 @@ assert.equal(canExecuteEnergyFlowNodeImport(nodePreview, currentNodeImportContex
 assert.equal(canExecuteEnergyFlowNodeImport(nodePreview, { ...currentNodeImportContext, loading: true }), false);
 assert.equal(canExecuteEnergyFlowNodeImport(nodePreview, { ...currentNodeImportContext, previewFileFingerprint: createEnergyFlowImportFileFingerprint({ ...nodeImportFile, lastModified: 1001 }) }), false);
 assert.deepStrictEqual(buildEnergyFlowNodeImportExecutePayload(nodePreview), {
-  ...nodePreview,
+  batchId: 11,
+  confirmText: '确认导入能流节点',
+  requireBackup: true,
+  acknowledgeSkippedRisks: true
+});
+const modelPreview = { ...nodePreview, batchId: 11, confirmText: '确认导入能流模型', candidateRowIds: ['model:1'], candidateRows: [{ candidateRowId: 'model:1' }] };
+assert.equal(canExecuteEnergyFlowModelImport(modelPreview, currentNodeImportContext), true);
+assert.equal(canExecuteEnergyFlowModelImport(null, currentNodeImportContext), false);
+assert.equal(canExecuteEnergyFlowModelImport(modelPreview, { ...currentNodeImportContext, currentFileFingerprint: '' }), false);
+assert.deepStrictEqual(buildEnergyFlowModelImportExecutePayload(modelPreview), {
+  batchId: 11,
+  confirmText: '确认导入能流模型',
   requireBackup: true,
   acknowledgeSkippedRisks: true
 });
@@ -355,6 +410,40 @@ assert.deepStrictEqual(buildEnergyFlowBundleImportExecutePayload(bundlePreview),
   acknowledgeSkippedRisks: true
 });
 assert.equal(canExecuteEnergyFlowBundleImport({ ...bundlePreview, recordBatchId: 21 }, currentBundleImportContext), false);
+
+// execute 快照必须冻结种类、预演和文件指纹，响应只允许提交到同一最新上下文。
+const mutableExecutePreview = { ...modelPreview, candidateRows: [{ candidateRowId: 'model:1' }] };
+const executeSnapshot = createEnergyFlowImportExecuteSnapshot('model', mutableExecutePreview, nodeImportFileFingerprint);
+mutableExecutePreview.confirmText = '已变化确认';
+mutableExecutePreview.candidateRows[0].candidateRowId = 'forged';
+assert.equal(executeSnapshot.kind, 'model');
+assert.equal(executeSnapshot.preview.confirmText, '确认导入能流模型');
+assert.equal(executeSnapshot.preview.candidateRows[0].candidateRowId, 'model:1');
+assert(Object.isFrozen(executeSnapshot) && Object.isFrozen(executeSnapshot.preview));
+assert.equal(canCommitEnergyFlowImportExecuteResponse({
+  isLatest: true,
+  snapshot: executeSnapshot,
+  currentKind: 'model',
+  currentFingerprint: nodeImportFileFingerprint
+}), true);
+assert.equal(canCommitEnergyFlowImportExecuteResponse({
+  isLatest: false,
+  snapshot: executeSnapshot,
+  currentKind: 'model',
+  currentFingerprint: nodeImportFileFingerprint
+}), false);
+assert.equal(canCommitEnergyFlowImportExecuteResponse({
+  isLatest: true,
+  snapshot: executeSnapshot,
+  currentKind: 'node',
+  currentFingerprint: nodeImportFileFingerprint
+}), false);
+assert.equal(canCommitEnergyFlowImportExecuteResponse({
+  isLatest: true,
+  snapshot: executeSnapshot,
+  currentKind: 'model',
+  currentFingerprint: createEnergyFlowImportFileFingerprint({ ...nodeImportFile, lastModified: 1002 })
+}), false);
 
 // 重新预演开始后必须立即禁用 execute，旧响应延迟返回也不能恢复旧预演。
 const previewRaceGuard = createEnergyFlowLatestResponseGuard();

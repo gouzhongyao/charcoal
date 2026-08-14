@@ -177,8 +177,10 @@
             <header class="section-heading"><div><h2>折标系数、定义与目标导入</h2><p>预演是执行的前置能力；执行需要同时具备 preview 与 execute 权限。页面只提交服务端持久化批次、固定确认文本和确认标志。</p></div></header>
             <el-alert v-if="!hasImportExecutePermission" type="info" :closable="false" show-icon title="当前账号可以预演；进入执行确认还需要 energy:benchmarks:import:execute 权限。" />
             <el-alert type="warning" :closable="false" show-icon title="导入只接受真实企业文件。对标定义模板不允许导入内部历史基准；内部历史必须由服务端按明确参考期固化。" />
+            <el-alert type="info" :closable="false" show-icon title="推荐顺序：先导入能源折标系数，再导入对标定义，最后导入对标目标。外部标准定义必须保留真实来源和文号；下载模板或示例不会自动导入、计算或执行对标。" />
             <el-form label-position="top" class="import-form">
               <el-form-item label="导入类型"><el-radio-group v-model="importType" :disabled="importPreviewLoading"><el-radio-button v-for="item in ENERGY_BENCHMARK_IMPORT_TYPES" :key="item.value" :label="item.value">{{ item.label }}</el-radio-button></el-radio-group></el-form-item>
+              <el-form-item label="当前类型文件"><div class="action-row"><el-button :loading="importTemplateLoading" @click="downloadImportTemplate">下载{{ currentImportTypeLabel }}空白模板</el-button><el-button :loading="importDemoExampleLoading" @click="downloadImportDemoExample">下载{{ currentImportTypeLabel }}青岚园区示例</el-button></div></el-form-item>
               <el-form-item label="选择文件"><el-upload :auto-upload="false" :limit="1" accept=".xlsx,.csv" :disabled="!canImportPreview || writeDisabled" :on-change="selectImportFile" :on-remove="clearImportFile"><el-button :disabled="!canImportPreview || writeDisabled">选择 .xlsx 或 .csv</el-button><template #tip><div class="el-upload__tip">服务端会校验冻结中文模板、字段、重复、有效期和范围主数据。</div></template></el-upload></el-form-item>
               <el-button v-if="canImportPreview" type="primary" :loading="importPreviewLoading" :disabled="!importFile || writeDisabled" @click="previewImport">开始预演</el-button>
             </el-form>
@@ -197,8 +199,9 @@
         </el-tab-pane>
       </el-tabs>
 
-      <ManagementDrawer v-model="definitionDrawerOpen" :title="definitionDrawerTitle" :loading="definitionSaving" :confirm-disabled="writeDisabled" @save="saveDefinition">
+      <ManagementDrawer v-model="definitionDrawerOpen" :title="definitionDrawerTitle" :loading="definitionSaving" :confirm-disabled="writeDisabled || definitionScopeBlocked" @save="saveDefinition">
         <el-alert v-if="definitionFormError" type="error" :closable="false" show-icon :title="definitionFormError" class="drawer-alert" />
+        <el-alert v-if="definitionScopeNotice" :type="definitionScopeError ? 'error' : 'warning'" :closable="false" show-icon :title="definitionScopeNotice" class="drawer-alert" />
         <el-alert v-if="definitionMode === 'version'" type="info" :closable="false" show-icon title="新定义版本使用创建接口。请填写新的 name:v1 版本标识并调整有效期；同编码 active 有效期不得重叠。" class="drawer-alert" />
         <el-form ref="definitionFormRef" :model="definitionForm" :rules="definitionRules" label-position="top">
           <el-form-item label="对标编码" prop="benchmarkCode"><el-input v-model.trim="definitionForm.benchmarkCode" maxlength="100" /></el-form-item>
@@ -207,38 +210,39 @@
           <el-form-item label="指标编码" prop="metricCode"><el-input v-model.trim="definitionForm.metricCode" /></el-form-item>
           <el-form-item label="指标单位" prop="unit"><el-input v-model.trim="definitionForm.unit" /></el-form-item>
           <el-form-item label="周期类型" prop="periodType"><el-input v-model.trim="definitionForm.periodType" placeholder="如 month" /></el-form-item>
-          <el-form-item label="范围类型" prop="scopeType"><el-select v-model="definitionForm.scopeType" class="full-control"><el-option label="组织" value="organization" /><el-option label="能源类型" value="energy" /><el-option label="产品" value="product" /></el-select></el-form-item>
-          <el-form-item label="范围标识" prop="scopeReference"><el-input v-model.trim="definitionForm.scopeReference" placeholder="必须能被当前 active 主数据解析" /></el-form-item>
+          <el-form-item label="范围类型" prop="scopeType"><el-select v-model="definitionForm.scopeType" class="full-control" @change="changeDefinitionScopeType"><el-option label="组织" value="organization" /><el-option label="能源类型" value="energy" /><el-option label="产品" value="product" /></el-select></el-form-item>
+          <el-form-item label="范围标识" prop="scopeReference"><el-select v-model="definitionForm.scopeReference" class="full-control" filterable clearable :loading="definitionScopeLoading" :disabled="definitionScopeBlocked" :placeholder="definitionScopePlaceholder"><el-option v-for="item in definitionScopeOptions" :key="definitionScopeOptionValue(item)" :label="formatEnergyBenchmarkScopeOptionLabel(definitionForm.scopeType, item)" :value="definitionScopeOptionValue(item)" /></el-select></el-form-item>
           <el-form-item label="指标方向" prop="direction"><el-select v-model="definitionForm.direction" class="full-control"><el-option v-for="(label, value) in ENERGY_BENCHMARK_DIRECTION_LABELS" :key="value" :label="label" :value="value" /></el-select></el-form-item>
           <el-form-item label="来源" prop="source"><el-input v-model.trim="definitionForm.source" maxlength="300" /></el-form-item>
           <el-form-item label="文号"><el-input v-model.trim="definitionForm.documentNo" placeholder="外部标准必填" /></el-form-item>
           <el-form-item label="版本" prop="version"><el-input v-model.trim="definitionForm.version" placeholder="如 enterprise-standard:v1" /></el-form-item>
-          <el-form-item label="生效开始 UTC" prop="effectiveStartUtc"><el-input v-model.trim="definitionForm.effectiveStartUtc" placeholder="2026-01-01T00:00:00Z" /></el-form-item>
-          <el-form-item label="生效结束 UTC（不含）" prop="effectiveEndUtc"><el-input v-model.trim="definitionForm.effectiveEndUtc" placeholder="2027-01-01T00:00:00Z" /></el-form-item>
-          <el-form-item label="来源时区" prop="sourceTimeZone"><el-input v-model.trim="definitionForm.sourceTimeZone" placeholder="Asia/Shanghai" /></el-form-item>
+          <el-form-item label="生效开始 UTC" prop="effectiveStartUtc"><StrictUtcDateTimeInput v-model="definitionForm.effectiveStartUtc" placeholder="2026-01-01T00:00:00Z" @change="validateUtcFormField(definitionFormRef, 'effectiveStartUtc')" @blur="validateUtcFormField(definitionFormRef, 'effectiveStartUtc')" /></el-form-item>
+          <el-form-item label="生效结束 UTC（不含）" prop="effectiveEndUtc"><StrictUtcDateTimeInput v-model="definitionForm.effectiveEndUtc" placeholder="2027-01-01T00:00:00Z" @change="validateUtcFormField(definitionFormRef, 'effectiveEndUtc')" @blur="validateUtcFormField(definitionFormRef, 'effectiveEndUtc')" /></el-form-item>
+          <el-form-item label="来源时区" prop="sourceTimeZone"><IanaTimeZoneSelect v-model="definitionForm.sourceTimeZone" placeholder="请选择或搜索来源时区" /></el-form-item>
           <el-form-item label="状态"><el-select v-model="definitionForm.status" class="full-control"><el-option label="启用" value="active" /><el-option label="停用" value="inactive" /></el-select></el-form-item>
         </el-form>
       </ManagementDrawer>
 
-      <ManagementDrawer v-model="internalDrawerOpen" title="固化企业内部历史基准" :loading="internalSaving" :confirm-disabled="writeDisabled" confirm-label="由服务端计算并固化" @save="saveInternalHistory">
+      <ManagementDrawer v-model="internalDrawerOpen" title="固化企业内部历史基准" :loading="internalSaving" :confirm-disabled="writeDisabled || internalMasterDataBlocked" confirm-label="由服务端计算并固化" @save="saveInternalHistory">
         <el-alert type="warning" :closable="false" show-icon title="页面只提交定义、参考期和显式计算范围。固化值、样本数、产量摘要、摘要哈希和固化时间全部由服务端计算，页面没有这些输入框。" class="drawer-alert" />
         <el-alert v-if="internalFormError" type="error" :closable="false" show-icon :title="internalFormError" class="drawer-alert" />
+        <el-alert v-if="internalMasterDataNotice" :type="internalMasterDataError ? 'error' : 'warning'" :closable="false" show-icon :title="internalMasterDataNotice" class="drawer-alert" />
         <el-form ref="internalFormRef" :model="internalForm" :rules="internalRules" label-position="top">
           <el-form-item label="对标编码" prop="definition.benchmarkCode"><el-input v-model.trim="internalForm.definition.benchmarkCode" /></el-form-item>
           <el-form-item label="对标名称" prop="definition.benchmarkName"><el-input v-model.trim="internalForm.definition.benchmarkName" /></el-form-item>
           <el-form-item label="指标编码"><el-input v-model="internalForm.definition.metricCode" disabled /></el-form-item>
           <el-form-item label="指标单位" prop="definition.unit"><el-input v-model.trim="internalForm.definition.unit" placeholder="如 kWh/t" /></el-form-item>
-          <el-form-item label="范围类型"><el-input v-model="internalForm.definition.scopeType" disabled /></el-form-item>
-          <el-form-item label="组织范围标识" prop="definition.scopeReference"><el-input v-model.trim="internalForm.definition.scopeReference" /></el-form-item>
+          <el-form-item label="范围类型" prop="definition.scopeType"><el-select v-model="internalForm.definition.scopeType" class="full-control" @change="changeInternalScopeType"><el-option label="组织" value="organization" /><el-option label="能源类型" value="energy" /><el-option label="产品" value="product" /></el-select></el-form-item>
+          <el-form-item label="范围标识" prop="definition.scopeReference"><el-select v-model="internalForm.definition.scopeReference" class="full-control" filterable clearable :loading="internalScopeLoading" :disabled="internalScopeBlocked" :placeholder="internalScopePlaceholder"><el-option v-for="item in internalScopeOptions" :key="internalScopeOptionValue(item)" :label="formatEnergyBenchmarkScopeOptionLabel(internalForm.definition.scopeType, item)" :value="internalScopeOptionValue(item)" /></el-select></el-form-item>
           <el-form-item label="来源" prop="definition.source"><el-input v-model.trim="internalForm.definition.source" /></el-form-item>
           <el-form-item label="版本" prop="definition.version"><el-input v-model.trim="internalForm.definition.version" placeholder="如 internal-baseline:v1" /></el-form-item>
-          <el-form-item label="定义生效开始 UTC" prop="definition.effectiveStartUtc"><el-input v-model.trim="internalForm.definition.effectiveStartUtc" placeholder="2026-01-01T00:00:00Z" /></el-form-item>
-          <el-form-item label="定义生效结束 UTC（不含）" prop="definition.effectiveEndUtc"><el-input v-model.trim="internalForm.definition.effectiveEndUtc" placeholder="2027-01-01T00:00:00Z" /></el-form-item>
-          <el-form-item label="来源时区"><el-input v-model.trim="internalForm.definition.sourceTimeZone" /></el-form-item>
-          <el-form-item label="历史参考期开始 UTC" prop="referencePeriod.startUtc"><el-input v-model.trim="internalForm.referencePeriod.startUtc" placeholder="2025-01-01T00:00:00Z" /></el-form-item>
-          <el-form-item label="历史参考期结束 UTC（不含）" prop="referencePeriod.endUtc"><el-input v-model.trim="internalForm.referencePeriod.endUtc" placeholder="2026-01-01T00:00:00Z" /></el-form-item>
-          <el-form-item label="产能单元 ID" prop="calculationScope.productionUnitId"><el-input-number v-model="internalForm.calculationScope.productionUnitId" :min="1" :precision="0" class="full-control" /></el-form-item>
-          <el-form-item label="能源类型编码" prop="calculationScope.energyTypeCode"><el-input v-model.trim="internalForm.calculationScope.energyTypeCode" placeholder="如 electricity" /></el-form-item>
+          <el-form-item label="定义生效开始 UTC" prop="definition.effectiveStartUtc"><StrictUtcDateTimeInput v-model="internalForm.definition.effectiveStartUtc" placeholder="2026-01-01T00:00:00Z" @change="validateUtcFormField(internalFormRef, 'definition.effectiveStartUtc')" @blur="validateUtcFormField(internalFormRef, 'definition.effectiveStartUtc')" /></el-form-item>
+          <el-form-item label="定义生效结束 UTC（不含）" prop="definition.effectiveEndUtc"><StrictUtcDateTimeInput v-model="internalForm.definition.effectiveEndUtc" placeholder="2027-01-01T00:00:00Z" @change="validateUtcFormField(internalFormRef, 'definition.effectiveEndUtc')" @blur="validateUtcFormField(internalFormRef, 'definition.effectiveEndUtc')" /></el-form-item>
+          <el-form-item label="来源时区"><IanaTimeZoneSelect v-model="internalForm.definition.sourceTimeZone" placeholder="请选择或搜索来源时区" /></el-form-item>
+          <el-form-item label="历史参考期开始 UTC" prop="referencePeriod.startUtc"><StrictUtcDateTimeInput v-model="internalForm.referencePeriod.startUtc" placeholder="2025-01-01T00:00:00Z" @change="validateUtcFormField(internalFormRef, 'referencePeriod.startUtc')" @blur="validateUtcFormField(internalFormRef, 'referencePeriod.startUtc')" /></el-form-item>
+          <el-form-item label="历史参考期结束 UTC（不含）" prop="referencePeriod.endUtc"><StrictUtcDateTimeInput v-model="internalForm.referencePeriod.endUtc" placeholder="2026-01-01T00:00:00Z" @change="validateUtcFormField(internalFormRef, 'referencePeriod.endUtc')" @blur="validateUtcFormField(internalFormRef, 'referencePeriod.endUtc')" /></el-form-item>
+          <el-form-item label="产能单元" prop="calculationScope.productionUnitId"><el-select v-model="internalForm.calculationScope.productionUnitId" class="full-control" filterable clearable :loading="productionMasterDataLoading" :disabled="Boolean(productionMasterDataError) || !productionUnits.length" placeholder="选择 active 产能单元"><el-option v-for="item in productionUnits" :key="item.id" :label="formatEnergyBenchmarkScopeOptionLabel('product', item)" :value="item.id" /></el-select></el-form-item>
+          <el-form-item label="能源类型" prop="calculationScope.energyTypeCode"><el-select v-model="internalForm.calculationScope.energyTypeCode" class="full-control" filterable clearable :loading="energyTypesLoading" :disabled="Boolean(energyTypesError) || !energyTypes.length" placeholder="选择 active 能源类型"><el-option v-for="item in energyTypes" :key="item.code" :label="formatEnergyBenchmarkScopeOptionLabel('energy', item)" :value="item.code" /></el-select></el-form-item>
         </el-form>
       </ManagementDrawer>
 
@@ -263,8 +267,8 @@
           <el-form-item label="指标编码"><el-input v-model.trim="actualContextForm.metricCode" /></el-form-item>
           <el-form-item label="单位"><el-input v-model.trim="actualContextForm.unit" /></el-form-item>
           <el-form-item label="周期类型"><el-input v-model.trim="actualContextForm.periodType" /></el-form-item>
-          <el-form-item label="周期开始 UTC"><el-input v-model.trim="actualContextForm.periodStartUtc" /></el-form-item>
-          <el-form-item label="周期结束 UTC（不含）"><el-input v-model.trim="actualContextForm.periodEndUtc" /></el-form-item>
+          <el-form-item label="周期开始 UTC"><StrictUtcDateTimeInput v-model="actualContextForm.periodStartUtc" /></el-form-item>
+          <el-form-item label="周期结束 UTC（不含）"><StrictUtcDateTimeInput v-model="actualContextForm.periodEndUtc" /></el-form-item>
           <el-form-item label="范围类型"><el-input v-model.trim="actualContextForm.scopeType" disabled /></el-form-item>
           <el-form-item label="对象自身范围标识"><el-input v-model.trim="actualContextForm.scopeReference" :disabled="analysisDefinition?.scopeType === 'organization'" /></el-form-item>
           <el-form-item label="对标范围标识"><el-input v-model.trim="actualContextForm.benchmarkScopeReference" disabled /></el-form-item>
@@ -301,17 +305,22 @@ import ManagementPage from '@/components/ManagementPage.vue';
 import ManagementToolbar from '@/components/ManagementToolbar.vue';
 import ManagementDrawer from '@/components/ManagementDrawer.vue';
 import HelpIcon from '@/components/HelpIcon.vue';
+import IanaTimeZoneSelect from '@/components/IanaTimeZoneSelect.vue';
 import PageState from '@/components/PageState.vue';
 import StatCard from '@/components/StatCard.vue';
 import StatusTag from '@/components/StatusTag.vue';
+import StrictUtcDateTimeInput from '@/components/StrictUtcDateTimeInput.vue';
 import {
   createEnergyBenchmarkDefinition,
   createEnergyBenchmarkInternalHistory,
   createEnergyBenchmarkTarget,
+  downloadEnergyBenchmarkDemoParkExample,
+  downloadEnergyBenchmarkImportTemplate,
   evaluateEnergyBenchmark,
   executeEnergyBenchmarkImport,
   getAllActiveEnergyBenchmarkDefinitions,
   getAllActiveEnergyBenchmarkOrganizationUnits,
+  getAllActiveEnergyBenchmarkProductionUnits,
   getAllActiveEnergyBenchmarkTargets,
   getEnergyBenchmarkBootstrap,
   getEnergyBenchmarkDefinition,
@@ -327,6 +336,7 @@ import {
   updateEnergyBenchmarkTargetStatus,
   versionEnergyBenchmarkTarget
 } from '@/api/energyBenchmarks';
+import { getEnergyTypes } from '@/api/energy';
 import {
   ENERGY_BENCHMARK_CHART_MAX_ENTITIES,
   ENERGY_BENCHMARK_DIRECTION_LABELS,
@@ -334,6 +344,7 @@ import {
   ENERGY_BENCHMARK_ORGANIZATION_LEVEL_LABELS,
   ENERGY_BENCHMARK_ORGANIZATION_VIEW_PERMISSIONS,
   ENERGY_BENCHMARK_PERMISSIONS,
+  ENERGY_BENCHMARK_PRODUCTION_VIEW_PERMISSIONS,
   ENERGY_BENCHMARK_SCOPE_LABELS,
   ENERGY_BENCHMARK_TYPE_LABELS,
   applyEnergyBenchmarkOrganizationSelection,
@@ -358,17 +369,23 @@ import {
   formatEnergyBenchmarkQualificationRate,
   formatEnergyBenchmarkRatio,
   formatEnergyBenchmarkReasons,
+  formatEnergyBenchmarkScopeOptionLabel,
+  isEnergyBenchmarkStrictUtcRange,
   normalizeEnergyBenchmarkOrganizationAccessError,
+  normalizeEnergyBenchmarkProductionAccessError,
   normalizeEnergyBenchmarkRankingRows,
   projectEnergyBenchmarkMaintenance,
   projectEnergyBenchmarkRequestError,
   reduceEnergyBenchmarkPageErrors,
+  resetEnergyBenchmarkScopeSelection,
   resolveEnergyBenchmarkAnalysisInvalidation,
   resolveEnergyBenchmarkDefinitionObjectLevel,
   resolveEnergyBenchmarkErrorDestination,
+  resolveEnergyBenchmarkScopeOptionValue,
   selectEnergyBenchmarkPageError,
   transitionEnergyBenchmarkAnalysisState,
-  validateEnergyBenchmarkAnalysisContext
+  validateEnergyBenchmarkAnalysisContext,
+  validateEnergyBenchmarkScopeSelection
 } from '@/utils/energyBenchmarkManagement';
 import { hasPermi } from '@/utils/permission';
 
@@ -404,7 +421,9 @@ const capabilityMatrix = computed(() => buildEnergyBenchmarkCapabilityMatrix({
   importPreview: hasPermi(ENERGY_BENCHMARK_PERMISSIONS.importPreview),
   importExecute: hasPermi(ENERGY_BENCHMARK_PERMISSIONS.importExecute),
   organizationUnitsView: hasPermi(ENERGY_BENCHMARK_ORGANIZATION_VIEW_PERMISSIONS.units),
-  organizationView: hasPermi(ENERGY_BENCHMARK_ORGANIZATION_VIEW_PERMISSIONS.organization)
+  organizationView: hasPermi(ENERGY_BENCHMARK_ORGANIZATION_VIEW_PERMISSIONS.organization),
+  productionUnitView: hasPermi(ENERGY_BENCHMARK_PRODUCTION_VIEW_PERMISSIONS.unit),
+  productionView: hasPermi(ENERGY_BENCHMARK_PRODUCTION_VIEW_PERMISSIONS.legacy)
 }));
 const canView = computed(() => capabilityMatrix.value.view);
 const canManage = computed(() => capabilityMatrix.value.manage);
@@ -415,7 +434,25 @@ const canImportPreview = computed(() => capabilityMatrix.value.importPreview);
 const hasImportExecutePermission = computed(() => capabilityMatrix.value.importExecutePermission);
 const canImportExecute = computed(() => capabilityMatrix.value.importExecuteWorkflow);
 const canViewOrganizationObjects = computed(() => capabilityMatrix.value.organizationView);
+const canViewProductionUnits = computed(() => capabilityMatrix.value.productionView);
 const writeDisabled = computed(() => maintenance.value.active === true);
+
+// 范围主数据模块；组织与产能接口按现有台账权限读取，能源类型复用现有公开字典接口。
+const organizationUnits = ref([]);
+const organizationMasterDataLoading = ref(false);
+const organizationMasterDataError = ref('');
+// 组织主数据状态：显式区分加载、权限、错误、空态和可用状态。
+const organizationMasterDataStatus = ref('idle');
+const productionUnits = ref([]);
+const productionMasterDataLoading = ref(false);
+const productionMasterDataError = ref('');
+// 产能主数据状态：用于避免将 403 或失败后的旧候选误当成功数据。
+const productionMasterDataStatus = ref('idle');
+const energyTypes = ref([]);
+const energyTypesLoading = ref(false);
+const energyTypesError = ref('');
+// 能源类型主数据状态：与组织和产能保持相同的状态机语义。
+const energyTypesStatus = ref('idle');
 
 // 对标定义列表、筛选和分页模块。
 const emptyDefinitionFilters = () => ({ status: '', benchmarkType: '', benchmarkCode: '', metricCode: '', scopeType: '', scopeReference: '' });
@@ -452,16 +489,42 @@ const definitionFormRef = ref();
 const definitionSaving = ref(false);
 const definitionFormError = ref('');
 const definitionDrawerTitle = computed(() => definitionMode.value === 'edit' ? '修改对标定义' : definitionMode.value === 'version' ? '新建对标定义版本' : '新增对标定义');
-const definitionRules = { benchmarkCode: requiredRule('请输入对标编码。'), benchmarkName: requiredRule('请输入对标名称。'), benchmarkType: requiredRule('请选择定义类型。'), metricCode: requiredRule('请输入指标编码。'), unit: requiredRule('请输入指标单位。'), periodType: requiredRule('请输入周期类型。'), scopeType: requiredRule('请选择范围类型。'), scopeReference: requiredRule('请输入 active 主数据范围标识。'), direction: requiredRule('请选择指标方向。'), source: requiredRule('请输入真实来源。'), version: requiredRule('请输入 name:v1 格式版本。'), effectiveStartUtc: requiredRule('请输入严格 UTC 生效开始时间。'), effectiveEndUtc: requiredRule('请输入严格 UTC 生效结束时间。') };
+const definitionScopeOptions = computed(() => definitionForm.value.scopeType === 'organization' ? organizationUnits.value : definitionForm.value.scopeType === 'energy' ? energyTypes.value : definitionForm.value.scopeType === 'product' ? productionUnits.value : []);
+const definitionScopeLoading = computed(() => definitionForm.value.scopeType === 'organization' ? organizationMasterDataLoading.value : definitionForm.value.scopeType === 'energy' ? energyTypesLoading.value : definitionForm.value.scopeType === 'product' ? productionMasterDataLoading.value : false);
+const definitionScopeError = computed(() => definitionForm.value.scopeType === 'organization' ? organizationMasterDataError.value : definitionForm.value.scopeType === 'energy' ? energyTypesError.value : definitionForm.value.scopeType === 'product' ? productionMasterDataError.value : '');
+const definitionScopeNotice = computed(() => {
+  if (definitionScopeError.value) return definitionScopeError.value;
+  if (!definitionScopeLoading.value && !definitionScopeOptions.value.length) return `当前没有可选择的 active ${ENERGY_BENCHMARK_SCOPE_LABELS[definitionForm.value.scopeType] || '范围'}主数据，请先维护对应台账。`;
+  const validation = validateEnergyBenchmarkScopeSelection(definitionForm.value.scopeType, definitionForm.value.scopeReference, currentScopeSources());
+  return definitionForm.value.scopeReference && !validation.valid ? `${validation.message}历史值保持原样显示，页面不会静默替换。` : '';
+});
+const definitionScopeBlocked = computed(() => definitionScopeLoading.value || Boolean(definitionScopeError.value) || !definitionScopeOptions.value.length);
+const definitionScopePlaceholder = computed(() => definitionScopeBlocked.value ? '当前范围主数据不可用' : `选择 active ${ENERGY_BENCHMARK_SCOPE_LABELS[definitionForm.value.scopeType] || '范围'}主数据`);
+const definitionRules = { benchmarkCode: requiredRule('请输入对标编码。'), benchmarkName: requiredRule('请输入对标名称。'), benchmarkType: requiredRule('请选择定义类型。'), metricCode: requiredRule('请输入指标编码。'), unit: requiredRule('请输入指标单位。'), periodType: requiredRule('请输入周期类型。'), scopeType: requiredRule('请选择范围类型。'), scopeReference: requiredRule('请选择 active 主数据范围。'), direction: requiredRule('请选择指标方向。'), source: requiredRule('请输入真实来源。'), version: requiredRule('请输入 name:v1 格式版本。'), effectiveStartUtc: requiredRule('请输入严格 UTC 生效开始时间。'), effectiveEndUtc: requiredRule('请输入严格 UTC 生效结束时间。') };
 
 // 内部历史基准原子固化表单模块；表单中刻意不存在服务端派生字段。
-const emptyInternalForm = () => ({ definition: { ...emptyDefinitionForm(), benchmarkType: 'internal_history_baseline', benchmarkName: '', metricCode: 'energy_intensity', periodType: 'month', scopeType: 'organization', direction: 'lower_better', source: '企业内部历史数据固化', documentNo: '', status: 'active' }, referencePeriod: { startUtc: '', endUtc: '' }, calculationScope: { productionUnitId: null, energyTypeCode: 'electricity' } });
+const emptyInternalForm = () => ({ definition: { ...emptyDefinitionForm(), benchmarkType: 'internal_history_baseline', benchmarkName: '', metricCode: 'energy_intensity', periodType: 'month', scopeType: 'organization', direction: 'lower_better', source: '企业内部历史数据固化', documentNo: '', status: 'active' }, referencePeriod: { startUtc: '', endUtc: '' }, calculationScope: { productionUnitId: null, energyTypeCode: '' } });
 const internalDrawerOpen = ref(false);
 const internalForm = ref(emptyInternalForm());
 const internalFormRef = ref();
 const internalSaving = ref(false);
 const internalFormError = ref('');
-const internalRules = { 'definition.benchmarkCode': requiredRule('请输入对标编码。'), 'definition.benchmarkName': requiredRule('请输入对标名称。'), 'definition.unit': requiredRule('请输入指标单位。'), 'definition.scopeReference': requiredRule('请输入组织范围标识。'), 'definition.source': requiredRule('请输入来源。'), 'definition.version': requiredRule('请输入版本。'), 'definition.effectiveStartUtc': requiredRule('请输入定义生效开始时间。'), 'definition.effectiveEndUtc': requiredRule('请输入定义生效结束时间。'), 'referencePeriod.startUtc': requiredRule('请输入历史参考期开始时间。'), 'referencePeriod.endUtc': requiredRule('请输入历史参考期结束时间。'), 'calculationScope.productionUnitId': requiredRule('请输入产能单元 ID。'), 'calculationScope.energyTypeCode': requiredRule('请输入能源类型编码。') };
+const internalScopeOptions = computed(() => internalForm.value.definition.scopeType === 'organization' ? organizationUnits.value : internalForm.value.definition.scopeType === 'energy' ? energyTypes.value : internalForm.value.definition.scopeType === 'product' ? productionUnits.value : []);
+const internalScopeLoading = computed(() => internalForm.value.definition.scopeType === 'organization' ? organizationMasterDataLoading.value : internalForm.value.definition.scopeType === 'energy' ? energyTypesLoading.value : internalForm.value.definition.scopeType === 'product' ? productionMasterDataLoading.value : false);
+const internalScopeError = computed(() => internalForm.value.definition.scopeType === 'organization' ? organizationMasterDataError.value : internalForm.value.definition.scopeType === 'energy' ? energyTypesError.value : internalForm.value.definition.scopeType === 'product' ? productionMasterDataError.value : '');
+const internalScopeBlocked = computed(() => internalScopeLoading.value || Boolean(internalScopeError.value) || !internalScopeOptions.value.length);
+const internalScopePlaceholder = computed(() => internalScopeBlocked.value ? '当前范围主数据不可用' : `选择 active ${ENERGY_BENCHMARK_SCOPE_LABELS[internalForm.value.definition.scopeType] || '范围'}主数据`);
+const internalMasterDataError = computed(() => internalScopeError.value || productionMasterDataError.value || energyTypesError.value);
+const internalMasterDataLoading = computed(() => internalScopeLoading.value || productionMasterDataLoading.value || energyTypesLoading.value);
+const internalMasterDataNotice = computed(() => {
+  if (internalMasterDataError.value) return internalMasterDataError.value;
+  if (!internalScopeLoading.value && !internalScopeOptions.value.length) return `当前没有可选择的 active ${ENERGY_BENCHMARK_SCOPE_LABELS[internalForm.value.definition.scopeType] || '范围'}主数据，请先维护对应台账。`;
+  if (!productionMasterDataLoading.value && !productionUnits.value.length) return '当前没有可选择的 active 产能单元，请先维护产能单元台账。';
+  if (!energyTypesLoading.value && !energyTypes.value.length) return '当前没有可选择的 active 能源类型，请先维护能源类型。';
+  return '';
+});
+const internalMasterDataBlocked = computed(() => internalMasterDataLoading.value || Boolean(internalMasterDataError.value) || !internalScopeOptions.value.length || !productionUnits.value.length || !energyTypes.value.length);
+const internalRules = { 'definition.benchmarkCode': requiredRule('请输入对标编码。'), 'definition.benchmarkName': requiredRule('请输入对标名称。'), 'definition.unit': requiredRule('请输入指标单位。'), 'definition.scopeType': requiredRule('请选择范围类型。'), 'definition.scopeReference': requiredRule('请选择 active 主数据范围。'), 'definition.source': requiredRule('请输入来源。'), 'definition.version': requiredRule('请输入版本。'), 'definition.effectiveStartUtc': requiredRule('请输入定义生效开始时间。'), 'definition.effectiveEndUtc': requiredRule('请输入定义生效结束时间。'), 'referencePeriod.startUtc': requiredRule('请输入历史参考期开始时间。'), 'referencePeriod.endUtc': requiredRule('请输入历史参考期结束时间。'), 'calculationScope.productionUnitId': requiredRule('请选择产能单元。'), 'calculationScope.energyTypeCode': requiredRule('请选择能源类型。') };
 
 // 目标版本维护抽屉模块。
 const emptyTargetForm = () => ({ benchmarkDefinitionId: null, targetValue: null, lowerBound: null, upperBound: null, version: '', status: 'inactive' });
@@ -541,19 +604,54 @@ const detailDescriptions = computed(() => buildDetailDescriptions(detailData.val
 const importType = ref('conversion-factors');
 const importFile = ref(null);
 const importPreview = ref(null);
+const importTemplateLoading = ref(false);
+const importDemoExampleLoading = ref(false);
 const importPreviewLoading = ref(false);
 const importError = ref('');
 const importExecuteOpen = ref(false);
 const importConfirmText = ref('');
 const importExecuteLoading = ref(false);
 const importExecuteError = ref('');
+/** 当前导入类型的中文名称，用于明确模板和示例归属。 */
+const currentImportTypeLabel = computed(() => ENERGY_BENCHMARK_IMPORT_TYPES.find((item) => item.value === importType.value)?.label || '能效对标');
 
-/** 创建 Element Plus 必填规则。 */
+/** 创建 Element Plus 必填规则，兼容日期选择器的 change 与 blur 校验触发。 */
 function requiredRule(message) { return [{ required: true, message, trigger: ['blur', 'change'] }]; }
+/** 响应共享日期选择器的 change 与 blur 事件并校验对应表单字段。 */
+function validateUtcFormField(formInstance, field) { formInstance?.validateField(field).catch(() => false); }
+/** 返回严格 UTC Z 左闭右开范围的保存兜底错误。 */
+function strictUtcRangeError(startUtc, endUtc, rangeLabel) {
+  return isEnergyBenchmarkStrictUtcRange(startUtc, endUtc)
+    ? ''
+    : `${rangeLabel}必须是合法严格 UTC Z 左闭右开区间，且开始早于结束（结束不含）。`;
+}
 /** 安全执行异步请求并统一返回成功标识。 */
 async function safe(task) { try { return { ok: true, value: await task() }; } catch (error) { return { ok: false, error }; } }
 /** 提取统一接口错误投影文案。 */
 function requestError(result, action = '请求') { return projectEnergyBenchmarkRequestError(result?.error, action).message; }
+/** 返回普通定义范围选择项的服务端契约值。 */
+function definitionScopeOptionValue(item) { return resolveEnergyBenchmarkScopeOptionValue(definitionForm.value.scopeType, item); }
+/** 返回内部历史定义范围选择项的服务端契约值。 */
+function internalScopeOptionValue(item) { return resolveEnergyBenchmarkScopeOptionValue(internalForm.value.definition.scopeType, item); }
+/** 返回当前 active 范围主数据集合，供保存前执行选择来源校验。 */
+function currentScopeSources() { return { organizationUnits: organizationUnits.value, energyTypes: energyTypes.value, productionUnits: productionUnits.value }; }
+/** 清除组织主数据失败后仍绑定在维护表单中的旧选择。 */
+function clearOrganizationMasterDataSelections() {
+  if (definitionForm.value.scopeType === 'organization') definitionForm.value.scopeReference = '';
+  if (internalForm.value.definition.scopeType === 'organization') internalForm.value.definition.scopeReference = '';
+}
+/** 清除产能主数据失败后仍绑定在维护表单中的旧选择。 */
+function clearProductionMasterDataSelections() {
+  if (definitionForm.value.scopeType === 'product') definitionForm.value.scopeReference = '';
+  if (internalForm.value.definition.scopeType === 'product') internalForm.value.definition.scopeReference = '';
+  internalForm.value.calculationScope.productionUnitId = null;
+}
+/** 清除能源类型主数据失败后仍绑定在维护表单中的旧选择。 */
+function clearEnergyTypeMasterDataSelections() {
+  if (definitionForm.value.scopeType === 'energy') definitionForm.value.scopeReference = '';
+  if (internalForm.value.definition.scopeType === 'energy') internalForm.value.definition.scopeReference = '';
+  internalForm.value.calculationScope.energyTypeCode = '';
+}
 /** 清除指定请求来源的全页错误，不影响其他来源。 */
 function clearPageRequestError(source) {
   pageErrors.value = reduceEnergyBenchmarkPageErrors(pageErrors.value, { type: 'clear', source });
@@ -583,6 +681,111 @@ function targetValueLabel(target = {}, definition = {}) { return definition?.dir
 function rankingAriaLabel(row) { const status = energyBenchmarkStatusPresentation(row); return `第 ${row.rank} 名，${row.objectName || row.objectId || '未命名对象'}，实际值 ${formatEnergyBenchmarkNumber(row.actualValue)} ${analysisDefinition.value?.unit || ''}，${status.label}，差额 ${formatEnergyBenchmarkNumber(row.absoluteDifference)}，差距比例 ${formatEnergyBenchmarkRatio(row.differenceRatio)}`; }
 /** 汇总预演问题。 */
 function previewIssueText(issues = []) { return Array.isArray(issues) && issues.length ? issues.map((item) => `${item.message || item.code}${item.code ? `（${item.code}）` : ''}`).join('；') : '—'; }
+
+/** 读取组织范围主数据；递增请求令牌阻止旧响应覆盖新上下文。 */
+async function loadOrganizationMasterData() {
+  const requestSnapshot = { permission: canViewOrganizationObjects.value };
+  const token = latestRequestGuard.next('organization-master-data', requestSnapshot);
+  organizationMasterDataLoading.value = true;
+  organizationMasterDataStatus.value = 'loading';
+  organizationMasterDataError.value = '';
+  if (!requestSnapshot.permission) {
+    if (!latestRequestGuard.isLatest(token, requestSnapshot)) return false;
+    organizationUnits.value = [];
+    clearOrganizationMasterDataSelections();
+    organizationMasterDataLoading.value = false;
+    organizationMasterDataStatus.value = 'permission';
+    organizationMasterDataError.value = normalizeEnergyBenchmarkOrganizationAccessError(null, false);
+    return false;
+  }
+  const result = await safe(getAllActiveEnergyBenchmarkOrganizationUnits);
+  if (!latestRequestGuard.isLatest(token, requestSnapshot)) return false;
+  organizationMasterDataLoading.value = false;
+  if (!result.ok) {
+    organizationUnits.value = [];
+    clearOrganizationMasterDataSelections();
+    organizationMasterDataStatus.value = Number(result.error?.response?.status) === 403 ? 'permission' : 'error';
+    organizationMasterDataError.value = normalizeEnergyBenchmarkOrganizationAccessError(result.error, true);
+    return false;
+  }
+  organizationUnits.value = (result.value.data || []).filter((item) => item.status === 'active');
+  organizationMasterDataStatus.value = organizationUnits.value.length ? 'ready' : 'empty';
+  if (!organizationUnits.value.length) clearOrganizationMasterDataSelections();
+  return true;
+}
+/** 读取全部 active 产能单元；递增请求令牌阻止旧响应覆盖新上下文。 */
+async function loadProductionMasterData() {
+  const requestSnapshot = { permission: canViewProductionUnits.value };
+  const token = latestRequestGuard.next('production-master-data', requestSnapshot);
+  productionMasterDataLoading.value = true;
+  productionMasterDataStatus.value = 'loading';
+  productionMasterDataError.value = '';
+  if (!requestSnapshot.permission) {
+    if (!latestRequestGuard.isLatest(token, requestSnapshot)) return false;
+    productionUnits.value = [];
+    clearProductionMasterDataSelections();
+    productionMasterDataLoading.value = false;
+    productionMasterDataStatus.value = 'permission';
+    productionMasterDataError.value = normalizeEnergyBenchmarkProductionAccessError(null, false);
+    return false;
+  }
+  const result = await safe(getAllActiveEnergyBenchmarkProductionUnits);
+  if (!latestRequestGuard.isLatest(token, requestSnapshot)) return false;
+  productionMasterDataLoading.value = false;
+  if (!result.ok) {
+    productionUnits.value = [];
+    clearProductionMasterDataSelections();
+    productionMasterDataStatus.value = Number(result.error?.response?.status) === 403 ? 'permission' : 'error';
+    productionMasterDataError.value = normalizeEnergyBenchmarkProductionAccessError(result.error, true);
+    return false;
+  }
+  productionUnits.value = (result.value.data || []).filter((item) => item.status === 'active');
+  productionMasterDataStatus.value = productionUnits.value.length ? 'ready' : 'empty';
+  if (!productionUnits.value.length) clearProductionMasterDataSelections();
+  return true;
+}
+/** 复用现有能源类型接口读取 active 能源主数据，并丢弃旧响应。 */
+async function loadEnergyTypeMasterData() {
+  const token = latestRequestGuard.next('energy-type-master-data');
+  energyTypesLoading.value = true;
+  energyTypesStatus.value = 'loading';
+  energyTypesError.value = '';
+  const result = await safe(getEnergyTypes);
+  if (!latestRequestGuard.isLatest(token)) return false;
+  energyTypesLoading.value = false;
+  if (!result.ok) {
+    energyTypes.value = [];
+    clearEnergyTypeMasterDataSelections();
+    energyTypesStatus.value = Number(result.error?.response?.status) === 403 ? 'permission' : 'error';
+    energyTypesError.value = requestError(result, '读取能源类型主数据');
+    return false;
+  }
+  energyTypes.value = (result.value.data || []).filter((item) => Number(item.isActive) === 1 || item.isActive === true);
+  energyTypesStatus.value = energyTypes.value.length ? 'ready' : 'empty';
+  if (!energyTypes.value.length) clearEnergyTypeMasterDataSelections();
+  return true;
+}
+/** 每次按当前范围类型重新读取主数据，空数据不会自动选择首项。 */
+async function refreshScopeMasterData(scopeType) {
+  if (scopeType === 'organization') return loadOrganizationMasterData();
+  if (scopeType === 'energy') return loadEnergyTypeMasterData();
+  if (scopeType === 'product') return loadProductionMasterData();
+  return true;
+}
+/** 切换普通定义范围类型，清空旧范围值和字段校验，不自动选择首项。 */
+async function changeDefinitionScopeType(scopeType) {
+  definitionForm.value = resetEnergyBenchmarkScopeSelection(definitionForm.value, scopeType);
+  definitionFormError.value = '';
+  definitionFormRef.value?.clearValidate(['scopeType', 'scopeReference']);
+  await refreshScopeMasterData(scopeType);
+}
+/** 切换内部历史定义范围类型，清空旧范围值和字段校验，不自动选择首项。 */
+async function changeInternalScopeType(scopeType) {
+  internalForm.value = { ...internalForm.value, definition: resetEnergyBenchmarkScopeSelection(internalForm.value.definition, scopeType) };
+  internalFormError.value = '';
+  internalFormRef.value?.clearValidate(['definition.scopeType', 'definition.scopeReference']);
+  await refreshScopeMasterData(scopeType);
+}
 
 /** 读取 bootstrap 维护态，并丢弃早于当前上下文的响应。 */
 async function loadMaintenance() {
@@ -768,6 +971,8 @@ async function loadOrganizationObjects() {
     return false;
   }
   organizationObjects.value = result.value.data || [];
+  organizationUnits.value = organizationObjects.value.filter((item) => item.status === 'active');
+  organizationMasterDataError.value = '';
   organizationObjectsError.value = '';
   return true;
 }
@@ -822,8 +1027,14 @@ function addActualRow() {
 function removeActualRow(index) { if (actualRows.value.length > 1) actualRows.value.splice(index, 1); }
 /** 打开实际值上下文编辑。 */
 function openActualContext(row, index) { actualContextIndex.value = index; actualContextForm.value = { ...row }; actualContextOpen.value = true; }
-/** 保存实际值兼容上下文。 */
-function saveActualContext() { if (actualContextIndex.value < 0 || !actualContextForm.value) return; actualRows.value[actualContextIndex.value] = { ...actualRows.value[actualContextIndex.value], ...actualContextForm.value }; actualContextOpen.value = false; }
+/** 保存实际值兼容上下文，并在写回分析行前兜底校验严格 UTC 左闭右开周期。 */
+function saveActualContext() {
+  if (actualContextIndex.value < 0 || !actualContextForm.value) return;
+  const rangeError = strictUtcRangeError(actualContextForm.value.periodStartUtc, actualContextForm.value.periodEndUtc, '实际值周期');
+  if (rangeError) { ElMessage.error(rangeError); return; }
+  actualRows.value[actualContextIndex.value] = { ...actualRows.value[actualContextIndex.value], ...actualContextForm.value };
+  actualContextOpen.value = false;
+}
 /** 对首个实际值调用服务端三方向评价，旧响应不得覆盖新输入。 */
 async function evaluateFirstActual() {
   if (!analysisReady.value || !canAnalyze.value) return;
@@ -891,25 +1102,34 @@ async function exportAnalysisCsv() {
   URL.revokeObjectURL(url);
 }
 
-/** 打开普通定义创建抽屉。 */
-function openCreateDefinition() { definitionMode.value = 'create'; editingDefinitionId.value = null; definitionForm.value = emptyDefinitionForm(); definitionFormError.value = ''; definitionDrawerOpen.value = true; }
-/** 打开普通定义修改抽屉。 */
-function openEditDefinition(row) { definitionMode.value = 'edit'; editingDefinitionId.value = row.id; definitionForm.value = { ...emptyDefinitionForm(), ...row, documentNo: row.documentNo || '' }; definitionFormError.value = ''; definitionDrawerOpen.value = true; }
-/** 打开普通定义新版本创建抽屉。 */
-function openDefinitionVersion(row) { definitionMode.value = 'version'; editingDefinitionId.value = null; definitionForm.value = { ...emptyDefinitionForm(), ...row, version: '', status: 'inactive', documentNo: row.documentNo || '' }; definitionFormError.value = ''; definitionDrawerOpen.value = true; }
+/** 打开普通定义创建抽屉，并按默认 organization 范围加载主数据。 */
+function openCreateDefinition() { definitionMode.value = 'create'; editingDefinitionId.value = null; definitionForm.value = emptyDefinitionForm(); definitionFormError.value = ''; definitionDrawerOpen.value = true; refreshScopeMasterData(definitionForm.value.scopeType); }
+/** 打开普通定义修改抽屉；历史值仅展示原值，不自动替换为任意 active 首项。 */
+function openEditDefinition(row) { definitionMode.value = 'edit'; editingDefinitionId.value = row.id; definitionForm.value = { ...emptyDefinitionForm(), ...row, documentNo: row.documentNo || '' }; definitionFormError.value = ''; definitionDrawerOpen.value = true; refreshScopeMasterData(definitionForm.value.scopeType); }
+/** 打开普通定义新版本创建抽屉；继承历史值但不静默替换。 */
+function openDefinitionVersion(row) { definitionMode.value = 'version'; editingDefinitionId.value = null; definitionForm.value = { ...emptyDefinitionForm(), ...row, version: '', status: 'inactive', documentNo: row.documentNo || '' }; definitionFormError.value = ''; definitionDrawerOpen.value = true; refreshScopeMasterData(definitionForm.value.scopeType); }
 /** 保存普通定义或新定义版本。 */
 async function saveDefinition() {
   if (writeDisabled.value) return;
   const valid = await definitionFormRef.value?.validate().catch(() => false);
   if (!valid) return;
+  const scopeValidation = validateEnergyBenchmarkScopeSelection(definitionForm.value.scopeType, definitionForm.value.scopeReference, currentScopeSources());
+  if (!scopeValidation.valid) { definitionFormError.value = scopeValidation.message; return; }
+  const effectiveRangeError = strictUtcRangeError(definitionForm.value.effectiveStartUtc, definitionForm.value.effectiveEndUtc, '定义生效期');
+  if (effectiveRangeError) { definitionFormError.value = effectiveRangeError; return; }
   if (definitionForm.value.benchmarkType === 'external_standard' && !String(definitionForm.value.documentNo || '').trim()) { definitionFormError.value = '外部标准必须填写真实文号。'; return; }
-  const payload = buildEnergyBenchmarkDefinitionPayload(definitionForm.value);
+  let payload;
+  try { payload = buildEnergyBenchmarkDefinitionPayload(definitionForm.value); }
+  catch (error) { definitionFormError.value = error.message; return; }
   const snapshot = { mode: definitionMode.value, id: editingDefinitionId.value, payload };
   const token = latestRequestGuard.next('save-definition', snapshot);
   definitionSaving.value = true;
   definitionFormError.value = '';
   const result = await safe(() => snapshot.mode === 'edit' ? updateEnergyBenchmarkDefinition(snapshot.id, payload) : createEnergyBenchmarkDefinition(payload));
-  const currentSnapshot = { mode: definitionMode.value, id: editingDefinitionId.value, payload: buildEnergyBenchmarkDefinitionPayload(definitionForm.value) };
+  let currentPayload;
+  try { currentPayload = buildEnergyBenchmarkDefinitionPayload(definitionForm.value); }
+  catch (_error) { return; }
+  const currentSnapshot = { mode: definitionMode.value, id: editingDefinitionId.value, payload: currentPayload };
   if (!latestRequestGuard.isLatest(token, currentSnapshot)) return;
   definitionSaving.value = false;
   if (!result.ok) { definitionFormError.value = writeErrorText(result, '保存对标定义'); return; }
@@ -935,19 +1155,32 @@ async function confirmDefinitionStatus(row) {
   await Promise.all([loadDefinitions(), loadAnalysisDefinitions()]);
 }
 
-/** 打开内部历史固化抽屉。 */
-function openInternalHistory() { internalForm.value = emptyInternalForm(); internalFormError.value = ''; internalDrawerOpen.value = true; }
+/** 打开内部历史固化抽屉，并加载组织、产能和能源三类 active 主数据。 */
+function openInternalHistory() { internalForm.value = emptyInternalForm(); internalFormError.value = ''; internalDrawerOpen.value = true; Promise.all([refreshScopeMasterData(internalForm.value.definition.scopeType), refreshScopeMasterData('product'), refreshScopeMasterData('energy')]); }
 /** 仅提交定义、参考期和显式计算范围创建内部历史基准。 */
 async function saveInternalHistory() {
   if (writeDisabled.value) return;
   const valid = await internalFormRef.value?.validate().catch(() => false);
   if (!valid) return;
-  const payload = buildEnergyBenchmarkInternalHistoryPayload(internalForm.value);
+  const scopeValidation = validateEnergyBenchmarkScopeSelection(internalForm.value.definition.scopeType, internalForm.value.definition.scopeReference, currentScopeSources());
+  const productionSelected = productionUnits.value.some((item) => Number(item.id) === Number(internalForm.value.calculationScope.productionUnitId));
+  const energySelected = energyTypes.value.some((item) => item.code === internalForm.value.calculationScope.energyTypeCode);
+  if (!scopeValidation.valid || !productionSelected || !energySelected) { internalFormError.value = scopeValidation.message || (!productionSelected ? '请选择当前可见的 active 产能单元。' : '请选择当前可见的 active 能源类型。'); return; }
+  const effectiveRangeError = strictUtcRangeError(internalForm.value.definition.effectiveStartUtc, internalForm.value.definition.effectiveEndUtc, '定义生效期');
+  if (effectiveRangeError) { internalFormError.value = effectiveRangeError; return; }
+  const referenceRangeError = strictUtcRangeError(internalForm.value.referencePeriod.startUtc, internalForm.value.referencePeriod.endUtc, '历史参考期');
+  if (referenceRangeError) { internalFormError.value = referenceRangeError; return; }
+  let payload;
+  try { payload = buildEnergyBenchmarkInternalHistoryPayload(internalForm.value); }
+  catch (error) { internalFormError.value = error.message; return; }
   const token = latestRequestGuard.next('save-internal-history', payload);
   internalSaving.value = true;
   internalFormError.value = '';
   const result = await safe(() => createEnergyBenchmarkInternalHistory(payload));
-  if (!latestRequestGuard.isLatest(token, buildEnergyBenchmarkInternalHistoryPayload(internalForm.value))) return;
+  let currentPayload;
+  try { currentPayload = buildEnergyBenchmarkInternalHistoryPayload(internalForm.value); }
+  catch (_error) { return; }
+  if (!latestRequestGuard.isLatest(token, currentPayload)) return;
   internalSaving.value = false;
   if (!result.ok) { internalFormError.value = writeErrorText(result, '固化内部历史基准'); return; }
   internalDrawerOpen.value = false;
@@ -1049,6 +1282,11 @@ async function openTargetDetail(row) {
 /** 构造详情描述项。 */
 function buildDetailDescriptions(data, kind) { if (!data) return []; if (kind === 'definition') return [{ label: '编码', value: data.benchmarkCode }, { label: '名称', value: data.benchmarkName }, { label: '类型', value: ENERGY_BENCHMARK_TYPE_LABELS[data.benchmarkType] || data.benchmarkType }, { label: '指标', value: `${data.metricCode} / ${data.unit}` }, { label: '方向', value: ENERGY_BENCHMARK_DIRECTION_LABELS[data.direction] || data.direction }, { label: '周期', value: data.periodType }, { label: '范围', value: `${ENERGY_BENCHMARK_SCOPE_LABELS[data.scopeType] || data.scopeType} / ${data.scopeReference}` }, { label: '来源', value: data.source }, { label: '文号', value: data.documentNo || '—' }, { label: '版本', value: data.version }, { label: '有效期', value: `${data.effectiveStartUtc} → ${data.effectiveEndUtc}` }, { label: '状态', value: data.status }]; return [{ label: '目标 ID', value: data.id }, { label: '定义', value: `${data.definition?.benchmarkName || data.benchmarkDefinitionId} · ${data.definition?.version || ''}` }, { label: '目标 / 边界', value: targetValueLabel(data, data.definition) }, { label: '版本', value: data.version }, { label: '状态', value: data.status }, { label: '是否固化', value: data.isFrozen ? '是' : '否' }, { label: '是否自动刷新', value: data.autoRefresh ? '是' : '否' }, { label: '参考期', value: data.referenceStartUtc ? `${data.referenceStartUtc} → ${data.referenceEndUtc}` : '—' }, { label: '固化值', value: formatEnergyBenchmarkNumber(data.frozenValue) }, { label: '样本数', value: formatInteger(data.sampleCount) }, { label: '来源数据摘要', value: data.sourceDataDigest || '—' }, { label: '固化时间', value: data.frozenAt || '—' }]; }
 
+/** 下载当前类型空白 XLSX 模板，不自动进入预演。 */
+async function downloadImportTemplate() { importTemplateLoading.value = true; const result = await safe(() => downloadEnergyBenchmarkImportTemplate(importType.value)); importTemplateLoading.value = false; if (!result.ok) ElMessage.error(`能效对标模板下载失败：${writeErrorText(result, '下载模板')}`); }
+/** 下载当前类型青岚园区 XLSX 示例，不自动导入或执行对标。 */
+async function downloadImportDemoExample() { importDemoExampleLoading.value = true; const result = await safe(() => downloadEnergyBenchmarkDemoParkExample(importType.value)); importDemoExampleLoading.value = false; if (!result.ok) ElMessage.error(`青岚园区示例下载失败：${writeErrorText(result, '下载示例')}`); }
+
 /** 保存用户选择的导入文件并清空旧预演。 */
 function selectImportFile(file) { latestRequestGuard.invalidate('import-preview'); latestRequestGuard.invalidate('import-execute'); importPreviewLoading.value = false; importExecuteLoading.value = false; importFile.value = file.raw || null; importPreview.value = null; importError.value = ''; }
 /** 清空导入文件与预演。 */
@@ -1098,7 +1336,7 @@ watch(analysisActualSignature, (current, previous) => {
 // 切换导入类型时旧文件预演上下文失效，禁止跨类型执行。
 watch(importType, () => { latestRequestGuard.invalidate('import-preview'); latestRequestGuard.invalidate('import-execute'); importPreviewLoading.value = false; importExecuteLoading.value = false; importPreview.value = null; importError.value = ''; });
 
-onMounted(async () => { if (!canView.value) return; await Promise.all([loadMaintenance(), loadDefinitions(), loadTargets(), loadAnalysisDefinitions()]); });
+onMounted(async () => { if (!canView.value) return; await Promise.all([loadMaintenance(), loadDefinitions(), loadTargets(), loadAnalysisDefinitions(), loadEnergyTypeMasterData()]); });
 </script>
 
 <style scoped>

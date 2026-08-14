@@ -3,8 +3,8 @@
     <template #title-extra><HelpIcon label="查看统计口径与台账回填说明" content="统计只读取 active energy_records。跨能源类型的标准化值合计仅作快速摘要；精确比较请查看能源类型结构。台账回填需要先预演，再以固定确认文本执行。" /></template>
 
     <ManagementToolbar :loading="loading" @search="applyFilters" @reset="resetFilters">
-      <el-form-item label="开始月份"><el-date-picker v-model="draftFilters.normalizedMonthStart" type="month" value-format="YYYY-MM" format="YYYY-MM" placeholder="开始月份" /></el-form-item>
-      <el-form-item label="结束月份"><el-date-picker v-model="draftFilters.normalizedMonthEnd" type="month" value-format="YYYY-MM" format="YYYY-MM" placeholder="结束月份" /></el-form-item>
+      <el-form-item label="开始月份"><el-date-picker v-model="draftFilters.normalizedMonthStart" type="month" value-format="YYYY-MM" format="YYYY-MM" :editable="true" placeholder="开始月份" /></el-form-item>
+      <el-form-item label="结束月份"><el-date-picker v-model="draftFilters.normalizedMonthEnd" type="month" value-format="YYYY-MM" format="YYYY-MM" :editable="true" placeholder="结束月份" /></el-form-item>
       <el-form-item label="能源类型"><el-select v-model="draftFilters.energyTypeCode" clearable placeholder="全部能源类型"><el-option v-for="item in energyTypes" :key="item.code" :label="`${item.name}（${item.code}）`" :value="item.code" /></el-select></el-form-item>
       <el-form-item label="组织"><el-input v-model.trim="draftFilters.organization" clearable placeholder="精确组织名称" /></el-form-item>
       <el-form-item label="字符搜索"><el-input v-model.trim="draftFilters.keyword" clearable placeholder="能源、组织、仪表或备注" /></el-form-item>

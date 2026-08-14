@@ -1,3 +1,5 @@
+import { parseStrictUtcDateTime } from './dateTimeFields.js';
+
 // 能流节点类型及中文文案模块。
 export const ENERGY_FLOW_NODE_TYPES = Object.freeze([
   { value: 'source', label: '来源' },
@@ -78,6 +80,59 @@ export const ENERGY_FLOW_HTTP_STATUS_TEXT = Object.freeze({
   413: '上传文件超过服务端允许大小，请缩小文件后重新选择。',
   423: '系统处于维护态，当前写入或导入执行已被阻断。'
 });
+
+// 能流严格 UTC 字段定义模块。
+const ENERGY_FLOW_MODEL_UTC_FIELDS = Object.freeze([
+  Object.freeze({ fieldName: 'effectiveStartUtc', label: '模型有效期开始 UTC' }),
+  Object.freeze({ fieldName: 'effectiveEndUtc', label: '模型有效期结束 UTC' })
+]);
+const ENERGY_FLOW_ANALYSIS_UTC_FIELDS = Object.freeze([
+  Object.freeze({ fieldName: 'startUtc', label: '分析开始 UTC' }),
+  Object.freeze({ fieldName: 'endUtc', label: '分析结束 UTC' })
+]);
+
+/**
+ * 规范指定能流 UTC 字段；合法零毫秒统一为秒精度，非法字段清空且仅在诊断中保留原文。
+ * @param {object} source 原始表单或筛选对象。
+ * @param {{fieldName:string,label:string}[]} definitions UTC 字段定义。
+ * @returns {{valid:boolean,value:object,errors:string[],message:string}} 规范结果。
+ */
+function normalizeEnergyFlowUtcFields(source = {}, definitions = []) {
+  const value = { ...(source || {}) };
+  const errors = [];
+  definitions.forEach(({ fieldName, label }) => {
+    const originalValue = value[fieldName];
+    const result = parseStrictUtcDateTime(originalValue);
+    if (result.valid) {
+      value[fieldName] = result.value;
+      return;
+    }
+    const originalDiagnostic = originalValue === '' || originalValue === null || originalValue === undefined
+      ? ''
+      : `（原值：${String(originalValue)}）`;
+    value[fieldName] = '';
+    errors.push(`${label}：${result.message}${originalDiagnostic}`);
+  });
+  return {
+    valid: errors.length === 0,
+    value,
+    errors: Object.freeze(errors),
+    message: errors.join('；')
+  };
+}
+
+/** 规范能流模型有效期 UTC 字段。 */
+export function normalizeEnergyFlowModelUtcFields(model = {}) {
+  return normalizeEnergyFlowUtcFields(model, ENERGY_FLOW_MODEL_UTC_FIELDS);
+}
+
+/** 规范 UTC 模式分析字段；月份模式保持原筛选不变。 */
+export function normalizeEnergyFlowAnalysisUtcFields(filters = {}) {
+  if (filters?.rangeMode !== 'utc') {
+    return { valid: true, value: { ...(filters || {}) }, errors: Object.freeze([]), message: '' };
+  }
+  return normalizeEnergyFlowUtcFields(filters, ENERGY_FLOW_ANALYSIS_UTC_FIELDS);
+}
 
 /**
  * 将任意记录投影为指定字段白名单。
@@ -556,12 +611,12 @@ function hasCurrentEnergyFlowImportBinding(context = {}) {
 }
 
 /**
- * 判断节点导入预演是否具备执行上下文。
+ * 判断单批次能流导入预演是否具备完整执行上下文。
  * @param {object|null} preview 预演结果。
  * @param {object} context 当前文件和请求绑定上下文。
  * @returns {boolean} 是否可执行。
  */
-export function canExecuteEnergyFlowNodeImport(preview, context = {}) {
+function canExecuteEnergyFlowSingleBatchImport(preview, context = {}) {
   return Boolean(hasCurrentEnergyFlowImportBinding(context)
     && preview?.batchId
     && preview?.confirmText
@@ -574,26 +629,67 @@ export function canExecuteEnergyFlowNodeImport(preview, context = {}) {
     && preview.candidateRowIds.length === Number(preview.expectedWouldImport));
 }
 
+/** 判断模型导入预演是否具备执行上下文。 */
+export function canExecuteEnergyFlowModelImport(preview, context = {}) {
+  return canExecuteEnergyFlowSingleBatchImport(preview, context);
+}
+
+/** 判断节点导入预演是否具备执行上下文。 */
+export function canExecuteEnergyFlowNodeImport(preview, context = {}) {
+  return canExecuteEnergyFlowSingleBatchImport(preview, context);
+}
+
 /**
- * 构造节点导入完整受控执行正文。
+ * 构造单批次能流导入完整受控执行正文。
  * @param {object} preview 可信预演结果。
  * @returns {object} execute 正文。
  */
-export function buildEnergyFlowNodeImportExecutePayload(preview = {}) {
+function buildEnergyFlowSingleBatchImportExecutePayload(preview = {}) {
   return {
     batchId: preview.batchId,
     confirmText: preview.confirmText,
-    backupReason: preview.backupReason,
-    duplicateStrategy: preview.duplicateStrategy,
     requireBackup: true,
-    acknowledgeSkippedRisks: true,
-    fileSha256: preview.fileSha256,
-    previewSignature: preview.previewSignature,
-    previewAuditDigest: preview.previewAuditDigest,
-    expectedWouldImport: preview.expectedWouldImport,
-    candidateRowIds: preview.candidateRowIds,
-    candidateRows: preview.candidateRows
+    acknowledgeSkippedRisks: true
   };
+}
+
+/**
+ * 冻结能流导入 execute 的种类、预演和文件指纹，避免异步完成时读取变化后的响应式状态。
+ * @param {string} kind 导入种类。
+ * @param {object} preview 当前预演。
+ * @param {string} fingerprint 当前文件指纹。
+ * @returns {object} 冻结执行快照。
+ */
+export function createEnergyFlowImportExecuteSnapshot(kind, preview, fingerprint) {
+  return cloneAndFreezeEnergyFlowSnapshot({
+    kind: String(kind || ''),
+    preview: preview || null,
+    fingerprint: String(fingerprint || '')
+  });
+}
+
+/**
+ * 判断 execute 响应是否仍属于最新请求及其冻结文件上下文。
+ * @param {object} context execute 响应上下文。
+ * @returns {boolean} 是否允许提交响应。
+ */
+export function canCommitEnergyFlowImportExecuteResponse(context = {}) {
+  return Boolean(context.isLatest
+    && context.snapshot?.kind
+    && context.snapshot?.preview
+    && context.snapshot?.fingerprint
+    && context.snapshot.kind === context.currentKind
+    && context.snapshot.fingerprint === context.currentFingerprint);
+}
+
+/** 构造模型导入服务端受控最小执行正文。 */
+export function buildEnergyFlowModelImportExecutePayload(preview = {}) {
+  return buildEnergyFlowSingleBatchImportExecutePayload(preview);
+}
+
+/** 构造节点导入服务端受控最小执行正文。 */
+export function buildEnergyFlowNodeImportExecutePayload(preview = {}) {
+  return buildEnergyFlowSingleBatchImportExecutePayload(preview);
 }
 
 /**

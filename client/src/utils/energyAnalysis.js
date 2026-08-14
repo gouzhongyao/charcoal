@@ -1,5 +1,8 @@
 // 能源消费分析页面的权限、筛选、状态和图表纯逻辑。
 
+import { parseStrictUtcDateTime } from './dateTimeFields.js';
+import { isIanaTimeZone } from './ianaTimeZones.js';
+
 /** 页面使用的冻结权限编码。 */
 export const ENERGY_ANALYSIS_PERMISSIONS = Object.freeze({
   view: 'energy:analysis:view',
@@ -13,18 +16,53 @@ export const ENERGY_ANALYSIS_PERMISSIONS = Object.freeze({
   timeseriesPreview: 'energy:analysis:timeseries:preview',
   timeseriesExecute: 'energy:analysis:timeseries:execute',
   operationsPreview: 'energy:analysis:operations:preview',
-  operationsExecute: 'energy:analysis:operations:execute'
+  operationsExecute: 'energy:analysis:operations:execute',
+  configurationImportPreview: 'energy:analysis:config:import:preview',
+  configurationImportExecute: 'energy:analysis:config:import:execute'
 });
 
-/** 三类受控导入定义。 */
+/** 六类受控导入定义，统一冻结上传格式、模板、青岚示例和执行后刷新目标。 */
 export const ENERGY_ANALYSIS_IMPORT_TYPES = Object.freeze({
-  timeseries: Object.freeze({ key: 'timeseries', label: '时序能耗', previewPermission: ENERGY_ANALYSIS_PERMISSIONS.timeseriesPreview, executePermission: ENERGY_ANALYSIS_PERMISSIONS.timeseriesExecute }),
-  shifts: Object.freeze({ key: 'shift-schedules', label: '排班记录', previewPermission: ENERGY_ANALYSIS_PERMISSIONS.operationsPreview, executePermission: ENERGY_ANALYSIS_PERMISSIONS.operationsExecute }),
-  states: Object.freeze({ key: 'device-states', label: '设备状态', previewPermission: ENERGY_ANALYSIS_PERMISSIONS.operationsPreview, executePermission: ENERGY_ANALYSIS_PERMISSIONS.operationsExecute })
+  timeseries: Object.freeze({
+    key: 'timeseries', label: '时序能耗', accept: '.xlsx,.csv', templateType: 'energy-timeseries',
+    demoArtifactKey: '15-energy-timeseries', previewPermission: ENERGY_ANALYSIS_PERMISSIONS.timeseriesPreview,
+    executePermission: ENERGY_ANALYSIS_PERMISSIONS.timeseriesExecute, refreshTarget: 'analysis', resultNoun: '可分析事实'
+  }),
+  shifts: Object.freeze({
+    key: 'shift-schedules', label: '排班记录', accept: '.xlsx,.csv', templateType: 'shift-schedules',
+    demoArtifactKey: '14-shift-schedules', previewPermission: ENERGY_ANALYSIS_PERMISSIONS.operationsPreview,
+    executePermission: ENERGY_ANALYSIS_PERMISSIONS.operationsExecute, refreshTarget: 'shift-analysis', resultNoun: '可分析事实'
+  }),
+  states: Object.freeze({
+    key: 'device-states', label: '设备状态', accept: '.xlsx,.csv', templateType: 'device-states',
+    demoArtifactKey: '16-device-states', previewPermission: ENERGY_ANALYSIS_PERMISSIONS.operationsPreview,
+    executePermission: ENERGY_ANALYSIS_PERMISSIONS.operationsExecute, refreshTarget: 'analysis', resultNoun: '可分析事实'
+  }),
+  shiftDefinitions: Object.freeze({
+    key: 'shift-definitions', label: '班次定义', accept: '.xlsx,.csv', templateType: 'shift-definitions',
+    demoArtifactKey: '13-shift-definitions', previewPermission: ENERGY_ANALYSIS_PERMISSIONS.configurationImportPreview,
+    executePermission: ENERGY_ANALYSIS_PERMISSIONS.configurationImportExecute, refreshTarget: 'shift-config', resultNoun: '配置记录'
+  }),
+  touSchemes: Object.freeze({
+    key: 'tou-schemes', label: 'TOU 方案与时段', accept: '.xlsx', templateType: 'tou-schemes',
+    demoArtifactKey: '17-tou-schemes', previewPermission: ENERGY_ANALYSIS_PERMISSIONS.configurationImportPreview,
+    executePermission: ENERGY_ANALYSIS_PERMISSIONS.configurationImportExecute, refreshTarget: 'tou-config', resultNoun: '配置记录'
+  }),
+  strategyRules: Object.freeze({
+    key: 'strategy-rules', label: '策略规则', accept: '.xlsx,.csv', templateType: 'strategy-rules',
+    demoArtifactKey: '18-strategy-rules', previewPermission: ENERGY_ANALYSIS_PERMISSIONS.configurationImportPreview,
+    executePermission: ENERGY_ANALYSIS_PERMISSIONS.configurationImportExecute, refreshTarget: 'strategy-config', resultNoun: '配置记录'
+  })
 });
 
 /** 固定图表系列颜色，状态颜色不得复用为数据系列。 */
 export const ENERGY_ANALYSIS_COLORS = Object.freeze(['#2a78d6', '#eb6834', '#1baf7a', '#eda100']);
+
+/** 固定 UTC 负荷曲线允许的输出网格分钟数。 */
+export const ENERGY_ANALYSIS_OUTPUT_INTERVAL_MINUTES = Object.freeze([15, 30, 60]);
+
+/** 来源时区日期时间格式器缓存，避免同一查询重复创建 Intl 实例。 */
+const energyAnalysisDateTimeFormatterCache = new Map();
 
 /** 峰平谷稳定业务键、标签和颜色，筛选缺类时不得按数组位置重排颜色。 */
 export const ENERGY_ANALYSIS_TOU_PRESENTATION = Object.freeze({
@@ -216,59 +254,192 @@ export function replaceEnergyAnalysisStrategyHit(snapshot, updatedHit) {
   });
 }
 
-/** 返回当前月所在的默认月份范围和最近七天 UTC 范围。 */
+/** 返回指定来源时区的稳定日期时间格式器，无效 IANA 时区直接抛出。 */
+function getEnergyAnalysisDateTimeFormatter(sourceTimeZone) {
+  const timeZone = String(sourceTimeZone || '').trim();
+  if (!timeZone) throw new Error('来源时区不能为空。');
+  if (!energyAnalysisDateTimeFormatterCache.has(timeZone)) {
+    energyAnalysisDateTimeFormatterCache.set(timeZone, new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+    }));
+  }
+  return energyAnalysisDateTimeFormatterCache.get(timeZone);
+}
+
+/** 将绝对时刻投影为来源时区的数值墙钟分量。 */
+function energyAnalysisWallClockParts(value, sourceTimeZone) {
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error('待投影时刻无效。');
+  const formatter = getEnergyAnalysisDateTimeFormatter(sourceTimeZone);
+  return Object.fromEntries(formatter.formatToParts(date).filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)]));
+}
+
+/** 返回墙钟分量的稳定比较键。 */
+function energyAnalysisWallClockKey(parts) {
+  return `${String(parts.year).padStart(4, '0')}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}T${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')}:${String(parts.second).padStart(2, '0')}`;
+}
+
+/** 校验墙钟分量是不会被 Date 自动归一化的真实公历日期时间。 */
+function isValidEnergyAnalysisWallClockParts(parts) {
+  if (!Number.isInteger(parts.year) || parts.year < 1 || parts.year > 9999
+    || !Number.isInteger(parts.month) || parts.month < 1 || parts.month > 12
+    || !Number.isInteger(parts.day) || parts.day < 1
+    || !Number.isInteger(parts.hour) || parts.hour < 0 || parts.hour > 23
+    || !Number.isInteger(parts.minute) || parts.minute < 0 || parts.minute > 59
+    || !Number.isInteger(parts.second) || parts.second < 0 || parts.second > 59) return false;
+  const daysInMonth = new Date(Date.UTC(parts.year, parts.month, 0)).getUTCDate();
+  return parts.day <= daysInMonth;
+}
+
+/** 解析完整来源时区墙钟文本并返回唯一 UTC 候选；DST gap 或 fold 均返回空。 */
+function uniqueEnergyAnalysisWallClockUtcIso(value, sourceTimeZone) {
+  const match = String(value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match) return '';
+  const parts = {
+    year: Number(match[1]), month: Number(match[2]), day: Number(match[3]),
+    hour: Number(match[4]), minute: Number(match[5]), second: Number(match[6] || 0)
+  };
+  if (!isValidEnergyAnalysisWallClockParts(parts)) return '';
+  let formatter;
+  try { formatter = getEnergyAnalysisDateTimeFormatter(sourceTimeZone); } catch (_error) { return ''; }
+  const targetKey = energyAnalysisWallClockKey(parts);
+  const naiveUtcMs = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
+  const candidateOffsets = new Set();
+  for (let deltaHours = -36; deltaHours <= 36; deltaHours += 1) {
+    const probeMs = naiveUtcMs + deltaHours * 60 * 60 * 1000;
+    const rendered = Object.fromEntries(formatter.formatToParts(new Date(probeMs)).filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)]));
+    const renderedAsUtcMs = Date.UTC(rendered.year, rendered.month - 1, rendered.day, rendered.hour, rendered.minute, rendered.second);
+    candidateOffsets.add(renderedAsUtcMs - probeMs);
+  }
+  const candidates = [...candidateOffsets]
+    .map((offsetMs) => naiveUtcMs - offsetMs)
+    .filter((candidateMs) => {
+      const rendered = Object.fromEntries(formatter.formatToParts(new Date(candidateMs)).filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)]));
+      return energyAnalysisWallClockKey(rendered) === targetKey;
+    });
+  const uniqueCandidates = [...new Set(candidates)];
+  return uniqueCandidates.length === 1 ? new Date(uniqueCandidates[0]).toISOString() : '';
+}
+
+/** 校验固定 UTC 输出网格分钟数并返回规范值。 */
+export function normalizeEnergyAnalysisOutputIntervalMinutes(value) {
+  const outputIntervalMinutes = Number(value);
+  if (!Number.isInteger(outputIntervalMinutes) || !ENERGY_ANALYSIS_OUTPUT_INTERVAL_MINUTES.includes(outputIntervalMinutes)) {
+    throw new Error('时序粒度只允许 15、30 或 60 分钟。');
+  }
+  return outputIntervalMinutes;
+}
+
+/** 将绝对时刻向下对齐到固定 UTC epoch 网格。 */
+export function floorEnergyAnalysisDateToUtcGrid(value, outputIntervalMinutes = 60) {
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error('待对齐时刻无效。');
+  const intervalMs = normalizeEnergyAnalysisOutputIntervalMinutes(outputIntervalMinutes) * 60 * 1000;
+  return new Date(Math.floor(date.getTime() / intervalMs) * intervalMs);
+}
+
+/** 将绝对时刻投影为来源时区墙钟控件使用的 YYYY-MM-DDTHH:mm 字符串。 */
+export function formatEnergyAnalysisWallClock(value, sourceTimeZone = 'Asia/Shanghai') {
+  try {
+    const parts = energyAnalysisWallClockParts(value, sourceTimeZone);
+    return `${String(parts.year).padStart(4, '0')}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}T${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')}`;
+  } catch (_error) {
+    throw new Error('来源时区无效，无法生成默认时序窗口。');
+  }
+}
+
+/** 将绝对网格边界投影为可唯一回转的来源时区墙钟值。 */
+function formatUniqueEnergyAnalysisWallClock(value, sourceTimeZone) {
+  const wallClock = formatEnergyAnalysisWallClock(value, sourceTimeZone);
+  const roundTripUtc = uniqueEnergyAnalysisWallClockUtcIso(wallClock, sourceTimeZone);
+  return roundTripUtc === new Date(value).toISOString() ? wallClock : '';
+}
+
+/** 创建最近七天固定 UTC 网格窗口；任一 DST 歧义边界均沿网格向前寻找唯一表示。 */
+export function createDefaultEnergyAnalysisTimeseriesWindow(now = new Date(), sourceTimeZone = 'Asia/Shanghai', outputIntervalMinutes = 60) {
+  const intervalMinutes = normalizeEnergyAnalysisOutputIntervalMinutes(outputIntervalMinutes);
+  const intervalMs = intervalMinutes * 60 * 1000;
+  let end = floorEnergyAnalysisDateToUtcGrid(now, intervalMinutes);
+  for (let attempts = 0; attempts <= Math.ceil(24 * 60 / intervalMinutes); attempts += 1) {
+    const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const startUtc = formatUniqueEnergyAnalysisWallClock(start, sourceTimeZone);
+    const endUtc = formatUniqueEnergyAnalysisWallClock(end, sourceTimeZone);
+    if (startUtc && endUtc) return { startUtc, endUtc };
+    end = new Date(end.getTime() - intervalMs);
+  }
+  throw new Error('来源时区在当前网格附近没有可唯一表示的默认窗口边界。');
+}
+
+/** 校验负荷曲线查询边界是否对齐固定 UTC epoch 网格，不静默舍入用户输入。 */
+export function validateEnergyAnalysisLoadCurveGrid(filters = {}) {
+  const outputIntervalMinutes = Number(filters.outputIntervalMinutes);
+  if (!ENERGY_ANALYSIS_OUTPUT_INTERVAL_MINUTES.includes(outputIntervalMinutes)) {
+    return { valid: false, message: '负荷曲线未请求：时序粒度只允许 15、30 或 60 分钟。' };
+  }
+  const startUtc = toUtcIso(filters.startUtc, filters.sourceTimeZone);
+  const endUtc = toUtcIso(filters.endUtc, filters.sourceTimeZone);
+  if (!startUtc || !endUtc) {
+    return { valid: false, message: '负荷曲线未请求：请检查时序起止时间和来源时区。' };
+  }
+  const intervalMs = outputIntervalMinutes * 60 * 1000;
+  if (Date.parse(startUtc) % intervalMs !== 0 || Date.parse(endUtc) % intervalMs !== 0) {
+    return { valid: false, message: `负荷曲线未请求：时序起止时间必须对齐 UTC epoch 的 ${outputIntervalMinutes} 分钟固定网格；页面不会静默舍入手工输入。` };
+  }
+  return { valid: true, message: '', startUtc, endUtc, outputIntervalMinutes };
+}
+
+/** 返回当前月所在的默认月份范围和最近七天来源时区墙钟范围。 */
 export function createDefaultEnergyAnalysisFilters(now = new Date()) {
+  const sourceTimeZone = 'Asia/Shanghai';
+  const outputIntervalMinutes = 60;
   const end = new Date(now);
-  const start = new Date(now);
-  start.setUTCDate(start.getUTCDate() - 7);
-  const month = end.toISOString().slice(0, 7);
-  const startMonthDate = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() - 5, 1));
+  const localMonthParts = energyAnalysisWallClockParts(end, sourceTimeZone);
+  const endMonthIndex = localMonthParts.year * 12 + localMonthParts.month - 1;
+  const startMonthIndex = endMonthIndex - 5;
+  const startMonthYear = Math.floor(startMonthIndex / 12);
+  const startMonthNumber = startMonthIndex - startMonthYear * 12 + 1;
+  const timeseriesWindow = createDefaultEnergyAnalysisTimeseriesWindow(end, sourceTimeZone, outputIntervalMinutes);
   return {
-    startMonth: startMonthDate.toISOString().slice(0, 7),
-    endMonth: month,
-    startUtc: start.toISOString().slice(0, 16),
-    endUtc: end.toISOString().slice(0, 16),
-    sourceTimeZone: 'Asia/Shanghai',
+    startMonth: `${String(startMonthYear).padStart(4, '0')}-${String(startMonthNumber).padStart(2, '0')}`,
+    endMonth: `${String(localMonthParts.year).padStart(4, '0')}-${String(localMonthParts.month).padStart(2, '0')}`,
+    ...timeseriesWindow,
+    sourceTimeZone,
     organizationUnitId: '',
     productionUnitId: '',
     meterDeviceId: '',
     energyTypeCode: '',
     unit: '',
-    outputIntervalMinutes: 60,
-    minimumCoverageRate: 0.8,
+    outputIntervalMinutes,
+    minimumCoverageRate: 1,
     touSchemeId: ''
   };
 }
 
-/** 将来源时区中的日期时间控件值规范为 UTC ISO 字符串。 */
+/** 将来源时区中的日期时间控件值规范为唯一 UTC ISO 字符串。 */
 export function toUtcIso(value, sourceTimeZone = 'UTC') {
   if (!value) return '';
   if (value instanceof Date) return Number.isNaN(value.getTime()) ? '' : value.toISOString();
   const text = String(value).trim();
-  if (/Z$|[+-]\d{2}:?\d{2}$/.test(text)) {
+  const absoluteMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:?\d{2})$/);
+  if (absoluteMatch) {
+    const parts = {
+      year: Number(absoluteMatch[1]), month: Number(absoluteMatch[2]), day: Number(absoluteMatch[3]),
+      hour: Number(absoluteMatch[4]), minute: Number(absoluteMatch[5]), second: Number(absoluteMatch[6] || 0)
+    };
+    if (!isValidEnergyAnalysisWallClockParts(parts)) return '';
+    const offsetText = absoluteMatch[8];
+    if (offsetText !== 'Z') {
+      const offsetMatch = offsetText.match(/^([+-])(\d{2}):?(\d{2})$/);
+      const offsetHours = Number(offsetMatch?.[2]);
+      const offsetMinutes = Number(offsetMatch?.[3]);
+      if (!offsetMatch || offsetHours > 23 || offsetMinutes > 59) return '';
+    }
     const absoluteDate = new Date(text);
     return Number.isNaN(absoluteDate.getTime()) ? '' : absoluteDate.toISOString();
   }
-  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
-  if (!match) return '';
-  const parts = match.slice(1).map(Number);
-  const targetUtc = Date.UTC(parts[0], parts[1] - 1, parts[2], parts[3], parts[4], parts[5] || 0);
-  try {
-    const formatter = new Intl.DateTimeFormat('en-CA', {
-      timeZone: sourceTimeZone,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
-    });
-    let candidate = targetUtc;
-    for (let pass = 0; pass < 2; pass += 1) {
-      const localParts = Object.fromEntries(formatter.formatToParts(new Date(candidate)).filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)]));
-      const renderedUtc = Date.UTC(localParts.year, localParts.month - 1, localParts.day, localParts.hour, localParts.minute, localParts.second);
-      candidate -= renderedUtc - targetUtc;
-    }
-    return new Date(candidate).toISOString();
-  } catch (_error) {
-    return '';
-  }
+  return uniqueEnergyAnalysisWallClockUtcIso(text, sourceTimeZone);
 }
 
 /** 清除空筛选字段，防止前端发送未冻结参数。 */
@@ -288,11 +459,11 @@ export function buildTimeseriesAnalysisParams(filters = {}) {
   });
 }
 
-/** 构造负荷摘要参数。 */
+/** 构造负荷摘要参数，完整覆盖阈值固定为后端要求的 1。 */
 export function buildLoadSummaryParams(filters = {}) {
   return compactEnergyAnalysisParams({
     ...buildTimeseriesAnalysisParams(filters),
-    minimumCoverageRate: filters.minimumCoverageRate
+    minimumCoverageRate: 1
   });
 }
 
@@ -468,13 +639,41 @@ export function validateStrategyReview(currentStatus, targetStatus, reviewNote =
   return { valid: true, message: '' };
 }
 
+/**
+ * 校验并规范配置有效期 UTC 字段；空值仅在回显阶段允许，非零毫秒不得截断。
+ * @param {unknown} value 待校验 UTC 字段。
+ * @param {string} label 字段中文标签。
+ * @param {boolean} required 是否为保存必填字段。
+ * @returns {string} 秒精度严格 UTC 字符串或回显空值。
+ */
+function normalizeConfigurationUtc(value, label, required = false) {
+  if (value === '' || value === null || value === undefined) {
+    if (required) throw new Error(`请填写${label}。`);
+    return '';
+  }
+  const result = parseStrictUtcDateTime(value);
+  if (!result.valid) throw new Error(`${label}无效：${result.message}`);
+  return result.value;
+}
+
+/**
+ * 将严格秒精度 UTC 表单值序列化为服务端要求的三位零毫秒格式。
+ * @param {unknown} value 待序列化 UTC 字段。
+ * @param {string} label 字段中文标签。
+ * @returns {string} YYYY-MM-DDTHH:mm:ss.000Z API 值。
+ */
+function serializeConfigurationUtcForApi(value, label) {
+  const normalizedValue = normalizeConfigurationUtc(value, label, true);
+  return normalizedValue.replace(/Z$/, '.000Z');
+}
+
 /** 返回配置抽屉初值；首版本不预填班次、周期、阈值、有效期等未经确认的业务事实。 */
 export function createEnergyAnalysisConfigForm(kind, source = null) {
   const shared = {
     source: source?.source || '',
     sourceTimeZone: source?.sourceTimeZone || '',
-    effectiveStartUtc: source?.effectiveStartUtc?.slice(0, 16) || '',
-    effectiveEndUtc: source?.effectiveEndUtc?.slice(0, 16) || '',
+    effectiveStartUtc: normalizeConfigurationUtc(source?.effectiveStartUtc, '生效开始 UTC'),
+    effectiveEndUtc: normalizeConfigurationUtc(source?.effectiveEndUtc, '生效结束 UTC'),
     status: ''
   };
   if (kind === 'shift') {
@@ -595,10 +794,10 @@ export function validateEnergyAnalysisEvidenceRequirements(requirements) {
 export function buildEnergyAnalysisConfigPayload(kind, form = {}, hasSource = false) {
   if (!['shift', 'tou', 'rule'].includes(kind)) throw new Error('配置类型只允许 shift、tou 或 rule。');
   const sourceTimeZone = requiredConfigurationText(form.sourceTimeZone, '来源时区');
-  const effectiveStartUtc = toUtcIso(requiredConfigurationText(form.effectiveStartUtc, '生效开始 UTC'));
-  const effectiveEndUtc = toUtcIso(requiredConfigurationText(form.effectiveEndUtc, '生效结束 UTC'));
-  if (!effectiveStartUtc || !effectiveEndUtc) throw new Error('生效时间或来源时区无效。');
-  if (Date.parse(effectiveStartUtc) >= Date.parse(effectiveEndUtc)) throw new Error('生效开始时间必须早于生效结束时间。');
+  if (!isIanaTimeZone(sourceTimeZone)) throw new Error('请选择当前运行时可识别的 IANA 来源时区。');
+  const effectiveStartUtc = serializeConfigurationUtcForApi(form.effectiveStartUtc, '生效开始 UTC');
+  const effectiveEndUtc = serializeConfigurationUtcForApi(form.effectiveEndUtc, '生效结束 UTC');
+  if (effectiveStartUtc >= effectiveEndUtc) throw new Error('生效开始时间必须早于生效结束时间。');
   if (!ENERGY_ANALYSIS_CONFIGURATION_CONTRACT.statuses.includes(form.status)) throw new Error('请选择启用或停用状态。');
   const shared = {
     source: requiredConfigurationText(form.source, '来源'),
@@ -703,6 +902,23 @@ export function canExecuteEnergyAnalysisImport(preview = {}) {
     && preview.candidateRows.length === expected
     && preview.candidateRowIds.length === expected
   );
+}
+
+/** 将导入 execute 响应规范为完整写入、部分写入或零写入三种稳定状态。 */
+export function summarizeEnergyAnalysisImportExecuteResult(result = {}) {
+  const normalizeCount = (value) => Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : 0;
+  const counts = {
+    imported: normalizeCount(result.imported),
+    skipped: normalizeCount(result.skipped),
+    blocked: normalizeCount(result.blocked),
+    errors: normalizeCount(result.errors),
+    warnings: normalizeCount(result.warnings)
+  };
+  const hasIssues = counts.skipped > 0 || counts.blocked > 0 || counts.errors > 0 || counts.warnings > 0;
+  return {
+    ...counts,
+    status: counts.imported <= 0 ? 'zero' : hasIssues ? 'partial' : 'complete'
+  };
 }
 
 /** 收集 API 错误中的业务原因码，优先展示 details 内的具体原因。 */

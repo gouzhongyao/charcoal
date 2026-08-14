@@ -11,6 +11,7 @@ import {
   isLatestDashboardRequest,
   projectBudgetWarningStatus,
   projectCarbonDashboardStats,
+  projectDashboardSceneState,
   resolveDashboardSummaryDomainState,
   settleDashboardPanelSuccess
 } from '../utils/dashboardCockpit.js';
@@ -132,5 +133,22 @@ assert.equal(calculateZeroSafePercentage(0, 100), 0);
 assert.equal(calculateZeroSafePercentage(25, 100), 25);
 assert.equal(calculateZeroSafePercentage(200, 100), 100);
 assert.equal(calculateZeroSafePercentage('bad', 100), 0);
+
+// 园区场景状态必须聚合五个真实面板，局部失败或无权限不得伪装为整体成功。
+assert.deepEqual(projectDashboardSceneState([
+  { status: 'loading' }, { status: 'success' }, { status: 'success' }, { status: 'empty' }, { status: 'success' }
+]), { status: 'loading', description: '正在汇总已授权的真实业务面板状态。' });
+assert.equal(projectDashboardSceneState(Array.from({ length: 5 }, () => ({ status: 'success' }))).status, 'success');
+assert.equal(projectDashboardSceneState(Array.from({ length: 5 }, () => ({ status: 'empty' }))).status, 'empty');
+assert.equal(projectDashboardSceneState(Array.from({ length: 5 }, () => ({ status: 'forbidden' }))).status, 'forbidden');
+assert.equal(projectDashboardSceneState(Array.from({ length: 5 }, () => ({ status: 'error' }))).status, 'error');
+const partialScene = projectDashboardSceneState([
+  { status: 'success' }, { status: 'empty' }, { status: 'forbidden' }, { status: 'error' }, { status: 'success' }
+]);
+assert.equal(partialScene.status, 'partial');
+assert.match(partialScene.description, /2 个面板读取失败或无权限/);
+assert.equal(projectDashboardSceneState([
+  { status: 'success' }, { status: 'empty' }, { status: 'success' }, { status: 'success' }, { status: 'empty' }
+]).status, 'success');
 
 console.log('dashboardCockpit.test.mjs passed');

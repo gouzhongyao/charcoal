@@ -11,6 +11,7 @@ const carbonRoutes = require('./routes/carbon');
 const predictionRoutes = require('./routes/predictions');
 const templateRoutes = require('./routes/templates');
 const backupRoutes = require('./routes/backups');
+const demoDataRoutes = require('./routes/demoData');
 const organizationRoutes = require('./routes/organization');
 const meterRoutes = require('./routes/meters');
 const meterReadingRoutes = require('./routes/meterReadings');
@@ -20,6 +21,7 @@ const energyBudgetRoutes = require('./routes/energyBudgets');
 const energyAnalysisImportRoutes = require('./routes/energyAnalysisImports');
 const energyBenchmarkImportRoutes = require('./routes/energyBenchmarkImports');
 const energyFlowImportRoutes = require('./routes/energyFlowImports');
+const energyBalanceImportRoutes = require('./routes/energyBalanceImports');
 const energyBenchmarkRoutes = require('./routes/energyBenchmarks');
 const energyAnalysisRoutes = require('./routes/energyAnalysis');
 const energyFlowRoutes = require('./routes/energyFlows');
@@ -89,13 +91,27 @@ app.use(cors({
     }
     callback(new AppError('CORS_ORIGIN_FORBIDDEN', '当前请求来源未被允许访问 API。', { statusCode: 403 }));
   },
-  exposedHeaders: ['Content-Disposition', 'Content-Length', 'X-Recommended-Format', 'X-Backup-Name']
+  exposedHeaders: [
+    'Content-Disposition',
+    'Content-Length',
+    'X-Recommended-Format',
+    'X-Backup-Name',
+    'X-Demo-Dataset-Id',
+    'X-Demo-Run-Id',
+    'X-Demo-Artifact-Key',
+    'X-Demo-Handler-Key',
+    'X-Demo-Manifest-Version',
+    'X-Demo-Manifest-Digest',
+    'X-Demo-Artifact-Sha256',
+    'X-Demo-Context'
+  ]
 }));
 
 // 受控导入和自带请求体限制的对标路由必须先完成认证、授权和维护态检查，再解析 JSON。
 app.use('/api/energy-analysis/imports', energyAnalysisImportRoutes);
 app.use('/api/energy-benchmarks/imports', energyBenchmarkImportRoutes);
 app.use('/api/energy-flow-imports', energyFlowImportRoutes);
+app.use('/api/energy-balance-imports', energyBalanceImportRoutes);
 app.use('/api/energy-benchmarks', energyBenchmarkRoutes);
 
 app.use(express.json({ limit: '2mb' }));
@@ -110,6 +126,7 @@ app.use('/api/carbon', carbonRoutes);
 app.use('/api/predictions', predictionRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/system/backups', backupRoutes);
+app.use('/api/system/demo-data', demoDataRoutes);
 app.use('/api/organization', organizationRoutes);
 app.use('/api/meters', meterRoutes);
 app.use('/api/meter-readings', meterReadingRoutes);

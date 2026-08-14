@@ -22,6 +22,7 @@ const { initDatabase, openDatabase } = require('../db/database');
 const { errorHandler, notFoundHandler } = require('../middleware/errorHandler');
 const energyAnalysisImportRoutes = require('../routes/energyAnalysisImports');
 const {
+  ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS,
   ENERGY_ANALYSIS_EXECUTE_JSON_LIMIT,
   ENERGY_ANALYSIS_IMPORT_ROUTER_MOUNT_REQUIREMENT,
   ENERGY_ANALYSIS_OPERATIONS_PERMISSIONS,
@@ -47,6 +48,24 @@ const SHIFT_HEADERS = Object.freeze([
 const DEVICE_HEADERS = Object.freeze([
   '计量器具编码', '用能单元编码', '设备状态', '开始时间（UTC）', '结束时间（UTC）',
   '来源时区', '来源标识', '数据来源'
+]);
+// 三类配置导入冻结模板表头。
+const SHIFT_DEFINITION_HEADERS = Object.freeze([
+  '班次编码', '班次名称', '开始分钟', '结束分钟', '是否跨日', '来源时区',
+  '来源', '版本', '生效开始时间（UTC）', '生效结束时间（UTC）', '状态'
+]);
+const TOU_SCHEME_HEADERS = Object.freeze([
+  '方案编码', '方案名称', '来源时区', '来源', '文号', '版本',
+  '生效开始时间（UTC）', '生效结束时间（UTC）', '状态'
+]);
+const TOU_RULE_HEADERS = Object.freeze([
+  '方案编码', '方案版本', '星期序号', '时段类型', '开始分钟', '结束分钟'
+]);
+const STRATEGY_HEADERS = Object.freeze([
+  '规则编码', '规则名称', '规则版本', '公式版本', '指标编码', '阈值操作符',
+  '阈值', '阈值下限', '阈值上限', '阈值单位', '预计降幅', '优先级',
+  '最低覆盖率', '最大证据数', '节省依据', '建议内容', '来源',
+  '生效开始时间（UTC）', '生效结束时间（UTC）', '来源时区', '状态'
 ]);
 
 /** 将 CSV 单元格转义为安全文本。 */
@@ -118,6 +137,86 @@ function createDeviceRow(overrides = {}) {
     数据来源: 'upload',
     ...overrides
   };
+}
+
+/** 创建合法班次定义配置行。 */
+function createShiftDefinitionRow(overrides = {}) {
+  return {
+    班次编码: 'ROUTE-SHIFT-CONFIG',
+    班次名称: '路由配置班次',
+    开始分钟: 480,
+    结束分钟: 1020,
+    是否跨日: 0,
+    来源时区: 'Asia/Shanghai',
+    来源: '路由配置导入测试',
+    版本: 'route-shift-config:v1',
+    '生效开始时间（UTC）': '2026-01-01T00:00:00Z',
+    '生效结束时间（UTC）': '2027-01-01T00:00:00Z',
+    状态: 'active',
+    ...overrides
+  };
+}
+
+/** 创建合法策略规则配置行。 */
+function createStrategyRow(overrides = {}) {
+  return {
+    规则编码: 'ROUTE-STRATEGY',
+    规则名称: '路由策略规则',
+    规则版本: 'route-strategy:v1',
+    公式版本: 'load-analysis:v1',
+    指标编码: 'load_rate',
+    阈值操作符: 'gte',
+    阈值: 80,
+    阈值下限: '',
+    阈值上限: '',
+    阈值单位: '%',
+    预计降幅: 0.1,
+    优先级: 'high',
+    最低覆盖率: 1,
+    最大证据数: 10,
+    节省依据: 'window_total_energy',
+    建议内容: '请人工复核。',
+    来源: '路由配置导入测试',
+    '生效开始时间（UTC）': '2026-01-01T00:00:00Z',
+    '生效结束时间（UTC）': '2027-01-01T00:00:00Z',
+    来源时区: 'Asia/Shanghai',
+    状态: 'active',
+    ...overrides
+  };
+}
+
+/** 创建七天完整覆盖的 TOU 规则行。 */
+function createTouRules(schemeCode = 'ROUTE-TOU', schemeVersion = 'route-tou:v1') {
+  return Array.from({ length: 7 }, (_value, dayIndex) => [
+    { 方案编码: schemeCode, 方案版本: schemeVersion, 星期序号: dayIndex + 1, 时段类型: 'valley', 开始分钟: 0, 结束分钟: 480 },
+    { 方案编码: schemeCode, 方案版本: schemeVersion, 星期序号: dayIndex + 1, 时段类型: 'flat', 开始分钟: 480, 结束分钟: 1080 },
+    { 方案编码: schemeCode, 方案版本: schemeVersion, 星期序号: dayIndex + 1, 时段类型: 'peak', 开始分钟: 1080, 结束分钟: 1440 }
+  ]).flat();
+}
+
+/** 构造精确双工作表 TOU XLSX。 */
+function buildTouXlsx() {
+  const workbook = XLSX.utils.book_new();
+  const schemeRow = {
+    方案编码: 'ROUTE-TOU',
+    方案名称: '路由 TOU 方案',
+    来源时区: 'Asia/Shanghai',
+    来源: '路由配置导入测试',
+    文号: 'ROUTE-TOU-001',
+    版本: 'route-tou:v1',
+    '生效开始时间（UTC）': '2026-01-01T00:00:00Z',
+    '生效结束时间（UTC）': '2027-01-01T00:00:00Z',
+    状态: 'active'
+  };
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
+    TOU_SCHEME_HEADERS,
+    TOU_SCHEME_HEADERS.map((header) => schemeRow[header] ?? '')
+  ]), 'TOU方案');
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
+    TOU_RULE_HEADERS,
+    ...createTouRules().map((row) => TOU_RULE_HEADERS.map((header) => row[header] ?? ''))
+  ]), '时段规则');
+  return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
 }
 
 /** 创建一个真实旧版 XLS Buffer，用于触发领域模板格式校验。 */
@@ -392,23 +491,46 @@ async function testPermissionAndMaintenanceBoundaries(server, tokens) {
       executePath: `${ROUTE_BASE}/device-states/execute`,
       previewToken: tokens.operationsPreview,
       executeToken: tokens.operationsExecute,
-      csv: buildCsv(DEVICE_HEADERS, [createDeviceRow({ 来源标识: 'permission:device' })])
+      file: { filename: 'permission-device.csv', content: buildCsv(DEVICE_HEADERS, [createDeviceRow({ 来源标识: 'permission:device' })]) }
+    },
+    {
+      label: 'shift-definitions',
+      previewPath: `${ROUTE_BASE}/shift-definitions/preview`,
+      executePath: `${ROUTE_BASE}/shift-definitions/execute`,
+      previewToken: tokens.configurationPreview,
+      executeToken: tokens.configurationExecute,
+      file: { filename: 'permission-shift-definition.csv', content: buildCsv(SHIFT_DEFINITION_HEADERS, [createShiftDefinitionRow()]) }
+    },
+    {
+      label: 'tou-schemes',
+      previewPath: `${ROUTE_BASE}/tou-schemes/preview`,
+      executePath: `${ROUTE_BASE}/tou-schemes/execute`,
+      previewToken: tokens.configurationPreview,
+      executeToken: tokens.configurationExecute,
+      file: { filename: 'permission-tou.xlsx', content: buildTouXlsx(), mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+    },
+    {
+      label: 'strategy-rules',
+      previewPath: `${ROUTE_BASE}/strategy-rules/preview`,
+      executePath: `${ROUTE_BASE}/strategy-rules/execute`,
+      previewToken: tokens.configurationPreview,
+      executeToken: tokens.configurationExecute,
+      file: { filename: 'permission-strategy.csv', content: buildCsv(STRATEGY_HEADERS, [createStrategyRow()]) }
     }
-  ];
+  ].map((route) => ({
+    ...route,
+    file: route.file || { filename: `${route.label}-permission.csv`, content: route.csv }
+  }));
 
   for (const route of routes) {
     const beforeFiles = listUploadFiles();
-    const anonymousPreview = await requestMultipart(server, route.previewPath, {
-      filename: `${route.label}-anonymous.csv`, content: route.csv
-    });
+    const anonymousPreview = await requestMultipart(server, route.previewPath, { ...route.file, filename: `anonymous-${route.file.filename}` });
     assert.strictEqual(anonymousPreview.status, 401, `${route.label} preview 必须先认证。`);
     assert.strictEqual(anonymousPreview.body.error.code, 'UNAUTHENTICATED');
     const anonymousExecute = await requestJson(server, 'POST', route.executePath, {}, null);
     assert.strictEqual(anonymousExecute.status, 401, `${route.label} execute 必须先认证。`);
 
-    const deniedPreview = await requestMultipart(server, route.previewPath, {
-      filename: `${route.label}-denied.csv`, content: route.csv
-    }, tokens.denied);
+    const deniedPreview = await requestMultipart(server, route.previewPath, { ...route.file, filename: `denied-${route.file.filename}` }, tokens.denied);
     assert.strictEqual(deniedPreview.status, 403, `${route.label} preview 必须校验权限。`);
     assert.strictEqual(deniedPreview.body.error.code, 'FORBIDDEN');
     const deniedExecute = await requestJson(server, 'POST', route.executePath, {}, tokens.denied);
@@ -416,9 +538,7 @@ async function testPermissionAndMaintenanceBoundaries(server, tokens) {
     assert.deepStrictEqual(listUploadFiles(), beforeFiles, `${route.label} 的 401/403 必须发生在上传落盘前。`);
 
     await runWithMaintenance(`route-${route.label}-maintenance`, async () => {
-      const maintenancePreview = await requestMultipart(server, route.previewPath, {
-        filename: `${route.label}-maintenance.csv`, content: route.csv
-      }, route.previewToken);
+      const maintenancePreview = await requestMultipart(server, route.previewPath, { ...route.file, filename: `maintenance-${route.file.filename}` }, route.previewToken);
       assert.strictEqual(maintenancePreview.status, 423);
       assert.strictEqual(maintenancePreview.body.error.code, 'MAINTENANCE_IN_PROGRESS');
       const maintenanceExecute = await requestJson(server, 'POST', route.executePath, {}, route.executeToken);
@@ -479,6 +599,36 @@ async function testMinimalPermissionMatrix(server, tokens) {
           来源标识: 'permission-matrix:device'
         })])
       }
+    },
+    {
+      label: 'shift-definitions',
+      previewPath: `${ROUTE_BASE}/shift-definitions/preview`,
+      executePath: `${ROUTE_BASE}/shift-definitions/execute`,
+      previewToken: tokens.configurationPreview,
+      executeToken: tokens.configurationExecute,
+      importType: 'shift_definition',
+      file: {
+        filename: 'permission-shift-definition.csv',
+        content: buildCsv(SHIFT_DEFINITION_HEADERS, [createShiftDefinitionRow({
+          班次编码: 'PERMISSION-SHIFT-CONFIG',
+          版本: 'permission-shift-config:v1'
+        })])
+      }
+    },
+    {
+      label: 'strategy-rules',
+      previewPath: `${ROUTE_BASE}/strategy-rules/preview`,
+      executePath: `${ROUTE_BASE}/strategy-rules/execute`,
+      previewToken: tokens.configurationPreview,
+      executeToken: tokens.configurationExecute,
+      importType: 'strategy_rule',
+      file: {
+        filename: 'permission-strategy.csv',
+        content: buildCsv(STRATEGY_HEADERS, [createStrategyRow({
+          规则编码: 'PERMISSION-STRATEGY',
+          规则版本: 'permission-strategy:v1'
+        })])
+      }
     }
   ];
 
@@ -505,6 +655,7 @@ async function testMinimalPermissionMatrix(server, tokens) {
 /** 校验 execute JSON 只在认证、权限和维护态后解析，并稳定脱敏 400/413。 */
 async function testExecuteJsonParsingBoundary(server, tokens) {
   const executePath = `${ROUTE_BASE}/timeseries/execute`;
+  const configurationExecutePath = `${ROUTE_BASE}/shift-definitions/execute`;
   const oversizedJson = Buffer.from(`"${'a'.repeat(2 * 1024 * 1024 + 1024)}"`, 'utf8');
 
   const anonymousValid = await requestRawJson(server, 'POST', executePath, '{}', null);
@@ -531,6 +682,14 @@ async function testExecuteJsonParsingBoundary(server, tokens) {
   assert.strictEqual(authorizedOversized.body.error.details.maxBodySize, '2mb');
   assert(!authorizedOversized.text.includes('entity.too.large'));
   assertNoAbsolutePath(authorizedOversized.body, 'execute 超限 JSON 响应');
+
+  const configurationAnonymousMalformed = await requestRawJson(server, 'POST', configurationExecutePath, '{', null);
+  assert.strictEqual(configurationAnonymousMalformed.status, 401, '配置 execute 匿名畸形 JSON 必须先认证。');
+  const configurationDeniedMalformed = await requestRawJson(server, 'POST', configurationExecutePath, '{', tokens.denied);
+  assert.strictEqual(configurationDeniedMalformed.status, 403, '配置 execute 无权限畸形 JSON 必须先校验权限。');
+  const configurationAuthorizedMalformed = await requestRawJson(server, 'POST', configurationExecutePath, '{', tokens.configurationExecute);
+  assert.strictEqual(configurationAuthorizedMalformed.status, 400);
+  assert.strictEqual(configurationAuthorizedMalformed.body.error.code, 'ENERGY_ANALYSIS_EXECUTE_JSON_INVALID');
 
   const globalParserProbe = await requestJson(server, 'POST', '/api/json-echo', { stillAvailable: true });
   assert.strictEqual(globalParserProbe.status, 200, '独立路由之后的其余路由仍必须可使用全局 JSON parser。');
@@ -809,6 +968,10 @@ async function testCrossRouteBatchIsolation(server, adminToken) {
       preview: 'energy:analysis:operations:preview',
       execute: 'energy:analysis:operations:execute'
     });
+    assert.deepStrictEqual(ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS, {
+      preview: 'energy:analysis:config:import:preview',
+      execute: 'energy:analysis:config:import:execute'
+    });
     assert.strictEqual(ENERGY_ANALYSIS_EXECUTE_JSON_LIMIT, '2mb');
     assert.deepStrictEqual(ENERGY_ANALYSIS_IMPORT_ROUTER_MOUNT_REQUIREMENT, {
       beforeGlobalJsonParser: true,
@@ -822,10 +985,14 @@ async function testCrossRouteBatchIsolation(server, adminToken) {
     register({ username: 'route-ts-execute', password: 'Password123!' });
     register({ username: 'route-ops-preview', password: 'Password123!' });
     register({ username: 'route-ops-execute', password: 'Password123!' });
+    register({ username: 'route-config-preview', password: 'Password123!' });
+    register({ username: 'route-config-execute', password: 'Password123!' });
     grantPermissions('route-ts-preview', [ENERGY_ANALYSIS_TIMESERIES_PERMISSIONS.preview]);
     grantPermissions('route-ts-execute', [ENERGY_ANALYSIS_TIMESERIES_PERMISSIONS.execute]);
     grantPermissions('route-ops-preview', [ENERGY_ANALYSIS_OPERATIONS_PERMISSIONS.preview]);
     grantPermissions('route-ops-execute', [ENERGY_ANALYSIS_OPERATIONS_PERMISSIONS.execute]);
+    grantPermissions('route-config-preview', [ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS.preview]);
+    grantPermissions('route-config-execute', [ENERGY_ANALYSIS_CONFIGURATION_IMPORT_PERMISSIONS.execute]);
 
     const tokens = {
       admin: login({ username: 'admin', password: process.env.CHARCOAL_ADMIN_PASSWORD }).token,
@@ -833,7 +1000,9 @@ async function testCrossRouteBatchIsolation(server, adminToken) {
       timeseriesPreview: login({ username: 'route-ts-preview', password: 'Password123!' }).token,
       timeseriesExecute: login({ username: 'route-ts-execute', password: 'Password123!' }).token,
       operationsPreview: login({ username: 'route-ops-preview', password: 'Password123!' }).token,
-      operationsExecute: login({ username: 'route-ops-execute', password: 'Password123!' }).token
+      operationsExecute: login({ username: 'route-ops-execute', password: 'Password123!' }).token,
+      configurationPreview: login({ username: 'route-config-preview', password: 'Password123!' }).token,
+      configurationExecute: login({ username: 'route-config-execute', password: 'Password123!' }).token
     };
     server = await startIsolatedServer();
 

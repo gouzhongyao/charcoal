@@ -7,6 +7,8 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
 const MANUAL_ROOT = path.join(PROJECT_ROOT, 'docs', '使用说明书');
 // 正式使用说明书总入口用于校验章节目录。
 const MANUAL_INDEX_PATH = path.join(MANUAL_ROOT, 'README.md');
+// 青岚完整演示主步骤用于校验首次演示入口和 25 项清单完整性。
+const PROJECT_STEPS_PATH = path.join(MANUAL_ROOT, '项目使用步骤.md');
 // 功能覆盖矩阵用于校验动态页面和特殊页面覆盖情况。
 const COVERAGE_MATRIX_PATH = path.join(MANUAL_ROOT, '维护附录', '功能覆盖矩阵.md');
 // 路由文件用于动态读取当前 componentMap 标识，避免脚本维护静态页面清单。
@@ -18,6 +20,8 @@ const validationFailures = [];
 // 必需说明书文件列表用于约束正式目录的最低结构。
 const requiredManualFiles = [
   'README.md',
+  '项目使用步骤.md',
+  '00-侧边栏模块总览与数据链路.md',
   '01-本地安装启动与首次管理员.md',
   '02-登录注册与个人中心.md',
   '03-导航权限与通用操作.md',
@@ -38,6 +42,71 @@ const requiredManualFiles = [
   '18-能效平衡与优化.md',
   '维护附录/功能覆盖矩阵.md',
   '维护附录/变更记录.md'
+];
+// 青岚演示 artifact 标识用于约束主步骤与服务端 manifest 的固定 25 项覆盖。
+const demoParkArtifactKeys = [
+  '01-organization-root',
+  '02-organization-departments',
+  '03-organization-process-equipment',
+  '04-meters',
+  '05-production-units',
+  '06-production-outputs',
+  '07-monthly-energy',
+  '08-meter-readings-2026-08',
+  '09-generation-records',
+  '10-energy-budgets',
+  '11-carbon-factors',
+  '12-prediction-configs',
+  '13-shift-definitions',
+  '14-shift-schedules',
+  '15-energy-timeseries',
+  '16-device-states',
+  '17-tou-schemes',
+  '18-strategy-rules',
+  '19-conversion-factors',
+  '20-benchmark-definitions',
+  '21-benchmark-targets',
+  '22-energy-flow-models',
+  '23-energy-flow-nodes',
+  '24-energy-flow-edges',
+  '25-energy-balance-configs'
+];
+// 侧边栏模块总览章节路径用于限定新增总览的主题完整性校验。
+const SIDEBAR_OVERVIEW_PATH = path.join(MANUAL_ROOT, '00-侧边栏模块总览与数据链路.md');
+// 侧边栏正式模块标题用于按当前第 00 章结构逐模块定位说明内容。
+const sidebarOverviewModuleTitles = [
+  '驾驶舱',
+  '能源数据导入（当前菜单：能耗数据导入）',
+  '能耗统计',
+  '月度预算（当前页面：用能预算）',
+  '能源消费分析',
+  '能效对标',
+  '能源分析（当前实现为能流分析）',
+  '能效平衡与优化',
+  '组织管理（用能单元）',
+  '计量器具',
+  '计量抄表',
+  '产能单元',
+  '月度产量',
+  '发电自用',
+  '碳核算',
+  '预测管理',
+  '用户管理',
+  '角色管理',
+  '菜单管理',
+  '备份恢复'
+];
+// 侧边栏模块固定主题用于检查每个正式模块的数据链路、权限边界和验收口径。
+const sidebarOverviewRequiredTopics = [
+  { label: '用途', titles: ['用途'] },
+  { label: '子功能', titles: ['子功能'] },
+  { label: '数据从哪里来 / 数据来源', titles: ['数据从哪里来', '数据来源'] },
+  { label: '如何产生或导入', titles: ['如何产生或导入'] },
+  { label: '显示数据条件', titles: ['显示数据条件'] },
+  { label: '空数据排查', titles: ['空数据排查'] },
+  { label: '权限与菜单可见', titles: ['权限与菜单可见'] },
+  { label: '副作用与非自动联动', titles: ['副作用与非自动联动'] },
+  { label: '快速验收', titles: ['快速验收'] }
 ];
 // 特殊页面标识用于确保固定入口、占位和兜底页面进入覆盖矩阵。
 const specialPageMarkers = [
@@ -278,6 +347,18 @@ function verifyRootReadmeEntry() {
   if (!hasManualIndexLink) {
     addFailure('README.md 必须通过相对链接指向 docs/使用说明书/README.md。');
   }
+
+  // 青岚主步骤绝对路径用于确认根入口提供完整演示流程。
+  const expectedProjectStepsPath = path.normalize(PROJECT_STEPS_PATH);
+  // 是否存在青岚主步骤链接用于避免根 README 继续维护重复且过期的长流程。
+  const hasProjectStepsLink = rootReadmeTargets.some((target) => {
+    // 当前 README 链接绝对路径用于主步骤目标比对。
+    const resolvedTarget = path.resolve(PROJECT_ROOT, target);
+    return path.normalize(resolvedTarget) === expectedProjectStepsPath;
+  });
+  if (!hasProjectStepsLink) {
+    addFailure('README.md 必须通过相对链接指向 docs/使用说明书/项目使用步骤.md。');
+  }
 }
 
 /**
@@ -298,6 +379,120 @@ function verifyManualIndexLinks() {
     const requiredAbsolutePath = path.normalize(path.join(MANUAL_ROOT, requiredManualFile));
     if (!manualIndexTargets.includes(requiredAbsolutePath)) {
       addFailure(`说明书总入口缺少章节链接：${requiredManualFile}`);
+    }
+  }
+}
+
+/**
+ * 从第 00 章提取二级、三级标题及各自正文范围。
+ * @param {string} markdownContent 第 00 章 Markdown 文本。
+ * @returns {{ level: number, title: string, content: string }[]} 标题与正文范围列表。
+ */
+function extractSidebarOverviewSections(markdownContent) {
+  // Markdown 标题表达式用于识别当前文档中的正式模块层级。
+  const headingPattern = /^(#{2,3})\s+(.+?)\s*#*\s*$/gm;
+  // 标题匹配结果用于计算每个模块正文的开始和结束位置。
+  const headingMatches = [];
+  // 当前标题匹配用于遍历第 00 章全部二级、三级标题。
+  let headingMatch;
+  while ((headingMatch = headingPattern.exec(markdownContent)) !== null) {
+    // 标准化标题用于去除整数、层级小数及可选末尾点号的章节编号，同时保留正式模块名称。
+    const normalizedTitle = headingMatch[2].trim().replace(/^\d+(?:\.\d+)*(?:\.)?\s+/, '');
+    headingMatches.push({
+      level: headingMatch[1].length,
+      title: normalizedTitle,
+      headingStart: headingMatch.index,
+      contentStart: headingPattern.lastIndex
+    });
+  }
+
+  return headingMatches.map((currentHeading, currentIndex) => {
+    // 后续同级或更高层级标题用于限定当前模块正文，避免借用其他模块主题。
+    const nextBoundaryHeading = headingMatches
+      .slice(currentIndex + 1)
+      .find((candidateHeading) => candidateHeading.level <= currentHeading.level);
+    // 当前正文结束位置用于截取模块自身内容。
+    const contentEnd = nextBoundaryHeading ? nextBoundaryHeading.headingStart : markdownContent.length;
+    return {
+      level: currentHeading.level,
+      title: currentHeading.title,
+      content: markdownContent.slice(currentHeading.contentStart, contentEnd)
+    };
+  });
+}
+
+/**
+ * 判断模块正文是否声明指定的固定主题标题。
+ * @param {string} moduleContent 模块正文。
+ * @param {string[]} topicTitles 允许的主题标题。
+ * @returns {boolean} 是否存在固定主题标题。
+ */
+function includesSidebarOverviewTopic(moduleContent, topicTitles) {
+  return topicTitles.some((topicTitle) => {
+    // 转义后的主题标题用于安全构造 Markdown 列表标题表达式。
+    const escapedTopicTitle = topicTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // 固定主题表达式用于匹配列表中的加粗主题标题，不依赖具体正文内容。
+    const topicPattern = new RegExp(`^\\s*[-*+]\\s+\\*\\*${escapedTopicTitle}\\*\\*\\s*[：:]`, 'm');
+    return topicPattern.test(moduleContent);
+  });
+}
+
+/**
+ * 校验侧边栏模块总览的二十个正式模块均包含九个固定主题。
+ */
+function verifyProjectSteps() {
+  // 青岚主步骤文本用于检查稳定标题、常量、执行边界和完整 artifact 清单。
+  const projectStepsContent = readText(PROJECT_STEPS_PATH);
+  if (!projectStepsContent) return;
+
+  // 主步骤稳定标识用于防止首次演示、安全、导入和主动计算关键段落被误删。
+  const projectStepsMarkerGroups = [
+    ['安全前提和完成判定'],
+    ['安装、登录、权限和演示前备份'],
+    ['25 个 artifact 的唯一导入顺序'],
+    ['preview / execute', 'preview/execute'],
+    ['全部导入完成后的主动操作'],
+    ['最终页面验收'],
+    ['非自动联动总表'],
+    ['QL-'],
+    ['Asia/Shanghai'],
+    ['真实 `data/energy-carbon.sqlite`', 'data/energy-carbon.sqlite']
+  ];
+  for (const projectStepsMarkerGroup of projectStepsMarkerGroups) {
+    if (!includesAny(projectStepsContent, projectStepsMarkerGroup)) {
+      addFailure(`项目使用步骤缺少关键主题：${projectStepsMarkerGroup.join(' / ')}`);
+    }
+  }
+
+  for (const artifactKey of demoParkArtifactKeys) {
+    if (!projectStepsContent.includes(artifactKey)) {
+      addFailure(`项目使用步骤缺少青岚 artifact：${artifactKey}`);
+    }
+  }
+}
+
+/**
+ * 校验侧边栏模块总览的二十个正式模块均包含九个固定主题。
+ */
+function verifySidebarOverviewTopics() {
+  // 侧边栏总览文本用于按模块边界检查主题，不约束具体段落或大段正文。
+  const sidebarOverviewContent = readText(SIDEBAR_OVERVIEW_PATH);
+  if (!sidebarOverviewContent) return;
+
+  // 第 00 章标题与正文范围用于精确定位每个正式模块。
+  const sidebarOverviewSections = extractSidebarOverviewSections(sidebarOverviewContent);
+  for (const moduleTitle of sidebarOverviewModuleTitles) {
+    // 当前正式模块用于确保标题存在且主题不能从相邻模块借用。
+    const moduleSection = sidebarOverviewSections.find((section) => section.title === moduleTitle);
+    if (!moduleSection) {
+      addFailure(`侧边栏模块总览缺少正式模块：${moduleTitle}`);
+      continue;
+    }
+
+    for (const requiredTopic of sidebarOverviewRequiredTopics) {
+      if (!includesSidebarOverviewTopic(moduleSection.content, requiredTopic.titles)) {
+        addFailure(`侧边栏模块“${moduleTitle}”缺少固定主题：${requiredTopic.label}`);
+      }
     }
   }
 }
@@ -450,6 +645,8 @@ function main() {
   verifyRequiredFiles();
   verifyRootReadmeEntry();
   verifyManualIndexLinks();
+  verifyProjectSteps();
+  verifySidebarOverviewTopics();
   verifyLocalMarkdownLinks();
   verifyCoverageMatrix();
   verifyCriticalTopics();

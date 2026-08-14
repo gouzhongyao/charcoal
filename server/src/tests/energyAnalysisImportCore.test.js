@@ -40,16 +40,21 @@ const TEST_FILE_BUFFER = Buffer.from('energy-analysis-import-test-file', 'utf8')
 // 测试固定使用的文件摘要。
 const TEST_FILE_SHA256 = crypto.createHash('sha256').update(TEST_FILE_BUFFER).digest('hex');
 
-// 八模板关键安全契约独立硬编码，避免测试复述生产常量。
+// 能源分析模板关键安全契约独立硬编码，避免测试复述生产常量。
 const EXPECTED_TEMPLATES = [
   ['energy-timeseries', 'energy-timeseries-import', 'energy_timeseries', ['energy_timeseries'], '确认导入时序能耗记录', false],
   ['shift-schedules', 'shift-schedule-import', 'shift_schedule', ['shift_schedule'], '确认导入排班记录', false],
   ['device-states', 'device-state-import', 'device_state', ['device_state'], '确认导入设备状态记录', false],
+  ['shift-definitions', 'shift-definition-import', 'shift_definition', ['shift_definition'], '确认导入班次定义', false],
+  ['tou-schemes', 'tou-scheme-import', 'tou_scheme', ['tou_scheme'], '确认导入TOU方案与时段', true],
+  ['strategy-rules', 'strategy-rule-import', 'strategy_rule', ['strategy_rule'], '确认导入策略规则', false],
   ['energy-conversion-factors', 'energy-conversion-factor-import', 'energy_conversion_factor', ['energy_conversion_factor'], '确认导入折标系数', false],
   ['energy-benchmark-definitions', 'energy-benchmark-standard-import', 'benchmark_standard', ['energy_benchmark'], '确认导入能效对标标准', false],
   ['energy-benchmark-targets', 'energy-benchmark-target-import', 'benchmark_target', ['energy_benchmark'], '确认导入能效对标目标', false],
+  ['energy-flow-models', 'energy-flow-model-import', 'energy_flow_model', ['energy_flow_model'], '确认导入能流模型', false],
   ['energy-flow-nodes', 'energy-flow-node-import', 'energy_flow_node', ['energy_flow_node'], '确认导入能流节点', false],
-  ['energy-flow-edges', 'energy-flow-edge-bundle-import', 'energy_flow_edge_record_bundle', ['energy_flow_edge', 'energy_flow_record'], '确认导入能流边及显式边值', true]
+  ['energy-flow-edges', 'energy-flow-edge-bundle-import', 'energy_flow_edge_record_bundle', ['energy_flow_edge', 'energy_flow_record'], '确认导入能流边及显式边值', true],
+  ['energy-balance-configs', 'energy-balance-config-bundle-import', 'energy_balance_config_bundle', ['energy_balance_boundary', 'energy_balance_item'], '确认导入平衡边界及九角色项目', true]
 ];
 
 /**
@@ -151,14 +156,17 @@ function createExecuteFixture(candidateRows, inputOverrides = {}, contextOverrid
 }
 
 /**
- * 运行八模板映射与冻结性测试。
+ * 运行模板映射与冻结性测试。
  */
 function testTemplateContracts() {
   assert.strictEqual(ENERGY_ANALYSIS_IMPORT_BACKUP_REASON, 'energy-analysis-import');
   assert.strictEqual(ENERGY_ANALYSIS_IMPORT_SIGNATURE_VERSION, 'energy-analysis-import-preview:v1');
   assert.strictEqual(ENERGY_ANALYSIS_IMPORT_SIGNATURE_PREFIX, 'hmac-sha256:v1');
   assert.strictEqual(ENERGY_ANALYSIS_IMPORT_AUDIT_DIGEST_PREFIX, 'hmac-sha256:v1:audit');
-  assert.strictEqual(ENERGY_ANALYSIS_IMPORT_TEMPLATES.length, 8);
+  assert.strictEqual(
+    ENERGY_ANALYSIS_IMPORT_TEMPLATES.length,
+    EXPECTED_TEMPLATES.length
+  );
   assert.deepStrictEqual(
     ENERGY_ANALYSIS_IMPORT_TEMPLATES.map((template) => [
       template.id,
@@ -177,10 +185,10 @@ function testTemplateContracts() {
     assert.strictEqual(Object.isFrozen(template.importTypes), true);
     assert.strictEqual(Object.isFrozen(template.targetTables), true);
   });
-  assert.strictEqual(ENERGY_ANALYSIS_IMPORT_TEMPLATES[4].importTypes[0], 'energy_benchmark');
-  assert.strictEqual(ENERGY_ANALYSIS_IMPORT_TEMPLATES[5].importTypes[0], 'energy_benchmark');
-  assert.notStrictEqual(ENERGY_ANALYSIS_IMPORT_TEMPLATES[4].operation, ENERGY_ANALYSIS_IMPORT_TEMPLATES[5].operation);
-  assert.notStrictEqual(ENERGY_ANALYSIS_IMPORT_TEMPLATES[4].recordKind, ENERGY_ANALYSIS_IMPORT_TEMPLATES[5].recordKind);
+  assert.strictEqual(ENERGY_ANALYSIS_IMPORT_TEMPLATES[7].importTypes[0], 'energy_benchmark');
+  assert.strictEqual(ENERGY_ANALYSIS_IMPORT_TEMPLATES[8].importTypes[0], 'energy_benchmark');
+  assert.notStrictEqual(ENERGY_ANALYSIS_IMPORT_TEMPLATES[7].operation, ENERGY_ANALYSIS_IMPORT_TEMPLATES[8].operation);
+  assert.notStrictEqual(ENERGY_ANALYSIS_IMPORT_TEMPLATES[7].recordKind, ENERGY_ANALYSIS_IMPORT_TEMPLATES[8].recordKind);
 }
 
 /**

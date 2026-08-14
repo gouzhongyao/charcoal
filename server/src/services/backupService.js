@@ -1,9 +1,20 @@
 const fs = require('fs');
 const crypto = require('crypto');
 const path = require('path');
-const { backupsDir, databasePath, ensureLocalDataDirectories, initDatabase, openDatabase } = require('../db/database');
+const {
+  backupsDir,
+  blockDatabaseAdmission,
+  databasePath,
+  ensureLocalDataDirectories,
+  getDatabaseAdmissionState,
+  initDatabase,
+  openDatabase,
+  poisonDatabaseAdmission,
+  unblockDatabaseAdmission
+} = require('../db/database');
 const { assertWritableAllowed, runWithMaintenance } = require('./maintenanceState');
-const { badRequest, invalidBackup, notFound } = require('../utils/errors');
+const { normalizeDemoRuntimeAfterRestore, readCanonicalDemoRuntime } = require('./demoRuntimeService');
+const { AppError, badRequest, invalidBackup, notFound } = require('../utils/errors');
 
 const BACKUP_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(sqlite|db)$/i;
 // 允许进入备份文件名和审计元数据的正式备份原因。
@@ -88,6 +99,14 @@ const REQUIRED_BACKUP_SCHEMA = {
   ]
 };
 const REQUIRED_BACKUP_TABLES = Object.keys(REQUIRED_BACKUP_SCHEMA);
+// admission drain 只等待有限时间，避免恢复接口无限占用维护态。
+const DATABASE_DRAIN_TIMEOUT_MS = 2000;
+const DATABASE_DRAIN_POLL_MS = 20;
+// durable marker 协议和 operationId 文件命名必须与启动恢复校验完全一致。
+const DATABASE_RESTORE_MARKER_SCHEMA = 'charcoal-database-restore-marker';
+const DATABASE_RESTORE_MARKER_VERSION = 1;
+const DATABASE_RESTORE_MARKER_PHASE = 'prepared';
+const DATABASE_RESTORE_MARKER_NAME = '.restore-in-progress.json';
 
 function getNowForFilename() {
   return new Date().toISOString().replace(/[-:]/g, '').replace(/\.(\d{3})Z$/, '-$1Z');
@@ -103,7 +122,7 @@ function assertInsideBackupsDir(filePath) {
   const target = path.resolve(filePath);
   const relative = path.relative(base, target);
   if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
-    throw badRequest('备份文件路径必须位于当前备份目录下。', { backupsDir: base, target });
+    throw badRequest('备份文件路径必须位于当前备份目录下。', { code: 'BACKUP_PATH_OUTSIDE_ALLOWLIST' });
   }
 }
 
@@ -134,8 +153,10 @@ function sha256File(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
-function buildBackupMetadata(filePath) {
-  const stat = fs.statSync(filePath);
+function buildBackupMetadata(filePath, fileOperations = fs) {
+  const statSync = typeof fileOperations.statSync === 'function'
+    ? fileOperations.statSync.bind(fileOperations) : fs.statSync.bind(fs);
+  const stat = statSync(filePath);
   return {
     backupName: path.basename(filePath),
     path: filePath,
@@ -146,11 +167,12 @@ function buildBackupMetadata(filePath) {
   };
 }
 
-function listBackups() {
+function listBackups(options = {}) {
+  const fileOperations = options.fileOperations || fs;
   ensureBackupDir();
   const rows = fs.readdirSync(backupsDir, { withFileTypes: true })
     .filter((entry) => entry.isFile() && BACKUP_NAME_PATTERN.test(entry.name))
-    .map((entry) => buildBackupMetadata(path.join(backupsDir, entry.name)))
+    .map((entry) => buildBackupMetadata(path.join(backupsDir, entry.name), fileOperations))
     .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)) || String(b.backupName).localeCompare(String(a.backupName)));
 
   return {
@@ -161,16 +183,16 @@ function listBackups() {
   };
 }
 
-function assertExistingBackup(backupName) {
+function assertExistingBackup(backupName, options = {}) {
   const safeName = assertSafeBackupName(backupName);
-  const listed = listBackups().rows.find((backup) => backup.backupName === safeName);
+  const listed = listBackups(options).rows.find((backup) => backup.backupName === safeName);
   if (!listed) {
-    throw notFound('备份文件不存在或不在当前备份目录白名单内。', { backupName: safeName, backupsDir });
+    throw notFound('备份文件不存在或不在当前备份目录白名单内。', { backupName: safeName, code: 'BACKUP_NOT_FOUND' });
   }
   const backupPath = getBackupPathFromName(safeName);
   assertInsideBackupsDir(backupPath);
   if (normalizeForCompare(backupPath) !== normalizeForCompare(listed.path)) {
-    throw badRequest('备份文件路径校验失败。', { backupName: safeName, backupPath, listedPath: listed.path });
+    throw badRequest('备份文件路径校验失败。', { backupName: safeName, code: 'BACKUP_PATH_VALIDATION_FAILED' });
   }
   return listed;
 }
@@ -180,15 +202,56 @@ function buildBackupName(reason = 'manual') {
   return `energy-carbon-${safeReason}-${getNowForFilename()}-${process.pid}.sqlite`;
 }
 
-function checkpointDatabase() {
-  if (!fs.existsSync(databasePath)) {
-    return;
-  }
-  const db = openDatabase();
+function checkpointDatabase(options = {}) {
+  if (!fs.existsSync(databasePath)) return;
+  const db = openDatabase({ admissionPermit: options.admissionPermit });
   try {
-    db.pragma('wal_checkpoint(TRUNCATE)');
+    assertCheckpointComplete(db.pragma('wal_checkpoint(TRUNCATE)'), 'DATABASE_CHECKPOINT_INCOMPLETE');
   } finally {
     db.close();
+  }
+}
+
+/**
+ * 校验 WAL checkpoint 无 busy 且全部 log frame 已写回。
+ * @param {object[]} checkpointRows better-sqlite3 pragma 返回行。
+ * @param {string} code 稳定错误子码。
+ */
+function assertCheckpointComplete(checkpointRows, code) {
+  const incomplete = !Array.isArray(checkpointRows) || checkpointRows.length < 1
+    || checkpointRows.some((row) => Number(row.busy) !== 0
+      || !Number.isSafeInteger(Number(row.log))
+      || !Number.isSafeInteger(Number(row.checkpointed))
+      || Number(row.log) !== Number(row.checkpointed));
+  if (incomplete) {
+    throw badRequest('数据库 checkpoint 未完整写回，暂不能执行恢复。', { code });
+  }
+}
+
+/** 等待 admission barrier 前已打开的正式库连接自然排空。 */
+async function waitForOfficialDatabaseDrain(timeoutMs = DATABASE_DRAIN_TIMEOUT_MS) {
+  const effectiveTimeoutMs = Number.isFinite(Number(timeoutMs))
+    ? Math.max(0, Number(timeoutMs))
+    : DATABASE_DRAIN_TIMEOUT_MS;
+  const deadline = Date.now() + effectiveTimeoutMs;
+  while (getDatabaseAdmissionState().activeConnections !== 0) {
+    if (Date.now() >= deadline) {
+      throw badRequest('正式数据库连接未在限定时间内排空，暂不能执行恢复。', {
+        code: 'DATABASE_DRAIN_TIMEOUT'
+      });
+    }
+    await new Promise((resolve) => setTimeout(resolve, DATABASE_DRAIN_POLL_MS));
+  }
+}
+
+/** 将恢复标记写入并 fsync，确保双 rename 中间窗口可在下次启动恢复。 */
+function writeDurableRestoreMarker(markerPath, marker) {
+  const descriptor = fs.openSync(markerPath, 'w');
+  try {
+    fs.writeFileSync(descriptor, JSON.stringify(marker), 'utf8');
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
   }
 }
 
@@ -250,7 +313,7 @@ function validateBackupFile(backupPath) {
       throw error;
     }
     throw invalidBackup('备份文件无效/损坏，无法作为 SQLite 备份恢复。', {
-      reason: error && error.message ? error.message : String(error)
+      code: 'BACKUP_SQLITE_OPEN_OR_READ_FAILED'
     });
   } finally {
     if (db) {
@@ -267,7 +330,7 @@ function validateBackupFile(backupPath) {
  */
 async function copyDatabaseToBackup(destinationPath, options = {}) {
   const skipCheckpoint = options.skipCheckpoint === true;
-  const db = openDatabase();
+  const db = openDatabase({ admissionPermit: options.admissionPermit });
   try {
     // BEGIN IMMEDIATE 调用方持有 RESERVED 锁时不能执行 checkpoint，但在线备份仍可读取锁前已提交快照。
     if (!skipCheckpoint) {
@@ -303,25 +366,29 @@ async function createBackup(options = {}) {
     throw badRequest('备份文件名冲突，请稍后重试。', { backupName });
   }
 
-  let method;
   try {
-    method = await copyDatabaseToBackup(backupPath, {
-      skipCheckpoint: options.skipCheckpoint === true
+    const method = await copyDatabaseToBackup(backupPath, {
+      skipCheckpoint: options.skipCheckpoint === true,
+      admissionPermit: options.admissionPermit
     });
+    const metadata = buildBackupMetadata(backupPath, options.fileOperations || fs);
+    return {
+      ...metadata,
+      reason,
+      method,
+      databasePath,
+      backupsDir
+    };
   } catch (error) {
-    if (fs.existsSync(backupPath)) {
-      fs.rmSync(backupPath, { force: true });
+    try {
+      if (fs.existsSync(backupPath)) {
+        fs.rmSync(backupPath, { force: true });
+      }
+    } catch (_cleanupError) {
+      // 备份清理是次生操作，不得覆盖原始备份失败。
     }
     throw error;
   }
-  const metadata = buildBackupMetadata(backupPath);
-  return {
-    ...metadata,
-    reason,
-    method,
-    databasePath,
-    backupsDir
-  };
 }
 
 function getBackupForDownload(backupName) {
@@ -342,7 +409,7 @@ function deleteBackup(backupName) {
   if (normalizeForCompare(backupPath) === normalizeForCompare(databasePath)) {
     throw badRequest('不能删除当前 SQLite 数据库，只能删除备份目录下的备份文件。', {
       backupName: metadata.backupName,
-      databasePath
+      code: 'CURRENT_DATABASE_DELETE_FORBIDDEN'
     });
   }
 
@@ -357,34 +424,231 @@ function deleteBackup(backupName) {
   };
 }
 
-async function restoreBackup(backupName) {
+async function restoreBackup(backupName, actor = {}, options = {}) {
+  const fileOperations = options.fileOperations || fs;
+  const safeBackupName = (() => {
+    try {
+      return assertSafeBackupName(backupName);
+    } catch (_error) {
+      return String(backupName || '').trim();
+    }
+  })();
   return runWithMaintenance('backups:restore', async () => {
-    const source = assertExistingBackup(backupName);
-    const validation = validateBackupFile(source.path);
-    const preRestoreBackup = await createBackup({ reason: 'pre-restore' });
+    const admissionPermit = blockDatabaseAdmission();
+    let source = null;
+    let validation = null;
+    let sourceResolutionAttempted = false;
+    let sourceValidated = false;
+    let preRestoreBackup = null;
+    let frozenLiveRuntime = null;
+    const operationId = crypto.randomUUID();
+    const candidatePath = path.join(path.dirname(databasePath), `.restore-candidate-${operationId}.sqlite`);
+    const oldStagingPath = path.join(path.dirname(databasePath), `.restore-old-${operationId}.sqlite`);
+    const markerPath = path.join(path.dirname(databasePath), DATABASE_RESTORE_MARKER_NAME);
+    let officialMoved = false;
+    let candidateMoved = false;
+    let demoRuntimeSafetyReset = null;
+    try {
+      if (typeof options.onAdmissionBlocked === 'function') {
+        await options.onAdmissionBlocked();
+      }
+      await waitForOfficialDatabaseDrain(options.drainTimeoutMs);
+      frozenLiveRuntime = readCanonicalDemoRuntime({ admissionPermit });
+      preRestoreBackup = await createBackup({
+        reason: 'pre-restore',
+        fileOperations,
+        admissionPermit
+      });
+      if (typeof options.onPreRestoreBackupCreated === 'function') {
+        await options.onPreRestoreBackupCreated(preRestoreBackup);
+      }
+      sourceResolutionAttempted = true;
+      source = assertExistingBackup(backupName, { fileOperations });
+      validation = validateBackupFile(source.path);
+      sourceValidated = true;
+      fs.copyFileSync(source.path, candidatePath);
+      removeSqliteSidecars(candidatePath);
+      initDatabase({ databasePath: candidatePath });
+      const candidateDb = openDatabase({ databasePath: candidatePath });
+      try {
+        if (typeof options.onCandidatePrepared === 'function') {
+          await options.onCandidatePrepared({ databasePath: candidatePath, db: candidateDb });
+        }
+        const requestActorSnapshot = {
+          userId: typeof actor.userId === 'number' && Number.isSafeInteger(actor.userId) && actor.userId > 0
+            ? actor.userId : null,
+          username: actor.username ? String(actor.username) : null,
+          displayName: actor.displayName ? String(actor.displayName) : null,
+          ip: actor.ip ? String(actor.ip) : null
+        };
+        const resolvedActor = requestActorSnapshot.userId && requestActorSnapshot.username
+          ? candidateDb.prepare(`SELECT id, username, display_name AS displayName FROM sys_users
+            WHERE id = ? AND username = ?`).get(requestActorSnapshot.userId, requestActorSnapshot.username)
+          : null;
+        if (candidateDb.pragma('quick_check', { simple: true }) !== 'ok'
+          || candidateDb.pragma('integrity_check', { simple: true }) !== 'ok'
+          || candidateDb.pragma('foreign_key_check').length > 0) {
+          throw new Error('候选数据库完整性检查失败。');
+        }
+      } finally {
+        candidateDb.close();
+      }
+      removeSqliteSidecars(candidatePath);
 
-    checkpointDatabase();
-    removeSqliteSidecars(databasePath);
-    fs.copyFileSync(source.path, databasePath);
-    removeSqliteSidecars(databasePath);
-    initDatabase();
+      const frozenCandidateDb = openDatabase({ databasePath: candidatePath });
+      try {
+        demoRuntimeSafetyReset = normalizeDemoRuntimeAfterRestore(actor, {
+          db: frozenCandidateDb,
+          minimumRuntimeEpoch: frozenLiveRuntime.runtimeEpoch,
+          minimumRevision: frozenLiveRuntime.revision
+        });
+        const requestActorSnapshot = {
+          userId: typeof actor.userId === 'number' && Number.isSafeInteger(actor.userId) && actor.userId > 0
+            ? actor.userId : null,
+          username: actor.username ? String(actor.username) : null,
+          displayName: actor.displayName ? String(actor.displayName) : null,
+          ip: actor.ip ? String(actor.ip) : null
+        };
+        const resolvedActor = requestActorSnapshot.userId && requestActorSnapshot.username
+          ? frozenCandidateDb.prepare(`SELECT id, username, display_name AS displayName FROM sys_users
+            WHERE id = ? AND username = ?`).get(requestActorSnapshot.userId, requestActorSnapshot.username)
+          : null;
+        frozenCandidateDb.prepare(`INSERT INTO sys_operation_logs
+          (user_id, operation, target_type, target_id, detail_json, ip, created_at)
+          VALUES (?, 'system.backup.restore', 'backup', ?, ?, ?, ?)`)
+          .run(resolvedActor ? resolvedActor.id : null, source.backupName, JSON.stringify({
+            requestActorSnapshot,
+            actorResolvedInRestoredDatabase: Boolean(resolvedActor),
+            resolvedActor: resolvedActor ? {
+              userId: resolvedActor.id,
+              username: resolvedActor.username,
+              displayName: resolvedActor.displayName
+            } : null,
+            backupName: source.backupName,
+            safetyReset: demoRuntimeSafetyReset
+          }), requestActorSnapshot.ip, new Date().toISOString());
+        if (frozenCandidateDb.pragma('quick_check', { simple: true }) !== 'ok'
+          || frozenCandidateDb.pragma('integrity_check', { simple: true }) !== 'ok'
+          || frozenCandidateDb.pragma('foreign_key_check').length > 0) {
+          throw new Error('候选数据库完整性检查失败。');
+        }
+        const candidateCheckpointRows = typeof options.checkpointCandidate === 'function'
+          ? options.checkpointCandidate(frozenCandidateDb)
+          : frozenCandidateDb.pragma('wal_checkpoint(TRUNCATE)');
+        assertCheckpointComplete(
+          candidateCheckpointRows,
+          'RESTORE_CANDIDATE_CHECKPOINT_INCOMPLETE'
+        );
+      } finally {
+        frozenCandidateDb.close();
+      }
+      removeSqliteSidecars(candidatePath);
 
-    return {
-      restoredFrom: {
-        backupName: source.backupName,
-        sizeBytes: source.sizeBytes,
-        sha256: source.sha256,
-        validation
-      },
-      preRestoreBackup: {
-        backupName: preRestoreBackup.backupName,
-        sizeBytes: preRestoreBackup.sizeBytes,
-        sha256: preRestoreBackup.sha256
-      },
-      databasePath,
-      backupsDir,
-      note: '恢复前已完成 SQLite quick_check 与关键 schema 校验，并自动创建 pre-restore 备份；恢复后建议刷新页面并重新检查当前数据。'
-    };
+      if (typeof options.checkpointOfficial === 'function') {
+        assertCheckpointComplete(
+          options.checkpointOfficial(),
+          'DATABASE_CHECKPOINT_INCOMPLETE'
+        );
+      } else {
+        checkpointDatabase({ admissionPermit });
+      }
+      if (getDatabaseAdmissionState().activeConnections !== 0) {
+        throw badRequest('正式数据库 checkpoint 后连接状态异常，拒绝切换。', {
+          code: 'DATABASE_DRAIN_STATE_CHANGED'
+        });
+      }
+      removeSqliteSidecars(databasePath);
+      writeDurableRestoreMarker(markerPath, {
+        schema: DATABASE_RESTORE_MARKER_SCHEMA,
+        version: DATABASE_RESTORE_MARKER_VERSION,
+        phase: DATABASE_RESTORE_MARKER_PHASE,
+        operationId,
+        candidate: path.basename(candidatePath),
+        old: path.basename(oldStagingPath)
+      });
+      fileOperations.renameSync(databasePath, oldStagingPath);
+      officialMoved = true;
+      fileOperations.renameSync(candidatePath, databasePath);
+      candidateMoved = true;
+      const cleanupWarnings = [];
+      try {
+        fileOperations.rmSync(oldStagingPath, { force: true });
+        fileOperations.rmSync(markerPath, { force: true });
+      } catch (_cleanupError) {
+        cleanupWarnings.push('RESTORE_SWITCH_CLEANUP_PENDING');
+      }
+      unblockDatabaseAdmission(admissionPermit);
+
+      return {
+        restoredFrom: { backupName: source.backupName, sizeBytes: source.sizeBytes, sha256: source.sha256, validation },
+        preRestoreBackup: { backupName: preRestoreBackup.backupName, sizeBytes: preRestoreBackup.sizeBytes, sha256: preRestoreBackup.sha256 },
+        demoRuntimeSafetyReset,
+        cleanupWarnings,
+        databasePath,
+        backupsDir,
+        note: cleanupWarnings.length > 0
+          ? '数据库已成功恢复；切换残留将在下次初始化时幂等清理。'
+          : '恢复候选库已完成迁移、演示安全重置、审计和完整性校验，并通过同卷原子替换切换。'
+      };
+    } catch (error) {
+      const errorBackupName = source ? source.backupName : safeBackupName;
+      // 输入白名单错误也必须先走 barrier 释放和候选清理，再保持原 code/status/details 对外返回。
+      const passthroughInputError = error instanceof AppError && sourceResolutionAttempted && (
+        (!source && ['BAD_REQUEST', 'NOT_FOUND'].includes(error.code))
+        || (!sourceValidated && error.code === 'INVALID_BACKUP_FILE')
+      );
+      if (candidateMoved) {
+        poisonDatabaseAdmission();
+        throw new AppError('BACKUP_RESTORE_SWITCH_INDETERMINATE', '数据库已完成文件切换但收尾状态无法确认，服务已安全锁定。', {
+          statusCode: 500,
+          details: {
+            backupName: errorBackupName,
+            phase: 'post_switch_verification',
+            rollbackStatus: 'not_applicable',
+            retryable: false,
+            code: 'DATABASE_POISONED'
+          }
+        });
+      }
+      let rollbackStatus = officialMoved ? 'not_attempted' : 'official_unchanged';
+      if (officialMoved && !candidateMoved) {
+        try {
+          fileOperations.renameSync(oldStagingPath, databasePath);
+          rollbackStatus = 'restored';
+          try {
+            fileOperations.rmSync(markerPath, { force: true });
+          } catch (_markerCleanupError) {
+            // 回滚已成功时 marker 清理失败不得覆盖主错误。
+          }
+          unblockDatabaseAdmission(admissionPermit);
+        } catch (_rollbackError) {
+          rollbackStatus = 'failed_poisoned';
+          poisonDatabaseAdmission();
+        }
+      } else if (!officialMoved) {
+        unblockDatabaseAdmission(admissionPermit);
+      }
+      for (const cleanupPath of [candidatePath, `${candidatePath}-wal`, `${candidatePath}-shm`]) {
+        try {
+          fileOperations.rmSync(cleanupPath, { force: true });
+        } catch (_cleanupError) {
+          // 候选清理是次生操作，不得覆盖恢复主错误。
+        }
+      }
+      if (passthroughInputError) {
+        throw error;
+      }
+      throw new AppError('BACKUP_RESTORE_FAILED', '备份恢复失败，正式数据库未切换或已安全回滚。', {
+        statusCode: 500,
+        details: {
+          backupName: errorBackupName,
+          phase: officialMoved ? 'atomic_switch' : 'candidate_prepare',
+          rollbackStatus,
+          retryable: rollbackStatus !== 'failed_poisoned',
+          code: rollbackStatus === 'failed_poisoned' ? 'DATABASE_POISONED' : 'RESTORE_CANDIDATE_REJECTED'
+        }
+      });
+    }
   }, { backupName: String(backupName || '') });
 }
 
@@ -395,5 +659,10 @@ module.exports = {
   getBackupForDownload,
   listBackups,
   restoreBackup,
-  validateBackupFile
+  validateBackupFile,
+  _test: {
+    assertCheckpointComplete,
+    checkpointDatabase,
+    waitForOfficialDatabaseDrain
+  }
 };

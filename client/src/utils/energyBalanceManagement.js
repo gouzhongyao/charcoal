@@ -1,10 +1,17 @@
+import { parseStrictUtcDateTime } from './dateTimeFields.js';
+
 /** 能效平衡页面稳定权限编码。 */
 export const ENERGY_BALANCE_PERMISSIONS = Object.freeze({
   view: 'energy:balance:view',
   manage: 'energy:balance:manage',
   calculate: 'energy:balance:calculate',
-  suggestionReview: 'energy:balance:suggestion:review'
+  suggestionReview: 'energy:balance:suggestion:review',
+  importPreview: 'energy:balance:import:preview',
+  importExecute: 'energy:balance:import:execute'
 });
+
+/** 平衡双批次导入固定中文确认文本。 */
+export const ENERGY_BALANCE_IMPORT_CONFIRM_TEXT = '确认导入平衡边界及九角色项目';
 
 /** 九类显式平衡角色及其中文口径。 */
 export const BALANCE_ROLE_DEFINITIONS = Object.freeze([
@@ -60,6 +67,75 @@ export const SUGGESTION_STATUS_TRANSITIONS = Object.freeze({
   rejected: Object.freeze([]),
   resolved: Object.freeze([])
 });
+
+// 平衡边界严格 UTC 字段定义模块。
+const ENERGY_BALANCE_BOUNDARY_UTC_FIELDS = Object.freeze([
+  Object.freeze({ fieldName: 'effectiveStartUtc', label: '边界有效期开始 UTC' }),
+  Object.freeze({ fieldName: 'effectiveEndUtc', label: '边界有效期结束 UTC' })
+]);
+
+/**
+ * 规范平衡边界有效期 UTC；合法零毫秒统一为秒精度，非法字段清空且仅在诊断中保留原文。
+ * @param {object} boundary 原始边界表单或接口记录。
+ * @returns {{valid:boolean,value:object,errors:string[],message:string}} 规范结果。
+ */
+export function normalizeEnergyBalanceBoundaryUtcFields(boundary = {}) {
+  const value = { ...(boundary || {}) };
+  const errors = [];
+  ENERGY_BALANCE_BOUNDARY_UTC_FIELDS.forEach(({ fieldName, label }) => {
+    const originalValue = value[fieldName];
+    const result = parseStrictUtcDateTime(originalValue);
+    if (result.valid) {
+      value[fieldName] = result.value;
+      return;
+    }
+    const originalDiagnostic = originalValue === '' || originalValue === null || originalValue === undefined
+      ? ''
+      : `（原值：${String(originalValue)}）`;
+    value[fieldName] = '';
+    errors.push(`${label}：${result.message}${originalDiagnostic}`);
+  });
+  return {
+    valid: errors.length === 0,
+    value,
+    errors: Object.freeze(errors),
+    message: errors.join('；')
+  };
+}
+
+/** 判断平衡双批次预演是否具备最小可执行上下文。 */
+export function canExecuteEnergyBalanceBundleImport(preview = null) {
+  if (!preview || typeof preview !== 'object') return false;
+  const boundaryBatchId = Number(preview.boundaryBatchId);
+  const itemBatchId = Number(preview.itemBatchId);
+  const expected = Number(preview.expectedWouldImport ?? preview.summary?.wouldImport ?? 0);
+  return Number.isSafeInteger(boundaryBatchId)
+    && boundaryBatchId > 0
+    && Number.isSafeInteger(itemBatchId)
+    && itemBatchId > 0
+    && boundaryBatchId !== itemBatchId
+    && String(preview.uploadGroupId || '').trim() !== ''
+    && String(preview.previewSignature || '').trim() !== ''
+    && String(preview.previewAuditDigest || '').trim() !== ''
+    && Number.isSafeInteger(expected)
+    && expected > 0
+    && Number(preview.summary?.blocked || 0) === 0
+    && Array.isArray(preview.candidateRows)
+    && Array.isArray(preview.candidateRowIds)
+    && preview.candidateRows.length === expected
+    && preview.candidateRowIds.length === expected;
+}
+
+/** 构造平衡双批次导入最小 execute 正文，不携带服务端见证。 */
+export function buildEnergyBalanceBundleExecutePayload(preview = null, confirmText = '') {
+  return {
+    boundaryBatchId: Number(preview?.boundaryBatchId),
+    itemBatchId: Number(preview?.itemBatchId),
+    confirmText: String(confirmText || ''),
+    requireBackup: true,
+    acknowledgeSkippedRisks: true
+  };
+}
 
 /** 从对象中删除空查询字段。 */
 export function compactEnergyBalanceQuery(source = {}) {

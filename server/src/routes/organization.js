@@ -5,6 +5,7 @@ const { requireAnyPermission, requirePermission } = require('../middleware/permi
 const { requireWritable } = require('../middleware/maintenance');
 const { assertWritableAllowed } = require('../services/maintenanceState');
 const { normalizeUploadError, uploadImportFile } = require('../middleware/upload');
+const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
 const {
   createOrganizationUnit,
   createOrganizationUnitImportBatchFromUpload,
@@ -37,7 +38,7 @@ router.get('/units/stats', authenticate, requireOrganizationView, asyncHandler(a
   sendSuccess(res, getOrganizationUnitStats());
 }));
 
-router.post('/units/import', authenticate, requirePermission('ledger:units:import'), requireWritable('organization:import-units'), (req, res, next) => {
+router.post('/units/import', authenticate, requirePermission('ledger:units:import'), requireWritable('organization:import-units'), rejectUnconnectedDemoContext, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {

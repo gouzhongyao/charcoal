@@ -15,7 +15,7 @@ process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
 process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
-const { getDatabaseInfo, initDatabase, openDatabase } = require('../db/database');
+const { IMPORT_BATCH_TYPES, getDatabaseInfo, initDatabase, openDatabase } = require('../db/database');
 const {
   AUDIT_IMPORT_TYPES,
   assertAuditBatchCanUseGenericDelete,
@@ -57,6 +57,9 @@ const ALL_IMPORT_TYPE_LABELS = Object.freeze({
   energy_timeseries: '能耗时序数据导入',
   shift_schedule: '排班计划导入',
   device_state: '设备状态导入',
+  shift_definition: '班次定义导入',
+  tou_scheme: 'TOU 方案与时段导入',
+  strategy_rule: '策略规则导入',
   energy_conversion_factor: '能源折标系数导入',
   energy_benchmark: '能效对标导入',
   energy_flow_node: '能流节点导入',
@@ -64,14 +67,19 @@ const ALL_IMPORT_TYPE_LABELS = Object.freeze({
   energy_flow_record: '显式边值导入'
 });
 
-// 统一审计服务正式支持的历史和新增类型。
+// 仅由历史通用导入链路维护、未接入统一审计服务的类型。
+const LEGACY_GENERIC_IMPORT_TYPES = Object.freeze([
+  'energy_record',
+  'meter_reading',
+  'organization_unit',
+  'meter_device'
+]);
+
+// 统一审计服务正式支持的类型由数据库完整白名单扣除历史通用类型得到，避免重复维护枚举。
 const AUDIT_IMPORT_TYPE_LABELS = Object.freeze(Object.fromEntries(
-  Object.entries(ALL_IMPORT_TYPE_LABELS).filter(([importType]) => ![
-    'energy_record',
-    'meter_reading',
-    'organization_unit',
-    'meter_device'
-  ].includes(importType))
+  IMPORT_BATCH_TYPES
+    .filter((importType) => !LEGACY_GENERIC_IMPORT_TYPES.includes(importType))
+    .map((importType) => [importType, ALL_IMPORT_TYPE_LABELS[importType]])
 ));
 
 /**
@@ -403,15 +411,24 @@ function assertFailedParserParity(buffer, filename, expectedCode) {
       maxExcelLogicalCells: EXPECTED_MAX_EXCEL_LOGICAL_CELLS
     }, '公共解析阈值必须保持固定安全口径。');
     assert.deepStrictEqual(
+      Object.keys(ALL_IMPORT_TYPE_LABELS).sort(),
+      IMPORT_BATCH_TYPES.filter((importType) => getImportTypeLabel(importType) !== importType).sort(),
+      '中央批次固定中文标签契约必须覆盖生产代码已声明的全部展示标签。'
+    );
+    assert(
+      Object.values(AUDIT_IMPORT_TYPE_LABELS).every((label) => label === undefined || (typeof label === 'string' && label.length > 0)),
+      '已提供中央批次中文标签的统一审计类型不得使用空标签。'
+    );
+    assert.deepStrictEqual(
       [...AUDIT_IMPORT_TYPES].sort(),
       Object.keys(AUDIT_IMPORT_TYPE_LABELS).sort(),
-      '统一审计类型必须完整覆盖固定的历史和新增正式类型。'
+      '统一审计类型必须覆盖数据库白名单中除历史通用类型外的全部正式类型。'
     );
 
     for (const [importType, expectedLabel] of Object.entries(AUDIT_IMPORT_TYPE_LABELS)) {
       const preview = createPreviewAuditBatch({
         importType,
-        originalFilename: `${expectedLabel}.csv`,
+        originalFilename: `${expectedLabel || importType}.csv`,
         storedFilename: `${importType}.csv`,
         fileType: 'csv',
         fileSizeBytes: 64,

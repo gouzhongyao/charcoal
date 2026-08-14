@@ -40,3 +40,8 @@ export function downloadImportTemplate(templateType = 'energy-records', extensio
   const safeExtension = extension === 'csv' ? 'csv' : 'xlsx';
   return download({ url: `/templates/${encodeURIComponent(templateType)}.${safeExtension}` }, `能耗数据导入模板.${safeExtension}`);
 }
+
+/** 下载月度能耗与预测历史青岚园区示例；预测历史复用同一已入库能耗文件。 */
+export function downloadMonthlyEnergyDemoParkExample() {
+  return download({ url: '/templates/demo-park/07-monthly-energy.xlsx' }, '青岚园区示例-月度能耗与预测历史.xlsx');
+}

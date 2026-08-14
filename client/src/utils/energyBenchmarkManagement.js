@@ -1,3 +1,6 @@
+import { parseStrictUtcDateTime } from './dateTimeFields.js';
+import { isIanaTimeZone } from './ianaTimeZones.js';
+
 // 能效对标页面使用的固定权限编码，前端只控制可见性，服务端仍是最终授权边界。
 export const ENERGY_BENCHMARK_PERMISSIONS = Object.freeze({
   view: 'energy:benchmarks:view',
@@ -11,6 +14,11 @@ export const ENERGY_BENCHMARK_PERMISSIONS = Object.freeze({
 export const ENERGY_BENCHMARK_ORGANIZATION_VIEW_PERMISSIONS = Object.freeze({
   units: 'ledger:units:view',
   organization: 'ledger:organization:view'
+});
+// 产品范围与内部历史计算范围复用现有产能单元台账读取权限。
+export const ENERGY_BENCHMARK_PRODUCTION_VIEW_PERMISSIONS = Object.freeze({
+  unit: 'ledger:production-unit:view',
+  legacy: 'ledger:production:view'
 });
 
 // 页面只允许三类真实服务端导入路径。
@@ -121,8 +129,49 @@ export function buildEnergyBenchmarkCapabilityMatrix(grants = {}) {
     importPreview,
     importExecutePermission,
     importExecuteWorkflow: importPreview && importExecutePermission,
-    organizationView: grants.organizationUnitsView === true || grants.organizationView === true
+    organizationView: grants.organizationUnitsView === true || grants.organizationView === true,
+    productionView: grants.productionUnitView === true || grants.productionView === true
   });
+}
+
+/** 返回范围主数据选择项的可读标签，值契约仍由选择器单独绑定。 */
+export function formatEnergyBenchmarkScopeOptionLabel(scopeType, item = {}) {
+  if (scopeType === 'organization') return `${item.unitPath || item.unitName || '未命名组织'}（${item.unitCode || '无编码'}）`;
+  if (scopeType === 'energy') return `${item.name || '未命名能源'}（${item.code || '无编码'}）`;
+  if (scopeType === 'product') {
+    const name = [item.productName, item.unitName].filter(Boolean).join(' / ') || '未命名产品';
+    return `${name}（${item.unitCode || '无编码'}）`;
+  }
+  return '';
+}
+
+/** 返回不同范围类型要求的权威选择值。 */
+export function resolveEnergyBenchmarkScopeOptionValue(scopeType, item = {}) {
+  if (scopeType === 'organization' || scopeType === 'product') return String(item.unitCode || '').trim();
+  if (scopeType === 'energy') return String(item.code || '').trim();
+  return '';
+}
+
+/** 切换范围类型时清空旧范围引用，禁止跨类型保留或自动选择首项。 */
+export function resetEnergyBenchmarkScopeSelection(form = {}, scopeType) {
+  return { ...form, scopeType, scopeReference: '' };
+}
+
+/** 校验范围引用必须来自当前可见的 active 主数据，不接受自由输入或历史别名回退。 */
+export function validateEnergyBenchmarkScopeSelection(scopeType, scopeReference, sources = {}) {
+  const reference = String(scopeReference || '').trim();
+  if (!reference) return { valid: false, message: '请选择 active 主数据范围。' };
+  const options = scopeType === 'organization'
+    ? sources.organizationUnits
+    : scopeType === 'energy'
+      ? sources.energyTypes
+      : scopeType === 'product'
+        ? sources.productionUnits
+        : [];
+  const matched = Array.isArray(options) && options.some((item) => resolveEnergyBenchmarkScopeOptionValue(scopeType, item) === reference);
+  return matched
+    ? { valid: true, message: '' }
+    : { valid: false, message: `当前${ENERGY_BENCHMARK_SCOPE_LABELS[scopeType] || '范围'}标识不是可见的 active 主数据，请重新选择。` };
 }
 
 /** 将 active 定义数据源不可用归一化为不可复用旧选择、目标、对象和结果的空状态。 */
@@ -218,9 +267,17 @@ export function resolveEnergyBenchmarkAnalysisInvalidation(source, changed = tru
 /** 将组织主数据权限缺失或 403 归一化为组织范围专属错误，不升级为全页错误。 */
 export function normalizeEnergyBenchmarkOrganizationAccessError(error, hasOrganizationPermission) {
   if (hasOrganizationPermission !== true || Number(error?.response?.status) === 403) {
-    return '组织范围分析需要组织台账查看权限（ledger:units:view 或 ledger:organization:view）。';
+    return '组织范围需要组织台账查看权限（ledger:units:view 或 ledger:organization:view）。';
   }
-  return projectEnergyBenchmarkRequestError(error, '读取组织实际对象').message;
+  return projectEnergyBenchmarkRequestError(error, '读取组织主数据').message;
+}
+
+/** 将产能主数据权限缺失或 403 归一化为产品范围专属错误。 */
+export function normalizeEnergyBenchmarkProductionAccessError(error, hasProductionPermission) {
+  if (hasProductionPermission !== true || Number(error?.response?.status) === 403) {
+    return '产品范围和内部历史计算范围需要产能单元查看权限（ledger:production-unit:view 或 ledger:production:view）。';
+  }
+  return projectEnergyBenchmarkRequestError(error, '读取产能单元主数据').message;
 }
 
 // 前端受控 CSV 中文列定义，与服务端结构化 export-rows 字段解耦。
@@ -264,8 +321,12 @@ export function buildEnergyBenchmarkTargetFilters(filters = {}, pagination = {})
   });
 }
 
-/** 构造定义写入白名单载荷。 */
+/** 构造定义写入白名单载荷，并在 API 前拒绝空值或当前运行时未知的来源时区。 */
 export function buildEnergyBenchmarkDefinitionPayload(form = {}) {
+  // 来源时区：不能只依赖静态候选，统一执行字符串形态与 Intl 运行时识别校验。
+  const sourceTimeZone = String(form.sourceTimeZone || '').trim();
+  if (!sourceTimeZone) throw new Error('请选择来源时区。');
+  if (!isIanaTimeZone(sourceTimeZone)) throw new Error('请选择当前运行时可识别的 IANA 来源时区。');
   return {
     benchmarkCode: String(form.benchmarkCode || '').trim(),
     benchmarkName: String(form.benchmarkName || '').trim(),
@@ -281,7 +342,7 @@ export function buildEnergyBenchmarkDefinitionPayload(form = {}) {
     version: String(form.version || '').trim(),
     effectiveStartUtc: String(form.effectiveStartUtc || '').trim(),
     effectiveEndUtc: String(form.effectiveEndUtc || '').trim(),
-    sourceTimeZone: String(form.sourceTimeZone || '').trim(),
+    sourceTimeZone,
     status: form.status || 'active'
   };
 }
@@ -391,7 +452,7 @@ export function validateEnergyBenchmarkAnalysisContext({ definition = null, targ
     if (!hasFiniteInput(row?.actualValue)) errors.push(`第 ${rowNumber} 个对象实际值必须是有限数字。`);
     if (row?.metricCode !== definition?.metricCode || row?.unit !== definition?.unit || row?.periodType !== definition?.periodType) errors.push(`第 ${rowNumber} 个对象的指标、单位或周期与定义不一致。`);
     if (row?.scopeType !== definition?.scopeType || row?.benchmarkScopeReference !== definition?.scopeReference) errors.push(`第 ${rowNumber} 个对象的对标范围与定义不一致。`);
-    if (!isStrictUtcRange(row?.periodStartUtc, row?.periodEndUtc)) errors.push(`第 ${rowNumber} 个对象必须填写合法 UTC Z 左闭右开周期。`);
+    if (!isEnergyBenchmarkStrictUtcRange(row?.periodStartUtc, row?.periodEndUtc)) errors.push(`第 ${rowNumber} 个对象必须填写合法 UTC Z 左闭右开周期。`);
     if (definition?.scopeType === 'organization') {
       const organization = organizationUnits.find((item) => item.status === 'active' && item.unitCode === objectId);
       if (!organization || organization.unitType !== expectedObjectLevel || row?.scopeReference !== objectId) errors.push(`第 ${rowNumber} 个组织对象必须从同层级 active 组织主数据中选择。`);
@@ -671,10 +732,11 @@ function hasFiniteInput(value) {
   return value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
 }
 
-/** 判断开始结束时间是否为严格 UTC Z 左闭右开区间。 */
-function isStrictUtcRange(startUtc, endUtc) {
-  const pattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
-  return pattern.test(String(startUtc || '')) && pattern.test(String(endUtc || '')) && Date.parse(startUtc) < Date.parse(endUtc);
+/** 判断开始结束时间是否为共享规则支持的严格 UTC Z 左闭右开区间。 */
+export function isEnergyBenchmarkStrictUtcRange(startUtc, endUtc) {
+  const startResult = parseStrictUtcDateTime(startUtc);
+  const endResult = parseStrictUtcDateTime(endUtc);
+  return startResult.valid && endResult.valid && startResult.value < endResult.value;
 }
 
 /** 移除对象中的空字符串、null 和 undefined。 */

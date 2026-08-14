@@ -17,6 +17,7 @@ import {
   groupSnapshotsByCalculationRun,
   isFullNaturalMonthWindow,
   loadAllEnergyBalanceItems,
+  normalizeEnergyBalanceBoundaryUtcFields,
   suggestionReviewTargets,
   validateSuggestionReview
 } from '../utils/energyBalanceManagement.js';
@@ -96,6 +97,28 @@ function testFullNaturalMonthWindow() {
   assert.equal(daylightSavingWindow.endUtc, '2026-04-01T04:00:00.000Z');
   assert.equal(isFullNaturalMonthWindow(daylightSavingWindow.startUtc, daylightSavingWindow.endUtc, 'America/New_York'), true);
   assert.equal(isFullNaturalMonthWindow('2026-03-02T05:00:00.000Z', daylightSavingWindow.endUtc, 'America/New_York'), false);
+}
+
+/** 验证边界回显与保存兜底规范零毫秒，并拒绝隐藏提交非零毫秒。 */
+function testBoundaryStrictUtcNormalization() {
+  const normalized = normalizeEnergyBalanceBoundaryUtcFields({
+    effectiveStartUtc: '2026-01-01T00:00:00.000Z',
+    effectiveEndUtc: '2027-01-01T00:00:00.000Z',
+    sourceTimeZone: 'Asia/Shanghai'
+  });
+  assert.equal(normalized.valid, true);
+  assert.equal(normalized.value.effectiveStartUtc, '2026-01-01T00:00:00Z');
+  assert.equal(normalized.value.effectiveEndUtc, '2027-01-01T00:00:00Z');
+  assert.equal(normalized.value.sourceTimeZone, 'Asia/Shanghai');
+
+  const rejected = normalizeEnergyBalanceBoundaryUtcFields({
+    effectiveStartUtc: '2026-01-01T00:00:00.001Z',
+    effectiveEndUtc: '2027-01-01T00:00:00Z'
+  });
+  assert.equal(rejected.valid, false);
+  assert.equal(rejected.value.effectiveStartUtc, '');
+  assert.equal(rejected.value.effectiveEndUtc, '2027-01-01T00:00:00Z');
+  assert.match(rejected.message, /边界有效期开始 UTC.*非零毫秒不能被截断.*原值：2026-01-01T00:00:00\.001Z/);
 }
 
 /** 验证非完整自然月错误给出可执行修正建议。 */
@@ -244,7 +267,9 @@ function testPermissionContracts() {
     view: 'energy:balance:view',
     manage: 'energy:balance:manage',
     calculate: 'energy:balance:calculate',
-    suggestionReview: 'energy:balance:suggestion:review'
+    suggestionReview: 'energy:balance:suggestion:review',
+    importPreview: 'energy:balance:import:preview',
+    importExecute: 'energy:balance:import:execute'
   });
   Object.values(ENERGY_BALANCE_PERMISSIONS).forEach((permission) => assert.match(utilitySource, new RegExp(permission.replaceAll(':', '\\:'))));
 }
@@ -284,6 +309,28 @@ function testPageAndChartStaticContract() {
   assert.match(pageSource, /effectiveStartUtc: '', effectiveEndUtc: '', sourceTimeZone: ''/);
   assert.doesNotMatch(pageSource, /effectiveStartUtc: '2026-01-01T00:00:00Z'/);
   assert.doesNotMatch(pageSource, /effectiveEndUtc: '2027-01-01T00:00:00Z'/);
+  assert.match(pageSource, /import StrictUtcDateTimeInput from '@\/components\/StrictUtcDateTimeInput\.vue';/);
+  assert.equal((pageSource.match(/<StrictUtcDateTimeInput\b/g) || []).length, 2, '边界有效期起止必须共使用两个共享严格 UTC 组件。');
+  assert.match(pageSource, /<StrictUtcDateTimeInput v-model="boundaryForm\.effectiveStartUtc"/);
+  assert.match(pageSource, /<StrictUtcDateTimeInput v-model="boundaryForm\.effectiveEndUtc"/);
+  assert.doesNotMatch(pageSource, /<el-input v-model\.trim="boundaryForm\.(?:effectiveStartUtc|effectiveEndUtc)"/);
+  assert.match(pageSource, /effectiveStartUtc: \[\{ required: true,[^\n]+trigger: \['change', 'blur'\] \}, strictBoundaryUtcRule\('边界有效期开始 UTC'\)\]/);
+  assert.match(pageSource, /effectiveEndUtc: \[\{ required: true,[^\n]+trigger: \['change', 'blur'\] \}, strictBoundaryUtcRule\('边界有效期结束 UTC'\)\]/);
+  assert.match(pageSource, /import \{ parseStrictUtcDateTime \} from '@\/utils\/dateTimeFields';/);
+  assert.match(pageSource, /import \{ isIanaTimeZone \} from '@\/utils\/ianaTimeZones';/);
+  assert.match(pageSource, /const boundaryIanaTimeZoneRule = \{[\s\S]*?isIanaTimeZone\(String\(value \|\| ''\)\.trim\(\)\)[\s\S]*?trigger: \['change', 'blur'\]/);
+  assert.doesNotMatch(pageSource, /sourceTimeZone: \[\{ required: true, pattern:/, '边界时区不得只用正则形态校验。');
+  assert.match(pageSource, /if \(!isIanaTimeZone\(utcNormalization\.value\.sourceTimeZone\)\) \{ boundaryFormError\.value = '请选择当前运行时可识别的 IANA 来源时区。'; return; \}[\s\S]*?createEnergyBalanceBoundary\(payload\)/, '边界保存必须在创建 API 前执行运行时 IANA 校验。');
+  assert.match(pageSource, /const normalization = normalizeEnergyBalanceBoundaryUtcFields\(\{/);
+  assert.match(pageSource, /const utcNormalization = normalizeEnergyBalanceBoundaryUtcFields\(boundaryForm\.value\);[\s\S]*?if \(!utcNormalization\.valid\) \{ boundaryFormError\.value = boundaryUtcDiagnostic\.value \|\| utcNormalization\.message; return; \}/);
+  assert(pageSource.includes("const boundaryUtcDiagnostic = ref('')") && pageSource.includes('boundaryUtcDiagnostic.value = normalization.message'), '边界非法原值只能保留在诊断状态。');
+  assert(pageSource.includes('boundaryForm.value = normalization.value') && pageSource.includes('boundaryFormError.value = boundaryUtcDiagnostic.value'), '边界编辑必须清空不可见非法字段，同时明确展示原始诊断。');
+  assert.match(pageSource, /<el-date-picker(?=[^>]*v-model="calculationForm\.monthRange")(?=[^>]*type="monthrange")(?=[^>]*value-format="YYYY-MM")(?=[^>]*format="YYYY-MM")(?=[^>]*:editable="true")[^>]*>/);
+  assert.match(pageSource, /import IanaTimeZoneSelect from '@\/components\/IanaTimeZoneSelect\.vue';/);
+  assert.equal((pageSource.match(/<IanaTimeZoneSelect\b/g) || []).length, 1, '边界可编辑来源时区必须使用共享选择组件。');
+  assert.match(pageSource, /<IanaTimeZoneSelect v-model="boundaryForm\.sourceTimeZone" placeholder="请选择或搜索来源时区"/);
+  assert.doesNotMatch(pageSource, /<el-input[^>]+v-model(?:\.trim)?="boundaryForm\.sourceTimeZone"/);
+  assert.match(pageSource, /Date\.parse\(boundaryForm\.value\.effectiveStartUtc\) >= Date\.parse\(boundaryForm\.value\.effectiveEndUtc\)/);
   assert.match(pageSource, /buildFullMonthCalculationWindow/);
   assert.match(pageSource, /BALANCE_MONTHLY_SOURCE_WINDOW_NOT_FULL_MONTH|formatEnergyBalanceRequestError/);
   assert.match(pageSource, /self_use_value_kwh/);
@@ -305,6 +352,7 @@ const tests = [
   testCalculationRunGroupingPreventsDigestMerge,
   testDigestIntegrityWarning,
   testFullNaturalMonthWindow,
+  testBoundaryStrictUtcNormalization,
   testFullMonthCorrectionMessage,
   testWriteFailureMessages,
   testLoadAllActiveItemsBeyondTwoHundred,

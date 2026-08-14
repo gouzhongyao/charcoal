@@ -105,14 +105,17 @@ function updateBalanceSuggestionStatus(suggestionId, input, options) {
  * 向隔离数据库插入组织单元并返回 ID。
  * @param {object} db SQLite 连接。
  * @param {string} code 组织编码。
+ * @param {object} options 层级和路径选项。
  * @returns {number} 组织 ID。
  */
-function insertOrganization(db, code) {
+function insertOrganization(db, code, options = {}) {
+  const parentId = options.parentId || null;
+  const unitPath = options.unitPath || `/${code}`;
   const result = db.prepare(
     `INSERT INTO organization_units (
-       unit_code, unit_name, unit_path, unit_type, status
-     ) VALUES (?, ?, ?, 'enterprise', 'active')`
-  ).run(code, `${code}组织`, `/${code}`);
+       parent_id, unit_code, unit_name, unit_path, unit_type, status
+     ) VALUES (?, ?, ?, ?, 'enterprise', 'active')`
+  ).run(parentId, code, `${code}组织`, unitPath);
   return Number(result.lastInsertRowid);
 }
 
@@ -159,6 +162,33 @@ function insertFactor(db, energyType, unit, factorCode, version, factorValue) {
     SOURCE_TIME_ZONE
   );
   return Number(result.lastInsertRowid);
+}
+
+/** 插入带组织端点的显式能流边和值记录。 */
+function insertExplicitEdgeFixture(db, input) {
+  const modelId = Number(db.prepare(`INSERT INTO energy_flow_models (
+    model_code, model_name, source, document_no, version,
+    effective_start_utc, effective_end_utc, source_timezone, status
+  ) VALUES (?, ?, 'test', ?, 'v1', ?, ?, ?, 'active')`)
+    .run(input.modelCode, input.modelCode, `DOC-${input.modelCode}`, EFFECTIVE_START_UTC, EFFECTIVE_END_UTC, SOURCE_TIME_ZONE)
+    .lastInsertRowid);
+  const insertNode = db.prepare(`INSERT INTO energy_flow_nodes (
+    energy_flow_model_id, node_code, node_name, node_type, organization_unit_id, x, y, status
+  ) VALUES (?, ?, ?, ?, ?, ?, 0, 'active')`);
+  const fromNodeId = Number(insertNode.run(modelId, `${input.modelCode}-FROM`, '起点', 'source', input.fromOrganizationId, 0).lastInsertRowid);
+  const toNodeId = Number(insertNode.run(modelId, `${input.modelCode}-TO`, '终点', 'sink', input.toOrganizationId, 100).lastInsertRowid);
+  const edgeId = Number(db.prepare(`INSERT INTO energy_flow_edges (
+    energy_flow_model_id, edge_code, from_node_id, to_node_id, energy_type_id,
+    unit, source_type, source_mapping_json, status
+  ) VALUES (?, ?, ?, ?, ?, ?, 'explicit_edge_value', ?, 'active')`)
+    .run(modelId, `${input.modelCode}-EDGE`, fromNodeId, toNodeId, input.energyType.id, input.energyType.standardUnit, JSON.stringify({ reference: input.modelCode }))
+    .lastInsertRowid);
+  return Number(db.prepare(`INSERT INTO energy_flow_records (
+    energy_flow_model_id, energy_flow_edge_id, start_utc, end_utc, source_timezone,
+    original_unit, original_value, source_type, source_mapping_json, formula_version, record_status
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, 'explicit_edge_value', ?, 'energy-flow:v1', 'active')`)
+    .run(modelId, edgeId, START_UTC, END_UTC, SOURCE_TIME_ZONE, input.energyType.standardUnit, input.value, JSON.stringify({ reference: input.modelCode }))
+    .lastInsertRowid);
 }
 
 /**
@@ -297,8 +327,15 @@ function run() {
   let electricity;
   let naturalGas;
   let heat;
+  let childOrganizationId;
+  let outsideOrganizationId;
   try {
     organizationId = insertOrganization(db, 'BALANCE-ORG');
+    childOrganizationId = insertOrganization(db, 'BALANCE-CHILD', {
+      parentId: organizationId,
+      unitPath: '/BALANCE-ORG/BALANCE-CHILD'
+    });
+    outsideOrganizationId = insertOrganization(db, 'BALANCE-OUTSIDE');
     electricity = getEnergyType(db, 'electricity');
     naturalGas = getEnergyType(db, 'natural_gas');
     heat = getEnergyType(db, 'heat');
@@ -857,6 +894,80 @@ function run() {
   );
   assert(unconfirmedGenerationCalculation.comprehensive.reasonCodes
     .includes('GENERATION_BOUNDARY_UNCONFIRMED'));
+
+  // 显式能流边起止节点组织均须位于边界组织自身或其后代，计算阶段再次防御已有脏配置。
+  const explicitEdgeDb = openDatabase();
+  let sameOrganizationEdgeRecordId;
+  let descendantEdgeRecordId;
+  let outsideEdgeRecordId;
+  try {
+    sameOrganizationEdgeRecordId = insertExplicitEdgeFixture(explicitEdgeDb, {
+      modelCode: 'BAL-EDGE-SAME',
+      fromOrganizationId: organizationId,
+      toOrganizationId: organizationId,
+      energyType: electricity,
+      value: 10
+    });
+    descendantEdgeRecordId = insertExplicitEdgeFixture(explicitEdgeDb, {
+      modelCode: 'BAL-EDGE-CHILD',
+      fromOrganizationId: organizationId,
+      toOrganizationId: childOrganizationId,
+      energyType: electricity,
+      value: 20
+    });
+    outsideEdgeRecordId = insertExplicitEdgeFixture(explicitEdgeDb, {
+      modelCode: 'BAL-EDGE-OUTSIDE',
+      fromOrganizationId: organizationId,
+      toOrganizationId: outsideOrganizationId,
+      energyType: electricity,
+      value: 30
+    });
+  } finally {
+    explicitEdgeDb.close();
+  }
+  const createExplicitEdgeBalanceItem = (boundaryId, recordId, suffix) => createBalanceItem(boundaryId, {
+    itemCode: `EXPLICIT-EDGE-${suffix}`,
+    itemName: `显式边项目-${suffix}`,
+    role: 'input',
+    energyTypeId: electricity.id,
+    originalUnit: electricity.standardUnit,
+    sourceType: 'explicit_edge_value',
+    sourceMapping: { reference: `explicit-edge:${suffix}`, recordIds: [recordId] }
+  });
+  const sameOrganizationEdgeBoundary = createTestBoundary(organizationId, 'EDGE-SAME', false);
+  createExplicitEdgeBalanceItem(sameOrganizationEdgeBoundary.id, sameOrganizationEdgeRecordId, 'SAME');
+  const sameOrganizationEdgeCalculation = calculateAndSaveBalanceSnapshots(sameOrganizationEdgeBoundary.id, {
+    startUtc: START_UTC,
+    endUtc: END_UTC
+  });
+  assert.strictEqual(sameOrganizationEdgeCalculation.originalFacets[0].inputTotalOriginal, 10);
+  assert.strictEqual(sameOrganizationEdgeCalculation.originalFacets[0].calculationStatus, 'available');
+  const descendantEdgeBoundary = createTestBoundary(organizationId, 'EDGE-CHILD', false);
+  createExplicitEdgeBalanceItem(descendantEdgeBoundary.id, descendantEdgeRecordId, 'CHILD');
+  const descendantEdgeCalculation = calculateAndSaveBalanceSnapshots(descendantEdgeBoundary.id, {
+    startUtc: START_UTC,
+    endUtc: END_UTC
+  });
+  assert.strictEqual(descendantEdgeCalculation.originalFacets[0].inputTotalOriginal, 20);
+  assert.strictEqual(descendantEdgeCalculation.originalFacets[0].calculationStatus, 'available');
+  const outsideEdgeBoundary = createTestBoundary(organizationId, 'EDGE-OUTSIDE', false);
+  createExplicitEdgeBalanceItem(outsideEdgeBoundary.id, outsideEdgeRecordId, 'OUTSIDE');
+  const outsideEdgeCalculation = calculateAndSaveBalanceSnapshots(outsideEdgeBoundary.id, {
+    startUtc: START_UTC,
+    endUtc: END_UTC
+  });
+  assert.strictEqual(outsideEdgeCalculation.originalFacets[0].inputTotalOriginal, 0);
+  assert.strictEqual(outsideEdgeCalculation.originalFacets[0].calculationStatus, 'frozen');
+  assert(outsideEdgeCalculation.originalFacets[0].reasonCodes.includes('BALANCE_ITEM_UNMAPPED'));
+  const unscopedEdgeBoundary = createTestBoundary(null, 'EDGE-UNSCOPED', false);
+  createExplicitEdgeBalanceItem(unscopedEdgeBoundary.id, sameOrganizationEdgeRecordId, 'UNSCOPED');
+  const unscopedEdgeCalculation = calculateAndSaveBalanceSnapshots(unscopedEdgeBoundary.id, {
+    startUtc: START_UTC,
+    endUtc: END_UTC
+  });
+  assert.strictEqual(unscopedEdgeCalculation.originalFacets[0].inputTotalOriginal, 0);
+  assert.strictEqual(unscopedEdgeCalculation.originalFacets[0].calculationStatus, 'frozen');
+  assert(unscopedEdgeCalculation.originalFacets[0].reasonCodes.includes('BALANCE_ITEM_UNMAPPED'));
 
   // 任一建议写入失败时，快照、快照项目和建议必须整体回滚。
   const rollbackBoundary = createTestBoundary(organizationId, 'ROLLBACK', false);

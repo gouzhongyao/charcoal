@@ -6,7 +6,7 @@
       <el-alert v-if="pageError" type="error" :closable="false" show-icon :title="pageError" class="panel-alert" />
       <section class="page-card import-actions">
         <div><h2>能耗数据导入</h2><p>支持 .xlsx、.xls、.csv；上传后立即由服务端校验、标准化并记录批次审计。</p></div>
-        <div class="action-row"><el-button v-if="canTemplate" :loading="templateLoading" @click="downloadTemplate">下载模板</el-button><el-button v-if="canCreate" type="primary" @click="openUpload">上传能耗表格</el-button><el-alert v-if="!canCreate" type="info" :closable="false" show-icon title="当前账号没有创建导入批次的权限；仍可在获得查看权限时核对既有批次。" /></div>
+        <div class="action-row"><el-button v-if="canTemplate" :loading="templateLoading" @click="downloadTemplate">下载模板</el-button><el-button v-if="canDemoExample" :loading="demoExampleLoading" @click="downloadDemoExample">下载青岚园区示例</el-button><el-button v-if="canCreate" type="primary" @click="openUpload">上传能耗表格</el-button><el-alert v-if="!canCreate" type="info" :closable="false" show-icon title="当前账号没有创建导入批次的权限；仍可在获得查看权限时核对既有批次。" /></div>
       </section>
 
       <article class="page-card">
@@ -37,18 +37,18 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 import ManagementPage from '@/components/ManagementPage.vue';
 import HelpIcon from '@/components/HelpIcon.vue';
 import PageState from '@/components/PageState.vue';
-import { createImportBatch, deleteImportBatch, downloadImportBatchFile, downloadImportTemplate, getImportBatchDetail, getImportBatchErrors, getImportBatches, getImportContract } from '@/api/imports';
+import { createImportBatch, deleteImportBatch, downloadImportBatchFile, downloadImportTemplate, downloadMonthlyEnergyDemoParkExample, getImportBatchDetail, getImportBatchErrors, getImportBatches, getImportContract } from '@/api/imports';
 import { buildImportBatchFilters, canUseGenericImportBatchDelete, compactFieldMapping, IMPORT_BATCH_TYPE_OPTIONS } from '@/utils/specialModules';
 import { hasPermi } from '@/utils/permission';
 
 // 导入契约、批次和详情状态。
 const emptyFilters = () => ({ importType: '', status: '', fileType: '', createdAtStart: '', createdAtEnd: '' });
-const contract = ref({}); const draftFilters = ref(emptyFilters()); const appliedFilters = ref(emptyFilters()); const batches = ref([]); const pagination = ref({ total: 0 }); const page = ref(1); const pageSize = ref(20); const loading = ref(false); const listError = ref(''); const pageError = ref(''); const templateLoading = ref(false);
+const contract = ref({}); const draftFilters = ref(emptyFilters()); const appliedFilters = ref(emptyFilters()); const batches = ref([]); const pagination = ref({ total: 0 }); const page = ref(1); const pageSize = ref(20); const loading = ref(false); const listError = ref(''); const pageError = ref(''); const templateLoading = ref(false); const demoExampleLoading = ref(false);
 const uploadOpen = ref(false); const uploadFile = ref(null); const fieldMapping = ref({}); const uploading = ref(false); const uploadError = ref('');
 const detailOpen = ref(false); const detail = ref(null); const detailLoading = ref(false); const detailError = ref(''); const errors = ref([]); const errorsLoading = ref(false); const errorPage = ref(1); const errorPagination = ref({ total: 0 });
 const safe = async (task) => { try { return { ok: true, value: await task() }; } catch (error) { return { ok: false, error }; } };
 const errorText = (result) => result?.error?.message || '接口请求失败。';
-const canView = computed(() => hasPermi('imports:view')); const canCreate = computed(() => hasPermi('imports:create')); const canDelete = computed(() => hasPermi('imports:delete')); const canDownload = computed(() => hasPermi('imports:download')); const canTemplate = computed(() => hasPermi('imports:view'));
+const canView = computed(() => hasPermi('imports:view')); const canCreate = computed(() => hasPermi('imports:create')); const canDelete = computed(() => hasPermi('imports:delete')); const canDownload = computed(() => hasPermi('imports:download')); const canTemplate = computed(() => hasPermi('imports:view')); const canDemoExample = computed(() => hasPermi('imports:view'));
 const supportedFileTypes = computed(() => contract.value.supportedFileTypes || []); const maxUploadFileSize = computed(() => contract.value.maxUploadFileSize || ''); const batchStatuses = computed(() => contract.value.batchStatuses || []); const importTypes = IMPORT_BATCH_TYPE_OPTIONS; const mappingFields = computed(() => [...(contract.value.requiredFields || []), ...(contract.value.optionalFields || [])]);
 
 /** 格式化导入计数。 */
@@ -67,6 +67,8 @@ function resetFilters() { draftFilters.value = emptyFilters(); appliedFilters.va
 function changePageSize() { page.value = 1; loadBatches(); }
 /** 下载服务端模板。 */
 async function downloadTemplate() { templateLoading.value = true; const result = await safe(() => downloadImportTemplate()); templateLoading.value = false; if (!result.ok) ElMessage.error(`模板下载失败：${errorText(result)}`); }
+/** 下载月度能耗与预测历史青岚园区示例，不自动创建导入批次。 */
+async function downloadDemoExample() { demoExampleLoading.value = true; const result = await safe(downloadMonthlyEnergyDemoParkExample); demoExampleLoading.value = false; if (!result.ok) ElMessage.error(`青岚园区示例下载失败：${errorText(result)}`); }
 /** 打开受控上传对话框。 */
 function openUpload() { uploadFile.value = null; fieldMapping.value = {}; uploadError.value = ''; uploadOpen.value = true; }
 /** 保存用户选择的上传文件。 */

@@ -212,6 +212,17 @@ function listUploadFiles(currentDir = process.env.UPLOADS_DIR, rootDir = process
   }).sort();
 }
 
+/** 递归列出备份目录中的文件相对路径。 */
+function listBackupFiles(currentDir = process.env.BACKUPS_DIR, rootDir = process.env.BACKUPS_DIR) {
+  if (!fs.existsSync(currentDir)) return [];
+  return fs.readdirSync(currentDir, { withFileTypes: true }).flatMap((entry) => {
+    const absolutePath = path.join(currentDir, entry.name);
+    return entry.isDirectory()
+      ? listBackupFiles(absolutePath, rootDir)
+      : [path.relative(rootDir, absolutePath).replace(/\\/g, '/')];
+  }).sort();
+}
+
 /** 断言响应或审计不含路径、密钥和原始内部异常。 */
 function assertNoSensitiveData(value, label) {
   const serialized = JSON.stringify(value).replace(/\\\\/g, '\\').replace(/\\/g, '/');
@@ -574,26 +585,40 @@ async function testExecuteSafetyAndFailureAudit(server, adminToken) {
   try {
     const tamperedBatch = getImportAuditBatchDetail(tamperedPreview.batchId, { db });
     const tamperedPath = path.join(process.env.UPLOADS_DIR, tamperedBatch.storedFilename);
-    const content = fs.readFileSync(tamperedPath);
-    const marker = content.indexOf(Buffer.from('FACTOR-tampered'));
+    const originalContent = fs.readFileSync(tamperedPath);
+    const tamperedContent = Buffer.from(originalContent);
+    const marker = tamperedContent.indexOf(Buffer.from('FACTOR-tampered'));
     assert(marker >= 0, '篡改测试必须定位系数编码。');
-    content[marker] = content[marker] === 0x46 ? 0x66 : 0x46;
-    fs.writeFileSync(tamperedPath, content);
+    tamperedContent[marker] = tamperedContent[marker] === 0x46 ? 0x66 : 0x46;
+    fs.writeFileSync(tamperedPath, tamperedContent);
     const beforeCount = db.prepare('SELECT COUNT(*) AS total FROM energy_conversion_factors').get().total;
+    const beforeBackups = listBackupFiles();
     const response = await requestJson(
       server, 'POST', `${ROUTE_BASE}/conversion-factors/execute`, createMinimalExecuteBody(tamperedPreview), adminToken
     );
     assert.strictEqual(response.status, 400);
     assert.strictEqual(response.body.error.details.code, 'ENERGY_ANALYSIS_IMPORT_CURRENT_FILE_SHA256_MISMATCH');
     assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM energy_conversion_factors').get().total, beforeCount);
-    const failedAudit = getImportAuditBatchDetail(tamperedPreview.batchId, { db });
-    assert.strictEqual(failedAudit.status, 'failed');
-    assert.strictEqual(failedAudit.auditPhase, 'execute');
-    assert.strictEqual(failedAudit.executeResult.executed, false);
-    assert.strictEqual(failedAudit.executeResult.errorCode, 'ENERGY_ANALYSIS_IMPORT_CURRENT_FILE_SHA256_MISMATCH');
-    assert.strictEqual(failedAudit.executeResult.writesBusinessRecords, false);
+    assert.deepStrictEqual(listBackupFiles(), beforeBackups, '备份前原文件预检失败不得创建备份。');
+    const retryableAudit = getImportAuditBatchDetail(tamperedPreview.batchId, { db });
+    assert.strictEqual(retryableAudit.status, tamperedPreview.auditBatch.status);
+    assert(['completed', 'completed_with_errors'].includes(retryableAudit.status), '原文件预检失败后批次仍必须可执行。');
+    assert.strictEqual(retryableAudit.auditPhase, 'preview');
+    assert.strictEqual(retryableAudit.executeResult, null, '备份前的原文件篡改拒绝不得写入 execute failure audit。');
+    assert.strictEqual(retryableAudit.backup, null, '备份前的原文件篡改拒绝不得写入备份摘要。');
     assertNoSensitiveData(response.body, '文件篡改响应');
-    assertNoSensitiveData(failedAudit, '文件篡改失败审计');
+    assertNoSensitiveData(retryableAudit, '文件篡改预演审计');
+
+    fs.writeFileSync(tamperedPath, originalContent);
+    const retryResponse = await requestJson(
+      server, 'POST', `${ROUTE_BASE}/conversion-factors/execute`, createMinimalExecuteBody(tamperedPreview), adminToken
+    );
+    assert.strictEqual(retryResponse.status, 200, '恢复原文件后必须允许同一 preview 批次重试。');
+    assert.strictEqual(retryResponse.body.data.imported, 1);
+    const completedAudit = getImportAuditBatchDetail(tamperedPreview.batchId, { db });
+    assert.strictEqual(completedAudit.status, 'completed');
+    assert.strictEqual(completedAudit.auditPhase, 'execute');
+    assert.strictEqual(completedAudit.executeResult.executed, true);
   } finally {
     db.close();
   }

@@ -321,6 +321,11 @@ function testConfigurationCrudAndTopology() {
   assert.strictEqual(setEnergyFlowEdgeStatus(model.id, incoming.id, 'active').status, 'active');
   assert.strictEqual(setEnergyFlowModelStatus(model.id, 'inactive').status, 'inactive');
   assert.strictEqual(setEnergyFlowModelStatus(model.id, 'active').status, 'active');
+  const nextVersion = createModel(model.modelCode, 'v2');
+  assert.strictEqual(nextVersion.status, 'active');
+  assert.strictEqual(listEnergyFlowModels({ modelCode: model.modelCode, pageSize: 20 }).rows.find((item) => item.id === model.id).status, 'inactive');
+  assert.strictEqual(setEnergyFlowModelStatus(model.id, 'active').status, 'active');
+  assert.strictEqual(listEnergyFlowModels({ modelCode: model.modelCode, pageSize: 20 }).rows.find((item) => item.id === nextVersion.id).status, 'inactive');
 
   const renamedIncoming = updateEnergyFlowEdge(model.id, incoming.id, { edgeCode: 'EDGE-IN-RENAMED' });
   assert.strictEqual(renamedIncoming.edgeCode, 'EDGE-IN-RENAMED');

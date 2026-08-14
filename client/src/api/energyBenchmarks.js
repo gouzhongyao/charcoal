@@ -1,4 +1,4 @@
-import { query, request } from '@/api/http';
+import { download, query, request } from '@/api/http';
 
 // 能效对标业务接口根路径。
 const ENERGY_BENCHMARK_BASE_URL = '/energy-benchmarks';
@@ -76,6 +76,32 @@ export const getEnergyBenchmarkQualificationRate = (payload) => request({ method
 /** 获取结构化导出行；该接口返回 JSON，禁止作为 Blob 下载。 */
 export const getEnergyBenchmarkExportRows = (payload) => request({ method: 'post', url: `${ENERGY_BENCHMARK_BASE_URL}/export-rows`, data: payload });
 
+/** 三类能效对标导入的空白模板与青岚园区示例映射。 */
+const ENERGY_BENCHMARK_IMPORT_DOWNLOADS = Object.freeze({
+  'conversion-factors': Object.freeze({ templateType: 'energy-conversion-factors', artifactKey: '19-conversion-factors', label: '能源折标系数' }),
+  definitions: Object.freeze({ templateType: 'energy-benchmark-definitions', artifactKey: '20-benchmark-definitions', label: '对标定义' }),
+  targets: Object.freeze({ templateType: 'energy-benchmark-targets', artifactKey: '21-benchmark-targets', label: '对标目标' })
+});
+
+/** 读取当前导入类型的下载配置，拒绝浏览器端猜测其他类型。 */
+function energyBenchmarkImportDownload(importType) {
+  const config = ENERGY_BENCHMARK_IMPORT_DOWNLOADS[importType];
+  if (!config) throw new Error('不支持的能效对标导入类型。');
+  return config;
+}
+
+/** 下载当前能效对标导入类型的空白 XLSX 模板。 */
+export function downloadEnergyBenchmarkImportTemplate(importType) {
+  const config = energyBenchmarkImportDownload(importType);
+  return download({ url: `/templates/${config.templateType}.xlsx` }, `${config.label}导入模板.xlsx`);
+}
+
+/** 下载当前能效对标导入类型的青岚园区 XLSX 示例。 */
+export function downloadEnergyBenchmarkDemoParkExample(importType) {
+  const config = energyBenchmarkImportDownload(importType);
+  return download({ url: `/templates/demo-park/${config.artifactKey}.xlsx` }, `青岚园区示例-${config.label}.xlsx`);
+}
+
 /** 上传文件并创建指定类型的受控导入预演。 */
 export function previewEnergyBenchmarkImport(importType, file) {
   const data = new FormData();
@@ -86,9 +112,16 @@ export function previewEnergyBenchmarkImport(importType, file) {
 /** 使用服务端持久化预演批次执行指定类型导入。 */
 export const executeEnergyBenchmarkImport = (importType, payload) => request({ method: 'post', url: `${ENERGY_BENCHMARK_IMPORT_BASE_URL}/${importType}/execute`, data: payload });
 
-/** 读取全部 active 组织对象，供 organization 实际对象按真实 unitType 选择。 */
+/** 读取全部 active 组织对象，供 organization 范围和实际对象按真实主数据选择。 */
 export const getAllActiveEnergyBenchmarkOrganizationUnits = () => getAllPages(
   (pageParams) => get('/organization/units', pageParams),
+  { status: 'active' },
+  500
+);
+
+/** 完整分页读取全部 active 产能单元，禁止只使用第一页主数据。 */
+export const getAllActiveEnergyBenchmarkProductionUnits = () => getAllPages(
+  (pageParams) => get('/production/units', pageParams),
   { status: 'active' },
   500
 );

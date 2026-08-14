@@ -1377,6 +1377,19 @@ function isSourceInBoundary(boundaryOrganization, sourceOrganizationPath) {
 }
 
 /**
+ * 判断显式边起止节点组织是否完整落在边界组织自身或后代范围。
+ * @param {object|null} boundaryOrganization 边界组织。
+ * @param {string|null} fromOrganizationPath 起点组织路径。
+ * @param {string|null} toOrganizationPath 终点组织路径。
+ * @returns {boolean} 是否完整位于边界内。
+ */
+function isExplicitEdgeInBoundary(boundaryOrganization, fromOrganizationPath, toOrganizationPath) {
+  return Boolean(boundaryOrganization)
+    && isSourceInBoundary(boundaryOrganization, fromOrganizationPath)
+    && isSourceInBoundary(boundaryOrganization, toOrganizationPath);
+}
+
+/**
  * 将已规范能源值转换为项目原单位，无法比较时返回空值。
  * @param {string} energyTypeCode 能源类型编码。
  * @param {number} value 来源数值。
@@ -1699,17 +1712,26 @@ function resolveGenerationSource(
  * @param {object} db SQLite 连接。
  * @param {object} item 平衡项目。
  * @param {object} mapping 来源映射。
+ * @param {object|null} boundaryOrganization 边界组织。
  * @param {object} calculationWindow 计算窗口。
  * @returns {object} 来源解析结果。
  */
-function resolveExplicitEdgeSource(db, item, mapping, calculationWindow) {
+function resolveExplicitEdgeSource(db, item, mapping, boundaryOrganization, calculationWindow) {
   const rows = db.prepare(
     `SELECT record.id, record.energy_flow_edge_id AS edgeId,
             record.start_utc AS startUtc, record.end_utc AS endUtc,
             record.original_unit AS unit, record.original_value AS value,
-            edge.energy_type_id AS energyTypeId, edge.source_type AS edgeSourceType
+            edge.energy_type_id AS energyTypeId, edge.source_type AS edgeSourceType,
+            from_organization.unit_path AS fromOrganizationPath,
+            to_organization.unit_path AS toOrganizationPath
      FROM energy_flow_records AS record
      JOIN energy_flow_edges AS edge ON edge.id = record.energy_flow_edge_id
+     JOIN energy_flow_nodes AS from_node ON from_node.id = edge.from_node_id
+       AND from_node.energy_flow_model_id = edge.energy_flow_model_id
+     JOIN energy_flow_nodes AS to_node ON to_node.id = edge.to_node_id
+       AND to_node.energy_flow_model_id = edge.energy_flow_model_id
+     LEFT JOIN organization_units AS from_organization ON from_organization.id = from_node.organization_unit_id
+     LEFT JOIN organization_units AS to_organization ON to_organization.id = to_node.organization_unit_id
      WHERE record.id IN (${idPlaceholders(mapping.recordIds)})
        AND record.record_status = 'active'
        AND record.source_type = 'explicit_edge_value'
@@ -1730,7 +1752,12 @@ function resolveExplicitEdgeSource(db, item, mapping, calculationWindow) {
       calculationWindow.startMs,
       calculationWindow.endMs
     );
-    if (!clipped || Number(row.energyTypeId) !== item.energyType.id) {
+    if (!clipped || Number(row.energyTypeId) !== item.energyType.id
+      || !isExplicitEdgeInBoundary(
+        boundaryOrganization,
+        row.fromOrganizationPath,
+        row.toOrganizationPath
+      )) {
       reasonCodes.push('BALANCE_ITEM_UNMAPPED');
       return;
     }
@@ -1805,7 +1832,7 @@ function resolveItemSource(db, item, boundary, boundaryOrganization, calculation
       boundary.generationBoundaryConfirmed
     );
   }
-  return resolveExplicitEdgeSource(db, item, mapping, calculationWindow);
+  return resolveExplicitEdgeSource(db, item, mapping, boundaryOrganization, calculationWindow);
 }
 
 /**

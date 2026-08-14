@@ -5,6 +5,7 @@ const { requireAnyPermission, requirePermission } = require('../middleware/permi
 const { requireWritable } = require('../middleware/maintenance');
 const { assertWritableAllowed } = require('../services/maintenanceState');
 const { normalizeUploadError, uploadImportFile } = require('../middleware/upload');
+const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
 const {
   createMeter,
   createMeterImportBatchFromUpload,
@@ -37,7 +38,7 @@ router.get('/stats', authenticate, requireMeterView, asyncHandler(async (req, re
   sendSuccess(res, getMeterStats());
 }));
 
-router.post('/import', authenticate, requirePermission('ledger:meters:import'), requireWritable('meters:import'), (req, res, next) => {
+router.post('/import', authenticate, requirePermission('ledger:meters:import'), requireWritable('meters:import'), rejectUnconnectedDemoContext, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {

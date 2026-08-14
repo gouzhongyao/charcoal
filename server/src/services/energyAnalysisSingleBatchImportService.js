@@ -4,10 +4,14 @@ const { openDatabase: defaultOpenDatabase, uploadsDir: defaultUploadsDir } = req
 const { AppError, badRequest } = require('../utils/errors');
 const backupService = require('./backupService');
 const {
+  bindDemoContextPreviewInTransaction,
+  markDemoContextExecutedInTransaction
+} = require('./demoContextService');
+const {
   createPreviewAuditBatch,
   getImportAuditBatchDetail,
   getImportAuditSummary,
-  replaceImportAuditIssues,
+  replaceImportAuditIssuesWithDatabase,
   updateExecuteAuditResult
 } = require('./importAuditService');
 const {
@@ -58,6 +62,20 @@ function openServiceDatabase(options = {}) {
   }
   const openDatabase = typeof options.openDatabase === 'function' ? options.openDatabase : defaultOpenDatabase;
   return { db: openDatabase(), shouldClose: true };
+}
+
+/** 使用当前连接执行 IMMEDIATE 写事务；已有外层事务时复用且不嵌套。 */
+function runImmediateWriteTransaction(db, operation) {
+  if (db.inTransaction) return operation();
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = operation();
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    if (db.inTransaction) db.exec('ROLLBACK');
+    throw error;
+  }
 }
 
 /**
@@ -113,6 +131,47 @@ function buildPersistedBatchBinding(batch) {
 }
 
 /**
+ * 从持久化 preview 批次恢复单批次 execute 完整见证，客户端只保留确认字段。
+ * @param {object} body 客户端最小 execute 请求体。
+ * @param {object} batch 持久化 preview 批次。
+ * @returns {object} 服务端受控的完整 execute 上下文。
+ */
+function buildPersistedSingleBatchExecuteBody(body, batch) {
+  const requestBody = body && typeof body === 'object' ? body : {};
+  const auditContext = batch && batch.auditContext && typeof batch.auditContext === 'object'
+    ? batch.auditContext
+    : {};
+  const candidateRows = normalizeCandidateRows(auditContext.candidateRows || []);
+  const persistedWitness = {
+    backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+    duplicateStrategy: ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY,
+    fileSha256: batch.fileSha256,
+    previewSignature: batch.previewSignature,
+    previewAuditDigest: batch.previewAuditDigest,
+    expectedWouldImport: candidateRows.length,
+    candidateRowIds: candidateRows.map((row) => row.candidateRowId),
+    candidateRows
+  };
+  const resolveWitness = (field) => Object.prototype.hasOwnProperty.call(requestBody, field)
+    ? requestBody[field]
+    : persistedWitness[field];
+  return {
+    batchId: batch.id,
+    confirmText: requestBody.confirmText,
+    backupReason: resolveWitness('backupReason'),
+    duplicateStrategy: resolveWitness('duplicateStrategy'),
+    requireBackup: requestBody.requireBackup,
+    acknowledgeSkippedRisks: requestBody.acknowledgeSkippedRisks,
+    fileSha256: resolveWitness('fileSha256'),
+    previewSignature: resolveWitness('previewSignature'),
+    previewAuditDigest: resolveWitness('previewAuditDigest'),
+    expectedWouldImport: resolveWitness('expectedWouldImport'),
+    candidateRowIds: resolveWitness('candidateRowIds'),
+    candidateRows: resolveWitness('candidateRows')
+  };
+}
+
+/**
  * 在读取原文件前验证 execute 请求确实属于当前 descriptor 的持久化 preview 批次。
  * @param {object} body execute 请求体。
  * @param {object} batch 服务端持久化批次。
@@ -143,23 +202,18 @@ function isTrustedPersistedBatchForFailureAudit(body, batch, template, secret) {
     if (typeof batch.storedFilename !== 'string' || !batch.storedFilename.trim()
       || !Number.isSafeInteger(batch.fileSizeBytes) || batch.fileSizeBytes < 0
       || typeof batch.fileSha256 !== 'string'
-      || body.fileSha256 !== batch.fileSha256
-      || previewAudit.fileSha256 !== batch.fileSha256) return false;
-    if (!timingSafeEqualText(body.previewSignature, batch.previewSignature)
-      || !timingSafeEqualText(body.previewAuditDigest, batch.previewAuditDigest)) return false;
+      || previewAudit.fileSha256 !== batch.fileSha256
+      || !timingSafeEqualText(batch.previewSignature, buildEnergyAnalysisImportPreviewSignature({
+        templateType: template.templateType,
+        fileSha256: batch.fileSha256,
+        candidateRows: normalizeCandidateRows(auditContext.candidateRows || [])
+      }, secret))) return false;
     if (body.confirmText !== template.confirmText
-      || body.backupReason !== ENERGY_ANALYSIS_IMPORT_BACKUP_REASON
-      || body.duplicateStrategy !== ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY
       || body.requireBackup !== true
       || body.acknowledgeSkippedRisks !== true) return false;
 
     const persistedCandidateRows = normalizeCandidateRows(auditContext.candidateRows || []);
-    const requestCandidateRows = normalizeCandidateRows(body.candidateRows || []);
-    const persistedCandidateRowIds = persistedCandidateRows.map((row) => row.candidateRowId);
-    if (stableSerialize(requestCandidateRows) !== stableSerialize(persistedCandidateRows)
-      || stableSerialize(body.candidateRowIds || []) !== stableSerialize(persistedCandidateRowIds)
-      || Number(body.expectedWouldImport) !== persistedCandidateRows.length
-      || Number(auditContext.summary?.wouldImport) !== persistedCandidateRows.length) return false;
+    if (Number(auditContext.summary?.wouldImport) !== persistedCandidateRows.length) return false;
 
     const signaturePayload = buildEnergyAnalysisImportSignaturePayload({
       templateType: template.templateType,
@@ -303,7 +357,7 @@ function createEnergyAnalysisSingleBatchPreview(file, descriptor, options = {}) 
       ? 'failed'
       : (Number(summary.blocked || 0) > 0 || Number(summary.skipped || 0) > 0 ? 'completed_with_errors' : 'completed');
 
-    const persistPreview = databaseContext.db.transaction(() => {
+    const persistPreview = () => runImmediateWriteTransaction(databaseContext.db, () => {
       const batch = createPreviewAuditBatch({
         importType: template.importTypes[0],
         originalFilename: file.originalname,
@@ -341,7 +395,16 @@ function createEnergyAnalysisSingleBatchPreview(file, descriptor, options = {}) 
         },
         errorSummary: buildPreviewErrorSummary(summary)
       }, { db: databaseContext.db });
-      replaceImportAuditIssues(batch.id, preview.auditIssues || [], { db: databaseContext.db });
+      replaceImportAuditIssuesWithDatabase(databaseContext.db, batch.id, preview.auditIssues || []);
+      if (options.demoContext) {
+        bindDemoContextPreviewInTransaction({
+          db: databaseContext.db,
+          ...options.demoContext,
+          uploadFileSha256: safeFile.fileSha256,
+          previewDigest: preview.previewAuditDigest,
+          batchBindings: [{ batchId: batch.id, batchRole: 'primary' }]
+        });
+      }
       return getImportAuditSummary(batch.id, { db: databaseContext.db });
     });
     const auditBatch = persistPreview();
@@ -382,22 +445,23 @@ function throwAuthorizationFailure(authorization) {
  */
 function authorizePersistedBatchExecute(body, batch, preview, fileBuffer, secret) {
   const template = getEnergyAnalysisImportTemplate(preview.templateType);
+  const trustedBody = buildPersistedSingleBatchExecuteBody(body, batch);
   return authorizeEnergyAnalysisImportExecute({
     templateType: template.templateType,
     operation: template.operation,
     recordKind: template.recordKind,
     importTypes: [...template.importTypes],
-    confirmText: body.confirmText,
-    backupReason: body.backupReason,
-    duplicateStrategy: body.duplicateStrategy,
-    requireBackup: body.requireBackup,
-    acknowledgeSkippedRisks: body.acknowledgeSkippedRisks,
-    fileSha256: body.fileSha256,
-    previewSignature: body.previewSignature,
-    previewAuditDigest: body.previewAuditDigest,
-    expectedWouldImport: body.expectedWouldImport,
-    candidateRowIds: body.candidateRowIds,
-    candidateRows: body.candidateRows,
+    confirmText: trustedBody.confirmText,
+    backupReason: trustedBody.backupReason,
+    duplicateStrategy: trustedBody.duplicateStrategy,
+    requireBackup: trustedBody.requireBackup,
+    acknowledgeSkippedRisks: trustedBody.acknowledgeSkippedRisks,
+    fileSha256: trustedBody.fileSha256,
+    previewSignature: trustedBody.previewSignature,
+    previewAuditDigest: trustedBody.previewAuditDigest,
+    expectedWouldImport: trustedBody.expectedWouldImport,
+    candidateRowIds: trustedBody.candidateRowIds,
+    candidateRows: trustedBody.candidateRows,
     expectedBatchId: batch.id,
     batch: buildPersistedBatchBinding(batch)
   }, {
@@ -545,9 +609,7 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
     try {
       const batch = getImportAuditBatchDetail(batchId, { db: databaseContext.db, includeIssues: false });
       const secret = resolveImportSecret(databaseContext.db, options);
-      if (isTrustedPersistedBatchForFailureAudit(body, batch, template, secret)) {
-        trustedFailureAuditBatchId = batchId;
-      }
+      const trustedPersistedBatch = isTrustedPersistedBatchForFailureAudit(body, batch, template, secret);
       if (!batch.storedFilename) {
         throw badRequest('持久化批次缺少服务端原文件。', { code: 'ENERGY_ANALYSIS_IMPORT_STORED_FILE_REQUIRED', batchId });
       }
@@ -556,6 +618,11 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
         expectedSizeBytes: Number.isSafeInteger(batch.fileSizeBytes) ? batch.fileSizeBytes : undefined,
         maxSizeBytes: options.maxFileSizeBytes
       });
+      if (safeFile.fileSha256 !== batch.fileSha256) {
+        throw badRequest('当前原文件 SHA-256 与 preview 批次不一致。', {
+          code: 'ENERGY_ANALYSIS_IMPORT_CURRENT_FILE_SHA256_MISMATCH'
+        });
+      }
       const recomputedDomainPreview = descriptor.buildPreview({
         db: databaseContext.db,
         buffer: safeFile.buffer,
@@ -573,7 +640,6 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
       const authorization = authorizePersistedBatchExecute(body, batch, recomputedPreview, safeFile.buffer, secret);
       if (!authorization.valid) throwAuthorizationFailure(authorization);
       if (Number(authorization.expectedWouldImport || 0) <= 0) throwAuthorizationFailure(authorization);
-      trustedFailureAuditBatchId = batchId;
 
       const createBackup = typeof options.createBackup === 'function'
         ? options.createBackup
@@ -605,6 +671,8 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
         if (Number(latestAuthorization.expectedWouldImport || 0) <= 0) throwAuthorizationFailure(latestAuthorization);
 
         failureStage = 'backup';
+        // 只有已经进入真实备份阶段的失败才写 execute failed；锁内重算和 stale 仍保留 preview 可重试。
+        if (trustedPersistedBatch) trustedFailureAuditBatchId = batchId;
         // 独立读连接在线备份锁前已提交快照；跳过会与当前 RESERVED 锁冲突的 checkpoint。
         backup = await createBackup({
           reason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
@@ -664,6 +732,15 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
           batchId,
           auditBatch: getImportAuditSummary(auditBatch.id, { db: databaseContext.db })
         };
+        if (options.demoContext) {
+          markDemoContextExecutedInTransaction({
+            db: databaseContext.db,
+            ...options.demoContext,
+            uploadFileSha256: safeFile.fileSha256,
+            previewDigest: latestPreview.previewAuditDigest,
+            batchBindings: [{ batchId, batchRole: 'primary' }]
+          });
+        }
         databaseContext.db.exec('COMMIT');
         transactionActive = false;
         return result;
@@ -693,6 +770,7 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
 module.exports = {
   SINGLE_BATCH_IMPORT_SERVICE_VERSION,
   buildPersistedBatchBinding,
+  buildPersistedSingleBatchExecuteBody,
   createEnergyAnalysisSingleBatchPreview,
   executeEnergyAnalysisSingleBatchImport,
   markEnergyAnalysisSingleBatchFailure,

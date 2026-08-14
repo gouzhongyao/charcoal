@@ -317,6 +317,42 @@ function deactivateSiblingVersions(db, tableName, codeColumn, code, exceptId, no
 }
 
 /**
+ * 在当前事务内插入班次定义，并按目标表能力写入导入追溯字段。
+ * @param {object} db SQLite 连接。
+ * @param {object} input 规范化班次定义。
+ * @param {string} nowUtc 写入时间。
+ * @param {object} trace 导入批次和物理行号。
+ * @returns {number} 班次定义 ID。
+ */
+function insertShiftDefinitionWithDb(db, input, nowUtc, trace = {}) {
+  const result = db.prepare(
+    `INSERT INTO shift_definitions (
+       source_batch_id, source_row_number,
+       shift_code, shift_name, start_minute, end_minute, crosses_midnight,
+       source_timezone, source, version, effective_start_utc, effective_end_utc,
+       status, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    trace.sourceBatchId ?? null,
+    trace.sourceRowNumber ?? null,
+    input.shiftCode,
+    input.shiftName,
+    input.startMinute,
+    input.endMinute,
+    input.crossesMidnight ? 1 : 0,
+    input.sourceTimeZone,
+    input.source,
+    input.version,
+    input.effectiveStartUtc,
+    input.effectiveEndUtc,
+    input.status,
+    nowUtc,
+    nowUtc
+  );
+  return Number(result.lastInsertRowid);
+}
+
+/**
  * 映射排班定义行。
  * @param {object} row 数据库行。
  * @returns {object} 排班定义。
@@ -445,28 +481,7 @@ function createShiftDefinition(input, options = {}) {
       throw conflict('排班编码已存在，请使用版本化修改入口。', { code: 'SHIFT_CODE_ALREADY_EXISTS' });
     }
     const nowUtc = new Date().toISOString();
-    const result = db.prepare(
-      `INSERT INTO shift_definitions (
-         shift_code, shift_name, start_minute, end_minute, crosses_midnight,
-         source_timezone, source, version, effective_start_utc, effective_end_utc,
-         status, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      normalizedInput.shiftCode,
-      normalizedInput.shiftName,
-      normalizedInput.startMinute,
-      normalizedInput.endMinute,
-      normalizedInput.crossesMidnight ? 1 : 0,
-      normalizedInput.sourceTimeZone,
-      normalizedInput.source,
-      normalizedInput.version,
-      normalizedInput.effectiveStartUtc,
-      normalizedInput.effectiveEndUtc,
-      normalizedInput.status,
-      nowUtc,
-      nowUtc
-    );
-    const shiftDefinitionId = Number(result.lastInsertRowid);
+    const shiftDefinitionId = insertShiftDefinitionWithDb(db, normalizedInput, nowUtc);
     return {
       value: getShiftDefinitionWithDb(db, shiftDefinitionId),
       audit: {
@@ -500,28 +515,7 @@ function createShiftDefinitionVersion(shiftDefinitionId, input, options = {}) {
     if (normalizedInput.status === 'active') {
       deactivateSiblingVersions(db, 'shift_definitions', 'shift_code', existing.shiftCode, null, nowUtc);
     }
-    const result = db.prepare(
-      `INSERT INTO shift_definitions (
-         shift_code, shift_name, start_minute, end_minute, crosses_midnight,
-         source_timezone, source, version, effective_start_utc, effective_end_utc,
-         status, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      existing.shiftCode,
-      normalizedInput.shiftName,
-      normalizedInput.startMinute,
-      normalizedInput.endMinute,
-      normalizedInput.crossesMidnight ? 1 : 0,
-      normalizedInput.sourceTimeZone,
-      normalizedInput.source,
-      normalizedInput.version,
-      normalizedInput.effectiveStartUtc,
-      normalizedInput.effectiveEndUtc,
-      normalizedInput.status,
-      nowUtc,
-      nowUtc
-    );
-    const newId = Number(result.lastInsertRowid);
+    const newId = insertShiftDefinitionWithDb(db, normalizedInput, nowUtc);
     return {
       value: getShiftDefinitionWithDb(db, newId),
       audit: {
@@ -1184,6 +1178,7 @@ module.exports = {
   createStrategyRuleVersion,
   createTouScheme,
   createTouSchemeVersion,
+  deactivateSiblingVersions,
   executeAtomicConfigurationWrite,
   getShiftDefinitionWithDb,
   getStrategyRuleWithDb,
@@ -1191,6 +1186,9 @@ module.exports = {
   listShiftDefinitions,
   listStrategyRules,
   listTouSchemes,
+  insertShiftDefinitionWithDb,
+  insertStrategyRuleWithDb,
+  insertTouSchemeWithDb,
   normalizeShiftDefinitionInput,
   normalizeStrategyRuleInput,
   normalizeTouPeriodRules,

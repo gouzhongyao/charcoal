@@ -8,6 +8,43 @@ class AppError extends Error {
   }
 }
 
+/** 数据库恢复切换或安全锁定期间使用的稳定应用错误类型。 */
+class DatabaseAvailabilityError extends AppError {
+  constructor(code, message, options = {}) {
+    super(code, message, options);
+    this.name = 'DatabaseAvailabilityError';
+  }
+}
+
+/** 构造正式数据库处于恢复切换屏障时的可重试错误。 */
+function databaseAdmissionBlocked() {
+  return new DatabaseAvailabilityError(
+    'DATABASE_ADMISSION_BLOCKED',
+    '正式数据库正在切换，暂不接受新连接。',
+    {
+      statusCode: 423,
+      details: {
+        retryable: true
+      }
+    }
+  );
+}
+
+/** 构造正式数据库状态不可确认时的不可重试安全锁定错误。 */
+function databasePoisoned() {
+  return new DatabaseAvailabilityError(
+    'DATABASE_POISONED',
+    '数据库处于安全锁定状态，请联系运维人员处理。',
+    {
+      statusCode: 503,
+      details: {
+        retryable: false,
+        operationalActionRequired: true
+      }
+    }
+  );
+}
+
 function badRequest(message, details) {
   return new AppError('BAD_REQUEST', message, { statusCode: 400, details });
 }
@@ -57,7 +94,10 @@ function normalizeError(error) {
 
 module.exports = {
   AppError,
+  DatabaseAvailabilityError,
   badRequest,
+  databaseAdmissionBlocked,
+  databasePoisoned,
   featurePending,
   invalidBackup,
   isPayloadTooLargeError,

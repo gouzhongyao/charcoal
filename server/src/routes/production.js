@@ -5,6 +5,7 @@ const { requireAnyPermission, requirePermission } = require('../middleware/permi
 const { requireWritable } = require('../middleware/maintenance');
 const { assertWritableAllowed } = require('../services/maintenanceState');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
+const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
 const {
   createProductionOutput,
   createProductionOutputImportPreviewFromUpload,
@@ -59,7 +60,7 @@ router.get('/units/export', authenticate, requirePermission('ledger:production:e
   res.status(200).send(result.body);
 }));
 
-router.post('/units/import/preview', authenticate, requirePermission('ledger:production:import'), requireWritable('production:units-import-preview'), (req, res, next) => {
+router.post('/units/import/preview', authenticate, requirePermission('ledger:production:import'), requireWritable('production:units-import-preview'), rejectUnconnectedDemoContext, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {
@@ -80,7 +81,7 @@ router.post('/units/import/preview', authenticate, requirePermission('ledger:pro
   });
 });
 
-router.post('/units/import/execute', authenticate, requirePermission('ledger:production:import'), requireWritable('production:units-import-execute'), asyncHandler(async (req, res) => {
+router.post('/units/import/execute', authenticate, requirePermission('ledger:production:import'), requireWritable('production:units-import-execute'), rejectUnconnectedDemoContext, asyncHandler(async (req, res) => {
   sendSuccess(res, await executeProductionUnitImport(req.body || {}));
 }));
 
@@ -106,7 +107,7 @@ router.get('/outputs/export', authenticate, requirePermission('ledger:production
   res.status(200).send(result.body);
 }));
 
-router.post('/outputs/import/preview', authenticate, requirePermission('ledger:production:preview'), requireWritable('production:outputs-import-preview'), (req, res, next) => {
+router.post('/outputs/import/preview', authenticate, requirePermission('ledger:production:preview'), requireWritable('production:outputs-import-preview'), rejectUnconnectedDemoContext, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {
@@ -123,7 +124,7 @@ router.post('/outputs/import/preview', authenticate, requirePermission('ledger:p
   });
 });
 
-router.post('/outputs/import/execute', authenticate, requirePermission('ledger:production:execute'), requireWritable('production:outputs-import-execute'), asyncHandler(async (req, res) => {
+router.post('/outputs/import/execute', authenticate, requirePermission('ledger:production:execute'), requireWritable('production:outputs-import-execute'), rejectUnconnectedDemoContext, asyncHandler(async (req, res) => {
   const audit = await executeProductionOutputImport(req.body || {});
   sendSuccess(res, audit);
 }));

@@ -29,6 +29,59 @@
 
       <el-tabs v-model="activeTab" class="balance-tabs">
         <el-tab-pane label="边界与九角色项目" name="boundaries">
+          <article v-if="canImportPreview" class="page-card balance-import-panel">
+            <header class="section-heading">
+              <div>
+                <h2>平衡边界与九角色项目导入</h2>
+                <small>仅接受包含“平衡边界”和“九角色项目”的 XLSX；模板不使用数据库自增 ID。</small>
+              </div>
+              <el-space wrap>
+                <el-button @click="downloadEnergyBalanceImportTemplate">下载空白模板</el-button>
+                <el-button @click="downloadEnergyBalanceDemoParkExample">下载青岚示例</el-button>
+              </el-space>
+            </header>
+            <el-alert
+              type="warning"
+              :closable="false"
+              show-icon
+              title="导入不会自动执行平衡计算、不会自动生成优化建议，也不会修改能耗记录、发电记录、预算或碳排记录。"
+            />
+            <div class="balance-import-actions">
+              <input ref="balanceImportFileInput" class="file-input" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" @change="selectBalanceImportFile">
+              <el-button @click="chooseBalanceImportFile">选择 XLSX</el-button>
+              <span class="muted-text">{{ balanceImportFile?.name || '尚未选择文件' }}</span>
+              <el-button type="primary" :loading="balanceImportPreviewLoading" :disabled="!balanceImportFile" @click="previewBalanceImport">预演</el-button>
+              <el-button v-if="canImportExecute" type="success" :disabled="!balanceImportExecutable" @click="openBalanceImportExecute">确认执行</el-button>
+            </div>
+            <el-alert v-if="balanceImportError" type="error" :closable="false" show-icon :title="balanceImportError" />
+            <template v-if="balanceImportPreview">
+              <dl class="definition-grid balance-import-summary">
+                <div><dt>边界批次</dt><dd>#{{ balanceImportPreview.boundaryBatchId }}</dd></div>
+                <div><dt>项目批次</dt><dd>#{{ balanceImportPreview.itemBatchId }}</dd></div>
+                <div><dt>候选写入</dt><dd>{{ formatInteger(balanceImportPreview.summary?.wouldImport || 0) }}</dd></div>
+                <div><dt>阻断</dt><dd>{{ formatInteger(balanceImportPreview.summary?.blocked || 0) }}</dd></div>
+                <div><dt>跳过</dt><dd>{{ formatInteger(balanceImportPreview.summary?.skipped || 0) }}</dd></div>
+                <div><dt>上传组</dt><dd class="digest-text">{{ balanceImportPreview.uploadGroupId }}</dd></div>
+              </dl>
+              <el-collapse>
+                <el-collapse-item title="平衡边界预演明细" name="boundary-import-preview">
+                  <el-table :data="balanceImportPreview.boundaryPreview?.items || []" size="small" max-height="280">
+                    <el-table-column prop="sourceRowNumber" label="Excel 行" width="90" />
+                    <el-table-column prop="status" label="结果" width="110" />
+                    <el-table-column label="问题" min-width="360"><template #default="{ row }">{{ importIssueSummary(row.issues) }}</template></el-table-column>
+                  </el-table>
+                </el-collapse-item>
+                <el-collapse-item title="九角色项目预演明细" name="item-import-preview">
+                  <el-table :data="balanceImportPreview.itemPreview?.items || []" size="small" max-height="320">
+                    <el-table-column prop="sourceRowNumber" label="Excel 行" width="90" />
+                    <el-table-column prop="status" label="结果" width="110" />
+                    <el-table-column label="问题" min-width="360"><template #default="{ row }">{{ importIssueSummary(row.issues) }}</template></el-table-column>
+                  </el-table>
+                </el-collapse-item>
+              </el-collapse>
+            </template>
+          </article>
+
           <ManagementToolbar :loading="boundaryLoading" @search="applyBoundaryFilters" @reset="resetBoundaryFilters">
             <el-form-item label="组织单元">
               <el-select v-model="boundaryDraftFilters.organizationUnitId" clearable filterable placeholder="全部组织单元">
@@ -203,9 +256,9 @@
           <el-form-item label="定义来源" prop="source"><HelpIcon label="查看定义来源说明" content="填写边界定义依据、文件或人工维护来源，不能用系统推测代替显式边界。" /><el-input v-model.trim="boundaryForm.source" maxlength="200" /></el-form-item>
           <el-form-item label="文号"><el-input v-model.trim="boundaryForm.documentNo" maxlength="200" /></el-form-item>
           <el-form-item label="版本" prop="version"><el-input v-model.trim="boundaryForm.version" maxlength="100" placeholder="如 balance-boundary:v1" /></el-form-item>
-          <el-form-item label="有效期开始（严格 UTC）" prop="effectiveStartUtc"><el-input v-model.trim="boundaryForm.effectiveStartUtc" placeholder="2026-01-01T00:00:00Z" /></el-form-item>
-          <el-form-item label="有效期结束（严格 UTC）" prop="effectiveEndUtc"><el-input v-model.trim="boundaryForm.effectiveEndUtc" placeholder="2027-01-01T00:00:00Z" /></el-form-item>
-          <el-form-item label="来源时区" prop="sourceTimeZone"><HelpIcon label="查看来源时区说明" content="填写 IANA 时区，如 Asia/Shanghai。月度能耗和发电来源按该时区校验完整自然月。" /><el-input v-model.trim="boundaryForm.sourceTimeZone" placeholder="Asia/Shanghai" /></el-form-item>
+          <el-form-item label="有效期开始（严格 UTC）" prop="effectiveStartUtc"><StrictUtcDateTimeInput v-model="boundaryForm.effectiveStartUtc" placeholder="2026-01-01T00:00:00Z" /></el-form-item>
+          <el-form-item label="有效期结束（严格 UTC）" prop="effectiveEndUtc"><StrictUtcDateTimeInput v-model="boundaryForm.effectiveEndUtc" placeholder="2027-01-01T00:00:00Z" /></el-form-item>
+          <el-form-item label="来源时区" prop="sourceTimeZone"><HelpIcon label="查看来源时区说明" content="选择 IANA 时区，如 Asia/Shanghai。月度能耗和发电来源按该时区校验完整自然月。" /><IanaTimeZoneSelect v-model="boundaryForm.sourceTimeZone" placeholder="请选择或搜索来源时区" /></el-form-item>
           <el-form-item><el-checkbox v-model="boundaryForm.generationBoundaryConfirmed">已人工确认发电边界和防重复计入口径</el-checkbox></el-form-item>
         </el-form>
       </ManagementDrawer>
@@ -271,7 +324,7 @@
         <el-form label-position="top">
           <el-form-item label="平衡边界"><el-input :model-value="calculationBoundaryLabel" disabled /></el-form-item>
           <el-form-item label="来源时区"><el-input :model-value="calculationBoundary?.sourceTimeZone || '—'" disabled /></el-form-item>
-          <el-form-item label="完整自然月统计期"><el-date-picker v-model="calculationForm.monthRange" type="monthrange" value-format="YYYY-MM" format="YYYY-MM" unlink-panels start-placeholder="开始月份" end-placeholder="结束月份" class="full-control" /></el-form-item>
+          <el-form-item label="完整自然月统计期"><el-date-picker v-model="calculationForm.monthRange" type="monthrange" value-format="YYYY-MM" format="YYYY-MM" :editable="true" unlink-panels start-placeholder="开始月份" end-placeholder="结束月份" class="full-control" /></el-form-item>
           <el-alert :type="calculationWindow.valid ? 'success' : 'warning'" :closable="false" show-icon :title="calculationWindow.valid ? `将提交 UTC 左闭右开窗口：${calculationWindow.startUtc} 至 ${calculationWindow.endUtc}` : calculationWindow.message" class="drawer-alert" />
           <template v-if="calculationExplicitItems.length">
             <h3 class="drawer-subtitle">人工显式值覆盖</h3>
@@ -318,6 +371,20 @@
         </template>
       </el-drawer>
 
+      <el-dialog v-model="balanceImportExecuteOpen" title="执行平衡配置导入" width="min(620px, 94vw)" destroy-on-close>
+        <el-alert type="warning" :closable="false" show-icon title="执行前服务端会重读原 XLSX、按当前数据库重新解析来源并复核 stale；任一边界或项目失败都会整体回滚。" />
+        <el-form label-position="top" class="balance-import-confirm-form">
+          <el-form-item :label="`请输入固定确认文本：${ENERGY_BALANCE_IMPORT_CONFIRM_TEXT}`">
+            <el-input v-model="balanceImportConfirmText" autocomplete="off" />
+          </el-form-item>
+        </el-form>
+        <el-alert v-if="balanceImportExecuteError" type="error" :closable="false" show-icon :title="balanceImportExecuteError" />
+        <template #footer>
+          <el-button @click="balanceImportExecuteOpen=false">取消</el-button>
+          <el-button type="primary" :loading="balanceImportExecuteLoading" :disabled="balanceImportConfirmText !== ENERGY_BALANCE_IMPORT_CONFIRM_TEXT || !balanceImportExecutable" @click="executeBalanceImport">创建备份并原子导入</el-button>
+        </template>
+      </el-dialog>
+
       <el-dialog v-model="suggestionReviewOpen" :title="reviewActionLabel(suggestionReviewForm.targetStatus)" width="min(540px, 92vw)" destroy-on-close>
         <el-alert type="info" :closable="false" show-icon :title="`仅更新建议人工状态，不触发自动执行。当前：${suggestionStatusLabel(suggestionReviewRow?.manualStatus)}；目标：${suggestionStatusLabel(suggestionReviewForm.targetStatus)}。`" class="drawer-alert" />
         <el-form label-position="top"><el-form-item :label="reviewNoteRequired ? '复核备注（必填）' : '复核备注（可选）'"><el-input v-model="suggestionReviewForm.reviewNote" type="textarea" :rows="4" maxlength="1000" show-word-limit /></el-form-item></el-form>
@@ -335,9 +402,11 @@ import ManagementPage from '@/components/ManagementPage.vue';
 import ManagementToolbar from '@/components/ManagementToolbar.vue';
 import ManagementDrawer from '@/components/ManagementDrawer.vue';
 import HelpIcon from '@/components/HelpIcon.vue';
+import IanaTimeZoneSelect from '@/components/IanaTimeZoneSelect.vue';
 import PageState from '@/components/PageState.vue';
 import StatCard from '@/components/StatCard.vue';
 import StatusTag from '@/components/StatusTag.vue';
+import StrictUtcDateTimeInput from '@/components/StrictUtcDateTimeInput.vue';
 import BalanceDivergingChart from './BalanceDivergingChart.vue';
 import { getEnergyTypes } from '@/api/energy';
 import { ledgerApi } from '@/api/ledger';
@@ -345,6 +414,9 @@ import {
   calculateEnergyBalanceSnapshots,
   createEnergyBalanceBoundary,
   createEnergyBalanceItem,
+  downloadEnergyBalanceDemoParkExample,
+  downloadEnergyBalanceImportTemplate,
+  executeEnergyBalanceBundleImport,
   getEnergyBalanceBoundaries,
   getEnergyBalanceBoundary,
   getEnergyBalanceContract,
@@ -353,6 +425,7 @@ import {
   getEnergyBalanceSnapshotRun,
   getEnergyBalanceSnapshotRuns,
   getEnergyBalanceSuggestions,
+  previewEnergyBalanceBundleImport,
   updateEnergyBalanceBoundary,
   updateEnergyBalanceBoundaryStatus,
   updateEnergyBalanceItem,
@@ -362,6 +435,7 @@ import {
 import {
   BALANCE_ROLE_DEFINITIONS,
   BALANCE_SOURCE_TYPE_DEFINITIONS,
+  ENERGY_BALANCE_IMPORT_CONFIRM_TEXT,
   ENERGY_BALANCE_PERMISSIONS,
   SUGGESTION_STATUS_LABELS,
   balanceReasonLabel,
@@ -371,6 +445,8 @@ import {
   buildBalanceChartRows,
   buildBalanceItemPayload,
   buildBoundaryFilters,
+  buildEnergyBalanceBundleExecutePayload,
+  canExecuteEnergyBalanceBundleImport,
   buildFullMonthCalculationWindow,
   buildItemFilters,
   buildSnapshotFilters,
@@ -379,9 +455,12 @@ import {
   formatEnergyBalanceRequestError,
   freezeEnergyBalanceRequestSnapshot,
   loadAllEnergyBalanceItems,
+  normalizeEnergyBalanceBoundaryUtcFields,
   suggestionReviewTargets,
   validateSuggestionReview
 } from '@/utils/energyBalanceManagement';
+import { parseStrictUtcDateTime } from '@/utils/dateTimeFields';
+import { isIanaTimeZone } from '@/utils/ianaTimeZones';
 import { hasPermi } from '@/utils/permission';
 
 /** 动态路由待接入的稳定组件标识。 */
@@ -396,6 +475,8 @@ const canView = computed(() => hasPermi(ENERGY_BALANCE_PERMISSIONS.view));
 const canManage = computed(() => hasPermi(ENERGY_BALANCE_PERMISSIONS.manage));
 const canCalculate = computed(() => hasPermi(ENERGY_BALANCE_PERMISSIONS.calculate));
 const canReviewSuggestions = computed(() => hasPermi(ENERGY_BALANCE_PERMISSIONS.suggestionReview));
+const canImportPreview = computed(() => hasPermi(ENERGY_BALANCE_PERMISSIONS.importPreview));
+const canImportExecute = computed(() => hasPermi(ENERGY_BALANCE_PERMISSIONS.importExecute));
 
 /** 服务端契约、能源类型与组织字典状态。 */
 const contract = ref(null);
@@ -430,6 +511,20 @@ const boundaryPagination = ref({ total: 0 });
 const boundaryLoading = ref(false);
 const boundaryError = ref('');
 
+/** 平衡双批次导入状态模块。 */
+const balanceImportFileInput = ref(null);
+const balanceImportFile = ref(null);
+const balanceImportPreview = ref(null);
+const balanceImportPreviewLoading = ref(false);
+const balanceImportError = ref('');
+const balanceImportExecuteOpen = ref(false);
+const balanceImportConfirmText = ref('');
+const balanceImportExecuteLoading = ref(false);
+const balanceImportExecuteError = ref('');
+/** 只有当前有效服务端预演且具备执行权限时才允许进入 execute。 */
+const balanceImportExecutable = computed(() => canImportExecute.value
+  && canExecuteEnergyBalanceBundleImport(balanceImportPreview.value));
+
 /** 边界新增修改抽屉状态。 */
 const emptyBoundaryForm = () => ({ boundaryCode: '', boundaryName: '', organizationUnitId: null, source: '', documentNo: '', version: 'energy-balance-boundary:v1', effectiveStartUtc: '', effectiveEndUtc: '', sourceTimeZone: '', generationBoundaryConfirmed: false });
 const boundaryDrawerOpen = ref(false);
@@ -438,15 +533,33 @@ const boundaryForm = ref(emptyBoundaryForm());
 const boundaryFormRef = ref();
 const boundarySaving = ref(false);
 const boundaryFormError = ref('');
+/** 边界 UTC 回显诊断：非法原文仅保留在错误文本，不进入可提交表单字段。 */
+const boundaryUtcDiagnostic = ref('');
+/** 校验边界严格 UTC 字段，拒绝隐藏的非零毫秒或非法日历日期。 */
+const strictBoundaryUtcRule = (label) => ({
+  validator: (_rule, value, callback) => {
+    if (value === '' || value === null || value === undefined) return callback();
+    const result = parseStrictUtcDateTime(value);
+    return result.valid ? callback() : callback(new Error(`${label}：${result.message}`));
+  },
+  trigger: ['change', 'blur']
+});
+/** 校验边界来源时区同时符合 IANA 形态并可由当前 Intl 运行时识别。 */
+const boundaryIanaTimeZoneRule = {
+  validator: (_rule, value, callback) => isIanaTimeZone(String(value || '').trim())
+    ? callback()
+    : callback(new Error('请选择当前运行时可识别的 IANA 来源时区。')),
+  trigger: ['change', 'blur']
+};
 /** 边界表单基础必填规则。 */
 const boundaryRules = {
   boundaryCode: [{ required: true, message: '请填写边界编码。', trigger: 'blur' }],
   boundaryName: [{ required: true, message: '请填写边界名称。', trigger: 'blur' }],
   source: [{ required: true, message: '请填写边界定义来源。', trigger: 'blur' }],
   version: [{ required: true, message: '请填写边界版本。', trigger: 'blur' }],
-  effectiveStartUtc: [{ required: true, pattern: /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/, message: '请输入携带 Z 的严格 UTC ISO 时间。', trigger: 'blur' }],
-  effectiveEndUtc: [{ required: true, pattern: /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/, message: '请输入携带 Z 的严格 UTC ISO 时间。', trigger: 'blur' }],
-  sourceTimeZone: [{ required: true, pattern: /^[A-Za-z_]+(?:\/[A-Za-z0-9_.+-]+)+$/, message: '请输入 IANA 时区，如 Asia/Shanghai。', trigger: 'blur' }]
+  effectiveStartUtc: [{ required: true, message: '请填写边界有效期开始 UTC。', trigger: ['change', 'blur'] }, strictBoundaryUtcRule('边界有效期开始 UTC')],
+  effectiveEndUtc: [{ required: true, message: '请填写边界有效期结束 UTC。', trigger: ['change', 'blur'] }, strictBoundaryUtcRule('边界有效期结束 UTC')],
+  sourceTimeZone: [{ required: true, message: '请选择来源时区。', trigger: ['change', 'blur'] }, boundaryIanaTimeZoneRule]
 };
 
 /** 边界详情和项目列表状态。 */
@@ -643,6 +756,72 @@ async function loadBoundaries() {
   if (result.ok) { boundaries.value = result.value.data || []; boundaryPagination.value = result.value.meta?.pagination || {}; boundaryError.value = ''; }
   else { boundaries.value = []; boundaryError.value = formatEnergyBalanceRequestError(result.error); }
 }
+/** 触发隐藏文件输入选择。 */
+function chooseBalanceImportFile() {
+  balanceImportFileInput.value?.click();
+}
+/** 绑定最新 XLSX，并使旧 preview 立即失效。 */
+function selectBalanceImportFile(event) {
+  const file = event?.target?.files?.[0] || null;
+  balanceImportFile.value = file;
+  balanceImportPreview.value = null;
+  balanceImportError.value = '';
+  balanceImportExecuteOpen.value = false;
+  balanceImportConfirmText.value = '';
+}
+/** 格式化导入行问题。 */
+function importIssueSummary(issues = []) {
+  return Array.isArray(issues) && issues.length
+    ? issues.map((issue) => `${issue.message}${issue.code ? `（${issue.code}）` : ''}`).join('；')
+    : '无';
+}
+/** 上传当前 XLSX 并保存最新服务端受控预演。 */
+async function previewBalanceImport() {
+  if (!balanceImportFile.value) return;
+  balanceImportPreviewLoading.value = true;
+  balanceImportError.value = '';
+  balanceImportPreview.value = null;
+  const selectedFile = balanceImportFile.value;
+  const result = await safeRequest(() => previewEnergyBalanceBundleImport(selectedFile));
+  balanceImportPreviewLoading.value = false;
+  if (balanceImportFile.value !== selectedFile) return;
+  if (!result.ok) {
+    balanceImportError.value = formatEnergyBalanceRequestError(result.error, '平衡配置导入预演失败。');
+    return;
+  }
+  balanceImportPreview.value = result.value.data || null;
+  if (!canExecuteEnergyBalanceBundleImport(balanceImportPreview.value)) {
+    balanceImportError.value = '预演存在阻断、没有可写候选或服务端见证不完整，不能执行导入。';
+  }
+}
+/** 打开固定中文确认对话框。 */
+function openBalanceImportExecute() {
+  if (!balanceImportExecutable.value) return;
+  balanceImportConfirmText.value = '';
+  balanceImportExecuteError.value = '';
+  balanceImportExecuteOpen.value = true;
+}
+/** 提交最小 execute 正文，成功后只刷新边界列表。 */
+async function executeBalanceImport() {
+  if (!balanceImportExecutable.value || balanceImportConfirmText.value !== ENERGY_BALANCE_IMPORT_CONFIRM_TEXT) return;
+  const previewSnapshot = balanceImportPreview.value;
+  balanceImportExecuteLoading.value = true;
+  balanceImportExecuteError.value = '';
+  const payload = buildEnergyBalanceBundleExecutePayload(previewSnapshot, balanceImportConfirmText.value);
+  const result = await safeRequest(() => executeEnergyBalanceBundleImport(payload));
+  balanceImportExecuteLoading.value = false;
+  if (!result.ok) {
+    balanceImportExecuteError.value = formatEnergyBalanceRequestError(result.error, '平衡配置导入执行失败。');
+    return;
+  }
+  balanceImportExecuteOpen.value = false;
+  balanceImportPreview.value = null;
+  balanceImportFile.value = null;
+  balanceImportConfirmText.value = '';
+  if (balanceImportFileInput.value) balanceImportFileInput.value.value = '';
+  ElMessage.success(`已原子导入 ${formatInteger(result.value.data?.imported || 0)} 条平衡配置；未自动计算或生成建议。`);
+  await loadBoundaries();
+}
 /** 应用边界筛选。 */
 function applyBoundaryFilters() { boundaryAppliedFilters.value = { ...boundaryDraftFilters.value }; boundaryPage.value = 1; loadBoundaries(); }
 /** 重置边界筛选。 */
@@ -650,13 +829,36 @@ function resetBoundaryFilters() { boundaryDraftFilters.value = emptyBoundaryFilt
 /** 边界页大小变化后回到第一页。 */
 function changeBoundaryPageSize() { boundaryPage.value = 1; loadBoundaries(); }
 /** 打开新增边界抽屉。 */
-function openBoundaryCreate() { boundaryEditingId.value = null; boundaryForm.value = emptyBoundaryForm(); boundaryFormError.value = ''; boundaryDrawerOpen.value = true; }
-/** 打开编辑边界抽屉。 */
-function openBoundaryEdit(row) { boundaryEditingId.value = row.id; boundaryForm.value = { boundaryCode: row.boundaryCode, boundaryName: row.boundaryName, organizationUnitId: row.organizationUnitId, source: row.source, documentNo: row.documentNo || '', version: row.version, effectiveStartUtc: row.effectiveStartUtc, effectiveEndUtc: row.effectiveEndUtc, sourceTimeZone: row.sourceTimeZone, generationBoundaryConfirmed: Boolean(row.generationBoundaryConfirmed) }; boundaryFormError.value = ''; boundaryDrawerOpen.value = true; }
-/** 保存边界并依赖服务端事务审计。 */
+function openBoundaryCreate() { boundaryEditingId.value = null; boundaryForm.value = emptyBoundaryForm(); boundaryUtcDiagnostic.value = ''; boundaryFormError.value = ''; boundaryDrawerOpen.value = true; }
+/** 打开编辑边界抽屉，并将零毫秒规范为可见秒精度，非零毫秒显示明确错误。 */
+function openBoundaryEdit(row) {
+  boundaryEditingId.value = row.id;
+  const normalization = normalizeEnergyBalanceBoundaryUtcFields({
+    boundaryCode: row.boundaryCode,
+    boundaryName: row.boundaryName,
+    organizationUnitId: row.organizationUnitId,
+    source: row.source,
+    documentNo: row.documentNo || '',
+    version: row.version,
+    effectiveStartUtc: row.effectiveStartUtc,
+    effectiveEndUtc: row.effectiveEndUtc,
+    sourceTimeZone: row.sourceTimeZone,
+    generationBoundaryConfirmed: Boolean(row.generationBoundaryConfirmed)
+  });
+  boundaryForm.value = normalization.value;
+  boundaryUtcDiagnostic.value = normalization.message;
+  boundaryFormError.value = boundaryUtcDiagnostic.value;
+  boundaryDrawerOpen.value = true;
+}
+/** 保存边界并在调用 API 前再次阻断非法或非零毫秒 UTC。 */
 async function saveBoundary() {
   const valid = await boundaryFormRef.value?.validate().catch(() => false);
+  const utcNormalization = normalizeEnergyBalanceBoundaryUtcFields(boundaryForm.value);
+  if (!utcNormalization.valid) { boundaryFormError.value = boundaryUtcDiagnostic.value || utcNormalization.message; return; }
   if (!valid) return;
+  if (!isIanaTimeZone(utcNormalization.value.sourceTimeZone)) { boundaryFormError.value = '请选择当前运行时可识别的 IANA 来源时区。'; return; }
+  boundaryUtcDiagnostic.value = '';
+  boundaryForm.value = utcNormalization.value;
   if (Date.parse(boundaryForm.value.effectiveStartUtc) >= Date.parse(boundaryForm.value.effectiveEndUtc)) { boundaryFormError.value = '有效期开始必须早于结束。'; return; }
   boundarySaving.value = true; boundaryFormError.value = '';
   const payload = { ...boundaryForm.value, organizationUnitId: boundaryForm.value.organizationUnitId || null, documentNo: boundaryForm.value.documentNo || null };
@@ -965,5 +1167,5 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.balance-tabs{min-width:0}.page-card{min-width:0}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.section-heading h2{margin:0;color:#123b79;font-size:17px}.section-heading small,.section-heading>span{color:#7385a2;font-size:12px}.table-scroll{max-width:100%;overflow-x:auto}.pagination{display:flex;justify-content:flex-end;margin-top:16px}.drawer-alert{margin-bottom:12px}.full-control{width:100%}.definition-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0}.definition-grid>div{padding:10px 12px;background:#f6f9fd;border:1px solid #dfe8f3;border-radius:8px}.definition-grid dt{color:#7385a2;font-size:12px}.definition-grid dd{margin:5px 0 0;color:#183153;line-height:1.6;word-break:break-word}.detail-grid{margin-bottom:14px}.item-heading{margin-top:18px}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.muted-text{color:#7385a2;font-size:12px;line-height:1.6}.digest-text{margin-right:6px;color:#516170;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.suggestion-detail{display:grid;gap:12px;padding:12px 24px}.suggestion-detail h3{margin:0;color:#123b79;font-size:15px}.snapshot-selector{display:flex;align-items:center;gap:12px;margin:14px 0}.snapshot-selector>span{color:#516170;font-size:13px}.snapshot-selector .el-select{width:min(420px,100%)}.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}.chart-panel{margin-bottom:16px}.reason-alert{margin-top:12px}.reason-chip{display:inline-block;margin-left:8px}.rate-grid{margin-top:12px;grid-template-columns:repeat(4,minmax(0,1fr))}.drawer-subtitle{margin:16px 0 4px;color:#123b79;font-size:15px}@media (max-width:1100px){.definition-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.rate-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media (max-width:700px){.section-heading,.snapshot-selector{align-items:flex-start;flex-direction:column}.definition-grid,.form-grid,.stat-grid,.rate-grid{grid-template-columns:1fr}.snapshot-selector .el-select{width:100%}}
+.balance-tabs{min-width:0}.page-card{min-width:0}.balance-import-panel{display:grid;gap:14px;margin-bottom:16px}.balance-import-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px}.balance-import-summary{grid-template-columns:repeat(3,minmax(0,1fr))}.balance-import-confirm-form{margin-top:14px}.file-input{display:none}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.section-heading h2{margin:0;color:#123b79;font-size:17px}.section-heading small,.section-heading>span{color:#7385a2;font-size:12px}.table-scroll{max-width:100%;overflow-x:auto}.pagination{display:flex;justify-content:flex-end;margin-top:16px}.drawer-alert{margin-bottom:12px}.full-control{width:100%}.definition-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0}.definition-grid>div{padding:10px 12px;background:#f6f9fd;border:1px solid #dfe8f3;border-radius:8px}.definition-grid dt{color:#7385a2;font-size:12px}.definition-grid dd{margin:5px 0 0;color:#183153;line-height:1.6;word-break:break-word}.detail-grid{margin-bottom:14px}.item-heading{margin-top:18px}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.muted-text{color:#7385a2;font-size:12px;line-height:1.6}.digest-text{margin-right:6px;color:#516170;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.suggestion-detail{display:grid;gap:12px;padding:12px 24px}.suggestion-detail h3{margin:0;color:#123b79;font-size:15px}.snapshot-selector{display:flex;align-items:center;gap:12px;margin:14px 0}.snapshot-selector>span{color:#516170;font-size:13px}.snapshot-selector .el-select{width:min(420px,100%)}.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}.chart-panel{margin-bottom:16px}.reason-alert{margin-top:12px}.reason-chip{display:inline-block;margin-left:8px}.rate-grid{margin-top:12px;grid-template-columns:repeat(4,minmax(0,1fr))}.drawer-subtitle{margin:16px 0 4px;color:#123b79;font-size:15px}@media (max-width:1100px){.definition-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.rate-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media (max-width:700px){.section-heading,.snapshot-selector{align-items:flex-start;flex-direction:column}.definition-grid,.form-grid,.stat-grid,.rate-grid{grid-template-columns:1fr}.snapshot-selector .el-select{width:100%}}
 </style>
