@@ -11,6 +11,8 @@ const MAX_PAGE_SIZE = 500;
 const UNIT_TYPES = Object.freeze(['enterprise', 'department', 'workshop', 'process', 'equipment']);
 const LEDGER_STATUSES = Object.freeze(['active', 'inactive']);
 const METER_TYPES = Object.freeze(['electricity', 'gas', 'heat', 'water', 'other']);
+// 计量器具导入兼容能源类型常用编码，并归一为 meter_devices 受控类型。
+const METER_TYPE_IMPORT_ALIASES = Object.freeze({ natural_gas: 'gas' });
 const ONLINE_STATUSES = Object.freeze(['online', 'offline', 'unknown']);
 const FLOW_DIRECTIONS = Object.freeze(['input', 'output', 'bidirectional', 'unknown']);
 const ORGANIZATION_UNIT_IMPORT_TYPE = 'organization_unit';
@@ -216,6 +218,14 @@ function normalizeUnitPayload(input = {}, options = {}) {
     return payload;
   }
   return payload;
+}
+
+/** 将计量器具导入中的能源编码别名归一为受控器具类型。 */
+function normalizeMeterTypeImportValue(value) {
+  const normalizedValue = normalizeText(value);
+  return Object.prototype.hasOwnProperty.call(METER_TYPE_IMPORT_ALIASES, normalizedValue)
+    ? METER_TYPE_IMPORT_ALIASES[normalizedValue]
+    : normalizedValue;
 }
 
 function normalizeMeterPayload(input = {}) {
@@ -1242,7 +1252,7 @@ function validateAndNormalizeMeterImportRow(row, rowNumber, indexes) {
     const payload = normalizeMeterPayload({
       meterCode: mapped.meterCode,
       meterName: mapped.meterName,
-      meterType: mapped.meterType,
+      meterType: normalizeMeterTypeImportValue(mapped.meterType),
       energyTypeId: energyType.id,
       organizationUnitId: unit.id,
       onlineStatus: mapped.onlineStatus,

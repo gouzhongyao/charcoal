@@ -1,3 +1,69 @@
-<template><main class="auth-page"><section class="auth-card"><p class="eyebrow">LOCAL ACCOUNT</p><h1>注册本地账号</h1><p>注册开放状态由服务端控制。注册成功后将获得最低权限角色，需由管理员分配业务权限。</p><el-alert v-if="disabledMessage" :title="disabledMessage" type="warning" :closable="false" show-icon /><el-form ref="formRef" :model="form" :rules="rules" @submit.prevent="submit"><el-form-item prop="displayName"><el-input v-model="form.displayName" placeholder="显示名称" /></el-form-item><el-form-item prop="username"><el-input v-model="form.username" placeholder="用户名（3-64 位）" /></el-form-item><el-form-item prop="password"><el-input v-model="form.password" type="password" show-password placeholder="密码（至少 8 位）" /></el-form-item><el-button type="primary" :loading="loading" :disabled="Boolean(disabledMessage)" class="login-button" @click="submit">提交注册</el-button></el-form><div class="auth-links"><router-link to="/login">返回登录</router-link></div></section></main></template>
-<script setup>import { reactive,ref } from 'vue'; import { ElMessage } from 'element-plus'; import { request } from '@/api/http'; import { useRouter } from 'vue-router'; const router=useRouter(),formRef=ref(),loading=ref(false),disabledMessage=ref(''); const form=reactive({displayName:'',username:'',password:''});const rules={username:[{required:true,message:'请输入用户名',trigger:'blur'}],password:[{required:true,min:8,message:'密码至少 8 位',trigger:'blur'}]};async function submit(){if(!(await formRef.value.validate().catch(()=>false)))return;loading.value=true;try{await request({method:'post',url:'/auth/register',data:form});ElMessage.success('注册成功，请登录。');router.replace('/login')}catch(error){if(error.response?.data?.error?.code==='REGISTRATION_DISABLED'){disabledMessage.value='当前环境未开放自助注册，请联系系统管理员创建账号。';}else ElMessage.error(error.message)}finally{loading.value=false}}</script>
-<style scoped>.auth-page{display:grid;min-height:100vh;place-items:center;padding:24px;background:linear-gradient(135deg,#0e2b6d,#1769df)}.auth-card{width:min(440px,100%);padding:38px;background:#fff;border-radius:20px}.eyebrow{color:#1769e0;font-weight:700;font-size:12px;letter-spacing:.12em}.auth-card h1{color:#143b7a}.auth-card p{color:#6b7f9d;line-height:1.7}.auth-card .el-form{margin-top:22px}.login-button{width:100%}.auth-links{margin-top:18px}.auth-links a{color:#3374cf;text-decoration:none}</style>
+<template>
+    <main class="auth-page">
+        <section class="auth-card">
+            <p class="eyebrow">REGISTER ACCOUNT</p>
+            <h1>注册账号</h1>
+            <!-- <p>注册开放状态由服务端控制。注册成功后将获得最低权限角色，需由管理员分配业务权限。</p> -->
+            <el-alert v-if="disabledMessage" :title="disabledMessage" type="warning" :closable="false"
+                show-icon /><el-form ref="formRef" :model="form" :rules="rules" @submit.prevent="submit"><el-form-item
+                    prop="displayName"><el-input v-model="form.displayName"
+                        placeholder="显示名称" /></el-form-item><el-form-item prop="username"><el-input
+                        v-model="form.username" placeholder="用户名（3-64 位）" /></el-form-item><el-form-item
+                    prop="password"><el-input v-model="form.password" type="password" show-password
+                        placeholder="密码（至少 8 位）" /></el-form-item><el-button type="primary" :loading="loading"
+                    :disabled="Boolean(disabledMessage)" class="login-button" @click="submit">提交注册</el-button></el-form>
+            <div class="auth-links"><router-link to="/login">返回登录</router-link></div>
+        </section>
+    </main>
+</template>
+<script
+    setup>    import { reactive, ref } from 'vue'; import { ElMessage } from 'element-plus'; import { request } from '@/api/http'; import { useRouter } from 'vue-router'; const router = useRouter(), formRef = ref(), loading = ref(false), disabledMessage = ref(''); const form = reactive({ displayName: '', username: '', password: '' }); const rules = { username: [{ required: true, message: '请输入用户名', trigger: 'blur' }], password: [{ required: true, min: 8, message: '密码至少 8 位', trigger: 'blur' }] }; async function submit() { if (!(await formRef.value.validate().catch(() => false))) return; loading.value = true; try { await request({ method: 'post', url: '/auth/register', data: form }); ElMessage.success('注册成功，请登录。'); router.replace('/login') } catch (error) { if (error.response?.data?.error?.code === 'REGISTRATION_DISABLED') { disabledMessage.value = '当前环境未开放自助注册，请联系系统管理员创建账号。'; } else ElMessage.error(error.message) } finally { loading.value = false } }</script>
+<style scoped>
+.auth-page {
+    display: grid;
+    min-height: 100vh;
+    place-items: center;
+    padding: 24px;
+    background: linear-gradient(135deg, #0e2b6d, #1769df)
+}
+
+.auth-card {
+    width: min(440px, 100%);
+    padding: 38px;
+    background: #fff;
+    border-radius: 20px
+}
+
+.eyebrow {
+    color: #1769e0;
+    font-weight: 700;
+    font-size: 12px;
+    letter-spacing: .12em
+}
+
+.auth-card h1 {
+    color: #143b7a
+}
+
+.auth-card p {
+    color: #6b7f9d;
+    line-height: 1.7
+}
+
+.auth-card .el-form {
+    margin-top: 22px
+}
+
+.login-button {
+    width: 100%
+}
+
+.auth-links {
+    margin-top: 18px
+}
+
+.auth-links a {
+    color: #3374cf;
+    text-decoration: none
+}
+</style>

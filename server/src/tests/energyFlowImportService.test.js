@@ -529,6 +529,53 @@ async function run() {
   assert.strictEqual(missingModelNodePreview.summary.blocked, 1);
   assert(missingModelNodePreview.items[0].issues.some((issue) => issue.code === 'ENERGY_FLOW_MODEL_NOT_FOUND'));
 
+  // 模型编码必须在 preview 使用 CRUD/SQLite 共享 ASCII 合同阻断全角、非法字符、内部空格、空值和超长值。
+  const invalidModelCodes = [
+    ['fullwidth', 'ＦＬＯＷ-MODEL-IMPORT', 'INVALID_ENERGY_FLOW_IDENTITY'],
+    ['character', 'FLOW/MODEL/IMPORT', 'INVALID_ENERGY_FLOW_IDENTITY'],
+    ['space', 'FLOW MODEL IMPORT', 'INVALID_ENERGY_FLOW_IDENTITY'],
+    ['blank', '   ', 'REQUIRED_FIELD_MISSING'],
+    ['too-long', `M${'A'.repeat(128)}`, 'INVALID_ENERGY_FLOW_IDENTITY']
+  ];
+  invalidModelCodes.forEach(([name, modelCode, expectedIssueCode]) => {
+    const invalidModelFile = createWorkbookUpload(`energy-flow-model-${name}.xlsx`, [{
+      templateType: 'energy-flow-models',
+      sheetName: '能流模型',
+      rows: [createModelRow({ modelCode })]
+    }]);
+    const invalidModelPreview = previewEnergyFlowModelImport(invalidModelFile, { uploadsDir: temporaryUploadsDir });
+    assert.strictEqual(invalidModelPreview.expectedWouldImport, 0);
+    assert.strictEqual(invalidModelPreview.summary.blocked, 1);
+    assert.strictEqual(invalidModelPreview.candidateRows.length, 0);
+    assert(invalidModelPreview.items[0].issues.some((issue) => issue.code === expectedIssueCode));
+  });
+
+  const maxLengthVersionFile = createWorkbookUpload('energy-flow-model-version-64.xlsx', [{
+    templateType: 'energy-flow-models',
+    sheetName: '能流模型',
+    rows: [createModelRow({
+      modelCode: 'FLOW-MODEL-VERSION-64',
+      version: `V${'1'.repeat(63)}`
+    })]
+  }]);
+  const maxLengthVersionPreview = previewEnergyFlowModelImport(maxLengthVersionFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(maxLengthVersionPreview.expectedWouldImport, 1);
+  assert.strictEqual(maxLengthVersionPreview.candidateRows[0].version.length, 64);
+
+  const overLengthVersionFile = createWorkbookUpload('energy-flow-model-version-65.xlsx', [{
+    templateType: 'energy-flow-models',
+    sheetName: '能流模型',
+    rows: [createModelRow({
+      modelCode: 'FLOW-MODEL-VERSION-65',
+      version: `V${'1'.repeat(64)}`
+    })]
+  }]);
+  const overLengthVersionPreview = previewEnergyFlowModelImport(overLengthVersionFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(overLengthVersionPreview.expectedWouldImport, 0);
+  assert.strictEqual(overLengthVersionPreview.summary.blocked, 1);
+  assert.strictEqual(overLengthVersionPreview.candidateRows.length, 0);
+  assert(overLengthVersionPreview.items[0].issues.some((issue) => issue.code === 'INVALID_ENERGY_FLOW_MODEL_VERSION'));
+
   const modelFile = createWorkbookUpload('energy-flow-models-valid.xlsx', [{
     templateType: 'energy-flow-models',
     sheetName: '能流模型',
@@ -546,6 +593,23 @@ async function run() {
   } finally {
     actorDb.close();
   }
+  const blockedVersionBackupCounter = { count: 0 };
+  const modelCountBeforeBlockedVersionExecute = countRows('energy_flow_models');
+  await assertRejectsWithCode(
+    () => executeEnergyFlowModelImport(
+      buildSingleBatchExecuteBody(overLengthVersionPreview),
+      {
+        uploadsDir: temporaryUploadsDir,
+        actorUserId,
+        actorIp: '127.0.0.1',
+        createBackup: createBackupStub(blockedVersionBackupCounter)
+      }
+    ),
+    'ENERGY_ANALYSIS_IMPORT_EMPTY_CANDIDATES_REJECTED'
+  );
+  assert.strictEqual(blockedVersionBackupCounter.count, 0, '65 字符模型版本 execute 必须在备份前拒绝。');
+  assert.strictEqual(countRows('energy_flow_models'), modelCountBeforeBlockedVersionExecute, '65 字符模型版本不得写业务数据。');
+
   const modelBackupCounter = { count: 0 };
   const modelExecute = await executeEnergyFlowModelImport(
     buildSingleBatchExecuteBody(modelPreview),
@@ -611,6 +675,46 @@ async function run() {
   const duplicateModelPreview = previewEnergyFlowModelImport(modelFile, { uploadsDir: temporaryUploadsDir });
   assert.strictEqual(duplicateModelPreview.expectedWouldImport, 0);
   assert.strictEqual(duplicateModelPreview.summary.skipped, 1);
+  const canonicalModelFile = createWorkbookUpload('energy-flow-models-canonical-skip.xlsx', [{
+    templateType: 'energy-flow-models',
+    sheetName: '能流模型',
+    rows: [createModelRow({ modelCode: 'flow-model-import', version: 'V1' })]
+  }]);
+  const canonicalModelPreview = previewEnergyFlowModelImport(canonicalModelFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(canonicalModelPreview.expectedWouldImport, 0);
+  assert.strictEqual(canonicalModelPreview.summary.skipped, 1);
+  const nfkcModelDb = openDatabase();
+  try {
+    nfkcModelDb.prepare(
+      `INSERT INTO energy_flow_models (
+         model_code, model_name, source, document_no, version,
+         effective_start_utc, effective_end_utc, source_timezone, status
+       ) VALUES ('FLOW-MODEL-NFKC-EXISTING', '批量导入模型', '隔离测试导入',
+         'FLOW-MODEL-DOC-2026', 'V１', '2026-01-01T00:00:00Z',
+         '2027-01-01T00:00:00Z', 'Asia/Shanghai', 'active')`
+    ).run();
+  } finally {
+    nfkcModelDb.close();
+  }
+  const nfkcModelFile = createWorkbookUpload('energy-flow-models-nfkc-skip.xlsx', [{
+    templateType: 'energy-flow-models',
+    sheetName: '能流模型',
+    rows: [createModelRow({ modelCode: 'flow-model-nfkc-existing', version: 'V1' })]
+  }]);
+  const nfkcModelPreview = previewEnergyFlowModelImport(nfkcModelFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(nfkcModelPreview.expectedWouldImport, 0);
+  assert.strictEqual(nfkcModelPreview.summary.skipped, 1);
+  const canonicalModelConflictFile = createWorkbookUpload('energy-flow-models-canonical-conflict.xlsx', [{
+    templateType: 'energy-flow-models',
+    sheetName: '能流模型',
+    rows: [
+      createModelRow({ modelCode: 'FLOW-MODEL-CANONICAL-CONFLICT', version: 'v1' }),
+      createModelRow({ modelCode: 'flow-model-canonical-conflict', version: 'V1', modelName: '规范键冲突名称' })
+    ]
+  }]);
+  const canonicalModelConflictPreview = previewEnergyFlowModelImport(canonicalModelConflictFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(canonicalModelConflictPreview.summary.blocked, 2);
+  assert(canonicalModelConflictPreview.auditIssues.some((issue) => issue.code === 'CONFLICTING_ENERGY_FLOW_MODEL_VERSION'));
   const conflictingModelFile = createWorkbookUpload('energy-flow-models-conflict.xlsx', [{
     templateType: 'energy-flow-models',
     sheetName: '能流模型',
@@ -666,6 +770,49 @@ async function run() {
   const duplicateNodePreview = previewEnergyFlowNodeImport(nodeFile, { uploadsDir: temporaryUploadsDir });
   assert.strictEqual(duplicateNodePreview.expectedWouldImport, 0);
   assert.strictEqual(duplicateNodePreview.summary.skipped, 1);
+  const canonicalNodeFile = createWorkbookUpload('energy-flow-nodes-canonical-skip.xlsx', [{
+    templateType: 'energy-flow-nodes',
+    sheetName: '能流节点',
+    rows: [createNodeRow({
+      modelCode: FLOW_MODEL.modelCode.toLowerCase(),
+      modelVersion: FLOW_MODEL.modelVersion.toUpperCase(),
+      nodeCode: 'process-import'
+    })]
+  }]);
+  const canonicalNodePreview = previewEnergyFlowNodeImport(canonicalNodeFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(canonicalNodePreview.expectedWouldImport, 0);
+  assert.strictEqual(canonicalNodePreview.summary.skipped, 1);
+  const invalidIdentityNodeFile = createWorkbookUpload('energy-flow-nodes-invalid-identity.xlsx', [{
+    templateType: 'energy-flow-nodes',
+    sheetName: '能流节点',
+    rows: [
+      createNodeRow({ nodeCode: 'ＮＯＤＥ-FULLWIDTH' }),
+      createNodeRow({ nodeCode: 'NODE/INVALID' }),
+      createNodeRow({ nodeCode: 'NODE INTERNAL SPACE' }),
+      createNodeRow({ nodeCode: `N${'O'.repeat(128)}` })
+    ]
+  }]);
+  const invalidIdentityNodePreview = previewEnergyFlowNodeImport(
+    invalidIdentityNodeFile,
+    { uploadsDir: temporaryUploadsDir }
+  );
+  assert.strictEqual(invalidIdentityNodePreview.expectedWouldImport, 0);
+  assert.strictEqual(invalidIdentityNodePreview.summary.blocked, 4);
+  assert.strictEqual(invalidIdentityNodePreview.candidateRows.length, 0);
+  assert(invalidIdentityNodePreview.items.every((item) => (
+    item.issues.some((issue) => issue.code === 'INVALID_ENERGY_FLOW_IDENTITY')
+  )));
+  const canonicalNodeConflictFile = createWorkbookUpload('energy-flow-nodes-canonical-conflict.xlsx', [{
+    templateType: 'energy-flow-nodes',
+    sheetName: '能流节点',
+    rows: [
+      createNodeRow({ nodeCode: 'NODE-CANONICAL-CONFLICT' }),
+      createNodeRow({ nodeCode: 'node-canonical-conflict', x: 81 })
+    ]
+  }]);
+  const canonicalNodeConflictPreview = previewEnergyFlowNodeImport(canonicalNodeConflictFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(canonicalNodeConflictPreview.summary.blocked, 2);
+  assert(canonicalNodeConflictPreview.auditIssues.some((issue) => issue.code === 'CONFLICTING_ENERGY_FLOW_NODE'));
   const invalidNodeFile = createWorkbookUpload('energy-flow-nodes-invalid.xlsx', [{
     templateType: 'energy-flow-nodes',
     sheetName: '能流节点',
@@ -692,7 +839,10 @@ async function run() {
   const bundleFile = createHardCodedBundleUpload(
     'energy-flow-bundle-valid.xlsx',
     [null, createEdgeRow()],
-    [null, createRecordRow()]
+    [null, createRecordRow({
+      startUtc: '2026-07-01T00:00:00.000Z',
+      endUtc: '2026-08-01T00:00:00.000Z'
+    })]
   );
   const bundlePreview = previewEnergyFlowBundleImport(bundleFile, { uploadsDir: temporaryUploadsDir, createUploadGroupId: () => 'flow-group-valid' });
   assert.notStrictEqual(bundlePreview.edgeBatchId, bundlePreview.recordBatchId);
@@ -703,8 +853,33 @@ async function run() {
   assert.strictEqual(bundlePreview.edgePreview.candidateRows[0].sourceRowNumber, 3);
   assert.strictEqual(bundlePreview.recordPreview.candidateRows[0].sourceRowNumber, 3);
   assert.strictEqual(bundlePreview.recordPreview.candidateRows[0].edgeReferenceKind, 'candidate');
+  assert.strictEqual(bundlePreview.recordPreview.candidateRows[0].startUtc, '2026-07-01T00:00:00Z');
+  assert.strictEqual(bundlePreview.recordPreview.candidateRows[0].endUtc, '2026-08-01T00:00:00Z');
   assert.strictEqual(countRows('energy_flow_edges'), edgeCountBefore);
   assert.strictEqual(countRows('energy_flow_records'), recordCountBefore);
+
+  const invalidMillisecondBundleFile = createHardCodedBundleUpload(
+    'energy-flow-bundle-invalid-millisecond.xlsx',
+    [createEdgeRow({
+      edgeCode: 'EDGE-INVALID-MILLISECOND',
+      sourceReference: 'explicit-edge:EDGE-INVALID-MILLISECOND'
+    })],
+    [createRecordRow({
+      edgeCode: 'EDGE-INVALID-MILLISECOND',
+      startUtc: '2026-09-01T00:00:00.001Z',
+      endUtc: '2026-10-01T00:00:00Z',
+      sourceReference: 'upload:explicit-edge:invalid-millisecond'
+    })]
+  );
+  const invalidMillisecondPreview = previewEnergyFlowBundleImport(
+    invalidMillisecondBundleFile,
+    { uploadsDir: temporaryUploadsDir }
+  );
+  assert.strictEqual(invalidMillisecondPreview.recordPreview.summary.blocked, 1);
+  assert(invalidMillisecondPreview.recordPreview.auditIssues.some(
+    (issue) => issue.code === 'INVALID_START_UTC'
+  ));
+  assert.strictEqual(invalidMillisecondPreview.recordPreview.candidateRows.length, 0);
 
   // execute 只备份一次，在同一事务中先边后记录并原子更新两个审计。
   const bundleBackupCounter = { count: 0 };
@@ -724,7 +899,7 @@ async function run() {
     ).get();
     const importedRecord = bundleDb.prepare(
       `SELECT energy_flow_edge_id AS edgeId, source_batch_id AS sourceBatchId,
-              source_row_number AS sourceRowNumber
+              source_row_number AS sourceRowNumber, start_utc AS startUtc, end_utc AS endUtc
        FROM energy_flow_records WHERE energy_flow_edge_id = ?`
     ).get(importedEdge.id);
     assert.strictEqual(importedEdge.sourceBatchId, bundlePreview.edgeBatchId);
@@ -733,6 +908,8 @@ async function run() {
     assert.strictEqual(importedRecord.edgeId, importedEdge.id);
     assert.strictEqual(importedRecord.sourceBatchId, bundlePreview.recordBatchId);
     assert.strictEqual(importedRecord.sourceRowNumber, 3);
+    assert.strictEqual(importedRecord.startUtc, '2026-07-01T00:00:00Z');
+    assert.strictEqual(importedRecord.endUtc, '2026-08-01T00:00:00Z');
     const audits = bundleDb.prepare(
       `SELECT id, audit_phase AS auditPhase, status FROM import_batches WHERE id IN (?, ?) ORDER BY id`
     ).all(bundlePreview.edgeBatchId, bundlePreview.recordBatchId);
@@ -750,6 +927,87 @@ async function run() {
   assert.strictEqual(duplicateBundlePreview.expectedWouldImport, 0);
   assert.strictEqual(duplicateBundlePreview.edgePreview.summary.skipped, 1);
   assert.strictEqual(duplicateBundlePreview.recordPreview.summary.skipped, 1);
+  const canonicalBundleFile = createHardCodedBundleUpload(
+    'energy-flow-bundle-canonical-skip.xlsx',
+    [createEdgeRow({
+      modelCode: FLOW_MODEL.modelCode.toLowerCase(),
+      modelVersion: FLOW_MODEL.modelVersion.toUpperCase(),
+      edgeCode: 'edge-import-001',
+      fromNodeCode: 'source-a',
+      toNodeCode: 'sink-a'
+    })],
+    [createRecordRow({
+      modelCode: FLOW_MODEL.modelCode.toLowerCase(),
+      modelVersion: FLOW_MODEL.modelVersion.toUpperCase(),
+      edgeCode: 'edge-import-001'
+    })]
+  );
+  const canonicalBundlePreview = previewEnergyFlowBundleImport(canonicalBundleFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(canonicalBundlePreview.expectedWouldImport, 0);
+  assert.strictEqual(canonicalBundlePreview.edgePreview.summary.skipped, 1);
+  assert.strictEqual(canonicalBundlePreview.recordPreview.summary.skipped, 1);
+  const invalidIdentityBundleFile = createHardCodedBundleUpload(
+    'energy-flow-bundle-invalid-identity.xlsx',
+    [
+      createEdgeRow({ edgeCode: 'ＥＤＧＥ-FULLWIDTH' }),
+      createEdgeRow({ edgeCode: 'EDGE/INVALID' }),
+      createEdgeRow({ edgeCode: 'EDGE INTERNAL SPACE' }),
+      createEdgeRow({ edgeCode: `E${'D'.repeat(128)}` })
+    ],
+    []
+  );
+  const invalidIdentityBundlePreview = previewEnergyFlowBundleImport(
+    invalidIdentityBundleFile,
+    { uploadsDir: temporaryUploadsDir }
+  );
+  assert.strictEqual(invalidIdentityBundlePreview.expectedWouldImport, 0);
+  assert.strictEqual(invalidIdentityBundlePreview.edgePreview.summary.blocked, 4);
+  assert.strictEqual(invalidIdentityBundlePreview.edgePreview.candidateRows.length, 0);
+  assert(invalidIdentityBundlePreview.edgePreview.items.every((item) => (
+    item.issues.some((issue) => issue.code === 'INVALID_ENERGY_FLOW_IDENTITY')
+  )));
+  const canonicalBundleConflictFile = createHardCodedBundleUpload(
+    'energy-flow-bundle-canonical-conflict.xlsx',
+    [
+      createEdgeRow({ edgeCode: 'EDGE-CANONICAL-CONFLICT', sourceReference: 'canonical:edge:first' }),
+      createEdgeRow({ edgeCode: 'edge-canonical-conflict', sourceReference: 'canonical:edge:second' })
+    ],
+    []
+  );
+  const canonicalBundleConflictPreview = previewEnergyFlowBundleImport(canonicalBundleConflictFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(canonicalBundleConflictPreview.edgePreview.summary.blocked, 2);
+  assert(canonicalBundleConflictPreview.edgePreview.auditIssues.some((issue) => issue.code === 'CONFLICTING_ENERGY_FLOW_EDGE'));
+  const canonicalCandidateFile = createHardCodedBundleUpload(
+    'energy-flow-bundle-canonical-candidate.xlsx',
+    [createEdgeRow({
+      modelCode: FLOW_MODEL.modelCode.toLowerCase(),
+      modelVersion: FLOW_MODEL.modelVersion.toUpperCase(),
+      edgeCode: 'EDGE-CANONICAL-CANDIDATE',
+      fromNodeCode: 'source-a',
+      toNodeCode: 'sink-a',
+      sourceReference: 'canonical:candidate:edge'
+    })],
+    [createRecordRow({
+      modelCode: FLOW_MODEL.modelCode.toLowerCase(),
+      modelVersion: FLOW_MODEL.modelVersion.toUpperCase(),
+      edgeCode: 'edge-canonical-candidate',
+      startUtc: '2026-12-01T00:00:00Z',
+      endUtc: '2027-01-01T00:00:00Z',
+      sourceReference: 'canonical:candidate:record'
+    })]
+  );
+  const canonicalCandidatePreview = previewEnergyFlowBundleImport(canonicalCandidateFile, { uploadsDir: temporaryUploadsDir });
+  assert.strictEqual(canonicalCandidatePreview.expectedWouldImport, 2);
+  assert.strictEqual(canonicalCandidatePreview.recordPreview.candidateRows[0].edgeReferenceKind, 'candidate');
+  const canonicalCandidateExecute = await executeEnergyFlowBundleImport(
+    buildExecuteBody(canonicalCandidatePreview, {
+      edgeBatchId: canonicalCandidatePreview.edgeBatchId,
+      recordBatchId: canonicalCandidatePreview.recordBatchId
+    }),
+    { uploadsDir: temporaryUploadsDir, createBackup: createBackupStub({ count: 0 }) }
+  );
+  assert.strictEqual(canonicalCandidateExecute.edge.imported, 1);
+  assert.strictEqual(canonicalCandidateExecute.record.imported, 1);
   const inputDuplicateEdge = createEdgeRow({ edgeCode: 'EDGE-INPUT-DUPLICATE', sourceReference: 'explicit-edge:EDGE-INPUT-DUPLICATE' });
   const inputDuplicateFile = createWorkbookUpload('energy-flow-edge-input-duplicate.xlsx', [
     { templateType: 'energy-flow-edges', sheetName: '能流边', rows: [inputDuplicateEdge, { ...inputDuplicateEdge }] },

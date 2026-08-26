@@ -23,6 +23,10 @@ const {
   isIanaTimeZone,
   isStrictCalendarDate,
   isStrictUtcIso,
+  normalizeEnergyFlowKey,
+  normalizeEnergyFlowModelVersionKey,
+  validateAndNormalizeEnergyFlowIdentityCode,
+  validateAndNormalizeEnergyFlowModelVersion,
   validateBalanceItemsContract,
   validateBenchmarkContract,
   validateConversionFactorContract,
@@ -223,6 +227,64 @@ assert.strictEqual(isIanaTimeZone('+08:00'), false);
 assert.strictEqual(isIanaTimeZone('Mars/Olympus_Mons'), false);
 assert.deepStrictEqual(validateIanaTimeZone('+08:00'), { status: 'invalid' });
 assert.deepStrictEqual(validateIanaTimeZone('Mars/Olympus_Mons'), { status: 'invalid' });
+
+// N8 稳定编码统一保留 trim 后显示值，并以 NFKC 大写键比较；全角和非法 ASCII 必须拒绝。
+assert.deepStrictEqual(validateAndNormalizeEnergyFlowIdentityCode(' flow-node:01 '), {
+  valid: true,
+  value: 'flow-node:01',
+  key: 'FLOW-NODE:01',
+  errorCode: null
+});
+assert.strictEqual(normalizeEnergyFlowKey(' ＦＬＯＷ-node:01 '), 'FLOW-NODE:01');
+[
+  '',
+  '   ',
+  'ＦＬＯＷ-NODE',
+  'FLOW NODE',
+  '_FLOW-NODE',
+  `A${'B'.repeat(128)}`
+].forEach((value) => {
+  assert.strictEqual(validateAndNormalizeEnergyFlowIdentityCode(value).valid, false);
+});
+assert.strictEqual(
+  validateAndNormalizeEnergyFlowIdentityCode('   ').errorCode,
+  'REQUIRED_FIELD_MISSING'
+);
+assert.strictEqual(
+  validateAndNormalizeEnergyFlowIdentityCode('ＦＬＯＷ-NODE').errorCode,
+  'INVALID_ENERGY_FLOW_IDENTITY'
+);
+
+// N8 模型版本使用独立 ASCII 1..64 合同，显示值与 NFKC 大写比较键分层且不得复用 128 字符编码上限。
+const sixtyFourCharacterModelVersion = `V${'1'.repeat(63)}`;
+const sixtyFiveCharacterModelVersion = `V${'1'.repeat(64)}`;
+assert.deepStrictEqual(validateAndNormalizeEnergyFlowModelVersion(' v1 '), {
+  valid: true,
+  value: 'v1',
+  key: 'V1',
+  errorCode: null
+});
+assert.strictEqual(validateAndNormalizeEnergyFlowModelVersion('A').valid, true);
+assert.strictEqual(validateAndNormalizeEnergyFlowModelVersion(sixtyFourCharacterModelVersion).valid, true);
+assert.strictEqual(validateAndNormalizeEnergyFlowModelVersion(sixtyFiveCharacterModelVersion).valid, false);
+assert.strictEqual(
+  validateAndNormalizeEnergyFlowModelVersion(sixtyFiveCharacterModelVersion).errorCode,
+  'INVALID_ENERGY_FLOW_MODEL_VERSION'
+);
+assert.strictEqual(validateAndNormalizeEnergyFlowIdentityCode(sixtyFiveCharacterModelVersion).valid, true);
+assert.strictEqual(normalizeEnergyFlowModelVersionKey(' ｖ１ '), 'V1');
+assert.strictEqual(
+  normalizeEnergyFlowModelVersionKey('model:v1'),
+  normalizeEnergyFlowModelVersionKey('MODEL:V1')
+);
+assert.deepStrictEqual(validateAndNormalizeEnergyFlowModelVersion('   '), {
+  valid: false,
+  value: null,
+  key: null,
+  errorCode: 'REQUIRED_FIELD_MISSING'
+});
+assert.doesNotThrow(() => validateAndNormalizeEnergyFlowModelVersion(null));
+assert.strictEqual(validateAndNormalizeEnergyFlowModelVersion('ｖ１').valid, false);
 
 // 冷缓存构造故障和 format 故障不得缓存，运行时恢复后同一时区必须重新验证成功。
 const nativeDateTimeFormat = Intl.DateTimeFormat;
@@ -538,19 +600,25 @@ assert.strictEqual(validateBenchmarkContract({
   lowerBound: 90,
   upperBound: 80
 }).errors.includes('INVALID_BENCHMARK_RANGE'), true);
+assert.deepStrictEqual(validateBenchmarkContract({
+  ...fixture.benchmarks.externalStandard,
+  documentNo: '',
+  version: ''
+}), { valid: true, errors: [] });
 assert.strictEqual(validateBenchmarkContract({
   ...fixture.benchmarks.externalStandard,
   documentNo: '',
+  version: '',
   effectiveStartDate: '2026-02-30'
 }).valid, false);
 assert.strictEqual(validateBenchmarkContract({
   ...fixture.benchmarks.internalFrozenBaseline,
   frozenAt: null
 }).errors.includes('INVALID_INTERNAL_BASELINE_SNAPSHOT'), true);
-assert.strictEqual(validateBenchmarkContract({
+assert.deepStrictEqual(validateBenchmarkContract({
   ...fixture.benchmarks.internalFrozenBaseline,
   version: ''
-}).errors.includes('INVALID_INTERNAL_BASELINE_VERSION'), true);
+}), { valid: true, errors: [] });
 assert.strictEqual(validateBenchmarkContract({
   ...fixture.benchmarks.internalFrozenBaseline,
   frozen: false
@@ -596,6 +664,14 @@ assert.strictEqual(fixture.benchmarks.internalFrozenBaseline.sourceDataDigest, '
 
 // 显式能流正常模型覆盖六类节点和四类来源，每条边均显式声明映射。
 assert.deepStrictEqual(validateEnergyFlowModelContract(fixture.energyFlowModels.normal), { valid: true, errors: [] });
+assert.strictEqual(validateEnergyFlowModelContract({
+  ...fixture.energyFlowModels.normal,
+  version: sixtyFourCharacterModelVersion
+}).valid, true);
+assert.strictEqual(validateEnergyFlowModelContract({
+  ...fixture.energyFlowModels.normal,
+  version: sixtyFiveCharacterModelVersion
+}).errors.includes('INVALID_ENERGY_FLOW_MODEL_VERSION'), true);
 assert.deepStrictEqual(
   [...new Set(fixture.energyFlowModels.normal.nodes.map((node) => node.type))].sort(),
   ['boundary', 'loss', 'process', 'sink', 'source', 'storage']

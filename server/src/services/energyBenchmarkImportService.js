@@ -20,6 +20,7 @@ const {
   createEnergyAnalysisSingleBatchPreview,
   executeEnergyAnalysisSingleBatchImport
 } = require('./energyAnalysisSingleBatchImportService');
+const { allocateBenchmarkCompatibilityVersion } = require('./energyBenchmarkService');
 
 // 三类导入固定绑定已冻结模板，调用方不能替换 operation、recordKind 或 importType。
 const ENERGY_CONVERSION_FACTOR_TEMPLATE_TYPE = 'energy-conversion-factors';
@@ -31,7 +32,7 @@ const RECORD_STATUSES = Object.freeze([...CONVERSION_FACTOR_STATUSES]);
 const IMPORTABLE_BENCHMARK_TYPES = Object.freeze(['external_standard', 'manual_benchmark']);
 // 当前 SQLite 主数据能够明确解析的三类对标适用范围。
 const RESOLVABLE_BENCHMARK_SCOPE_TYPES = Object.freeze(['organization', 'energy', 'product']);
-// 稳定版本标识沿用阶段 1 的 name:v1 冻结格式。
+// 折标系数仍沿用阶段 1 的 name:v1 冻结格式；对标兼容版本改由服务端生成。
 const VERSION_PATTERN = /^[a-z][a-z0-9-]*:v1$/;
 // 三类单工作表模板与其固定中文工作表名称。
 const TEMPLATE_SHEET_NAMES = Object.freeze({
@@ -56,6 +57,47 @@ function isBlank(value) {
  */
 function normalizeText(value) {
   return isBlank(value) ? '' : String(value).trim();
+}
+
+/**
+ * 按物理行顺序为可导入候选分配确定性的下一内部修订和兼容版本。
+ * 同一文件尚未落库的候选版本也会按业务键保留，确保 preview 与锁内重算稳定一致。
+ * @param {object} db SQLite 连接。
+ * @param {object[]} rows 已完成冲突标记的行。
+ * @param {'definition'|'target'} recordType 对标记录类型。
+ */
+function assignBenchmarkInternalRevisions(db, rows, recordType) {
+  const businessKeyField = recordType === 'definition' ? 'benchmarkCode' : 'benchmarkDefinitionId';
+  const tableName = recordType === 'definition' ? 'benchmark_definitions' : 'benchmark_targets';
+  const businessKeyColumn = recordType === 'definition' ? 'benchmark_code' : 'benchmark_definition_id';
+  const revisionByBusinessKey = new Map();
+  const reservedVersionsByBusinessKey = new Map();
+  rows.forEach((row) => {
+    if (!row.record || row.skipDuplicate || row.issues.some((issue) => issue.severity === 'error')) return;
+    const businessKey = row.record[businessKeyField];
+    if (!revisionByBusinessKey.has(businessKey)) {
+      const currentRevision = Number(db.prepare(`SELECT COALESCE(MAX(internal_revision), 0) AS revision
+        FROM ${tableName} WHERE ${businessKeyColumn} = ?`).get(businessKey).revision);
+      if (!Number.isSafeInteger(currentRevision) || currentRevision < 0) {
+        throw new Error('对标导入读取内部修订失败。');
+      }
+      revisionByBusinessKey.set(businessKey, currentRevision);
+      reservedVersionsByBusinessKey.set(businessKey, new Set());
+    }
+    const nextRevision = revisionByBusinessKey.get(businessKey) + 1;
+    if (!Number.isSafeInteger(nextRevision) || nextRevision <= 0) {
+      throw new Error('对标导入内部修订超出安全整数范围。');
+    }
+    revisionByBusinessKey.set(businessKey, nextRevision);
+    row.record.internalRevision = nextRevision;
+    row.record.version = allocateBenchmarkCompatibilityVersion(
+      db,
+      recordType,
+      businessKey,
+      nextRevision,
+      reservedVersionsByBusinessKey.get(businessKey)
+    );
+  });
 }
 
 /**
@@ -557,8 +599,6 @@ function isExactBenchmarkDefinition(left, right) {
     scopeReference: value.scopeReference,
     direction: value.direction,
     source: value.source,
-    documentNo: value.documentNo || null,
-    version: value.version,
     effectiveStartUtc: value.effectiveStartUtc,
     effectiveEndUtc: value.effectiveEndUtc,
     sourceTimeZone: value.sourceTimeZone,
@@ -590,8 +630,6 @@ function validateBenchmarkDefinitionRow(row, masterData) {
     scopeReference: normalizeText(mapped.scopeReference),
     direction: normalizeText(mapped.direction),
     source: normalizeText(mapped.source),
-    documentNo: normalizeText(mapped.documentNo) || null,
-    version: normalizeText(mapped.version),
     effectiveStartUtc: normalizeText(mapped.effectiveStartUtc),
     effectiveEndUtc: normalizeText(mapped.effectiveEndUtc),
     sourceTimeZone: normalizeText(mapped.sourceTimeZone),
@@ -605,8 +643,6 @@ function validateBenchmarkDefinitionRow(row, masterData) {
       : '对标类型仅支持 external_standard 或 manual_benchmark。'));
   }
   if (!BENCHMARK_DIRECTIONS.includes(record.direction)) issues.push(createBenchmarkIssue(rowNumber, 'direction', mapped.direction, 'INVALID_BENCHMARK_DIRECTION', '指标方向仅支持 lower_better、higher_better 或 range。'));
-  if (!VERSION_PATTERN.test(record.version)) issues.push(createBenchmarkIssue(rowNumber, 'version', mapped.version, 'INVALID_BENCHMARK_VERSION', '版本必须使用 name:v1 格式。'));
-  if (record.benchmarkType === 'external_standard' && !record.documentNo) issues.push(createBenchmarkIssue(rowNumber, 'documentNo', mapped.documentNo, 'MISSING_BENCHMARK_DOCUMENT_NO', '外部标准必须填写文号。'));
   if (!RECORD_STATUSES.includes(record.status)) issues.push(createBenchmarkIssue(rowNumber, 'status', mapped.status, 'INVALID_BENCHMARK_STATUS', '状态仅支持 active 或 inactive。'));
   if (!isStrictUtcIso(record.effectiveStartUtc)) issues.push(createBenchmarkIssue(rowNumber, 'effectiveStartUtc', mapped.effectiveStartUtc, 'INVALID_EFFECTIVE_START_UTC', '生效开始时间必须是严格 UTC Z 格式。'));
   if (!isStrictUtcIso(record.effectiveEndUtc)) issues.push(createBenchmarkIssue(rowNumber, 'effectiveEndUtc', mapped.effectiveEndUtc, 'INVALID_EFFECTIVE_END_UTC', '生效结束时间必须是严格 UTC Z 格式。'));
@@ -632,9 +668,6 @@ function markInputBenchmarkDefinitionConflicts(rows) {
       if (isExactBenchmarkDefinition(left.record, right.record)) {
         markInputExactDuplicate(right, left, 'DUPLICATE_BENCHMARK_DEFINITION_SKIPPED', '对标定义');
         continue;
-      }
-      if (left.record.benchmarkCode === right.record.benchmarkCode && left.record.version === right.record.version) {
-        markInputPairConflict(left, right, 'BENCHMARK_DEFINITION_UNIQUE_KEY_CONFLICT', '同一对标编码和版本存在非完全相同定义');
       }
       if (left.record.benchmarkCode === right.record.benchmarkCode
         && left.record.status === 'active' && right.record.status === 'active'
@@ -668,11 +701,6 @@ function markDatabaseBenchmarkDefinitionConflicts(db, rows) {
       row.issues.push(createBenchmarkIssue(row.rowNumber, 'benchmarkCode', row.record.benchmarkCode, 'DUPLICATE_BENCHMARK_DEFINITION_SKIPPED', `数据库定义 ${exact.id} 完全相同，本行按 skip 策略跳过。`, 'warning'));
       return;
     }
-    const uniqueConflict = existingRows.find((existing) => existing.version === row.record.version);
-    if (uniqueConflict) {
-      row.issues.push(createBenchmarkIssue(row.rowNumber, 'version', row.record.version, 'BENCHMARK_DEFINITION_UNIQUE_KEY_CONFLICT', `数据库定义 ${uniqueConflict.id} 已占用同一对标编码和版本。`));
-      return;
-    }
     const overlap = existingRows.find((existing) => existing.status === 'active' && row.record.status === 'active' && intervalsOverlap(existing, row.record));
     if (overlap) row.issues.push(createBenchmarkIssue(row.rowNumber, 'effectiveStartUtc', null, 'BENCHMARK_DEFINITION_ACTIVE_PERIOD_OVERLAP', `数据库 active 定义 ${overlap.id} 与当前候选有效期重叠。`));
   });
@@ -689,9 +717,11 @@ function buildEnergyBenchmarkDefinitionImportPreview(input) {
   const rows = parsedRows.rows.map((row) => validateBenchmarkDefinitionRow(row, masterData));
   markInputBenchmarkDefinitionConflicts(rows);
   markDatabaseBenchmarkDefinitionConflicts(input.db, rows);
+  assignBenchmarkInternalRevisions(input.db, rows, 'definition');
   return buildDomainPreview(parsedRows, rows, [
     'preview 不写 benchmark_definitions；普通模板只允许外部标准和人工标杆。',
-    '完全相同定义按 skip 处理；业务唯一键或同编码 active 有效期冲突会阻断。'
+    '文号和旧模板版本值会被忽略；内部修订及兼容版本由服务端按对标编码单调生成。',
+    '完全相同定义按 skip 处理；同编码 active 有效期冲突会阻断。'
   ]);
 }
 
@@ -704,14 +734,15 @@ function insertEnergyBenchmarkDefinitionCandidates(input) {
   const statement = input.db.prepare(`INSERT INTO benchmark_definitions (
     source_batch_id, source_row_number, benchmark_code, benchmark_name, benchmark_type,
     metric_code, unit, period_type, scope_type, scope_reference, direction, source,
-    document_no, version, effective_start_utc, effective_end_utc, source_timezone, status
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    document_no, version, internal_revision, effective_start_utc, effective_end_utc,
+    source_timezone, status
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`);
   return insertCandidates(input, statement, (candidate) => [
     input.batchId, candidate.sourceRowNumber, candidate.benchmarkCode, candidate.benchmarkName,
     candidate.benchmarkType, candidate.metricCode, candidate.unit, candidate.periodType,
     candidate.scopeType, candidate.scopeReference, candidate.direction, candidate.source,
-    candidate.documentNo, candidate.version, candidate.effectiveStartUtc, candidate.effectiveEndUtc,
-    candidate.sourceTimeZone, candidate.status
+    candidate.version, candidate.internalRevision, candidate.effectiveStartUtc,
+    candidate.effectiveEndUtc, candidate.sourceTimeZone, candidate.status
   ]);
 }
 
@@ -729,20 +760,23 @@ function isExactBenchmarkTarget(left, right) {
     upperBound: value.upperBound === null ? null : Number(value.upperBound),
     isFrozen: Number(value.isFrozen),
     autoRefresh: Number(value.autoRefresh),
-    version: value.version,
     status: value.status
   });
   return stableSerialize(project(left)) === stableSerialize(project(right));
 }
 
 /**
- * 加载对标目标引用的定义索引。
+ * 按对标编码加载全部 active 定义，目标导入必须显式区分零条、唯一一条和多条。
  * @param {object} db SQLite 连接。
- * @returns {Map} 对标编码与版本复合索引。
+ * @returns {Map} 对标编码到 active 定义数组的索引。
  */
 function loadBenchmarkDefinitions(db) {
-  return new Map(db.prepare(`SELECT id, benchmark_code AS benchmarkCode, version, benchmark_type AS benchmarkType,
-    direction, status FROM benchmark_definitions`).all().map((row) => [`${row.benchmarkCode} ${row.version}`, row]));
+  const definitions = new Map();
+  db.prepare(`SELECT id, benchmark_code AS benchmarkCode, benchmark_type AS benchmarkType,
+    direction, status FROM benchmark_definitions WHERE status = 'active' ORDER BY id`).all().forEach((row) => {
+    definitions.set(row.benchmarkCode, [...(definitions.get(row.benchmarkCode) || []), row]);
+  });
+  return definitions;
 }
 
 /**
@@ -756,8 +790,8 @@ function validateBenchmarkTargetRow(row, definitions) {
   const rowNumber = row.sourceRowNumber;
   const issues = [...(row.issues || []), ...validateRequiredFields(ENERGY_BENCHMARK_TARGET_TEMPLATE_TYPE, mapped, rowNumber)];
   const benchmarkCode = normalizeText(mapped.benchmarkCode);
-  const benchmarkVersion = normalizeText(mapped.benchmarkVersion);
-  const definition = definitions.get(`${benchmarkCode} ${benchmarkVersion}`);
+  const activeDefinitions = definitions.get(benchmarkCode) || [];
+  const definition = activeDefinitions.length === 1 ? activeDefinitions[0] : null;
   const targetValue = normalizeOptionalNumber(mapped.targetValue);
   const lowerBound = normalizeOptionalNumber(mapped.lowerBound);
   const upperBound = normalizeOptionalNumber(mapped.upperBound);
@@ -765,8 +799,15 @@ function validateBenchmarkTargetRow(row, definitions) {
   const autoRefresh = normalizeBoolean(mapped.autoRefresh);
   const status = normalizeText(mapped.status) || 'active';
 
-  if (!definition) issues.push(createBenchmarkIssue(rowNumber, 'benchmarkCode', { benchmarkCode, benchmarkVersion }, 'BENCHMARK_DEFINITION_NOT_FOUND', '指定编码和版本的对标定义不存在。'));
-  else if (definition.status !== 'active') issues.push(createBenchmarkIssue(rowNumber, 'benchmarkCode', { benchmarkCode, benchmarkVersion }, 'BENCHMARK_DEFINITION_INACTIVE', '指定对标定义已停用。'));
+  if (activeDefinitions.length === 0) {
+    issues.push(createBenchmarkIssue(rowNumber, 'benchmarkCode', benchmarkCode,
+      'BENCHMARK_ACTIVE_DEFINITION_NOT_FOUND', '对标编码没有唯一可用的 active 定义，目标导入已阻断。'));
+  } else if (activeDefinitions.length > 1) {
+    issues.push(createBenchmarkIssue(rowNumber, 'benchmarkCode', {
+      benchmarkCode,
+      definitionIds: activeDefinitions.map((item) => item.id)
+    }, 'BENCHMARK_ACTIVE_DEFINITION_AMBIGUOUS', '对标编码存在多条 active 定义，目标导入禁止猜测或任取。'));
+  }
   if (definition?.benchmarkType === 'internal_history_baseline') issues.push(createBenchmarkIssue(rowNumber, 'benchmarkCode', benchmarkCode, 'INTERNAL_HISTORY_BENCHMARK_TARGET_IMPORT_FORBIDDEN', '内部历史基准目标必须由领域服务计算并固化，普通模板不得导入。'));
 
   if (definition && ['lower_better', 'higher_better'].includes(definition.direction)) {
@@ -789,7 +830,6 @@ function validateBenchmarkTargetRow(row, definitions) {
     issues.push(createBenchmarkIssue(rowNumber, 'isFrozen', { fields: forgedFields, isFrozen: mapped.isFrozen, autoRefresh: mapped.autoRefresh }, 'BENCHMARK_INTERNAL_SNAPSHOT_FIELDS_FORBIDDEN', '普通目标模板不得填写内部参考期、固化值、数据摘要、样本或自动刷新字段。'));
   }
   if (isFrozen === null || autoRefresh === null) issues.push(createBenchmarkIssue(rowNumber, 'isFrozen', { isFrozen: mapped.isFrozen, autoRefresh: mapped.autoRefresh }, 'INVALID_BENCHMARK_TARGET_BOOLEAN', '是否固化和是否自动刷新仅支持 0/1 或等价布尔值。'));
-  if (!VERSION_PATTERN.test(normalizeText(mapped.version))) issues.push(createBenchmarkIssue(rowNumber, 'version', mapped.version, 'INVALID_BENCHMARK_TARGET_VERSION', '目标版本必须使用 name:v1 格式。'));
   if (!RECORD_STATUSES.includes(status)) issues.push(createBenchmarkIssue(rowNumber, 'status', mapped.status, 'INVALID_BENCHMARK_STATUS', '状态仅支持 active 或 inactive。'));
 
   const record = definition ? {
@@ -797,7 +837,6 @@ function validateBenchmarkTargetRow(row, definitions) {
     sourceRowNumber: rowNumber,
     benchmarkDefinitionId: definition.id,
     benchmarkCode,
-    benchmarkVersion,
     direction: definition.direction,
     targetValue,
     lowerBound,
@@ -811,7 +850,6 @@ function validateBenchmarkTargetRow(row, definitions) {
     sourceDataDigest: null,
     isFrozen: 0,
     autoRefresh: 0,
-    version: normalizeText(mapped.version),
     status
   } : null;
   return { rowNumber, mapped, issues, record };
@@ -829,9 +867,6 @@ function markInputBenchmarkTargetConflicts(rows) {
       const right = comparable[rightIndex];
       if (isExactBenchmarkTarget(left.record, right.record)) {
         markInputExactDuplicate(right, left, 'DUPLICATE_BENCHMARK_TARGET_SKIPPED', '对标目标');
-      } else if (Number(left.record.benchmarkDefinitionId) === Number(right.record.benchmarkDefinitionId)
-        && left.record.version === right.record.version) {
-        markInputPairConflict(left, right, 'BENCHMARK_TARGET_UNIQUE_KEY_CONFLICT', '同一对标定义和目标版本存在非完全相同目标');
       }
     }
   }
@@ -845,17 +880,16 @@ function markInputBenchmarkTargetConflicts(rows) {
 function markDatabaseBenchmarkTargetConflicts(db, rows) {
   const selectTargets = db.prepare(`SELECT id, benchmark_definition_id AS benchmarkDefinitionId,
     target_value AS targetValue, lower_bound AS lowerBound, upper_bound AS upperBound,
-    is_frozen AS isFrozen, auto_refresh AS autoRefresh, version, status
-    FROM benchmark_targets WHERE benchmark_definition_id = ? AND version = ? ORDER BY id`);
+    is_frozen AS isFrozen, auto_refresh AS autoRefresh, status
+    FROM benchmark_targets WHERE benchmark_definition_id = ? ORDER BY id`);
   rows.forEach((row) => {
     if (!row.record || row.skipDuplicate || row.issues.some((issue) => issue.severity === 'error')) return;
-    const existingRows = selectTargets.all(row.record.benchmarkDefinitionId, row.record.version);
+    const existingRows = selectTargets.all(row.record.benchmarkDefinitionId);
     const exact = existingRows.find((existing) => isExactBenchmarkTarget(existing, row.record));
     if (exact) {
       row.skipDuplicate = true;
-      row.issues.push(createBenchmarkIssue(row.rowNumber, 'version', row.record.version, 'DUPLICATE_BENCHMARK_TARGET_SKIPPED', `数据库目标 ${exact.id} 完全相同，本行按 skip 策略跳过。`, 'warning'));
-    } else if (existingRows.length > 0) {
-      row.issues.push(createBenchmarkIssue(row.rowNumber, 'version', row.record.version, 'BENCHMARK_TARGET_UNIQUE_KEY_CONFLICT', `数据库目标 ${existingRows[0].id} 已占用同一对标定义和目标版本。`));
+      row.issues.push(createBenchmarkIssue(row.rowNumber, 'benchmarkCode', row.record.benchmarkCode,
+        'DUPLICATE_BENCHMARK_TARGET_SKIPPED', `数据库目标 ${exact.id} 完全相同，本行按 skip 策略跳过。`, 'warning'));
     }
   });
 }
@@ -871,8 +905,11 @@ function buildEnergyBenchmarkTargetImportPreview(input) {
   const rows = parsedRows.rows.map((row) => validateBenchmarkTargetRow(row, definitions));
   markInputBenchmarkTargetConflicts(rows);
   markDatabaseBenchmarkTargetConflicts(input.db, rows);
+  assignBenchmarkInternalRevisions(input.db, rows, 'target');
   return buildDomainPreview(parsedRows, rows, [
     'preview 不写 benchmark_targets；execute 插入时同时保存来源批次与物理行号。',
+    '目标仅按对标编码匹配唯一 active 定义；零条或多条 active 定义都会阻断。',
+    '旧模板中的定义版本和目标版本值会被忽略；内部修订及兼容版本由服务端单调生成。',
     '普通模板不得导入内部历史基准目标或伪造内部参考期、固化值和数据摘要。'
   ]);
 }
@@ -886,13 +923,15 @@ function insertEnergyBenchmarkTargetCandidates(input) {
   const statement = input.db.prepare(`INSERT INTO benchmark_targets (
     source_batch_id, source_row_number, benchmark_definition_id, target_value, lower_bound,
     upper_bound, reference_start_utc, reference_end_utc, frozen_value, frozen_at, sample_count,
-    production_summary_json, source_data_digest, is_frozen, auto_refresh, version, status
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    production_summary_json, source_data_digest, is_frozen, auto_refresh, version,
+    internal_revision, status
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   return insertCandidates(input, statement, (candidate) => [
     input.batchId, candidate.sourceRowNumber, candidate.benchmarkDefinitionId, candidate.targetValue,
     candidate.lowerBound, candidate.upperBound, candidate.referenceStartUtc, candidate.referenceEndUtc,
     candidate.frozenValue, candidate.frozenAt, candidate.sampleCount, candidate.productionSummaryJson,
-    candidate.sourceDataDigest, candidate.isFrozen, candidate.autoRefresh, candidate.version, candidate.status
+    candidate.sourceDataDigest, candidate.isFrozen, candidate.autoRefresh, candidate.version,
+    candidate.internalRevision, candidate.status
   ]);
 }
 

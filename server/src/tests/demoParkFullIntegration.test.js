@@ -223,6 +223,8 @@ async function importArtifact(artifact, file, context) {
     case '04-meters': {
       const result = createMeterImportBatchFromUpload(file, { duplicateStrategy: 'skip' });
       assertImmediateImport(result, artifact.artifactKey);
+      assert.strictEqual(result.summary.failureCount, 0, '04 计量器具首次导入不得产生领域值校验失败。');
+      assert.strictEqual(result.summary.successCount, artifact.rows.length, '04 计量器具首次导入必须完整写入三项器具。');
       return result;
     }
     case '05-production-units': {
@@ -303,14 +305,16 @@ async function importArtifact(artifact, file, context) {
     }
     case '20-benchmark-definitions': {
       const preview = previewEnergyBenchmarkDefinitionImport(file, analysisOptions);
-      assert.strictEqual(preview.expectedWouldImport, 1);
-      assert.strictEqual(preview.summary.blocked, 0);
+      const diagnostic = JSON.stringify({ summary: preview.summary, issues: preview.auditIssues });
+      assert.strictEqual(preview.expectedWouldImport, 1, `20-benchmark-definitions 预演候选异常：${diagnostic}`);
+      assert.strictEqual(preview.summary.blocked, 0, `20-benchmark-definitions 存在阻断项：${diagnostic}`);
       return executeEnergyBenchmarkDefinitionImport(buildAnalysisExecuteBody(preview), analysisOptions);
     }
     case '21-benchmark-targets': {
       const preview = previewEnergyBenchmarkTargetImport(file, analysisOptions);
-      assert.strictEqual(preview.expectedWouldImport, 1);
-      assert.strictEqual(preview.summary.blocked, 0);
+      const diagnostic = JSON.stringify({ summary: preview.summary, issues: preview.auditIssues });
+      assert.strictEqual(preview.expectedWouldImport, 1, `21-benchmark-targets 预演候选异常：${diagnostic}`);
+      assert.strictEqual(preview.summary.blocked, 0, `21-benchmark-targets 存在阻断项：${diagnostic}`);
       return executeEnergyBenchmarkTargetImport(buildAnalysisExecuteBody(preview), analysisOptions);
     }
     case '22-energy-flow-models': {
@@ -436,7 +440,7 @@ async function verifyDuplicateImports(context) {
   assert(balancePreview.itemPreview.summary.skipped > 0);
 }
 
-/** 主动执行抄表生成、核算、预测、分析、策略、对标、能流、平衡和驾驶舱断言。 */
+/** 主动执行抄表生成、核算、预测、分析、策略、对标、能流、平衡和中控断言。 */
 function runDerivedOperations(db, actor) {
   const generatedPreview = getMeterReadingEnergyRecordGenerationPreview({
     monthStart: '2026-08',
@@ -559,13 +563,25 @@ function runDerivedOperations(db, actor) {
     assert.strictEqual(strategyRun.hits[0].matchStatus, 'matched');
 
     const definition = db.prepare(
-      "SELECT id FROM benchmark_definitions WHERE benchmark_code = 'QL-BENCH-INTENSITY' AND version = 'energy-benchmark:v1'"
+      `SELECT id, internal_revision AS internalRevision, version
+         FROM benchmark_definitions
+        WHERE benchmark_code = 'QL-BENCH-INTENSITY' AND status = 'active'`
     ).get();
-    assert(definition, '必须通过生产支持的对标定义版本解析 ID。');
+    assert(definition, '必须通过唯一 active 对标定义解析 ID。');
+    assert.deepStrictEqual(
+      { internalRevision: definition.internalRevision, version: definition.version },
+      { internalRevision: 1, version: 'benchmark-definition-internal-revision:v1' }
+    );
     const target = db.prepare(
-      "SELECT id FROM benchmark_targets WHERE benchmark_definition_id = ? AND version = 'benchmark-target:v1'"
+      `SELECT id, internal_revision AS internalRevision, version
+         FROM benchmark_targets
+        WHERE benchmark_definition_id = ? AND status = 'active'`
     ).get(definition.id);
-    assert(target, '必须通过生产支持的对标目标版本解析 ID。');
+    assert(target, '必须通过 active 对标定义解析服务端管理的目标。');
+    assert.deepStrictEqual(
+      { internalRevision: target.internalRevision, version: target.version },
+      { internalRevision: 1, version: 'benchmark-target-internal-revision:v1' }
+    );
     const production = db.prepare(
       `SELECT por.output_value AS outputValue
          FROM production_output_records por
@@ -663,7 +679,7 @@ function runDerivedOperations(db, actor) {
     assert(breakdown.length > 0, '能源结构必须非空。');
     assert(budgets.rows.length > 0, '预算比较必须非空。');
     assert.strictEqual(dashboard.energy.status, 'available');
-    assert(dashboard.energy.totals.length > 0, '驾驶舱能耗核心域必须非空。');
+    assert(dashboard.energy.totals.length > 0, '中控能耗核心域必须非空。');
     assert.strictEqual(dashboard.imports.status, 'available');
     assert(Number(dashboard.imports.batchCount) >= DEMO_PARK_ARTIFACTS.length);
 

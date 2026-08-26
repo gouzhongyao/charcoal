@@ -187,8 +187,15 @@ assert.match(strictUtcSource, /modelValue:\s*\{\s*type:\s*String/);
 assert.match(strictUtcSource, /disabled:\s*\{\s*type:\s*Boolean/);
 assert.match(strictUtcSource, /clearable:\s*\{\s*type:\s*Boolean/);
 assert.match(strictUtcSource, /placeholder:\s*\{\s*type:\s*String/);
-assert.match(strictUtcSource, /defineEmits\(\['update:modelValue', 'change', 'blur'\]\)/);
+assert.match(strictUtcSource, /defineEmits\(\['update:modelValue', 'change', 'blur', 'validity-change', 'invalid'\]\)/);
 assert.match(strictUtcSource, /parseStrictUtcDateTime/);
+assert.match(strictUtcSource, /:aria-invalid="isInvalid \? 'true' : 'false'"/);
+assert.match(strictUtcSource, /:aria-describedby="isInvalid \? errorMessageId : undefined"/);
+assert.match(strictUtcSource, /role="alert"/);
+assert.match(strictUtcSource, /UTC 日期时间输入无效。/);
+assert.match(strictUtcSource, /emit\('validity-change', valid\)/);
+assert.match(strictUtcSource, /emit\('invalid', \{ message: validationError\.value, value \}\)/);
+assert.match(strictUtcSource, /非法值绝不提交旧模型/);
 assert.match(strictUtcSource, /emit\('update:modelValue', null\)/);
 assert.match(strictUtcSource, /emit\('change', result\.value\)/);
 assert.match(strictUtcSource, /emit\('blur', event\)/);
@@ -259,14 +266,16 @@ const specializedDateContracts = new Map([
   ['views/predictions/PredictionManagement.vue|month|configForm.trainEndMonth', 'YYYY-MM'],
   ['views/predictions/PredictionManagement.vue|month|configForm.predictStartMonth', 'YYYY-MM'],
   ['views/predictions/PredictionManagement.vue|month|configForm.predictEndMonth', 'YYYY-MM'],
-  ['views/carbon/CarbonManagement.vue|year|factorDraftFilters.factorYear', 'YYYY'],
-  ['views/carbon/CarbonManagement.vue|month|emissionDraftFilters.normalizedMonthStart', 'YYYY-MM'],
-  ['views/carbon/CarbonManagement.vue|month|emissionDraftFilters.normalizedMonthEnd', 'YYYY-MM'],
-  ['views/carbon/CarbonManagement.vue|year|factorForm.factorYear', 'YYYY'],
-  ['views/carbon/CarbonManagement.vue|date|factorForm.effectiveFrom', 'YYYY-MM-DD'],
-  ['views/carbon/CarbonManagement.vue|date|factorForm.effectiveTo', 'YYYY-MM-DD'],
-  ['views/carbon/CarbonManagement.vue|month|calculateForm.normalizedMonthStart', 'YYYY-MM'],
-  ['views/carbon/CarbonManagement.vue|month|calculateForm.normalizedMonthEnd', 'YYYY-MM'],
+  ['views/carbon/components/CarbonFactorsSection.vue|year|factorDraftFilters.factorYear', 'YYYY'],
+  ['views/carbon/components/CarbonFactorsSection.vue|year|factorForm.factorYear', 'YYYY'],
+  ['views/carbon/components/CarbonFactorsSection.vue|date|factorForm.effectiveFrom', 'YYYY-MM-DD'],
+  ['views/carbon/components/CarbonFactorsSection.vue|date|factorForm.effectiveTo', 'YYYY-MM-DD'],
+  ['views/carbon/components/LegacyEnergyCalculationPanel.vue|month|emissionDraftFilters.normalizedMonthStart', 'YYYY-MM'],
+  ['views/carbon/components/LegacyEnergyCalculationPanel.vue|month|emissionDraftFilters.normalizedMonthEnd', 'YYYY-MM'],
+  ['views/carbon/components/LegacyEnergyCalculationPanel.vue|month|calculateForm.normalizedMonthStart', 'YYYY-MM'],
+  ['views/carbon/components/LegacyEnergyCalculationPanel.vue|month|calculateForm.normalizedMonthEnd', 'YYYY-MM'],
+  ['views/carbon/components/CarbonEmissionResultsSection.vue|month|draftFilters.monthStart', 'YYYY-MM'],
+  ['views/carbon/components/CarbonEmissionResultsSection.vue|month|draftFilters.monthEnd', 'YYYY-MM'],
   ['views/ledger/LedgerManagement.vue|month|draft.monthStart', 'YYYY-MM'],
   ['views/ledger/LedgerManagement.vue|month|draft.monthEnd', 'YYYY-MM'],
   ['views/energy/balances/index.vue|monthrange|calculationForm.monthRange', 'YYYY-MM'],

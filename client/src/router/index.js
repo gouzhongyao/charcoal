@@ -20,6 +20,8 @@ import MeterReadings from '@/views/ledger/MeterReadings.vue';
 import Generation from '@/views/ledger/Generation.vue';
 import ProductionUnits from '@/views/ledger/ProductionUnits.vue';
 import ProductionOutputs from '@/views/ledger/ProductionOutputs.vue';
+// 供应商使用独立管理页，不复用通用基础台账占位组件。
+import SupplierManagement from '@/views/ledger/SupplierManagement.vue';
 import CarbonManagement from '@/views/carbon/CarbonManagement.vue';
 import PredictionManagement from '@/views/predictions/PredictionManagement.vue';
 import Dashboard from '@/views/dashboard/Dashboard.vue';
@@ -33,9 +35,8 @@ import {
   decideAuthorizedNavigation,
   findFirstAuthorizedBusinessPath,
   flattenMenus,
-  getMenuRoutePath,
   getUnauthenticatedLoginLocation,
-  isBusinessRouteMenu
+  projectDynamicRouteContract
 } from '@/utils/navigationRoutes';
 
 // 动态菜单组件映射只允许加载前端已登记的可信页面组件。
@@ -57,6 +58,7 @@ const componentMap = Object.freeze({
   'ledger/generation/index': Generation,
   'ledger/production-units/index': ProductionUnits,
   'ledger/production-output/index': ProductionOutputs,
+  'ledger/suppliers/index': SupplierManagement,
   'carbon/index': CarbonManagement,
   'predictions/index': PredictionManagement,
   'system/backups/index': Backups
@@ -72,15 +74,15 @@ let unauthenticatedEventHandling = false;
 
 // 将后端菜单转换为安全的前端动态路由记录，未知组件继续落到迁移占位页。
 function safeRoute(menu) {
-  if (!isBusinessRouteMenu(menu)) return null;
-  const component = componentMap[menu.component] || MigrationPlaceholder;
+  const routeContract = projectDynamicRouteContract(menu);
+  if (!routeContract) return null;
+  const component = componentMap[routeContract.componentKey] || MigrationPlaceholder;
   return {
-    path: getMenuRoutePath(menu),
-    name: `menu-${menu.id}`,
+    path: routeContract.path,
+    name: routeContract.name,
     component,
     meta: {
-      title: menu.menuName,
-      permission: menu.permissionCode,
+      ...routeContract.meta,
       migration: component === MigrationPlaceholder
     }
   };

@@ -3,13 +3,13 @@
     <header class="immersive-header">
       <div class="immersive-header__brand">
         <span>LOCAL ENERGY &amp; CARBON COCKPIT</span>
-        <h1>驾驶舱 · 园区业务大屏</h1>
+        <h1>中控 · 园区业务大屏</h1>
         <p>真实业务面板与抽象园区示意分层展示；园区图不代表实时设备运行或物理拓扑。</p>
       </div>
-      <div class="immersive-controls" aria-label="沉浸驾驶舱筛选与显示控制">
+      <div class="immersive-controls" aria-label="沉浸中控筛选与显示控制">
         <label>
           <span>统计年度</span>
-          <el-select :model-value="viewModel.selectedYear" :teleported="false" popper-class="immersive-dashboard-popper" aria-label="选择沉浸驾驶舱统计年度" @change="emit('change-year', $event)">
+          <el-select :model-value="viewModel.selectedYear" :teleported="false" popper-class="immersive-dashboard-popper" aria-label="选择沉浸中控统计年度" @change="emit('change-year', $event)">
             <el-option v-for="year in viewModel.yearOptions" :key="year" :label="`${year} 年`" :value="year" />
           </el-select>
         </label>
@@ -24,7 +24,7 @@
       </div>
     </header>
 
-    <section class="immersive-grid" aria-label="沉浸驾驶舱独立数据布局">
+    <section class="immersive-grid" aria-label="沉浸中控独立数据布局">
       <div class="immersive-column immersive-column--left">
         <CockpitPanel title="年度能源态势" eyebrow="ENERGY" description="当前选定能源序列及同单位结构。完整月度趋势请在标准布局查看。" :status="viewModel.energyPanel.status" :error="viewModel.energyPanel.error" forbidden-text="需要能耗记录或能耗统计查看权限。" empty-text="当前年度暂无 active 能耗记录。" @retry="emit('retry-energy')">
           <template #actions>

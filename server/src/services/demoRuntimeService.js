@@ -9,6 +9,8 @@ const LEGACY_CLAIM_CONFIRMATION_TEXT = '确认纳管青岚历史演示数据 qin
 const CLEANUP_CONFIRMATION_TEXT = '确认清除青岚演示数据 qinglan-park-v1';
 // 恢复数据库后的安全重置原因写入设置和操作审计。
 const DATABASE_RESTORE_SAFETY_REASON = 'database_restore_safety_reset';
+// 托管 artifact 下载首次惰性启用 runtime 时使用独立原因，禁止伪装为用户手工开关。
+const MANAGED_DOWNLOAD_AUTO_ENABLE_REASON = 'managed_download_auto_enable';
 
 /**
  * 将数据库行映射为稳定的运行期状态响应。
@@ -227,6 +229,61 @@ function toggleDemoRuntime(input = {}) {
 }
 
 /**
+ * 为已经通过双权限和维护态检查的托管 artifact 下载幂等开启 runtime。
+ * @param {object} input 下载 actor、artifact 与可选事务连接。
+ * @returns {object} 当前运行期状态及本次是否自动激活。
+ */
+function ensureDemoRuntimeEnabledForManagedDownload(input = {}) {
+  const actorUserId = validateActorUserId(input.actorUserId);
+  const actorIp = input.actorIp ? String(input.actorIp) : null;
+  const artifactKey = String(input.artifactKey || '').trim().toLowerCase();
+  if (!/^\d{2}-[a-z0-9-]+$/.test(artifactKey)) {
+    throw badRequest('managed 下载 artifactKey 无效。', { code: 'INVALID_MANAGED_DEMO_ARTIFACT_KEY' });
+  }
+  const ownedDb = !input.db;
+  const db = input.db || openDatabase();
+  try {
+    const activate = () => {
+      const canonicalCurrent = assertCanonicalRuntimeRow(readRuntimeSettingRow(db));
+      if (canonicalCurrent.enabled === 1) {
+        return { ...mapRuntimeStatus(canonicalCurrent), autoActivated: false };
+      }
+      const updatedAt = new Date().toISOString();
+      db.prepare(`UPDATE demo_runtime_settings
+        SET enabled = 1, runtime_epoch = runtime_epoch + 1, revision = revision + 1,
+          updated_by = ?, updated_at = ?, change_reason = ?
+        WHERE id = ? AND enabled = 0`).run(
+        actorUserId,
+        updatedAt,
+        MANAGED_DOWNLOAD_AUTO_ENABLE_REASON,
+        DEMO_RUNTIME_SETTINGS_ID
+      );
+      const canonicalNext = assertCanonicalRuntimeRow(readRuntimeSettingRow(db));
+      db.prepare(`INSERT INTO sys_operation_logs
+        (user_id, operation, target_type, target_id, detail_json, ip, created_at)
+        VALUES (?, 'system.demo.runtime.auto-enable', 'demo_runtime_settings', ?, ?, ?, ?)`).run(
+        actorUserId,
+        String(DEMO_RUNTIME_SETTINGS_ID),
+        JSON.stringify({
+          artifactKey,
+          previousEnabled: false,
+          enabled: true,
+          runtimeEpoch: canonicalNext.runtimeEpoch,
+          revision: canonicalNext.revision,
+          changeReason: MANAGED_DOWNLOAD_AUTO_ENABLE_REASON
+        }),
+        actorIp,
+        updatedAt
+      );
+      return { ...mapRuntimeStatus(canonicalNext), autoActivated: true };
+    };
+    return ownedDb ? db.transaction(activate).immediate() : activate();
+  } finally {
+    if (ownedDb) db.close();
+  }
+}
+
+/**
  * 数据库恢复后强制关闭演示开关并提升 epoch/revision，使备份内旧上下文全部失效。
  * @returns {object} 安全归一化后的运行期状态。
  */
@@ -304,6 +361,8 @@ module.exports = {
   CLEANUP_CONFIRMATION_TEXT,
   DATABASE_RESTORE_SAFETY_REASON,
   LEGACY_CLAIM_CONFIRMATION_TEXT,
+  MANAGED_DOWNLOAD_AUTO_ENABLE_REASON,
+  ensureDemoRuntimeEnabledForManagedDownload,
   getDemoCapabilities,
   getDemoConfirmationTexts,
   getDemoRuntimeStatus,

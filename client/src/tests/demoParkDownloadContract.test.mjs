@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 
@@ -104,7 +105,14 @@ for (const artifact of manifest) {
   assert.strictEqual(artifact.downloads.xlsx, `/api/templates/demo-park/${artifact.artifactKey}.xlsx`, `${artifact.artifactKey} 必须可构造固定 XLSX 下载路径。`);
   assert.strictEqual(typeof artifact.targetPage, 'string');
   assert(artifact.targetPage.length > 0, `${artifact.artifactKey} 必须声明可见目标页面。`);
+  assert.strictEqual(
+    artifact.downloadLifecycle,
+    artifact.order <= 12 ? 'stateless-formal-import' : 'managed-context-auto-runtime',
+    `${artifact.artifactKey} 必须按真实 context 接入能力声明下载生命周期。`
+  );
 }
+assert.strictEqual(manifest.filter((artifact) => artifact.downloadLifecycle === 'stateless-formal-import').length, 12);
+assert.strictEqual(manifest.filter((artifact) => artifact.downloadLifecycle === 'managed-context-auto-runtime').length, 13);
 
 // 模板路由必须同时要求系统演示下载权限和条目真实领域权限。
 for (const routeContract of [
@@ -118,6 +126,11 @@ for (const routeContract of [
 ]) assert(routeSource.includes(routeContract), `模板路由缺少青岚契约：${routeContract}`);
 const permissionMiddlewareMatch = routeSource.match(/requirePermission\(\s*'system:demo:download',\s*registration\.permissions\.download\s*\)/);
 assert(permissionMiddlewareMatch, '青岚 artifact 下载必须使用 requirePermission 的 AND 语义同时校验系统权限和领域权限。');
+assert(routeSource.includes('DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.STATELESS_FORMAL_IMPORT'), '模板路由必须按 registry 的无状态生命周期处理 01—12。');
+assert(routeSource.includes('DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME'), '模板路由必须按 registry 的托管生命周期处理 13—25。');
+assert(routeSource.includes("requireWritable('system:demo:managed-download')"), '托管下载的 runtime/run/context 写入必须受维护态保护。');
+assert(routeSource.includes('ensureDemoRuntimeEnabledForManagedDownload({'), '托管下载必须使用专用幂等 runtime 激活服务。');
+assert(!routeSource.includes('STATELESS_ORGANIZATION_EXAMPLE_KEYS'), '模板路由不得保留 01—03 artifactKey 临时白名单。');
 
 // 各类 API 都必须复用共享 HTTP download，禁止页面自行拼 Blob 或创建 Axios 实例。
 for (const apiSourceName of ['ledgerApi', 'importsApi', 'budgetsApi', 'carbonApi', 'predictionsApi', 'analysisApi', 'benchmarksApi', 'flowsApi', 'balancesApi']) {
@@ -156,7 +169,7 @@ for (const expectation of PAGE_EXPECTATIONS) {
     assert(definitionPattern.test(sources.analysisConfig), `${expectation.key} 能源分析定义必须将 key 与预演权限成员成组绑定。`);
     assert(sources.analysisConfig.includes(`${expectation.permissionMember}: '${expectation.permission}'`), `${expectation.key} 权限成员必须等于 manifest requiredPermission。`);
     const apiBlock = functionWindow(sources.analysisApi, 'downloadEnergyAnalysisDemoArtifact');
-    assert(apiBlock.includes('return download(') && apiBlock.includes('/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}'), '能源分析共享方法必须通过 download 构造编码后的青岚路径。');
+    assert(apiBlock.includes('return downloadManagedDemoArtifact(') && apiBlock.includes('/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}'), '能源分析共享方法必须通过托管 download 构造编码后的青岚路径。');
     assert(sources.analysisPage.includes("downloadEnergyAnalysisDemoArtifact(definition.demoArtifactKey, 'xlsx')"), `${expectation.key} 页面必须把配置 key 传给共享下载方法。`);
     assert(sources.analysisPage.includes('hasPermissionCode(definition.previewPermission)'), `${expectation.key} 页面入口必须使用同一配置权限控制可见性。`);
     continue;
@@ -166,7 +179,7 @@ for (const expectation of PAGE_EXPECTATIONS) {
     const apiMappingPattern = new RegExp(`(?:'${escapeRegExp(expectation.importType)}'|${escapeRegExp(expectation.importType)}):\\s*Object\\.freeze\\(\\{[^}]*artifactKey:\\s*'${escapeRegExp(expectation.key)}'`);
     assert(apiMappingPattern.test(sources.benchmarksApi), `${expectation.key} 必须绑定能效对标导入类型 ${expectation.importType}。`);
     const apiBlock = functionWindow(sources.benchmarksApi, 'downloadEnergyBenchmarkDemoParkExample');
-    assert(apiBlock.includes('return download(') && apiBlock.includes('/templates/demo-park/${config.artifactKey}.xlsx'), '能效对标共享方法必须使用配置 key 调用 download。');
+    assert(apiBlock.includes('return downloadManagedDemoArtifact(') && apiBlock.includes('/templates/demo-park/${config.artifactKey}.xlsx'), '能效对标共享方法必须使用配置 key 调用托管 download。');
     assert(sources.benchmarksConfig.includes(`importPreview: '${expectation.permission}'`), `${expectation.key} 对标预演权限必须对照 manifest。`);
     assert(sources.benchmarksPage.includes('downloadEnergyBenchmarkDemoParkExample(importType.value)'), `${expectation.key} 页面必须按当前配置类型调用共享下载方法。`);
     assert(sources.benchmarksPage.includes('hasPermi(ENERGY_BENCHMARK_PERMISSIONS.importPreview)'), `${expectation.key} 页面必须以预演权限控制入口。`);
@@ -177,14 +190,14 @@ for (const expectation of PAGE_EXPECTATIONS) {
     const flowDefinitionPattern = new RegExp(`key:\\s*'${escapeRegExp(expectation.flowKey)}'[^}]*demoArtifactKey:\\s*'${escapeRegExp(expectation.key)}'`);
     assert(flowDefinitionPattern.test(sources.flowsPage), `${expectation.key} 必须绑定能流入口 ${expectation.flowKey}。`);
     const apiBlock = functionWindow(sources.flowsApi, 'downloadEnergyFlowDemoArtifact');
-    assert(apiBlock.includes('return download(') && apiBlock.includes('/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}'), '能流共享方法必须通过 download 构造编码后的青岚路径。');
+    assert(apiBlock.includes('return downloadManagedDemoArtifact(') && apiBlock.includes('/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}'), '能流共享方法必须通过托管 download 构造编码后的青岚路径。');
     assert(sources.flowsPage.includes("downloadEnergyFlowDemoArtifact(definition.demoArtifactKey, 'xlsx')"), `${expectation.key} 页面必须把配置 key 传给共享下载方法。`);
     assert(sources.flowsPage.includes(`hasPermi('${expectation.permission}')`), `${expectation.key} 页面必须以 manifest 权限控制入口。`);
     continue;
   }
 
   const apiBlock = functionWindow(sources.balancesApi, expectation.apiFunction);
-  assert(apiBlock.includes('return download(') && apiBlock.includes(clientPath), `${expectation.key} 平衡 API 必须通过共享 download 使用固定 XLSX 路径。`);
+  assert(apiBlock.includes('return downloadManagedDemoArtifact(') && apiBlock.includes(clientPath), `${expectation.key} 平衡 API 必须通过托管 download 使用固定 XLSX 路径。`);
   assert(sources.balancesConfig.includes(`importPreview: '${expectation.permission}'`), `${expectation.key} 平衡权限必须对照 manifest。`);
   assert(sources.balancesPage.includes(expectation.apiFunction), `${expectation.key} 平衡页面必须调用青岚下载方法。`);
   assert(sources.balancesPage.includes('hasPermi(ENERGY_BALANCE_PERMISSIONS.importPreview)'), `${expectation.key} 平衡页面必须以预演权限控制入口。`);
@@ -201,6 +214,28 @@ assert(sources.analysisConfig.includes("demoArtifactKey: '17-tou-schemes'") && s
 assert(sources.flowsPage.includes("demoArtifactKey: '24-energy-flow-edges'") && sources.flowsPage.includes("downloadEnergyFlowDemoArtifact(definition.demoArtifactKey, 'xlsx')"), '能流双工作表页面必须固定下载 XLSX。');
 assert(sources.balancesApi.includes('/templates/demo-park/25-energy-balance-configs.xlsx') && !sources.balancesApi.includes('/templates/demo-park/25-energy-balance-configs.csv'), '平衡双工作表 API 只能提供 XLSX 示例。');
 
+// 13—25 的四个领域 API 必须统一保存下载 context，并在 preview/execute 中复用共享生命周期。
+for (const apiSourceName of ['analysisApi', 'benchmarksApi', 'flowsApi', 'balancesApi']) {
+  assert(sources[apiSourceName].includes('downloadManagedDemoArtifact'), `${apiSourceName} 必须保存托管下载 context。`);
+  assert(sources[apiSourceName].includes('previewManagedDemoImport'), `${apiSourceName} 必须使用 demo-aware preview。`);
+  assert(sources[apiSourceName].includes('executeManagedDemoImport'), `${apiSourceName} 必须在 execute 成功后清理 context。`);
+}
+for (const handlerKey of [
+  'shift-definitions-import', 'shift-schedules-import', 'energy-timeseries-import',
+  'device-states-import', 'tou-schemes-import', 'strategy-rules-import',
+  'energy-conversion-factors-import', 'energy-benchmark-definitions-import',
+  'energy-benchmark-targets-import', 'energy-flow-models-import',
+  'energy-flow-nodes-import', 'energy-flow-bundle-import', 'energy-balance-bundle-import'
+]) {
+  assert(
+    sources.analysisApi.includes(handlerKey)
+      || sources.benchmarksApi.includes(handlerKey)
+      || sources.flowsApi.includes(handlerKey)
+      || sources.balancesApi.includes(handlerKey),
+    `前端 managed API 必须显式绑定 handler：${handlerKey}`
+  );
+}
+
 // 重新关联只能从响应 header 读取新 token，并成功替换当前标签页 sessionStorage。
 assert(sources.httpApi.includes('export async function requestWithHeaders'), '共享 HTTP 必须提供不丢失响应头的受控请求入口。');
 assert(sources.demoDataApi.includes('requestWithHeaders({'), '重新关联必须使用可读取响应头的共享请求。');
@@ -209,15 +244,22 @@ assert(sources.demoDataApi.includes('storeDemoContext({'), '重新关联成功�
 assert(!sources.demoDataApi.includes('contextToken: response.data'), '重新关联不得从响应 body 读取明文 token。');
 
 // sessionStorage 生命周期使用真实纯逻辑函数验证，不以源码字符串代替存取、隔离和清理行为。
+globalThis.__demoContractRequests = [];
+globalThis.__demoContractDownloadResult = null;
 const demoDataModuleSource = sources.demoDataApi.replace(
-  "import { request, requestWithHeaders } from '@/api/http';",
-  'const request = async () => null; const requestWithHeaders = async () => null;'
+  "import { download, request, requestWithHeaders } from '@/api/http';",
+  `const request = async (config) => { globalThis.__demoContractRequests.push(config); return { success: true, data: { accepted: true } }; };
+   const requestWithHeaders = async () => null;
+   const download = async () => globalThis.__demoContractDownloadResult;`
 );
 const demoDataModuleUrl = `data:text/javascript;base64,${Buffer.from(demoDataModuleSource).toString('base64')}`;
 const {
   DEMO_CONTEXT_STORAGE_PREFIX,
   clearDemoContexts,
   demoContextRequestConfig,
+  downloadManagedDemoArtifact,
+  executeManagedDemoImport,
+  previewManagedDemoImport,
   readDemoContext,
   storeDemoContext
 } = await import(demoDataModuleUrl);
@@ -280,6 +322,49 @@ const invalidStorageKey = `${DEMO_CONTEXT_STORAGE_PREFIX}:13-shift-definitions:s
 firstTabStorage.setItem(invalidStorageKey, JSON.stringify({ ...firstContextMetadata, token: 'invalid' }));
 assert.strictEqual(readDemoContext('13-shift-definitions', 'shift-definitions-import', firstTabStorage), null);
 assert.strictEqual(firstTabStorage.getItem(invalidStorageKey), null, '畸形 context 必须在读取时清理');
+
+// 托管下载、原文件 preview、execute 成功清理和非匹配文件正式降级必须执行真实纯逻辑函数。
+const managedFile = new Blob([Buffer.from('managed-demo-file', 'utf8')]);
+const managedFileSha256 = createHash('sha256').update(Buffer.from('managed-demo-file', 'utf8')).digest('hex');
+const managedMetadata = {
+  ...firstContextMetadata,
+  artifactSha256: managedFileSha256,
+  contextToken: 'e'.repeat(43)
+};
+globalThis.__demoContractDownloadResult = { fileName: 'demo.xlsx', headers: {}, demo: managedMetadata };
+const managedDownload = await downloadManagedDemoArtifact({ url: '/demo.xlsx' }, 'demo.xlsx', firstTabStorage);
+assert.strictEqual(managedDownload.demoContextStored, true, '托管下载必须保存完整 context。');
+await previewManagedDemoImport(
+  { method: 'post', url: '/preview', data: {} },
+  managedMetadata.artifactKey,
+  managedMetadata.handlerKey,
+  managedFile,
+  firstTabStorage
+);
+assert.deepStrictEqual(globalThis.__demoContractRequests.at(-1).demoContext, {
+  artifactKey: managedMetadata.artifactKey,
+  handlerKey: managedMetadata.handlerKey,
+  token: managedMetadata.contextToken
+}, '原始下载文件摘要匹配时 preview 必须附加唯一 context。');
+await executeManagedDemoImport(
+  { method: 'post', url: '/execute', data: {} },
+  managedMetadata.artifactKey,
+  managedMetadata.handlerKey,
+  firstTabStorage
+);
+assert.strictEqual(readDemoContext(managedMetadata.artifactKey, managedMetadata.handlerKey, firstTabStorage), null, 'execute 成功后必须清理一次性 context。');
+storeDemoContext(managedMetadata, firstTabStorage);
+await previewManagedDemoImport(
+  { method: 'post', url: '/formal-preview', data: {} },
+  managedMetadata.artifactKey,
+  managedMetadata.handlerKey,
+  new Blob([Buffer.from('ordinary-formal-file', 'utf8')]),
+  firstTabStorage
+);
+assert.strictEqual(globalThis.__demoContractRequests.at(-1).demoContext, undefined, '文件摘要不匹配时不得把 stale context 附加到正式导入。');
+assert.strictEqual(readDemoContext(managedMetadata.artifactKey, managedMetadata.handlerKey, firstTabStorage), null, '正式 preview 成功后必须清理不匹配的 stale context。');
+delete globalThis.__demoContractRequests;
+delete globalThis.__demoContractDownloadResult;
 
 // prediction-history 只复用月度能耗条目，不得伪造第 26 个独立 artifact。
 const predictionHistoryArtifacts = DEMO_PARK_ARTIFACTS.filter((artifact) => artifact.coveredTemplateTypes.includes('prediction-history'));

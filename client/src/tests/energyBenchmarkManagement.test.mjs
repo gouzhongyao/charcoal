@@ -19,6 +19,7 @@ import {
   buildEnergyBenchmarkImportExecutePayload,
   buildEnergyBenchmarkInternalHistoryPayload,
   buildEnergyBenchmarkTargetFilters,
+  buildEnergyBenchmarkTargetPayload,
   canExecuteEnergyBenchmarkImport,
   createEnergyBenchmarkActualRow,
   createEnergyBenchmarkEntityColorRegistry,
@@ -406,7 +407,50 @@ test('内部历史载荷只包含定义、参考期和显式计算范围', () =>
   assert.deepEqual(payload.referencePeriod, { startUtc: '2025-01-01T00:00:00Z', endUtc: '2026-01-01T00:00:00Z' });
   assert.deepEqual(payload.calculationScope, { productionUnitId: 2, energyTypeCode: 'electricity' });
   const serialized = JSON.stringify(payload);
-  for (const forbidden of ['snapshot', 'frozenValue', 'sampleCount', 'productionSummary', 'productionSummaryJson', 'sourceDataDigest', 'frozenAt', 'targetValue']) assert.equal(serialized.includes(forbidden), false, `不得提交 ${forbidden}`);
+  for (const forbidden of ['snapshot', 'frozenValue', 'sampleCount', 'productionSummary', 'productionSummaryJson', 'sourceDataDigest', 'frozenAt', 'targetValue', 'documentNo', 'version', 'benchmarkVersion', 'targetVersion', 'internalRevision']) assert.equal(serialized.includes(forbidden), false, `不得提交 ${forbidden}`);
+});
+
+test('定义和目标写载荷忽略客户端伪造的历史技术字段与内部修订', () => {
+  const definitionPayload = buildEnergyBenchmarkDefinitionPayload({
+    benchmarkCode: 'BENCH-1',
+    benchmarkName: '标杆',
+    benchmarkType: 'external_standard',
+    metricCode: 'energy_intensity',
+    unit: 'kWh/t',
+    periodType: 'month',
+    scopeType: 'organization',
+    scopeReference: 'OU-1',
+    direction: 'lower_better',
+    source: '公开来源',
+    documentNo: '客户端文号',
+    version: 'client-definition:v999',
+    benchmarkVersion: 'client-benchmark:v999',
+    targetVersion: 'client-target:v999',
+    internalRevision: 999,
+    effectiveStartUtc: '2026-01-01T00:00:00Z',
+    effectiveEndUtc: '2027-01-01T00:00:00Z',
+    sourceTimeZone: 'Asia/Shanghai',
+    status: 'active'
+  });
+  const targetPayload = buildEnergyBenchmarkTargetPayload({
+    benchmarkDefinitionId: 9,
+    targetValue: 8,
+    lowerBound: null,
+    upperBound: null,
+    documentNo: '客户端文号',
+    version: 'client-target:v999',
+    benchmarkVersion: 'client-benchmark:v999',
+    targetVersion: 'client-target-version:v999',
+    internalRevision: 999,
+    status: 'active'
+  }, true);
+  for (const payload of [definitionPayload, targetPayload]) {
+    for (const forbidden of ['documentNo', 'version', 'benchmarkVersion', 'targetVersion', 'internalRevision']) {
+      assert.equal(Object.prototype.hasOwnProperty.call(payload, forbidden), false, `写载荷不得包含 ${forbidden}`);
+    }
+  }
+  assert.equal(targetPayload.benchmarkDefinitionId, 9);
+  assert.equal(targetPayload.targetValue, 8);
 });
 
 test('导入执行载荷只有持久化批次和固定确认字段', () => {

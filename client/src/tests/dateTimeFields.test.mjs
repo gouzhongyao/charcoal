@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   MINUTES_PER_DAY,
+  areStrictUtcInputsValid,
   daysInGregorianMonth,
   formatMinutesAsTimeOfDay,
   isGregorianLeapYear,
@@ -98,6 +99,13 @@ assertInvalidUtc('2024-01-01T00:00:00.001Z', 'millisecond-precision');
 assertInvalidUtc('2024-01-01T00:00:00.999Z', 'millisecond-precision');
 assertInvalidUtc('2024-01-01T00:00:00.0000Z', 'format');
 assert.equal(normalizeStrictUtcDateTime('2024-01-01T00:00:00.001Z'), null);
+
+// UTC 输入组件合法性快照：任一字段非法都必须阻止查询或创建，空快照按无阻断处理。
+assert.equal(areStrictUtcInputsValid({ startUtc: true, endUtc: true }), true);
+assert.equal(areStrictUtcInputsValid({ startUtc: false, endUtc: true }), false);
+assert.equal(areStrictUtcInputsValid({ startUtc: true, endUtc: false }), false);
+assert.equal(areStrictUtcInputsValid({ startUtc: 1, endUtc: true }), false);
+assert.equal(areStrictUtcInputsValid({}), true);
 
 // UTC 往返测试：所有合法规范值再次解析后保持完全一致。
 const utcRoundTripValues = [

@@ -125,6 +125,12 @@ const ENERGY_ANALYSIS_VERSIONS = Object.freeze({
 
 // 严格 UTC ISO 时间戳格式，必须显式携带 Z。
 const STRICT_UTC_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+// N8 能流输入只允许秒精度或可无损折叠的零毫秒。
+const ENERGY_FLOW_UTC_SECOND_INPUT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.000)?Z$/;
+// N8 模型、节点和边稳定编码只接受首字符为字母或数字的受控 ASCII。
+const ENERGY_FLOW_IDENTITY_CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+// N8 模型版本使用独立受控 ASCII 合同，长度与 schema.sql 的 1..64 字符约束一致。
+const ENERGY_FLOW_MODEL_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 
 // IANA 来源时区格式，要求区域与地点分段。
 const IANA_TIME_ZONE_PATTERN = /^[A-Za-z_]+(?:\/[A-Za-z0-9_.+-]+)+$/;
@@ -207,6 +213,137 @@ function isStrictUtcIso(value) {
 
   const canonicalValue = new Date(timeValue).toISOString();
   return value.includes('.') ? canonicalValue === value : canonicalValue.replace('.000Z', 'Z') === value;
+}
+
+/**
+ * 将 N8 能流稳定键规范化为 trim + Unicode NFKC + 大写比较值。
+ * @param {*} value 待规范化值。
+ * @returns {string|null} 规范比较键。
+ */
+function normalizeEnergyFlowKey(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return String(value).trim().normalize('NFKC').toUpperCase();
+}
+
+/**
+ * 校验并规范 N8 模型、节点和边稳定编码，同时返回显示值和规范比较键。
+ * @param {*} value 待校验编码。
+ * @returns {{valid:boolean,value:string|null,key:string|null,errorCode:string|null}} 稳定校验结果。
+ */
+function validateAndNormalizeEnergyFlowIdentityCode(value) {
+  if (value === null || value === undefined) {
+    return {
+      valid: false,
+      value: null,
+      key: null,
+      errorCode: 'REQUIRED_FIELD_MISSING'
+    };
+  }
+  const displayValue = String(value).trim();
+  const normalizedKey = normalizeEnergyFlowKey(displayValue);
+  if (!displayValue || !normalizedKey) {
+    return {
+      valid: false,
+      value: null,
+      key: null,
+      errorCode: 'REQUIRED_FIELD_MISSING'
+    };
+  }
+  if (!ENERGY_FLOW_IDENTITY_CODE_PATTERN.test(displayValue)) {
+    return {
+      valid: false,
+      value: displayValue,
+      key: normalizedKey,
+      errorCode: 'INVALID_ENERGY_FLOW_IDENTITY'
+    };
+  }
+  return {
+    valid: true,
+    value: displayValue,
+    key: normalizedKey,
+    errorCode: null
+  };
+}
+
+/**
+ * 将 N8 模型版本规范为 trim + Unicode NFKC + 大写比较值。
+ * @param {*} value 待规范化模型版本。
+ * @returns {string|null} 模型版本规范比较键。
+ */
+function normalizeEnergyFlowModelVersionKey(value) {
+  return normalizeEnergyFlowKey(value);
+}
+
+/**
+ * 校验并规范 N8 模型版本，保留 trim 后 ASCII 显示值和 NFKC 大写比较键。
+ * @param {*} value 待校验模型版本。
+ * @returns {{valid:boolean,value:string|null,key:string|null,errorCode:string|null}} 稳定校验结果。
+ */
+function validateAndNormalizeEnergyFlowModelVersion(value) {
+  if (value === null || value === undefined) {
+    return {
+      valid: false,
+      value: null,
+      key: null,
+      errorCode: 'REQUIRED_FIELD_MISSING'
+    };
+  }
+  const displayValue = String(value).trim();
+  const normalizedKey = normalizeEnergyFlowModelVersionKey(displayValue);
+  if (!displayValue || !normalizedKey) {
+    return {
+      valid: false,
+      value: null,
+      key: null,
+      errorCode: 'REQUIRED_FIELD_MISSING'
+    };
+  }
+  if (!ENERGY_FLOW_MODEL_VERSION_PATTERN.test(displayValue)) {
+    return {
+      valid: false,
+      value: displayValue,
+      key: normalizedKey,
+      errorCode: 'INVALID_ENERGY_FLOW_MODEL_VERSION'
+    };
+  }
+  return {
+    valid: true,
+    value: displayValue,
+    key: normalizedKey,
+    errorCode: null
+  };
+}
+
+/**
+ * 将 N8 能流 UTC 时间规范为严格秒精度，零毫秒无损折叠为 Z。
+ * @param {*} value 待规范化值。
+ * @returns {string|null} 秒精度 UTC 时间；非法或非零毫秒返回 null。
+ */
+function normalizeEnergyFlowUtcSecond(value) {
+  if (typeof value !== 'string' || !ENERGY_FLOW_UTC_SECOND_INPUT_PATTERN.test(value)) {
+    return null;
+  }
+  const normalizedValue = value.endsWith('.000Z')
+    ? `${value.slice(0, -5)}Z`
+    : value;
+  const timeValue = Date.parse(normalizedValue);
+  if (!Number.isFinite(timeValue)) {
+    return null;
+  }
+  const canonicalValue = new Date(timeValue).toISOString().replace('.000Z', 'Z');
+  return canonicalValue === normalizedValue ? normalizedValue : null;
+}
+
+/**
+ * 判断值是否符合 N8 能流 UTC 秒精度合同。
+ * @param {*} value 待验证值。
+ * @returns {boolean} 是否可规范为秒精度 UTC。
+ */
+function isEnergyFlowUtcSecond(value) {
+  const normalizedValue = normalizeEnergyFlowUtcSecond(value);
+  return normalizedValue !== null && normalizedValue === value;
 }
 
 /**
@@ -500,11 +637,8 @@ function validateBenchmarkContract(benchmark) {
   }
 
   if (benchmark.type === 'external_standard' || benchmark.type === 'manual_benchmark') {
-    if (!isNonEmptyString(benchmark.source) || !VERSION_PATTERN.test(benchmark.version || '')) {
+    if (!isNonEmptyString(benchmark.source)) {
       errors.push('MISSING_BENCHMARK_SOURCE');
-    }
-    if (benchmark.type === 'external_standard' && !isNonEmptyString(benchmark.documentNo)) {
-      errors.push('MISSING_BENCHMARK_DOCUMENT_NO');
     }
     appendDateRangeErrors(
       errors,
@@ -523,9 +657,6 @@ function validateBenchmarkContract(benchmark) {
       'INVALID_REFERENCE_PERIOD_DATE',
       'INVALID_REFERENCE_PERIOD_RANGE'
     );
-    if (!VERSION_PATTERN.test(benchmark.version || '')) {
-      errors.push('INVALID_INTERNAL_BASELINE_VERSION');
-    }
     if (!Number.isFinite(benchmark.frozenValue) || !isStrictUtcIso(benchmark.frozenAt)
       || benchmark.frozen !== true || benchmark.autoRefresh !== false
       || !isNonEmptyString(benchmark.sourceDataDigest)
@@ -560,8 +691,11 @@ function validateEnergyFlowModelContract(model) {
     return createValidationResult(['INVALID_ENERGY_FLOW_MODEL']);
   }
 
-  if (!isNonEmptyString(model.modelCode) || !VERSION_PATTERN.test(model.version || '')) {
+  if (!validateAndNormalizeEnergyFlowIdentityCode(model.modelCode).valid) {
     errors.push('INVALID_ENERGY_FLOW_MODEL_IDENTITY');
+  }
+  if (!validateAndNormalizeEnergyFlowModelVersion(model.version).valid) {
+    errors.push('INVALID_ENERGY_FLOW_MODEL_VERSION');
   }
 
   const nodes = Array.isArray(model.nodes) ? model.nodes : [];
@@ -887,9 +1021,15 @@ module.exports = {
   TIME_INTERVAL_BOUNDARY,
   TIME_OF_USE_PERIOD_TYPES,
   hasForbiddenAutomationRecommendation,
+  isEnergyFlowUtcSecond,
   isIanaTimeZone,
   isStrictCalendarDate,
   isStrictUtcIso,
+  normalizeEnergyFlowKey,
+  normalizeEnergyFlowModelVersionKey,
+  normalizeEnergyFlowUtcSecond,
+  validateAndNormalizeEnergyFlowIdentityCode,
+  validateAndNormalizeEnergyFlowModelVersion,
   validateBalanceItemsContract,
   validateBenchmarkContract,
   validateConversionFactorContract,

@@ -4,7 +4,9 @@ const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticate } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
-const { createBackup, deleteBackup, getBackupForDownload, listBackups, restoreBackup } = require('../services/backupService');
+const backupService = require('../services/backupService');
+const { deleteBackup, getBackupForDownload, listBackups, restoreBackup } = backupService;
+const { AppError } = require('../utils/errors');
 const { sendSuccess } = require('../utils/response');
 
 const router = express.Router();
@@ -40,6 +42,21 @@ function toPublicRestoreResult(result = {}) {
   };
 }
 
+/**
+ * 构造系统手工备份失败的稳定公开错误，避免底层文件和 SQLite 异常进入响应。
+ * @returns {AppError} 不含原生异常消息和本机路径的应用错误。
+ */
+function createSystemBackupFailedError() {
+  return new AppError(
+    'SYSTEM_BACKUP_CREATE_FAILED',
+    '系统备份创建失败，请稍后重试。',
+    {
+      statusCode: 500,
+      details: null
+    }
+  );
+}
+
 router.get('/', authenticate, requirePermission('system:backup:view'), asyncHandler(async (req, res) => {
   const result = listBackups();
   sendSuccess(res, result.rows.map(toPublicBackupMetadata), {
@@ -51,7 +68,13 @@ router.get('/', authenticate, requirePermission('system:backup:view'), asyncHand
 }));
 
 router.post('/', authenticate, requirePermission('system:backup:create'), requireWritable('backups:create'), asyncHandler(async (req, res) => {
-  const backup = await createBackup({ reason: 'manual' });
+  // 手工备份结果仅在创建成功后投影为公开元数据。
+  let backup;
+  try {
+    backup = await backupService.createBackup({ reason: 'manual' });
+  } catch {
+    throw createSystemBackupFailedError();
+  }
   sendSuccess(res, toPublicBackupMetadata(backup), { statusCode: 201 });
 }));
 

@@ -124,7 +124,9 @@ assert.equal(resolveDashboardSummaryDomainState({ authorized: false, status: 'fo
 assert.equal(resolveDashboardSummaryDomainState({ authorized: true, status: 'available' }).status, 'success');
 assert.equal(resolveDashboardSummaryDomainState({ authorized: true, status: 'empty' }).status, 'empty');
 assert.equal(resolveDashboardSummaryDomainState({ status: 'available' }).status, 'error');
+assert.equal(resolveDashboardSummaryDomainState({ status: 'available' }).error, '中控摘要缺少明确的领域授权状态。');
 assert.equal(resolveDashboardSummaryDomainState({ authorized: true, status: 'unknown' }).status, 'error');
+assert.equal(resolveDashboardSummaryDomainState({ authorized: true, status: 'unknown' }).error, '中控摘要返回了无法识别的领域状态。');
 
 // 请求版本必须严格匹配；零值比例不得伪造最小可视值。
 assert.equal(isLatestDashboardRequest(3, 3), true);

@@ -36,6 +36,18 @@ assert.equal((pageSource.match(/@blur="validateUtcFormField\(/g) || []).length, 
 assert.ok(pageSource.includes('严格 UTC Z 左闭右开区间'), '页面必须保留严格 UTC Z 左闭右开提示');
 assert.ok((pageSource.match(/UTC（不含）/g) || []).length >= 4, '四个结束字段必须保留结束不含标签');
 for (const section of ['对标分析', '定义与目标', '受控导入', '排除对象与原因']) assert.ok(pageSource.includes(section), `页面缺少 ${section}`);
+assert.equal(pageSource.includes('HelpIcon'), false, '能效对标页面不得继续引入或使用标题问号帮助组件');
+assert.equal(pageSource.includes('文号'), false, '页面用户文案、列表、详情和表单不得出现文号概念');
+assert.equal(pageSource.includes('版本'), false, '页面用户文案、列表、详情和表单不得出现版本概念');
+for (const forbiddenField of ['documentNo', 'benchmarkVersion', 'targetVersion']) assert.equal(pageSource.includes(forbiddenField), false, `页面不得访问技术字段 ${forbiddenField}`);
+assert.equal(pageSource.includes('.version'), false, '页面不得展示或回填只读兼容版本');
+assert.equal(pageSource.includes('openDefinitionVersion'), false, '页面不得保留定义版本入口');
+assert.equal(pageSource.includes('openVersionTarget'), false, '页面不得保留目标版本入口');
+assert.match(pageSource, /function projectDefinitionRecordToForm\(row = \{\}\) \{[\s\S]*?benchmarkCode: row\.benchmarkCode[\s\S]*?status: row\.status \|\| 'active'[\s\S]*?\n\}/, '定义详情必须通过显式业务字段投影后再回填表单');
+assert.ok(pageSource.includes('targetForm.value = {') && pageSource.includes('benchmarkDefinitionId: row.benchmarkDefinitionId'), '目标调整必须通过显式业务字段投影回填表单');
+assert.ok(pageSource.includes('对标目标'), '目标选择、管理和详情必须使用不含版本概念的名称');
+assert.ok(pageSource.includes('服务端会保留原定义并创建后继记录'), '定义调整必须说明保留历史记录');
+assert.ok(pageSource.includes('服务端会保留原目标并创建后继记录'), '目标调整必须说明保留历史记录');
 assert.ok(pageSource.includes('equivalent-table'), '排名图必须提供完整等价表格');
 assert.ok(pageSource.includes('ranking-legend'), '多对象排名必须提供图例');
 assert.ok(pageSource.includes('图形最多展示 ${ENERGY_BENCHMARK_CHART_MAX_ENTITIES} 个明确对象'), '页面必须说明图形容量');
@@ -48,7 +60,7 @@ assert.ok(pageSource.includes("clearValidate(['scopeType', 'scopeReference'])") 
 assert.ok(pageSource.includes("import { getEnergyTypes } from '@/api/energy';"), '能源类型必须复用现有 API');
 assert.ok(pageSource.includes('getAllActiveEnergyBenchmarkProductionUnits'), '页面必须完整读取 active 产能单元');
 assert.ok(pageSource.includes('历史值保持原样显示，页面不会静默替换'), '不可见历史值不得静默替换');
-for (const opener of ['openCreateDefinition', 'openEditDefinition', 'openDefinitionVersion']) {
+for (const opener of ['openCreateDefinition', 'openEditDefinition']) {
   assert.match(pageSource, new RegExp(`function ${opener}\\([^)]*\\) \\{[\\s\\S]*?definitionDrawerOpen\\.value = true; refreshScopeMasterData\\(definitionForm\\.value\\.scopeType\\); \\}`), `${opener} 每次打开都必须刷新当前范围主数据。`);
 }
 assert.match(pageSource, /function openInternalHistory\(\) \{[\s\S]*?Promise\.all\(\[refreshScopeMasterData\(internalForm\.value\.definition\.scopeType\), refreshScopeMasterData\('product'\), refreshScopeMasterData\('energy'\)\]\); \}/, '内部历史抽屉每次打开必须刷新范围、产能和能源三类主数据。');
@@ -91,6 +103,8 @@ for (const permission of [
 
 // API 路由结构必须覆盖定义、目标、分析、导出、组织/产能主数据和三类导入。
 for (const route of ['/definitions', '/internal-history', '/targets', '/evaluate', '/rankings', '/qualification-rate', '/export-rows', '/organization/units', '/production/units']) assert.ok(apiSource.includes(route), `API 模块缺少 ${route}`);
+assert.ok(apiSource.includes('updateEnergyBenchmarkTarget'), 'API 模块必须提供目标调整入口');
+assert.equal(apiSource.includes('versionEnergyBenchmarkTarget'), false, 'API 模块不得继续暴露用户版本入口');
 for (const importType of ['conversion-factors', 'definitions', 'targets']) assert.ok(utilitySource.includes(`value: '${importType}'`), `缺少导入类型 ${importType}`);
 assert.ok(apiSource.includes("data.append('file', file)"), '导入预演必须使用 FormData 上传文件');
 assert.ok(apiSource.includes('${importType}/preview'), '缺少导入预演路由结构');
@@ -107,7 +121,7 @@ assert.ok(apiSource.includes("import { download, query, request } from '@/api/ht
 assert.ok(pageSource.includes('下载{{ currentImportTypeLabel }}空白模板'), '当前导入类型必须提供空白模板入口');
 assert.ok(pageSource.includes('下载{{ currentImportTypeLabel }}青岚园区示例'), '当前导入类型必须提供青岚园区示例入口');
 assert.ok(pageSource.includes('推荐顺序：先导入能源折标系数，再导入对标定义，最后导入对标目标'), '页面必须说明三类文件导入顺序');
-assert.ok(pageSource.includes('外部标准定义必须保留真实来源和文号'), '页面必须保留真实来源和文号边界');
+assert.ok(pageSource.includes('外部标准定义必须填写真实来源'), '页面必须保留外部标准真实来源边界');
 assert.ok(pageSource.includes('内部历史必须由服务端按明确参考期固化'), '页面必须保留内部历史固化边界');
 assert.ok(pageSource.includes('不会自动导入、计算或执行对标'), '模板和示例下载不得伪装自动导入或自动对标');
 assert.ok(pageSource.includes('青岚园区示例下载失败'), '示例下载失败必须复用现有消息反馈');

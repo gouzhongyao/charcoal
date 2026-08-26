@@ -1,9 +1,5 @@
 <template>
   <ManagementPage title="能效对标">
-    <template #title-extra>
-      <HelpIcon label="查看能效对标口径" content="本页面只使用企业自定义、页面维护或本地模板导入的标准与标杆，不内置、不抓取也不虚构行业同行数据。排名和合格率仅使用调用方显式提交且通过指标、单位、周期、范围、层级和有效期校验的对象。" />
-    </template>
-
     <PageState v-if="!canView" description="当前账号没有查看能效对标的权限。请联系管理员授予 energy:benchmarks:view 权限。" />
     <template v-else>
       <el-alert type="info" :closable="false" show-icon title="数据边界：只使用企业自定义或导入标准，不内置、不虚构行业同行数据。" />
@@ -28,12 +24,12 @@
               <el-form inline class="analysis-selector">
                 <el-form-item label="对标定义">
                   <el-select v-model="analysisDefinitionId" filterable placeholder="选择启用定义" :loading="analysisDefinitionsLoading" @change="changeAnalysisDefinition">
-                    <el-option v-for="item in activeDefinitions" :key="item.id" :label="`${item.benchmarkName} · ${item.version}`" :value="item.id" />
+                    <el-option v-for="item in activeDefinitions" :key="item.id" :label="`${item.benchmarkName} · ${item.benchmarkCode}`" :value="item.id" />
                   </el-select>
                 </el-form-item>
-                <el-form-item label="目标版本">
+                <el-form-item label="对标目标">
                   <el-select v-model="analysisTargetId" filterable placeholder="选择启用目标" :loading="analysisTargetsLoading" @change="changeAnalysisTarget">
-                    <el-option v-for="item in activeAnalysisTargets" :key="item.id" :label="`${item.version} · ${targetValueLabel(item, analysisDefinition)}`" :value="item.id" />
+                    <el-option v-for="item in activeAnalysisTargets" :key="item.id" :label="targetValueLabel(item, analysisDefinition)" :value="item.id" />
                   </el-select>
                 </el-form-item>
               </el-form>
@@ -126,13 +122,13 @@
 
           <section class="stat-grid" aria-label="定义与目标汇总">
             <StatCard label="定义总数" :value="formatInteger(definitionPagination.total)" note="当前服务端筛选结果" />
-            <StatCard label="当前页启用定义" :value="formatInteger(definitions.filter((item) => item.status === 'active').length)" note="启停用于版本选择，不物理删除" />
+            <StatCard label="当前页启用定义" :value="formatInteger(definitions.filter((item) => item.status === 'active').length)" note="启停用于业务选择，不物理删除" />
             <StatCard label="当前页内部基准" :value="formatInteger(definitions.filter((item) => item.benchmarkType === 'internal_history_baseline').length)" note="创建时固化，不自动刷新" />
-            <StatCard label="目标版本" :value="formatInteger(targetPagination.total)" note="目标修改会创建后继版本" />
+            <StatCard label="对标目标" :value="formatInteger(targetPagination.total)" note="调整会保留原目标记录" />
           </section>
 
           <article class="page-card">
-            <header class="section-heading"><div><h2>对标定义</h2><p>外部标准必须填写真实来源和文号；普通定义已有目标后，口径字段由服务端保护。</p></div></header>
+            <header class="section-heading"><div><h2>对标定义</h2><p>外部标准填写真实来源；定义调整由服务端保留原记录并创建后继记录。</p></div></header>
             <PageState v-if="definitionsError" :error="definitionsError" @retry="loadDefinitions" />
             <PageState v-else-if="!definitions.length && !definitionsLoading" description="暂无对标定义。企业可手工维护或通过受控模板导入真实标准。" />
             <template v-else>
@@ -143,28 +139,26 @@
                 <el-table-column label="指标 / 单位" min-width="150"><template #default="{ row }">{{ row.metricCode }} / {{ row.unit }}</template></el-table-column>
                 <el-table-column label="方向" min-width="100"><template #default="{ row }">{{ ENERGY_BENCHMARK_DIRECTION_LABELS[row.direction] || row.direction }}</template></el-table-column>
                 <el-table-column label="范围" min-width="150"><template #default="{ row }">{{ ENERGY_BENCHMARK_SCOPE_LABELS[row.scopeType] || row.scopeType }} / {{ row.scopeReference }}</template></el-table-column>
-                <el-table-column prop="version" label="版本" min-width="130" />
                 <el-table-column label="状态" width="90"><template #default="{ row }"><StatusTag :status="row.status" /></template></el-table-column>
-                <el-table-column label="操作" min-width="280" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openDefinitionDetail(row)">详情</el-button><el-button v-if="canManage && row.benchmarkType !== 'internal_history_baseline'" link type="primary" :disabled="writeDisabled" @click="openEditDefinition(row)">修改</el-button><el-button v-if="canManage && row.benchmarkType !== 'internal_history_baseline'" link :disabled="writeDisabled" @click="openDefinitionVersion(row)">新建版本</el-button><el-button v-if="canManage && row.benchmarkType !== 'internal_history_baseline'" link :disabled="writeDisabled || row.status !== 'active'" @click="openCreateTarget(row)">新增目标</el-button><el-button v-if="canManage" link :type="row.status === 'active' ? 'warning' : 'success'" :disabled="writeDisabled" @click="confirmDefinitionStatus(row)">{{ row.status === 'active' ? '停用' : '启用' }}</el-button></template></el-table-column>
+                <el-table-column label="操作" min-width="240" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openDefinitionDetail(row)">详情</el-button><el-button v-if="canManage && row.benchmarkType !== 'internal_history_baseline'" link type="primary" :disabled="writeDisabled" @click="openEditDefinition(row)">调整</el-button><el-button v-if="canManage && row.benchmarkType !== 'internal_history_baseline'" link :disabled="writeDisabled || row.status !== 'active'" @click="openCreateTarget(row)">新增目标</el-button><el-button v-if="canManage" link :type="row.status === 'active' ? 'warning' : 'success'" :disabled="writeDisabled" @click="confirmDefinitionStatus(row)">{{ row.status === 'active' ? '停用' : '启用' }}</el-button></template></el-table-column>
               </el-table>
               <div class="pagination"><el-pagination v-model:current-page="definitionPage" v-model:page-size="definitionPageSize" layout="total, sizes, prev, pager, next" :page-sizes="[20,50,100]" :total="definitionPagination.total || 0" @current-change="changeDefinitionPage" @size-change="changeDefinitionPageSize" /></div>
             </template>
           </article>
 
           <article class="page-card">
-            <header class="section-heading"><div><h2>目标版本</h2><p>修改目标会创建后继版本并保留旧版本；固化内部历史目标不可修改，只能启停。</p></div><el-select v-model="targetDefinitionFilter" clearable filterable placeholder="按定义筛选" @change="applyTargetFilter"><el-option v-for="item in definitions" :key="item.id" :label="`${item.benchmarkName} · ${item.version}`" :value="item.id" /></el-select></header>
+            <header class="section-heading"><div><h2>对标目标</h2><p>调整目标会保留原目标记录；固化内部历史目标不可调整，只能启停。</p></div><el-select v-model="targetDefinitionFilter" clearable filterable placeholder="按定义筛选" @change="applyTargetFilter"><el-option v-for="item in definitions" :key="item.id" :label="`${item.benchmarkName} · ${item.benchmarkCode}`" :value="item.id" /></el-select></header>
             <PageState v-if="targetsError" :error="targetsError" @retry="loadTargets" />
-            <PageState v-else-if="!targets.length && !targetsLoading" description="当前筛选下暂无目标版本。" />
+            <PageState v-else-if="!targets.length && !targetsLoading" description="当前筛选下暂无对标目标。" />
             <template v-else>
               <el-table :data="targets" v-loading="targetsLoading" stripe>
                 <el-table-column prop="id" label="ID" width="70" />
                 <el-table-column prop="benchmarkDefinitionId" label="定义 ID" width="90" />
                 <el-table-column label="目标 / 边界" min-width="150"><template #default="{ row }">{{ targetValueLabel(row, definitionById(row.benchmarkDefinitionId)) }}</template></el-table-column>
-                <el-table-column prop="version" label="版本" min-width="135" />
                 <el-table-column label="固化" width="90"><template #default="{ row }"><el-tag :type="row.isFrozen ? 'warning' : 'info'" effect="light">{{ row.isFrozen ? '锁 固化' : '普通' }}</el-tag></template></el-table-column>
                 <el-table-column label="参考期" min-width="240"><template #default="{ row }">{{ row.referenceStartUtc ? `${row.referenceStartUtc} → ${row.referenceEndUtc}` : '—' }}</template></el-table-column>
                 <el-table-column label="状态" width="90"><template #default="{ row }"><StatusTag :status="row.status" /></template></el-table-column>
-                <el-table-column label="操作" min-width="160" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openTargetDetail(row)">详情</el-button><el-button v-if="canManage && !row.isFrozen" link type="primary" :disabled="writeDisabled" @click="openVersionTarget(row)">新版本</el-button><el-button v-if="canManage" link :type="row.status === 'active' ? 'warning' : 'success'" :disabled="writeDisabled" @click="confirmTargetStatus(row)">{{ row.status === 'active' ? '停用' : '启用' }}</el-button></template></el-table-column>
+                <el-table-column label="操作" min-width="160" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openTargetDetail(row)">详情</el-button><el-button v-if="canManage && !row.isFrozen" link type="primary" :disabled="writeDisabled" @click="openAdjustTarget(row)">调整</el-button><el-button v-if="canManage" link :type="row.status === 'active' ? 'warning' : 'success'" :disabled="writeDisabled" @click="confirmTargetStatus(row)">{{ row.status === 'active' ? '停用' : '启用' }}</el-button></template></el-table-column>
               </el-table>
               <div class="pagination"><el-pagination v-model:current-page="targetPage" v-model:page-size="targetPageSize" layout="total, sizes, prev, pager, next" :page-sizes="[20,50,100]" :total="targetPagination.total || 0" @current-change="changeTargetPage" @size-change="changeTargetPageSize" /></div>
             </template>
@@ -177,7 +171,7 @@
             <header class="section-heading"><div><h2>折标系数、定义与目标导入</h2><p>预演是执行的前置能力；执行需要同时具备 preview 与 execute 权限。页面只提交服务端持久化批次、固定确认文本和确认标志。</p></div></header>
             <el-alert v-if="!hasImportExecutePermission" type="info" :closable="false" show-icon title="当前账号可以预演；进入执行确认还需要 energy:benchmarks:import:execute 权限。" />
             <el-alert type="warning" :closable="false" show-icon title="导入只接受真实企业文件。对标定义模板不允许导入内部历史基准；内部历史必须由服务端按明确参考期固化。" />
-            <el-alert type="info" :closable="false" show-icon title="推荐顺序：先导入能源折标系数，再导入对标定义，最后导入对标目标。外部标准定义必须保留真实来源和文号；下载模板或示例不会自动导入、计算或执行对标。" />
+            <el-alert type="info" :closable="false" show-icon title="推荐顺序：先导入能源折标系数，再导入对标定义，最后导入对标目标。外部标准定义必须填写真实来源；下载模板或示例不会自动导入、计算或执行对标。" />
             <el-form label-position="top" class="import-form">
               <el-form-item label="导入类型"><el-radio-group v-model="importType" :disabled="importPreviewLoading"><el-radio-button v-for="item in ENERGY_BENCHMARK_IMPORT_TYPES" :key="item.value" :label="item.value">{{ item.label }}</el-radio-button></el-radio-group></el-form-item>
               <el-form-item label="当前类型文件"><div class="action-row"><el-button :loading="importTemplateLoading" @click="downloadImportTemplate">下载{{ currentImportTypeLabel }}空白模板</el-button><el-button :loading="importDemoExampleLoading" @click="downloadImportDemoExample">下载{{ currentImportTypeLabel }}青岚园区示例</el-button></div></el-form-item>
@@ -202,7 +196,7 @@
       <ManagementDrawer v-model="definitionDrawerOpen" :title="definitionDrawerTitle" :loading="definitionSaving" :confirm-disabled="writeDisabled || definitionScopeBlocked" @save="saveDefinition">
         <el-alert v-if="definitionFormError" type="error" :closable="false" show-icon :title="definitionFormError" class="drawer-alert" />
         <el-alert v-if="definitionScopeNotice" :type="definitionScopeError ? 'error' : 'warning'" :closable="false" show-icon :title="definitionScopeNotice" class="drawer-alert" />
-        <el-alert v-if="definitionMode === 'version'" type="info" :closable="false" show-icon title="新定义版本使用创建接口。请填写新的 name:v1 版本标识并调整有效期；同编码 active 有效期不得重叠。" class="drawer-alert" />
+        <el-alert v-if="definitionMode === 'edit'" type="info" :closable="false" show-icon title="保存调整后，服务端会保留原定义并创建后继记录；同编码 active 定义的有效期不得重叠。" class="drawer-alert" />
         <el-form ref="definitionFormRef" :model="definitionForm" :rules="definitionRules" label-position="top">
           <el-form-item label="对标编码" prop="benchmarkCode"><el-input v-model.trim="definitionForm.benchmarkCode" maxlength="100" /></el-form-item>
           <el-form-item label="对标名称" prop="benchmarkName"><el-input v-model.trim="definitionForm.benchmarkName" maxlength="200" /></el-form-item>
@@ -214,8 +208,6 @@
           <el-form-item label="范围标识" prop="scopeReference"><el-select v-model="definitionForm.scopeReference" class="full-control" filterable clearable :loading="definitionScopeLoading" :disabled="definitionScopeBlocked" :placeholder="definitionScopePlaceholder"><el-option v-for="item in definitionScopeOptions" :key="definitionScopeOptionValue(item)" :label="formatEnergyBenchmarkScopeOptionLabel(definitionForm.scopeType, item)" :value="definitionScopeOptionValue(item)" /></el-select></el-form-item>
           <el-form-item label="指标方向" prop="direction"><el-select v-model="definitionForm.direction" class="full-control"><el-option v-for="(label, value) in ENERGY_BENCHMARK_DIRECTION_LABELS" :key="value" :label="label" :value="value" /></el-select></el-form-item>
           <el-form-item label="来源" prop="source"><el-input v-model.trim="definitionForm.source" maxlength="300" /></el-form-item>
-          <el-form-item label="文号"><el-input v-model.trim="definitionForm.documentNo" placeholder="外部标准必填" /></el-form-item>
-          <el-form-item label="版本" prop="version"><el-input v-model.trim="definitionForm.version" placeholder="如 enterprise-standard:v1" /></el-form-item>
           <el-form-item label="生效开始 UTC" prop="effectiveStartUtc"><StrictUtcDateTimeInput v-model="definitionForm.effectiveStartUtc" placeholder="2026-01-01T00:00:00Z" @change="validateUtcFormField(definitionFormRef, 'effectiveStartUtc')" @blur="validateUtcFormField(definitionFormRef, 'effectiveStartUtc')" /></el-form-item>
           <el-form-item label="生效结束 UTC（不含）" prop="effectiveEndUtc"><StrictUtcDateTimeInput v-model="definitionForm.effectiveEndUtc" placeholder="2027-01-01T00:00:00Z" @change="validateUtcFormField(definitionFormRef, 'effectiveEndUtc')" @blur="validateUtcFormField(definitionFormRef, 'effectiveEndUtc')" /></el-form-item>
           <el-form-item label="来源时区" prop="sourceTimeZone"><IanaTimeZoneSelect v-model="definitionForm.sourceTimeZone" placeholder="请选择或搜索来源时区" /></el-form-item>
@@ -235,7 +227,6 @@
           <el-form-item label="范围类型" prop="definition.scopeType"><el-select v-model="internalForm.definition.scopeType" class="full-control" @change="changeInternalScopeType"><el-option label="组织" value="organization" /><el-option label="能源类型" value="energy" /><el-option label="产品" value="product" /></el-select></el-form-item>
           <el-form-item label="范围标识" prop="definition.scopeReference"><el-select v-model="internalForm.definition.scopeReference" class="full-control" filterable clearable :loading="internalScopeLoading" :disabled="internalScopeBlocked" :placeholder="internalScopePlaceholder"><el-option v-for="item in internalScopeOptions" :key="internalScopeOptionValue(item)" :label="formatEnergyBenchmarkScopeOptionLabel(internalForm.definition.scopeType, item)" :value="internalScopeOptionValue(item)" /></el-select></el-form-item>
           <el-form-item label="来源" prop="definition.source"><el-input v-model.trim="internalForm.definition.source" /></el-form-item>
-          <el-form-item label="版本" prop="definition.version"><el-input v-model.trim="internalForm.definition.version" placeholder="如 internal-baseline:v1" /></el-form-item>
           <el-form-item label="定义生效开始 UTC" prop="definition.effectiveStartUtc"><StrictUtcDateTimeInput v-model="internalForm.definition.effectiveStartUtc" placeholder="2026-01-01T00:00:00Z" @change="validateUtcFormField(internalFormRef, 'definition.effectiveStartUtc')" @blur="validateUtcFormField(internalFormRef, 'definition.effectiveStartUtc')" /></el-form-item>
           <el-form-item label="定义生效结束 UTC（不含）" prop="definition.effectiveEndUtc"><StrictUtcDateTimeInput v-model="internalForm.definition.effectiveEndUtc" placeholder="2027-01-01T00:00:00Z" @change="validateUtcFormField(internalFormRef, 'definition.effectiveEndUtc')" @blur="validateUtcFormField(internalFormRef, 'definition.effectiveEndUtc')" /></el-form-item>
           <el-form-item label="来源时区"><IanaTimeZoneSelect v-model="internalForm.definition.sourceTimeZone" placeholder="请选择或搜索来源时区" /></el-form-item>
@@ -248,7 +239,7 @@
 
       <ManagementDrawer v-model="targetDrawerOpen" :title="targetDrawerTitle" :loading="targetSaving" :confirm-disabled="writeDisabled" @save="saveTarget">
         <el-alert v-if="targetFormError" type="error" :closable="false" show-icon :title="targetFormError" class="drawer-alert" />
-        <el-alert v-if="targetMode === 'version'" type="info" :closable="false" show-icon title="保存会创建后继目标版本，旧版本继续保留。新版本必须使用新的 name:v1 标识。" class="drawer-alert" />
+        <el-alert v-if="targetMode === 'adjust'" type="info" :closable="false" show-icon title="保存调整后，服务端会保留原目标并创建后继记录。" class="drawer-alert" />
         <el-form ref="targetFormRef" :model="targetForm" :rules="targetRules" label-position="top">
           <el-form-item label="对标定义"><el-input :model-value="targetDefinitionLabel" disabled /></el-form-item>
           <template v-if="targetDefinition?.direction === 'range'">
@@ -256,7 +247,6 @@
             <el-form-item label="上限值" prop="upperBound"><el-input-number v-model="targetForm.upperBound" :controls="false" class="full-control" /></el-form-item>
           </template>
           <el-form-item v-else label="目标值" prop="targetValue"><el-input-number v-model="targetForm.targetValue" :controls="false" class="full-control" /></el-form-item>
-          <el-form-item label="目标版本" prop="version"><el-input v-model.trim="targetForm.version" placeholder="如 target-2026:v1" /></el-form-item>
           <el-form-item label="状态"><el-select v-model="targetForm.status" class="full-control"><el-option label="启用" value="active" /><el-option label="停用" value="inactive" /></el-select></el-form-item>
         </el-form>
       </ManagementDrawer>
@@ -284,8 +274,8 @@
           <el-descriptions-item v-for="item in detailDescriptions" :key="item.label" :label="item.label">{{ item.value }}</el-descriptions-item>
         </el-descriptions>
         <template v-if="detailData?.targets">
-          <h3 class="detail-subtitle">目标版本历史</h3>
-          <el-table :data="detailData.targets" size="small"><el-table-column prop="version" label="版本" min-width="130" /><el-table-column label="目标 / 边界" min-width="150"><template #default="{ row }">{{ targetValueLabel(row, detailData) }}</template></el-table-column><el-table-column label="固化" width="90"><template #default="{ row }">{{ row.isFrozen ? '是' : '否' }}</template></el-table-column><el-table-column prop="status" label="状态" width="90" /></el-table>
+          <h3 class="detail-subtitle">目标历史记录</h3>
+          <el-table :data="detailData.targets" size="small"><el-table-column label="目标 / 边界" min-width="150"><template #default="{ row }">{{ targetValueLabel(row, detailData) }}</template></el-table-column><el-table-column label="固化" width="90"><template #default="{ row }">{{ row.isFrozen ? '是' : '否' }}</template></el-table-column><el-table-column prop="status" label="状态" width="90" /></el-table>
         </template>
       </el-dialog>
 
@@ -304,7 +294,6 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 import ManagementPage from '@/components/ManagementPage.vue';
 import ManagementToolbar from '@/components/ManagementToolbar.vue';
 import ManagementDrawer from '@/components/ManagementDrawer.vue';
-import HelpIcon from '@/components/HelpIcon.vue';
 import IanaTimeZoneSelect from '@/components/IanaTimeZoneSelect.vue';
 import PageState from '@/components/PageState.vue';
 import StatCard from '@/components/StatCard.vue';
@@ -333,8 +322,8 @@ import {
   rankEnergyBenchmarks,
   updateEnergyBenchmarkDefinition,
   updateEnergyBenchmarkDefinitionStatus,
-  updateEnergyBenchmarkTargetStatus,
-  versionEnergyBenchmarkTarget
+  updateEnergyBenchmarkTarget,
+  updateEnergyBenchmarkTargetStatus
 } from '@/api/energyBenchmarks';
 import { getEnergyTypes } from '@/api/energy';
 import {
@@ -403,7 +392,7 @@ const PAGE_ERROR_SOURCES = Object.freeze({
   export: 'analysis-export',
   definitionStatus: 'definition-status',
   targetStatus: 'target-status',
-  targetVersionContext: 'target-version-context'
+  targetAdjustContext: 'target-adjust-context'
 });
 
 // 通用页面状态与权限模块。
@@ -480,7 +469,7 @@ const targetPageSize = ref(20);
 const targetPagination = ref({ total: 0 });
 
 // 定义维护抽屉模块。
-const emptyDefinitionForm = () => ({ benchmarkCode: '', benchmarkName: '', benchmarkType: 'manual_benchmark', metricCode: 'energy_intensity', unit: '', periodType: 'month', scopeType: 'organization', scopeReference: '', direction: 'lower_better', source: '企业自定义标杆', documentNo: '', version: '', effectiveStartUtc: '', effectiveEndUtc: '', sourceTimeZone: 'Asia/Shanghai', status: 'active' });
+const emptyDefinitionForm = () => ({ benchmarkCode: '', benchmarkName: '', benchmarkType: 'manual_benchmark', metricCode: 'energy_intensity', unit: '', periodType: 'month', scopeType: 'organization', scopeReference: '', direction: 'lower_better', source: '企业自定义标杆', effectiveStartUtc: '', effectiveEndUtc: '', sourceTimeZone: 'Asia/Shanghai', status: 'active' });
 const definitionDrawerOpen = ref(false);
 const definitionMode = ref('create');
 const editingDefinitionId = ref(null);
@@ -488,7 +477,7 @@ const definitionForm = ref(emptyDefinitionForm());
 const definitionFormRef = ref();
 const definitionSaving = ref(false);
 const definitionFormError = ref('');
-const definitionDrawerTitle = computed(() => definitionMode.value === 'edit' ? '修改对标定义' : definitionMode.value === 'version' ? '新建对标定义版本' : '新增对标定义');
+const definitionDrawerTitle = computed(() => definitionMode.value === 'edit' ? '调整对标定义' : '新增对标定义');
 const definitionScopeOptions = computed(() => definitionForm.value.scopeType === 'organization' ? organizationUnits.value : definitionForm.value.scopeType === 'energy' ? energyTypes.value : definitionForm.value.scopeType === 'product' ? productionUnits.value : []);
 const definitionScopeLoading = computed(() => definitionForm.value.scopeType === 'organization' ? organizationMasterDataLoading.value : definitionForm.value.scopeType === 'energy' ? energyTypesLoading.value : definitionForm.value.scopeType === 'product' ? productionMasterDataLoading.value : false);
 const definitionScopeError = computed(() => definitionForm.value.scopeType === 'organization' ? organizationMasterDataError.value : definitionForm.value.scopeType === 'energy' ? energyTypesError.value : definitionForm.value.scopeType === 'product' ? productionMasterDataError.value : '');
@@ -500,10 +489,10 @@ const definitionScopeNotice = computed(() => {
 });
 const definitionScopeBlocked = computed(() => definitionScopeLoading.value || Boolean(definitionScopeError.value) || !definitionScopeOptions.value.length);
 const definitionScopePlaceholder = computed(() => definitionScopeBlocked.value ? '当前范围主数据不可用' : `选择 active ${ENERGY_BENCHMARK_SCOPE_LABELS[definitionForm.value.scopeType] || '范围'}主数据`);
-const definitionRules = { benchmarkCode: requiredRule('请输入对标编码。'), benchmarkName: requiredRule('请输入对标名称。'), benchmarkType: requiredRule('请选择定义类型。'), metricCode: requiredRule('请输入指标编码。'), unit: requiredRule('请输入指标单位。'), periodType: requiredRule('请输入周期类型。'), scopeType: requiredRule('请选择范围类型。'), scopeReference: requiredRule('请选择 active 主数据范围。'), direction: requiredRule('请选择指标方向。'), source: requiredRule('请输入真实来源。'), version: requiredRule('请输入 name:v1 格式版本。'), effectiveStartUtc: requiredRule('请输入严格 UTC 生效开始时间。'), effectiveEndUtc: requiredRule('请输入严格 UTC 生效结束时间。') };
+const definitionRules = { benchmarkCode: requiredRule('请输入对标编码。'), benchmarkName: requiredRule('请输入对标名称。'), benchmarkType: requiredRule('请选择定义类型。'), metricCode: requiredRule('请输入指标编码。'), unit: requiredRule('请输入指标单位。'), periodType: requiredRule('请输入周期类型。'), scopeType: requiredRule('请选择范围类型。'), scopeReference: requiredRule('请选择 active 主数据范围。'), direction: requiredRule('请选择指标方向。'), source: requiredRule('请输入真实来源。'), effectiveStartUtc: requiredRule('请输入严格 UTC 生效开始时间。'), effectiveEndUtc: requiredRule('请输入严格 UTC 生效结束时间。') };
 
 // 内部历史基准原子固化表单模块；表单中刻意不存在服务端派生字段。
-const emptyInternalForm = () => ({ definition: { ...emptyDefinitionForm(), benchmarkType: 'internal_history_baseline', benchmarkName: '', metricCode: 'energy_intensity', periodType: 'month', scopeType: 'organization', direction: 'lower_better', source: '企业内部历史数据固化', documentNo: '', status: 'active' }, referencePeriod: { startUtc: '', endUtc: '' }, calculationScope: { productionUnitId: null, energyTypeCode: '' } });
+const emptyInternalForm = () => ({ definition: { ...emptyDefinitionForm(), benchmarkType: 'internal_history_baseline', benchmarkName: '', metricCode: 'energy_intensity', periodType: 'month', scopeType: 'organization', direction: 'lower_better', source: '企业内部历史数据固化', status: 'active' }, referencePeriod: { startUtc: '', endUtc: '' }, calculationScope: { productionUnitId: null, energyTypeCode: '' } });
 const internalDrawerOpen = ref(false);
 const internalForm = ref(emptyInternalForm());
 const internalFormRef = ref();
@@ -524,10 +513,10 @@ const internalMasterDataNotice = computed(() => {
   return '';
 });
 const internalMasterDataBlocked = computed(() => internalMasterDataLoading.value || Boolean(internalMasterDataError.value) || !internalScopeOptions.value.length || !productionUnits.value.length || !energyTypes.value.length);
-const internalRules = { 'definition.benchmarkCode': requiredRule('请输入对标编码。'), 'definition.benchmarkName': requiredRule('请输入对标名称。'), 'definition.unit': requiredRule('请输入指标单位。'), 'definition.scopeType': requiredRule('请选择范围类型。'), 'definition.scopeReference': requiredRule('请选择 active 主数据范围。'), 'definition.source': requiredRule('请输入来源。'), 'definition.version': requiredRule('请输入版本。'), 'definition.effectiveStartUtc': requiredRule('请输入定义生效开始时间。'), 'definition.effectiveEndUtc': requiredRule('请输入定义生效结束时间。'), 'referencePeriod.startUtc': requiredRule('请输入历史参考期开始时间。'), 'referencePeriod.endUtc': requiredRule('请输入历史参考期结束时间。'), 'calculationScope.productionUnitId': requiredRule('请选择产能单元。'), 'calculationScope.energyTypeCode': requiredRule('请选择能源类型。') };
+const internalRules = { 'definition.benchmarkCode': requiredRule('请输入对标编码。'), 'definition.benchmarkName': requiredRule('请输入对标名称。'), 'definition.unit': requiredRule('请输入指标单位。'), 'definition.scopeType': requiredRule('请选择范围类型。'), 'definition.scopeReference': requiredRule('请选择 active 主数据范围。'), 'definition.source': requiredRule('请输入来源。'), 'definition.effectiveStartUtc': requiredRule('请输入定义生效开始时间。'), 'definition.effectiveEndUtc': requiredRule('请输入定义生效结束时间。'), 'referencePeriod.startUtc': requiredRule('请输入历史参考期开始时间。'), 'referencePeriod.endUtc': requiredRule('请输入历史参考期结束时间。'), 'calculationScope.productionUnitId': requiredRule('请选择产能单元。'), 'calculationScope.energyTypeCode': requiredRule('请选择能源类型。') };
 
-// 目标版本维护抽屉模块。
-const emptyTargetForm = () => ({ benchmarkDefinitionId: null, targetValue: null, lowerBound: null, upperBound: null, version: '', status: 'inactive' });
+// 对标目标维护抽屉模块。
+const emptyTargetForm = () => ({ benchmarkDefinitionId: null, targetValue: null, lowerBound: null, upperBound: null, status: 'inactive' });
 const targetDrawerOpen = ref(false);
 const targetMode = ref('create');
 const editingTargetId = ref(null);
@@ -537,9 +526,9 @@ const targetSaving = ref(false);
 const targetFormError = ref('');
 const targetDefinitionContext = ref(null);
 const targetDefinition = computed(() => definitionById(targetForm.value.benchmarkDefinitionId) || targetDefinitionContext.value);
-const targetDefinitionLabel = computed(() => targetDefinition.value ? `${targetDefinition.value.benchmarkName} · ${targetDefinition.value.version} · ${ENERGY_BENCHMARK_DIRECTION_LABELS[targetDefinition.value.direction]}` : `定义 #${targetForm.value.benchmarkDefinitionId || '—'}`);
-const targetDrawerTitle = computed(() => targetMode.value === 'version' ? '创建后继目标版本' : '新增对标目标');
-const targetRules = { version: requiredRule('请输入新的 name:v1 目标版本。') };
+const targetDefinitionLabel = computed(() => targetDefinition.value ? `${targetDefinition.value.benchmarkName} · ${targetDefinition.value.benchmarkCode} · ${ENERGY_BENCHMARK_DIRECTION_LABELS[targetDefinition.value.direction]}` : `定义 #${targetForm.value.benchmarkDefinitionId || '—'}`);
+const targetDrawerTitle = computed(() => targetMode.value === 'adjust' ? '调整对标目标' : '新增对标目标');
+const targetRules = {};
 
 // 显式实际值分析模块。
 const analysisDefinitionId = ref(null);
@@ -851,7 +840,7 @@ async function loadTargets() {
   const result = await safe(() => getEnergyBenchmarkTargets(buildEnergyBenchmarkTargetFilters({ definitionId: snapshot.definitionId }, snapshot)));
   if (!latestRequestGuard.isLatest(token, { definitionId: targetDefinitionFilter.value, page: targetPage.value, pageSize: targetPageSize.value })) return;
   targetsLoading.value = false;
-  if (!result.ok) { targets.value = []; presentRequestError(result, '读取目标版本列表', { target: targetsError, toast: false }); return; }
+  if (!result.ok) { targets.value = []; presentRequestError(result, '读取对标目标列表', { target: targetsError, toast: false }); return; }
   targets.value = result.value.data || [];
   targetPagination.value = { total: result.value.meta?.total || 0 };
 }
@@ -976,7 +965,7 @@ async function loadOrganizationObjects() {
   organizationObjectsError.value = '';
   return true;
 }
-/** 切换分析定义并独立读取全部 active 目标版本和必要组织主数据。 */
+/** 切换分析定义并独立读取全部 active 目标和必要组织主数据。 */
 async function changeAnalysisDefinition() {
   invalidateAnalysisResults('对标定义已变化，旧分析结果已清空。', 'definition-context');
   latestRequestGuard.invalidate('organization-objects');
@@ -1011,7 +1000,7 @@ async function changeAnalysisDefinition() {
 }
 /** 切换目标语义上下文并整体重建当前定义下的实体颜色槽位。 */
 function changeAnalysisTarget() {
-  invalidateAnalysisResults('目标版本已变化，请重新分析。', 'target-context');
+  invalidateAnalysisResults('对标目标已变化，请重新分析。', 'target-context');
 }
 /** 将组织选择项映射为真实编码、名称、范围标识和五级 unitType。 */
 function selectOrganizationActual(row, unitCode) {
@@ -1104,11 +1093,19 @@ async function exportAnalysisCsv() {
 
 /** 打开普通定义创建抽屉，并按默认 organization 范围加载主数据。 */
 function openCreateDefinition() { definitionMode.value = 'create'; editingDefinitionId.value = null; definitionForm.value = emptyDefinitionForm(); definitionFormError.value = ''; definitionDrawerOpen.value = true; refreshScopeMasterData(definitionForm.value.scopeType); }
-/** 打开普通定义修改抽屉；历史值仅展示原值，不自动替换为任意 active 首项。 */
-function openEditDefinition(row) { definitionMode.value = 'edit'; editingDefinitionId.value = row.id; definitionForm.value = { ...emptyDefinitionForm(), ...row, documentNo: row.documentNo || '' }; definitionFormError.value = ''; definitionDrawerOpen.value = true; refreshScopeMasterData(definitionForm.value.scopeType); }
-/** 打开普通定义新版本创建抽屉；继承历史值但不静默替换。 */
-function openDefinitionVersion(row) { definitionMode.value = 'version'; editingDefinitionId.value = null; definitionForm.value = { ...emptyDefinitionForm(), ...row, version: '', status: 'inactive', documentNo: row.documentNo || '' }; definitionFormError.value = ''; definitionDrawerOpen.value = true; refreshScopeMasterData(definitionForm.value.scopeType); }
-/** 保存普通定义或新定义版本。 */
+/** 将定义只读响应投影为页面允许维护的字段，历史技术字段不得回填表单。 */
+function projectDefinitionRecordToForm(row = {}) {
+  return {
+    benchmarkCode: row.benchmarkCode || '', benchmarkName: row.benchmarkName || '', benchmarkType: row.benchmarkType || 'manual_benchmark',
+    metricCode: row.metricCode || '', unit: row.unit || '', periodType: row.periodType || '', scopeType: row.scopeType || 'organization',
+    scopeReference: row.scopeReference || '', direction: row.direction || 'lower_better', source: row.source || '',
+    effectiveStartUtc: row.effectiveStartUtc || '', effectiveEndUtc: row.effectiveEndUtc || '', sourceTimeZone: row.sourceTimeZone || 'Asia/Shanghai',
+    status: row.status || 'active'
+  };
+}
+/** 打开普通定义调整抽屉；历史范围值仅展示原值，不自动替换为任意 active 首项。 */
+function openEditDefinition(row) { definitionMode.value = 'edit'; editingDefinitionId.value = row.id; definitionForm.value = projectDefinitionRecordToForm(row); definitionFormError.value = ''; definitionDrawerOpen.value = true; refreshScopeMasterData(definitionForm.value.scopeType); }
+/** 保存普通定义；调整操作由服务端保留原记录并创建后继记录。 */
 async function saveDefinition() {
   if (writeDisabled.value) return;
   const valid = await definitionFormRef.value?.validate().catch(() => false);
@@ -1117,7 +1114,6 @@ async function saveDefinition() {
   if (!scopeValidation.valid) { definitionFormError.value = scopeValidation.message; return; }
   const effectiveRangeError = strictUtcRangeError(definitionForm.value.effectiveStartUtc, definitionForm.value.effectiveEndUtc, '定义生效期');
   if (effectiveRangeError) { definitionFormError.value = effectiveRangeError; return; }
-  if (definitionForm.value.benchmarkType === 'external_standard' && !String(definitionForm.value.documentNo || '').trim()) { definitionFormError.value = '外部标准必须填写真实文号。'; return; }
   let payload;
   try { payload = buildEnergyBenchmarkDefinitionPayload(definitionForm.value); }
   catch (error) { definitionFormError.value = error.message; return; }
@@ -1134,14 +1130,14 @@ async function saveDefinition() {
   definitionSaving.value = false;
   if (!result.ok) { definitionFormError.value = writeErrorText(result, '保存对标定义'); return; }
   definitionDrawerOpen.value = false;
-  ElMessage.success(snapshot.mode === 'edit' ? '对标定义已修改。' : '对标定义版本已创建。');
+  ElMessage.success(snapshot.mode === 'edit' ? '对标定义已调整，原记录继续保留。' : '对标定义已创建。');
   await Promise.all([loadDefinitions(), loadTargets(), loadAnalysisDefinitions()]);
 }
 /** 二次确认并切换定义状态。 */
 async function confirmDefinitionStatus(row) {
   const status = row.status === 'active' ? 'inactive' : 'active';
   const action = status === 'active' ? '启用' : '停用';
-  try { await ElMessageBox.confirm(`${action}对标定义“${row.benchmarkName} · ${row.version}”？停用不是物理删除，历史版本和目标仍保留。`, `确认${action}`, { type: status === 'active' ? 'info' : 'warning' }); } catch { return; }
+  try { await ElMessageBox.confirm(`${action}对标定义“${row.benchmarkName}（${row.benchmarkCode}）”？停用不是物理删除，历史定义和目标仍保留。`, `确认${action}`, { type: status === 'active' ? 'info' : 'warning' }); } catch { return; }
   const snapshot = { id: row.id, status };
   const token = latestRequestGuard.next('definition-status', snapshot);
   const result = await safe(() => updateEnergyBenchmarkDefinitionStatus(row.id, status));
@@ -1190,29 +1186,29 @@ async function saveInternalHistory() {
 
 /** 打开普通目标创建抽屉。 */
 function openCreateTarget(definition) { targetMode.value = 'create'; editingTargetId.value = null; targetDefinitionContext.value = definition; targetForm.value = { ...emptyTargetForm(), benchmarkDefinitionId: definition.id }; targetFormError.value = ''; targetDrawerOpen.value = true; }
-/** 打开后继目标版本抽屉；定义不在当前分页时通过目标详情补齐上下文。 */
-async function openVersionTarget(row) {
+/** 打开目标调整抽屉；定义不在当前分页时通过目标详情补齐上下文。 */
+async function openAdjustTarget(row) {
   const snapshot = { targetId: row.id, definitionId: row.benchmarkDefinitionId };
-  const token = latestRequestGuard.next('target-version-context', snapshot);
-  targetMode.value = 'version';
+  const token = latestRequestGuard.next('target-adjust-context', snapshot);
+  targetMode.value = 'adjust';
   editingTargetId.value = row.id;
   targetDefinitionContext.value = definitionById(row.benchmarkDefinitionId);
-  clearPageRequestError(PAGE_ERROR_SOURCES.targetVersionContext);
+  clearPageRequestError(PAGE_ERROR_SOURCES.targetAdjustContext);
   if (!targetDefinitionContext.value) {
     const detail = await safe(() => getEnergyBenchmarkTarget(row.id));
     if (!latestRequestGuard.isLatest(token, { targetId: editingTargetId.value, definitionId: row.benchmarkDefinitionId })) return;
     if (!detail.ok) {
-      presentRequestError(detail, '读取目标定义上下文', { toast: false, source: PAGE_ERROR_SOURCES.targetVersionContext });
+      presentRequestError(detail, '读取目标定义上下文', { toast: false, source: PAGE_ERROR_SOURCES.targetAdjustContext });
       return;
     }
-    clearPageRequestError(PAGE_ERROR_SOURCES.targetVersionContext);
+    clearPageRequestError(PAGE_ERROR_SOURCES.targetAdjustContext);
     targetDefinitionContext.value = detail.value.data?.definition || null;
   }
-  targetForm.value = { ...emptyTargetForm(), benchmarkDefinitionId: row.benchmarkDefinitionId, targetValue: row.targetValue, lowerBound: row.lowerBound, upperBound: row.upperBound, version: '', status: row.status };
+  targetForm.value = { benchmarkDefinitionId: row.benchmarkDefinitionId, targetValue: row.targetValue, lowerBound: row.lowerBound, upperBound: row.upperBound, status: row.status };
   targetFormError.value = '';
   targetDrawerOpen.value = true;
 }
-/** 保存普通目标或后继目标版本。 */
+/** 保存普通目标；调整操作由服务端保留原记录并创建后继记录。 */
 async function saveTarget() {
   if (writeDisabled.value) return;
   const valid = await targetFormRef.value?.validate().catch(() => false);
@@ -1228,13 +1224,13 @@ async function saveTarget() {
   const token = latestRequestGuard.next('save-target', snapshot);
   targetSaving.value = true;
   targetFormError.value = '';
-  const result = await safe(() => mode === 'version' ? versionEnergyBenchmarkTarget(targetId, payload) : createEnergyBenchmarkTarget(payload));
+  const result = await safe(() => mode === 'adjust' ? updateEnergyBenchmarkTarget(targetId, payload) : createEnergyBenchmarkTarget(payload));
   const currentSnapshot = { mode: targetMode.value, targetId: editingTargetId.value, payload: buildEnergyBenchmarkTargetPayload(targetForm.value, targetMode.value === 'create') };
   if (!latestRequestGuard.isLatest(token, currentSnapshot)) return;
   targetSaving.value = false;
-  if (!result.ok) { targetFormError.value = writeErrorText(result, '保存目标版本'); return; }
+  if (!result.ok) { targetFormError.value = writeErrorText(result, '保存对标目标'); return; }
   targetDrawerOpen.value = false;
-  ElMessage.success(mode === 'version' ? '后继目标版本已创建，旧版本继续保留。' : '目标版本已创建。');
+  ElMessage.success(mode === 'adjust' ? '对标目标已调整，原记录继续保留。' : '对标目标已创建。');
   await Promise.all([loadTargets(), loadAnalysisDefinitions()]);
   if (Number(analysisDefinitionId.value) === Number(definition.id)) await changeAnalysisDefinition();
 }
@@ -1242,17 +1238,17 @@ async function saveTarget() {
 async function confirmTargetStatus(row) {
   const status = row.status === 'active' ? 'inactive' : 'active';
   const action = status === 'active' ? '启用' : '停用';
-  try { await ElMessageBox.confirm(`${action}目标版本“${row.version}”？同一定义只能有一个 active 目标，服务端会执行最终冲突校验。`, `确认${action}`, { type: status === 'active' ? 'info' : 'warning' }); } catch { return; }
+  try { await ElMessageBox.confirm(`${action}该对标目标？同一定义只能有一个 active 目标，服务端会执行最终冲突校验。`, `确认${action}`, { type: status === 'active' ? 'info' : 'warning' }); } catch { return; }
   const snapshot = { id: row.id, status };
   const token = latestRequestGuard.next('target-status', snapshot);
   const result = await safe(() => updateEnergyBenchmarkTargetStatus(row.id, status));
   if (!latestRequestGuard.isLatest(token, snapshot)) return;
   if (!result.ok) {
-    presentRequestError(result, `${action}目标版本`, { toast: false, source: PAGE_ERROR_SOURCES.targetStatus });
+    presentRequestError(result, `${action}对标目标`, { toast: false, source: PAGE_ERROR_SOURCES.targetStatus });
     return;
   }
   clearPageRequestError(PAGE_ERROR_SOURCES.targetStatus);
-  ElMessage.success(`目标版本已${action}。`);
+  ElMessage.success(`对标目标已${action}。`);
   await loadTargets();
   if (Number(analysisDefinitionId.value) === Number(row.benchmarkDefinitionId)) await changeAnalysisDefinition();
 }
@@ -1280,7 +1276,7 @@ async function openTargetDetail(row) {
   detailData.value = result.value.data || null;
 }
 /** 构造详情描述项。 */
-function buildDetailDescriptions(data, kind) { if (!data) return []; if (kind === 'definition') return [{ label: '编码', value: data.benchmarkCode }, { label: '名称', value: data.benchmarkName }, { label: '类型', value: ENERGY_BENCHMARK_TYPE_LABELS[data.benchmarkType] || data.benchmarkType }, { label: '指标', value: `${data.metricCode} / ${data.unit}` }, { label: '方向', value: ENERGY_BENCHMARK_DIRECTION_LABELS[data.direction] || data.direction }, { label: '周期', value: data.periodType }, { label: '范围', value: `${ENERGY_BENCHMARK_SCOPE_LABELS[data.scopeType] || data.scopeType} / ${data.scopeReference}` }, { label: '来源', value: data.source }, { label: '文号', value: data.documentNo || '—' }, { label: '版本', value: data.version }, { label: '有效期', value: `${data.effectiveStartUtc} → ${data.effectiveEndUtc}` }, { label: '状态', value: data.status }]; return [{ label: '目标 ID', value: data.id }, { label: '定义', value: `${data.definition?.benchmarkName || data.benchmarkDefinitionId} · ${data.definition?.version || ''}` }, { label: '目标 / 边界', value: targetValueLabel(data, data.definition) }, { label: '版本', value: data.version }, { label: '状态', value: data.status }, { label: '是否固化', value: data.isFrozen ? '是' : '否' }, { label: '是否自动刷新', value: data.autoRefresh ? '是' : '否' }, { label: '参考期', value: data.referenceStartUtc ? `${data.referenceStartUtc} → ${data.referenceEndUtc}` : '—' }, { label: '固化值', value: formatEnergyBenchmarkNumber(data.frozenValue) }, { label: '样本数', value: formatInteger(data.sampleCount) }, { label: '来源数据摘要', value: data.sourceDataDigest || '—' }, { label: '固化时间', value: data.frozenAt || '—' }]; }
+function buildDetailDescriptions(data, kind) { if (!data) return []; if (kind === 'definition') return [{ label: '编码', value: data.benchmarkCode }, { label: '名称', value: data.benchmarkName }, { label: '类型', value: ENERGY_BENCHMARK_TYPE_LABELS[data.benchmarkType] || data.benchmarkType }, { label: '指标', value: `${data.metricCode} / ${data.unit}` }, { label: '方向', value: ENERGY_BENCHMARK_DIRECTION_LABELS[data.direction] || data.direction }, { label: '周期', value: data.periodType }, { label: '范围', value: `${ENERGY_BENCHMARK_SCOPE_LABELS[data.scopeType] || data.scopeType} / ${data.scopeReference}` }, { label: '来源', value: data.source }, { label: '有效期', value: `${data.effectiveStartUtc} → ${data.effectiveEndUtc}` }, { label: '状态', value: data.status }]; return [{ label: '目标 ID', value: data.id }, { label: '定义', value: `${data.definition?.benchmarkName || data.benchmarkDefinitionId}${data.definition?.benchmarkCode ? ` · ${data.definition.benchmarkCode}` : ''}` }, { label: '目标 / 边界', value: targetValueLabel(data, data.definition) }, { label: '状态', value: data.status }, { label: '是否固化', value: data.isFrozen ? '是' : '否' }, { label: '是否自动刷新', value: data.autoRefresh ? '是' : '否' }, { label: '参考期', value: data.referenceStartUtc ? `${data.referenceStartUtc} → ${data.referenceEndUtc}` : '—' }, { label: '固化值', value: formatEnergyBenchmarkNumber(data.frozenValue) }, { label: '样本数', value: formatInteger(data.sampleCount) }, { label: '来源数据摘要', value: data.sourceDataDigest || '—' }, { label: '固化时间', value: data.frozenAt || '—' }]; }
 
 /** 下载当前类型空白 XLSX 模板，不自动进入预演。 */
 async function downloadImportTemplate() { importTemplateLoading.value = true; const result = await safe(() => downloadEnergyBenchmarkImportTemplate(importType.value)); importTemplateLoading.value = false; if (!result.ok) ElMessage.error(`能效对标模板下载失败：${writeErrorText(result, '下载模板')}`); }

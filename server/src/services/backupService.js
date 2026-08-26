@@ -25,7 +25,10 @@ const BACKUP_REASONS = new Set([
   'meter-reading-energy-record-generation',
   'production-output-import',
   'generation-record-import',
-  'energy-analysis-import'
+  'energy-analysis-import',
+  'carbon-activity-import',
+  'carbon-emission-report-import',
+  'import-batch-delete'
 ]);
 const REQUIRED_BACKUP_SCHEMA = {
   app_meta: [

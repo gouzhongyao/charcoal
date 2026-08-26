@@ -7,7 +7,16 @@ const { assertWritableAllowed } = require('../services/maintenanceState');
 const { normalizeUploadError, uploadImportFile } = require('../middleware/upload');
 const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
 const { getImportContract } = require('../services/contractService');
-const { createImportBatchFromUpload, deleteImportBatch, getImportBatchFileDownload, getImportBatchQueryDetail, listImportBatches, listImportErrors } = require('../services/importService');
+const {
+  assertImportBatchDomainPermission,
+  createImportBatchFromUpload,
+  deleteImportBatch,
+  getImportBatchFileDownload,
+  getImportBatchQueryDetail,
+  getRestrictedImportTypesForUser,
+  listImportBatches,
+  listImportErrors
+} = require('../services/importService');
 const { sendSuccess } = require('../utils/response');
 
 const router = express.Router();
@@ -35,7 +44,8 @@ router.get('/contract', authenticate, requirePermission('imports:view'), (req, r
 });
 
 router.get('/batches', authenticate, requirePermission('imports:view'), asyncHandler(async (req, res) => {
-  const result = listImportBatches(req.query);
+  const excludedImportTypes = getRestrictedImportTypesForUser(req.user.id, 'view');
+  const result = listImportBatches(req.query, { excludedImportTypes });
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination } });
 }));
 
@@ -63,16 +73,26 @@ router.post('/batches', authenticate, requirePermission('imports:create'), requi
 });
 
 router.get('/batches/:batchId', authenticate, requirePermission('imports:view'), asyncHandler(async (req, res) => {
+  assertImportBatchDomainPermission(req.params.batchId, req.user.id, 'view');
   const result = getImportBatchQueryDetail(req.params.batchId);
   sendSuccess(res, result);
 }));
 
 router.delete('/batches/:batchId', authenticate, requirePermission('imports:delete'), requireWritable('imports:delete-batch'), asyncHandler(async (req, res) => {
-  const result = deleteImportBatch(req.params.batchId);
+  // 删除结果由服务在强制备份、业务删除和持久化审计全部成功后返回。
+  const result = await deleteImportBatch(req.params.batchId, {
+    actor: {
+      userId: req.user.id,
+      username: req.user.username,
+      displayName: req.user.displayName,
+      ip: req.ip
+    }
+  });
   sendSuccess(res, result);
 }));
 
 router.get('/batches/:batchId/download', authenticate, requirePermission('imports:download'), asyncHandler(async (req, res, next) => {
+  assertImportBatchDomainPermission(req.params.batchId, req.user.id, 'download');
   const result = getImportBatchFileDownload(req.params.batchId);
   res.setHeader('Content-Type', getImportFileContentType(result.fileType));
   res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `daoru-pici-yuanwen-${result.batchId}.${result.fileType}`));
@@ -84,6 +104,7 @@ router.get('/batches/:batchId/download', authenticate, requirePermission('import
 }));
 
 router.get('/batches/:batchId/errors', authenticate, requirePermission('imports:view'), asyncHandler(async (req, res) => {
+  assertImportBatchDomainPermission(req.params.batchId, req.user.id, 'view');
   const result = listImportErrors(req.params.batchId, req.query);
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination } });
 }));

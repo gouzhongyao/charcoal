@@ -108,7 +108,7 @@ const EXPECTED_SINGLE_SHEET_TEMPLATES = Object.freeze({
     sheetName: '对标定义',
     headers: Object.freeze([
       '对标编码', '对标名称', '对标类型', '指标编码', '指标单位', '周期类型', '范围类型', '范围标识', '指标方向',
-      '来源', '文号', '版本', '生效开始时间（UTC）', '生效结束时间（UTC）', '来源时区', '状态'
+      '来源', '生效开始时间（UTC）', '生效结束时间（UTC）', '来源时区', '状态'
     ])
   }),
   'energy-benchmark-targets': Object.freeze({
@@ -116,8 +116,8 @@ const EXPECTED_SINGLE_SHEET_TEMPLATES = Object.freeze({
     asciiBaseFileName: 'nengxiao-duibiao-mubiao-template',
     sheetName: '对标目标',
     headers: Object.freeze([
-      '对标编码', '对标定义版本', '目标值', '下限值', '上限值', '参考期开始时间（UTC）', '参考期结束时间（UTC）',
-      '固化值', '固化时间（UTC）', '样本数量', '产量摘要 JSON', '来源数据摘要', '是否固化', '是否自动刷新', '目标版本', '状态'
+      '对标编码', '目标值', '下限值', '上限值', '参考期开始时间（UTC）', '参考期结束时间（UTC）',
+      '固化值', '固化时间（UTC）', '样本数量', '产量摘要 JSON', '来源数据摘要', '是否固化', '是否自动刷新', '状态'
     ])
   }),
   'energy-flow-models': Object.freeze({

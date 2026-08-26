@@ -1,3 +1,8 @@
+const { loadRuntimeEnvironment } = require('../../config/runtimeEnvironment');
+
+// 运行环境配置模块：必须先加载根 .env，再加载数据库、路由及其环境依赖。
+const runtimeEnvironment = loadRuntimeEnvironment();
+
 const express = require('express');
 const cors = require('cors');
 const { initDatabase } = require('./db/database');
@@ -26,6 +31,16 @@ const energyBenchmarkRoutes = require('./routes/energyBenchmarks');
 const energyAnalysisRoutes = require('./routes/energyAnalysis');
 const energyFlowRoutes = require('./routes/energyFlows');
 const energyBalanceRoutes = require('./routes/energyBalances');
+// 供应商路由自带受限 JSON 解析器，必须在全局解析器前挂载。
+const supplierRoutes = require('./routes/suppliers');
+// 独立碳活动受控导入和作废同样必须在全局 JSON 解析器前挂载。
+const carbonActivityRoutes = require('./routes/carbonActivities');
+// 碳排放报告受控导入自带 64 KiB JSON 限制，必须先于全局解析器完成访问控制。
+const carbonEmissionReportRoutes = require('./routes/carbonEmissionReports');
+// 温室气体报告受控导入自带 64 KiB JSON 限制，必须先于全局解析器完成访问控制。
+const ghgReportRoutes = require('./routes/ghgReports');
+// 独立核算运行自带 64 KiB JSON 限制，必须在全局解析器前完成认证、权限和维护态检查。
+const carbonAccountingRoutes = require('./routes/carbonAccounting');
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const roleRoutes = require('./routes/roles');
@@ -34,7 +49,9 @@ const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
 const { AppError } = require('./utils/errors');
 
 const app = express();
-const port = Number(process.env.PORT || 3002);
+// API 监听模块：端口来自集中配置，主机继续固定为本机回环地址。
+const backendHost = runtimeEnvironment.backendHost;
+const port = runtimeEnvironment.backendPort;
 const defaultAllowedOrigins = [
   'http://127.0.0.1:5173',
   'http://localhost:5173',
@@ -103,16 +120,24 @@ app.use(cors({
     'X-Demo-Manifest-Version',
     'X-Demo-Manifest-Digest',
     'X-Demo-Artifact-Sha256',
-    'X-Demo-Context'
+    'X-Demo-Context',
+    'X-Exported-Row-Count',
+    'X-Exported-Row-Count-Independent-Activity',
+    'X-Exported-Row-Count-Energy-Record'
   ]
 }));
 
-// 受控导入和自带请求体限制的对标路由必须先完成认证、授权和维护态检查，再解析 JSON。
+// 受控导入和自带请求体限制的业务路由必须先完成认证、授权和维护态检查，再解析 JSON。
 app.use('/api/energy-analysis/imports', energyAnalysisImportRoutes);
 app.use('/api/energy-benchmarks/imports', energyBenchmarkImportRoutes);
 app.use('/api/energy-flow-imports', energyFlowImportRoutes);
 app.use('/api/energy-balance-imports', energyBalanceImportRoutes);
 app.use('/api/energy-benchmarks', energyBenchmarkRoutes);
+app.use('/api/suppliers', supplierRoutes);
+app.use('/api/carbon/activities', carbonActivityRoutes);
+app.use('/api/carbon/emission-reports', carbonEmissionReportRoutes);
+app.use('/api/carbon/ghg-reports', ghgReportRoutes);
+app.use('/api/carbon/accounting', carbonAccountingRoutes);
 
 app.use(express.json({ limit: '2mb' }));
 
@@ -149,8 +174,8 @@ app.use(errorHandler);
 
 function start() {
   initDatabase();
-  app.listen(port, '127.0.0.1', () => {
-    console.log(`Energy carbon platform API listening at http://127.0.0.1:${port}`);
+  app.listen(port, backendHost, () => {
+    console.log(`Energy carbon platform API listening at ${runtimeEnvironment.backendOrigin}`);
   });
 }
 

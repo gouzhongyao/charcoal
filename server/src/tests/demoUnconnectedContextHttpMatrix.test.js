@@ -81,17 +81,22 @@ function request(server, method, pathname, options = {}) {
   });
 }
 
+/** 将任意内存文件构造成单文件 multipart 请求体。 */
+function createBufferMultipart(filename, mimeType, buffer) {
+  const boundary = `----charcoal-unconnected-${crypto.randomUUID()}`;
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${mimeType}\r\n\r\n`, 'utf8'),
+    buffer,
+    Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8')
+  ]);
+  return { boundary, body };
+}
+
 /** 将服务端生成的 artifact 构造成单文件 multipart 请求体。 */
 function createArtifactMultipart(artifactKey) {
   const generated = generateDemoParkArtifact(artifactKey, 'xlsx');
   assert(generated, `缺少服务端 artifact ${artifactKey}`);
-  const boundary = `----charcoal-unconnected-${crypto.randomUUID()}`;
-  const body = Buffer.concat([
-    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${generated.asciiFileName}"\r\nContent-Type: ${generated.mimeType}\r\n\r\n`, 'utf8'),
-    generated.buffer,
-    Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8')
-  ]);
-  return { boundary, body };
+  return createBufferMultipart(generated.asciiFileName, generated.mimeType, generated.buffer);
 }
 
 /** 递归快照上传目录的相对文件名、大小与 SHA-256。 */
@@ -132,6 +137,42 @@ function snapshotTables(tableNames) {
   } finally {
     db.close();
   }
+}
+
+/** 读取 stateless 下载不得触发的演示 runtime、run 与 context 状态。 */
+function readStatelessDownloadGovernance() {
+  const db = openDatabase();
+  try {
+    return {
+      runtime: db.prepare('SELECT enabled, runtime_epoch AS runtimeEpoch, revision FROM demo_runtime_settings WHERE id = 1').get(),
+      runCount: db.prepare('SELECT COUNT(*) AS total FROM demo_dataset_runs').get().total,
+      contextCount: db.prepare('SELECT COUNT(*) AS total FROM demo_import_contexts').get().total,
+      autoEnableAuditCount: db.prepare("SELECT COUNT(*) AS total FROM sys_operation_logs WHERE operation = 'system.demo.runtime.auto-enable'").get().total
+    };
+  } finally {
+    db.close();
+  }
+}
+
+/** 通过真实模板下载响应直接走页面既定 multipart 导入路由。 */
+async function downloadAndDirectImport(server, token, artifactKey, importPath) {
+  const downloadResponse = await request(server, 'GET', `/api/templates/demo-park/${artifactKey}.xlsx`, { token });
+  assert.strictEqual(downloadResponse.status, 200, `${artifactKey} 真实下载失败：${JSON.stringify(downloadResponse.body)}`);
+  assert(downloadResponse.buffer.length > 0, `${artifactKey} 下载文件不能为空。`);
+  assert.strictEqual(downloadResponse.headers['x-demo-context'], undefined, `${artifactKey} stateless 下载不得签发 context。`);
+  const multipart = createBufferMultipart(
+    `${artifactKey}.xlsx`,
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    downloadResponse.buffer
+  );
+  const importResponse = await request(server, 'POST', importPath, {
+    token,
+    headers: { 'Content-Type': `multipart/form-data; boundary=${multipart.boundary}` },
+    rawBody: multipart.body
+  });
+  assert.strictEqual(importResponse.status, 201, `${artifactKey} 直接导入失败：${JSON.stringify(importResponse.body)}`);
+  assert.strictEqual(importResponse.body?.success, true, `${artifactKey} 直接导入必须返回 success=true。`);
+  return importResponse.body.data;
 }
 
 /** 根据真实 preview 响应构造正式产能单元 execute 请求。 */
@@ -210,6 +251,30 @@ async function assertUnconnectedCase(server, adminToken, testCase) {
     assert.strictEqual(loginResponse.status, 200, JSON.stringify(loginResponse.body));
     const adminToken = loginResponse.body.data.token;
 
+    // 真实 stateless 下载必须在 runtime 初始关闭时继续进入既定 direct-upload 导入链路。
+    const statelessGovernanceBefore = readStatelessDownloadGovernance();
+    assert.strictEqual(statelessGovernanceBefore.runtime.enabled, 0, 'stateless 下载前 runtime 必须保持初始关闭。');
+    assert.strictEqual(statelessGovernanceBefore.runCount, 0);
+    assert.strictEqual(statelessGovernanceBefore.contextCount, 0);
+    assert.strictEqual(statelessGovernanceBefore.autoEnableAuditCount, 0);
+    await downloadAndDirectImport(server, adminToken, '02-organization-departments', '/api/organization/units/import');
+    await downloadAndDirectImport(server, adminToken, '03-organization-process-equipment', '/api/organization/units/import');
+    await downloadAndDirectImport(server, adminToken, '04-meters', '/api/meters/import');
+    await downloadAndDirectImport(server, adminToken, '08-meter-readings-2026-08', '/api/meter-readings/import');
+    assert.deepStrictEqual(readStatelessDownloadGovernance(), statelessGovernanceBefore, '02、03、04、08 下载与正式导入不得开启 runtime、创建 run/context 或写自动激活审计。');
+    const statelessDb = openDatabase();
+    try {
+      assert.strictEqual(statelessDb.prepare("SELECT COUNT(*) AS total FROM meter_devices WHERE meter_code IN ('QL-M-ELEC-PARK', 'QL-M-ELEC-CNC01', 'QL-M-GAS-UTILITY')").get().total, 3, '04 下载文件必须真实完整导入三项计量器具。');
+      assert.deepStrictEqual(statelessDb.prepare("SELECT meter_type AS meterType FROM meter_devices WHERE meter_code = 'QL-M-GAS-UTILITY'").get(), { meterType: 'gas' }, '天然气器具的 natural_gas 导入别名必须归一为 gas。');
+      assert.strictEqual(statelessDb.prepare(`SELECT COUNT(*) AS total FROM meter_reading_records reading
+        JOIN meter_devices meter ON meter.id = reading.meter_device_id
+        WHERE meter.meter_code IN ('QL-M-ELEC-PARK', 'QL-M-ELEC-CNC01')
+          AND reading.reading_date = '2026-08-01'`).get().total, 2, '08 下载文件必须真实导入两项计量抄表。');
+      assert.strictEqual(statelessDb.prepare('SELECT COUNT(*) AS total FROM energy_records').get().total, 0, '计量抄表直接导入不得自动生成能耗记录。');
+    } finally {
+      statelessDb.close();
+    }
+
     // 代表性无 context 正式链路：真实 multipart preview 与 JSON execute 必须继续成功并写入产能单元。
     const formalMultipart = createArtifactMultipart('05-production-units');
     const formalPreviewResponse = await request(server, 'POST', '/api/production/units/import/preview', {
@@ -267,7 +332,7 @@ async function assertUnconnectedCase(server, adminToken, testCase) {
       await assertUnconnectedCase(server, adminToken, testCase);
     }
 
-    console.log(`demo unconnected context HTTP matrix tests passed (${matrix.length} fail-closed requests + 1 formal preview/execute flow)`);
+    console.log(`demo unconnected context HTTP matrix tests passed (${matrix.length} fail-closed requests + 4 stateless download/import flows + 1 formal preview/execute flow)`);
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));
     try {

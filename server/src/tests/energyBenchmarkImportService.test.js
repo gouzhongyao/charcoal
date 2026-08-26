@@ -18,6 +18,7 @@ process.env.ENERGY_ANALYSIS_IMPORT_HMAC_SECRET = 'energy-benchmark-import-test-s
 const { initDatabase, openDatabase } = require('../db/database');
 const { getImportAuditBatchDetail } = require('../services/importAuditService');
 const { createEnergyAnalysisSingleBatchPreview } = require('../services/energyAnalysisSingleBatchImportService');
+const { getEnergyAnalysisTemplateDefinition } = require('../services/energyAnalysisTemplateService');
 const {
   ENERGY_BENCHMARK_DEFINITION_IMPORT_DESCRIPTOR,
   ENERGY_BENCHMARK_TARGET_IMPORT_DESCRIPTOR,
@@ -37,12 +38,18 @@ const FACTOR_HEADERS = Object.freeze([
 ]);
 const DEFINITION_HEADERS = Object.freeze([
   '对标编码', '对标名称', '对标类型', '指标编码', '指标单位', '周期类型', '范围类型', '范围标识',
-  '指标方向', '来源', '文号', '版本', '生效开始时间（UTC）', '生效结束时间（UTC）', '来源时区', '状态'
+  '指标方向', '来源', '生效开始时间（UTC）', '生效结束时间（UTC）', '来源时区', '状态'
+]);
+const LEGACY_DEFINITION_HEADERS = Object.freeze([
+  ...DEFINITION_HEADERS.slice(0, 10), '文号', '版本', ...DEFINITION_HEADERS.slice(10)
 ]);
 const TARGET_HEADERS = Object.freeze([
-  '对标编码', '对标定义版本', '目标值', '下限值', '上限值', '参考期开始时间（UTC）',
+  '对标编码', '目标值', '下限值', '上限值', '参考期开始时间（UTC）',
   '参考期结束时间（UTC）', '固化值', '固化时间（UTC）', '样本数量', '产量摘要 JSON',
-  '来源数据摘要', '是否固化', '是否自动刷新', '目标版本', '状态'
+  '来源数据摘要', '是否固化', '是否自动刷新', '状态'
+]);
+const LEGACY_TARGET_HEADERS = Object.freeze([
+  '对标编码', '对标定义版本', ...TARGET_HEADERS.slice(1, -1), '目标版本', '状态'
 ]);
 
 /** 创建合法折标系数行。 */
@@ -60,8 +67,8 @@ function createDefinitionRow(overrides = {}) {
   return {
     对标编码: 'BENCH-LOWER', 对标名称: '单位产品综合能耗基准', 对标类型: 'external_standard',
     指标编码: 'energy_intensity', 指标单位: 'kgce/t', 周期类型: 'month', 范围类型: 'organization',
-    范围标识: 'OU-001', 指标方向: 'lower_better', 来源: '行业标准', 文号: 'GB/T-EXAMPLE',
-    版本: 'energy-benchmark:v1', '生效开始时间（UTC）': '2026-01-01T00:00:00Z',
+    范围标识: 'OU-001', 指标方向: 'lower_better', 来源: '行业标准',
+    '生效开始时间（UTC）': '2026-01-01T00:00:00Z',
     '生效结束时间（UTC）': '2027-01-01T00:00:00Z', 来源时区: 'Asia/Shanghai', 状态: 'active', ...overrides
   };
 }
@@ -69,10 +76,10 @@ function createDefinitionRow(overrides = {}) {
 /** 创建合法对标目标行。 */
 function createTargetRow(overrides = {}) {
   return {
-    对标编码: 'BENCH-LOWER', 对标定义版本: 'energy-benchmark:v1', 目标值: 120,
-    下限值: '', 上限值: '', '参考期开始时间（UTC）': '', '参考期结束时间（UTC）': '', 固化值: '',
-    '固化时间（UTC）': '', 样本数量: '', '产量摘要 JSON': '', 来源数据摘要: '', 是否固化: 0,
-    是否自动刷新: 0, 目标版本: 'benchmark-target:v1', 状态: 'active', ...overrides
+    对标编码: 'BENCH-LOWER', 目标值: 120, 下限值: '', 上限值: '',
+    '参考期开始时间（UTC）': '', '参考期结束时间（UTC）': '', 固化值: '', '固化时间（UTC）': '',
+    样本数量: '', '产量摘要 JSON': '', 来源数据摘要: '', 是否固化: 0,
+    是否自动刷新: 0, 状态: 'active', ...overrides
   };
 }
 
@@ -152,14 +159,14 @@ function seedMasterData(db) {
     VALUES ('PU-001', '产品一线', ?, '产品A', 't', 'active')`).run(organizationId);
   db.prepare(`INSERT INTO benchmark_definitions
     (benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type, scope_type, scope_reference,
-     direction, source, version, effective_start_utc, effective_end_utc, source_timezone, status)
+     direction, source, version, internal_revision, effective_start_utc, effective_end_utc, source_timezone, status)
     VALUES ('BENCH-INACTIVE', '停用定义', 'manual_benchmark', 'metric', '%', 'month', 'organization', 'OU-001',
-     'higher_better', '人工', 'inactive-benchmark:v1', '2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai', 'inactive')`).run();
+     'higher_better', '人工', 'inactive-benchmark:v1', 1, '2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai', 'inactive')`).run();
   db.prepare(`INSERT INTO benchmark_definitions
     (benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type, scope_type, scope_reference,
-     direction, source, version, effective_start_utc, effective_end_utc, source_timezone, status)
+     direction, source, version, internal_revision, effective_start_utc, effective_end_utc, source_timezone, status)
     VALUES ('BENCH-INTERNAL', '内部历史', 'internal_history_baseline', 'metric', '%', 'month', 'organization', 'OU-001',
-     'lower_better', '内部计算', 'internal-benchmark:v1', '2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai', 'active')`).run();
+     'lower_better', '内部计算', 'internal-benchmark:v1', 1, '2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai', 'active')`).run();
 }
 
 /** 验证三个描述器的冻结绑定。 */
@@ -171,6 +178,13 @@ function testDescriptorBindings() {
   assert.strictEqual(Object.isFrozen(ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR), true);
   assert.strictEqual(Object.isFrozen(ENERGY_BENCHMARK_DEFINITION_IMPORT_DESCRIPTOR), true);
   assert.strictEqual(Object.isFrozen(ENERGY_BENCHMARK_TARGET_IMPORT_DESCRIPTOR), true);
+
+  const definitionTemplate = getEnergyAnalysisTemplateDefinition('energy-benchmark-definitions');
+  const targetTemplate = getEnergyAnalysisTemplateDefinition('energy-benchmark-targets');
+  assert.deepStrictEqual(definitionTemplate.sheets[0].headers, DEFINITION_HEADERS);
+  assert.deepStrictEqual(targetTemplate.sheets[0].headers, TARGET_HEADERS);
+  for (const removedHeader of ['文号', '版本']) assert(!definitionTemplate.sheets[0].headers.includes(removedHeader));
+  for (const removedHeader of ['对标定义版本', '目标版本']) assert(!targetTemplate.sheets[0].headers.includes(removedHeader));
 }
 
 /** 验证三类 CSV 均通过统一模板 Buffer 解析保留重复标题、别名冲突和零数据结构问题。 */
@@ -258,8 +272,8 @@ async function testPreviewExecuteAndTraceability(db, options) {
 
   const definitionRows = [
     createDefinitionRow(),
-    createDefinitionRow({ 对标编码: 'BENCH-HIGHER', 对标名称: '产出率标杆', 对标类型: 'manual_benchmark', 指标编码: 'yield_rate', 指标单位: '%', 范围类型: 'energy', 范围标识: 'electricity', 指标方向: 'higher_better', 文号: '' }),
-    createDefinitionRow({ 对标编码: 'BENCH-RANGE', 对标名称: '产品区间', 对标类型: 'manual_benchmark', 指标编码: 'range_metric', 指标单位: '%', 范围类型: 'product', 范围标识: '产品A', 指标方向: 'range', 文号: '' })
+    createDefinitionRow({ 对标编码: 'BENCH-HIGHER', 对标名称: '产出率标杆', 对标类型: 'manual_benchmark', 指标编码: 'yield_rate', 指标单位: '%', 范围类型: 'energy', 范围标识: 'electricity', 指标方向: 'higher_better' }),
+    createDefinitionRow({ 对标编码: 'BENCH-RANGE', 对标名称: '产品区间', 对标类型: 'manual_benchmark', 指标编码: 'range_metric', 指标单位: '%', 范围类型: 'product', 范围标识: '产品A', 指标方向: 'range' })
   ];
   const definitionFile = writeCsvWithBlankLines('definition-physical.csv', DEFINITION_HEADERS, definitionRows[0]);
   const definitionPreview = previewEnergyBenchmarkDefinitionImport(definitionFile, options);
@@ -268,7 +282,16 @@ async function testPreviewExecuteAndTraceability(db, options) {
   assert.strictEqual(definitionPreview.auditBatch.importType, 'energy_benchmark');
   assert.strictEqual(definitionPreview.operation, 'energy-benchmark-standard-import');
   assert.strictEqual(definitionPreview.recordKind, 'benchmark_standard');
+  assert.strictEqual(definitionPreview.candidateRows[0].internalRevision, 1);
+  assert.strictEqual(definitionPreview.candidateRows[0].version, 'benchmark-definition-internal-revision:v1');
   await executeEnergyBenchmarkDefinitionImport(createExecuteBody(definitionPreview), options);
+  const storedDefinition = db.prepare(`SELECT document_no AS documentNo, version,
+    internal_revision AS internalRevision FROM benchmark_definitions WHERE benchmark_code = 'BENCH-LOWER'`).get();
+  assert.deepStrictEqual(storedDefinition, {
+    documentNo: null,
+    version: 'benchmark-definition-internal-revision:v1',
+    internalRevision: 1
+  });
 
   const moreDefinitions = writeCsvUpload('definition-directions.csv', DEFINITION_HEADERS, definitionRows.slice(1));
   const moreDefinitionsPreview = previewEnergyBenchmarkDefinitionImport(moreDefinitions, options);
@@ -281,21 +304,31 @@ async function testPreviewExecuteAndTraceability(db, options) {
   assert.strictEqual(targetPreview.candidateRows[0].sourceRowNumber, 4);
   assert.strictEqual(targetPreview.operation, 'energy-benchmark-target-import');
   assert.strictEqual(targetPreview.recordKind, 'benchmark_target');
+  assert.strictEqual(targetPreview.candidateRows[0].internalRevision, 1);
+  assert.strictEqual(targetPreview.candidateRows[0].version, 'benchmark-target-internal-revision:v1');
   const targetResult = await executeEnergyBenchmarkTargetImport(createExecuteBody(targetPreview), options);
   assert.strictEqual(targetResult.imported, 1);
   const target = db.prepare(`SELECT source_batch_id AS batchId, source_row_number AS rowNumber,
-    reference_start_utc AS referenceStartUtc, is_frozen AS isFrozen FROM benchmark_targets`).get();
-  assert.deepStrictEqual(target, { batchId: targetPreview.batchId, rowNumber: 4, referenceStartUtc: null, isFrozen: 0 });
+    reference_start_utc AS referenceStartUtc, is_frozen AS isFrozen, version,
+    internal_revision AS internalRevision FROM benchmark_targets`).get();
+  assert.deepStrictEqual(target, {
+    batchId: targetPreview.batchId,
+    rowNumber: 4,
+    referenceStartUtc: null,
+    isFrozen: 0,
+    version: 'benchmark-target-internal-revision:v1',
+    internalRevision: 1
+  });
 
   const rangeCsv = writeCsvWithBlankLines('target-range-physical.csv', TARGET_HEADERS, createTargetRow({
-    对标编码: 'BENCH-RANGE', 目标值: '', 下限值: 80, 上限值: 90, 目标版本: 'range-target:v1'
+    对标编码: 'BENCH-RANGE', 目标值: '', 下限值: 80, 上限值: 90
   }));
   const rangePreview = previewEnergyBenchmarkTargetImport(rangeCsv, options);
   assert.strictEqual(rangePreview.candidateRows[0].sourceRowNumber, 4);
   await executeEnergyBenchmarkTargetImport(createExecuteBody(rangePreview), options);
 
   const higherFile = writeCsvUpload('target-higher.csv', TARGET_HEADERS, [createTargetRow({
-    对标编码: 'BENCH-HIGHER', 目标值: 95, 目标版本: 'higher-target:v1'
+    对标编码: 'BENCH-HIGHER', 目标值: 95
   })]);
   const higherPreview = previewEnergyBenchmarkTargetImport(higherFile, options);
   assert.strictEqual(higherPreview.summary.wouldImport, 1);
@@ -401,17 +434,174 @@ async function testConversionFactorRules(db, options) {
   assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code = 'MS-EXECUTE-CANDIDATE'").get().total, 0);
 }
 
-/** 验证定义类型、方向、范围、来源版本、重复和冲突。 */
+/** 验证旧定义和目标模板列仅产生弃用 warning，且旧值不会控制内部修订或兼容版本。 */
+async function testLegacyBenchmarkHeaders(db, options) {
+  const legacyDefinitionRow = createDefinitionRow({
+    对标编码: 'BENCH-LEGACY-COLUMNS',
+    对标名称: '旧模板列兼容定义',
+    文号: 'LEGACY-DOCUMENT-NO',
+    版本: 'legacy-definition:v999',
+    '生效开始时间（UTC）': '2031-01-01T00:00:00Z',
+    '生效结束时间（UTC）': '2032-01-01T00:00:00Z'
+  });
+  const definitionPreview = previewEnergyBenchmarkDefinitionImport(
+    writeCsvUpload('legacy-definition-columns.csv', LEGACY_DEFINITION_HEADERS, [legacyDefinitionRow]), options
+  );
+  assert.strictEqual(definitionPreview.summary.wouldImport, 1);
+  const definitionWarnings = definitionPreview.auditIssues.filter((issue) => issue.code === 'DEPRECATED_BENCHMARK_HEADER_IGNORED');
+  assert.strictEqual(definitionWarnings.length, 2);
+  assert(definitionWarnings.some((issue) => issue.message.includes('文号列已弃用')));
+  assert(definitionWarnings.some((issue) => issue.message.includes('定义版本列已弃用')));
+  assert.strictEqual(definitionPreview.candidateRows[0].documentNo, undefined);
+  assert.strictEqual(definitionPreview.candidateRows[0].internalRevision, 1);
+  assert.strictEqual(definitionPreview.candidateRows[0].version, 'benchmark-definition-internal-revision:v1');
+  assert.notStrictEqual(definitionPreview.candidateRows[0].version, legacyDefinitionRow.版本);
+  await executeEnergyBenchmarkDefinitionImport(createExecuteBody(definitionPreview), options);
+  const storedDefinition = db.prepare(`SELECT id, document_no AS documentNo, version,
+    internal_revision AS internalRevision FROM benchmark_definitions WHERE benchmark_code = 'BENCH-LEGACY-COLUMNS'`).get();
+  assert.deepStrictEqual({
+    documentNo: storedDefinition.documentNo,
+    version: storedDefinition.version,
+    internalRevision: storedDefinition.internalRevision
+  }, {
+    documentNo: null,
+    version: 'benchmark-definition-internal-revision:v1',
+    internalRevision: 1
+  });
+
+  const legacyTargetRow = createTargetRow({
+    对标编码: 'BENCH-LEGACY-COLUMNS',
+    目标值: 121,
+    对标定义版本: 'legacy-definition:v999',
+    目标版本: 'legacy-target:v999'
+  });
+  const targetPreview = previewEnergyBenchmarkTargetImport(
+    writeCsvUpload('legacy-target-columns.csv', LEGACY_TARGET_HEADERS, [legacyTargetRow]), options
+  );
+  assert.strictEqual(targetPreview.summary.wouldImport, 1);
+  const targetWarnings = targetPreview.auditIssues.filter((issue) => issue.code === 'DEPRECATED_BENCHMARK_HEADER_IGNORED');
+  assert.strictEqual(targetWarnings.length, 2);
+  assert(targetWarnings.some((issue) => issue.message.includes('对标定义版本列已弃用')));
+  assert(targetWarnings.some((issue) => issue.message.includes('目标版本列已弃用')));
+  assert.strictEqual(targetPreview.candidateRows[0].benchmarkDefinitionId, storedDefinition.id);
+  assert.strictEqual(targetPreview.candidateRows[0].internalRevision, 1);
+  assert.strictEqual(targetPreview.candidateRows[0].version, 'benchmark-target-internal-revision:v1');
+  assert.notStrictEqual(targetPreview.candidateRows[0].version, legacyTargetRow.目标版本);
+  assert.strictEqual(targetPreview.candidateRows[0].benchmarkVersion, undefined);
+  await executeEnergyBenchmarkTargetImport(createExecuteBody(targetPreview), options);
+  const storedTarget = db.prepare(`SELECT version, internal_revision AS internalRevision
+    FROM benchmark_targets WHERE benchmark_definition_id = ?`).get(storedDefinition.id);
+  assert.deepStrictEqual(storedTarget, {
+    version: 'benchmark-target-internal-revision:v1',
+    internalRevision: 1
+  });
+}
+
+/** 验证历史兼容版本占位时 preview、锁内重算和 execute 使用同一确定性备用后缀。 */
+async function testCompatibilityVersionFallbackAndPreviewStability(db, options) {
+  const definitionCode = 'BENCH-IMPORT-DEFINITION-VERSION-COLLISION';
+  const definitionBaseVersion = 'benchmark-definition-internal-revision:v3';
+  const insertDefinitionHistory = db.prepare(`INSERT INTO benchmark_definitions (
+    benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type,
+    scope_type, scope_reference, direction, source, version, internal_revision,
+    effective_start_utc, effective_end_utc, source_timezone, status
+  ) VALUES (?, ?, 'external_standard', 'energy_intensity', 'kgce/t', 'month',
+    'organization', 'OU-001', 'lower_better', '历史导入兼容测试', ?, ?, ?, ?, 'Asia/Shanghai', 'inactive')`);
+  insertDefinitionHistory.run(definitionCode, '历史导入定义一', definitionBaseVersion, 1,
+    '2034-01-01T00:00:00Z', '2035-01-01T00:00:00Z');
+  insertDefinitionHistory.run(definitionCode, '历史导入定义二', `${definitionBaseVersion}:server-1`, 2,
+    '2035-01-01T00:00:00Z', '2036-01-01T00:00:00Z');
+
+  const definitionFile = writeCsvUpload('definition-version-fallback.csv', DEFINITION_HEADERS, [createDefinitionRow({
+    对标编码: definitionCode,
+    对标名称: '导入定义确定性备用后缀',
+    '生效开始时间（UTC）': '2036-01-01T00:00:00Z',
+    '生效结束时间（UTC）': '2037-01-01T00:00:00Z'
+  })]);
+  const firstDefinitionPreview = previewEnergyBenchmarkDefinitionImport(definitionFile, options);
+  const secondDefinitionPreview = previewEnergyBenchmarkDefinitionImport(definitionFile, options);
+  assert.strictEqual(firstDefinitionPreview.summary.wouldImport, 1);
+  assert.strictEqual(firstDefinitionPreview.candidateRows[0].internalRevision, 3);
+  assert.strictEqual(firstDefinitionPreview.candidateRows[0].version, `${definitionBaseVersion}:server-2`);
+  assert.deepStrictEqual(secondDefinitionPreview.candidateRows, firstDefinitionPreview.candidateRows,
+    '重复定义 preview 必须生成完全一致的兼容版本候选。');
+  await executeEnergyBenchmarkDefinitionImport(createExecuteBody(firstDefinitionPreview), options);
+  const storedDefinition = db.prepare(`SELECT id, version, internal_revision AS internalRevision
+    FROM benchmark_definitions WHERE benchmark_code = ? AND internal_revision = 3`).get(definitionCode);
+  assert.deepStrictEqual({
+    version: storedDefinition.version,
+    internalRevision: storedDefinition.internalRevision
+  }, {
+    version: firstDefinitionPreview.candidateRows[0].version,
+    internalRevision: firstDefinitionPreview.candidateRows[0].internalRevision
+  }, '定义 execute 落库结果必须与 preview 候选一致。');
+  assert.deepStrictEqual(db.prepare(`SELECT version FROM benchmark_definitions
+    WHERE benchmark_code = ? AND internal_revision <= 2 ORDER BY internal_revision`).all(definitionCode).map((row) => row.version), [
+    definitionBaseVersion,
+    `${definitionBaseVersion}:server-1`
+  ], '定义导入不得改写历史 version。');
+
+  const targetDefinitionCode = 'BENCH-IMPORT-TARGET-VERSION-COLLISION';
+  const activeTargetDefinitionId = Number(db.prepare(`INSERT INTO benchmark_definitions (
+    benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type,
+    scope_type, scope_reference, direction, source, version, internal_revision,
+    effective_start_utc, effective_end_utc, source_timezone, status
+  ) VALUES (?, '目标导入 active 定义', 'manual_benchmark', 'energy_intensity', 'kgce/t', 'month',
+    'organization', 'OU-001', 'lower_better', '目标导入兼容测试', 'target-import-definition:v1', 1,
+    '2036-01-01T00:00:00Z', '2037-01-01T00:00:00Z', 'Asia/Shanghai', 'active')`).run(targetDefinitionCode).lastInsertRowid);
+  db.prepare(`INSERT INTO benchmark_definitions (
+    benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type,
+    scope_type, scope_reference, direction, source, version, internal_revision,
+    effective_start_utc, effective_end_utc, source_timezone, status
+  ) VALUES (?, '目标导入 inactive 后继', 'manual_benchmark', 'energy_intensity', 'kgce/t', 'month',
+    'organization', 'OU-001', 'lower_better', '目标导入兼容测试', 'target-import-definition:v2', 2,
+    '2037-01-01T00:00:00Z', '2038-01-01T00:00:00Z', 'Asia/Shanghai', 'inactive')`).run(targetDefinitionCode);
+
+  const targetBaseVersion = 'benchmark-target-internal-revision:v3';
+  const insertTargetHistory = db.prepare(`INSERT INTO benchmark_targets (
+    benchmark_definition_id, target_value, version, internal_revision, status
+  ) VALUES (?, ?, ?, ?, 'inactive')`);
+  insertTargetHistory.run(activeTargetDefinitionId, 301, targetBaseVersion, 1);
+  insertTargetHistory.run(activeTargetDefinitionId, 302, `${targetBaseVersion}:server-1`, 2);
+
+  const targetFile = writeCsvUpload('target-version-fallback.csv', TARGET_HEADERS, [createTargetRow({
+    对标编码: targetDefinitionCode,
+    目标值: 303
+  })]);
+  const firstTargetPreview = previewEnergyBenchmarkTargetImport(targetFile, options);
+  const secondTargetPreview = previewEnergyBenchmarkTargetImport(targetFile, options);
+  assert.strictEqual(firstTargetPreview.summary.wouldImport, 1);
+  assert.strictEqual(firstTargetPreview.candidateRows[0].benchmarkDefinitionId, activeTargetDefinitionId,
+    'inactive 定义后继不得参与目标导入的唯一 active 匹配。');
+  assert.strictEqual(firstTargetPreview.candidateRows[0].internalRevision, 3);
+  assert.strictEqual(firstTargetPreview.candidateRows[0].version, `${targetBaseVersion}:server-2`);
+  assert.deepStrictEqual(secondTargetPreview.candidateRows, firstTargetPreview.candidateRows,
+    '重复目标 preview 必须生成完全一致的兼容版本候选。');
+  await executeEnergyBenchmarkTargetImport(createExecuteBody(firstTargetPreview), options);
+  const storedTarget = db.prepare(`SELECT version, internal_revision AS internalRevision
+    FROM benchmark_targets WHERE benchmark_definition_id = ? AND internal_revision = 3`).get(activeTargetDefinitionId);
+  assert.deepStrictEqual(storedTarget, {
+    version: firstTargetPreview.candidateRows[0].version,
+    internalRevision: firstTargetPreview.candidateRows[0].internalRevision
+  }, '目标 execute 锁内重算和落库结果必须与 preview 候选一致。');
+  assert.deepStrictEqual(db.prepare(`SELECT version FROM benchmark_targets
+    WHERE benchmark_definition_id = ? AND internal_revision <= 2 ORDER BY internal_revision`).all(activeTargetDefinitionId).map((row) => row.version), [
+    targetBaseVersion,
+    `${targetBaseVersion}:server-1`
+  ], '目标导入不得改写历史 version。');
+}
+
+/** 验证定义类型、方向、范围、来源、重复和有效期冲突。 */
 function testBenchmarkDefinitionRules(db, options) {
   const invalidFile = writeCsvUpload('definition-invalid.csv', DEFINITION_HEADERS, [
     createDefinitionRow({ 对标编码: 'INTERNAL-FAKE', 对标类型: 'internal_history_baseline' }),
-    createDefinitionRow({ 对标编码: 'MISSING-SOURCE', 对标类型: 'manual_benchmark', 来源: '', 文号: '', 版本: '' }),
+    createDefinitionRow({ 对标编码: 'MISSING-SOURCE', 对标类型: 'manual_benchmark', 来源: '' }),
     createDefinitionRow({ 对标编码: 'BAD-SCOPE', 范围标识: 'OU-NOT-FOUND' }),
     createDefinitionRow({ 对标编码: 'BAD-DIRECTION', 指标方向: 'smaller' })
   ]);
   const invalid = previewEnergyBenchmarkDefinitionImport(invalidFile, options);
   const codes = new Set(invalid.auditIssues.map((issue) => issue.code));
-  ['INTERNAL_HISTORY_BENCHMARK_IMPORT_FORBIDDEN', 'REQUIRED_FIELD_MISSING', 'INVALID_BENCHMARK_VERSION',
+  ['INTERNAL_HISTORY_BENCHMARK_IMPORT_FORBIDDEN', 'REQUIRED_FIELD_MISSING',
     'BENCHMARK_ORGANIZATION_SCOPE_NOT_FOUND', 'INVALID_BENCHMARK_DIRECTION'].forEach((code) => assert(codes.has(code), `缺少 ${code}`));
 
   const duplicate = previewEnergyBenchmarkDefinitionImport(
@@ -420,15 +610,15 @@ function testBenchmarkDefinitionRules(db, options) {
   assert.strictEqual(duplicate.summary.skipped, 1);
   assert(duplicate.auditIssues.some((issue) => issue.code === 'DUPLICATE_BENCHMARK_DEFINITION_SKIPPED'));
 
-  const conflict = previewEnergyBenchmarkDefinitionImport(
-    writeCsvUpload('definition-conflict.csv', DEFINITION_HEADERS, [createDefinitionRow({ 对标名称: '非完全相同定义' })]), options
+  const changedOverlap = previewEnergyBenchmarkDefinitionImport(
+    writeCsvUpload('definition-changed-overlap.csv', DEFINITION_HEADERS, [createDefinitionRow({ 对标名称: '非完全相同定义' })]), options
   );
-  assert.strictEqual(conflict.summary.blocked, 1);
-  assert(conflict.auditIssues.some((issue) => issue.code === 'BENCHMARK_DEFINITION_UNIQUE_KEY_CONFLICT'));
+  assert.strictEqual(changedOverlap.summary.blocked, 1);
+  assert(changedOverlap.auditIssues.some((issue) => issue.code === 'BENCHMARK_DEFINITION_ACTIVE_PERIOD_OVERLAP'));
 
   const overlap = previewEnergyBenchmarkDefinitionImport(
     writeCsvUpload('definition-overlap.csv', DEFINITION_HEADERS, [createDefinitionRow({
-      版本: 'energy-benchmark-overlap:v1', '生效开始时间（UTC）': '2026-06-01T00:00:00Z',
+      '生效开始时间（UTC）': '2026-06-01T00:00:00Z',
       '生效结束时间（UTC）': '2027-06-01T00:00:00Z'
     })]), options
   );
@@ -436,21 +626,37 @@ function testBenchmarkDefinitionRules(db, options) {
   assert(overlap.auditIssues.some((issue) => issue.code === 'BENCHMARK_DEFINITION_ACTIVE_PERIOD_OVERLAP'));
 }
 
-/** 验证目标定义引用、方向值结构、内部历史伪造、重复和冲突。 */
+/** 验证目标唯一 active 定义引用、方向值结构、内部历史伪造和重复。 */
 function testBenchmarkTargetRules(db, options) {
+  const ambiguousFirst = db.prepare(`INSERT INTO benchmark_definitions
+    (benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type, scope_type, scope_reference,
+     direction, source, version, internal_revision, effective_start_utc, effective_end_utc, source_timezone, status)
+    VALUES ('BENCH-AMBIGUOUS', '多 active 定义一', 'manual_benchmark', 'metric', '%', 'month', 'organization', 'OU-001',
+     'higher_better', '人工', 'legacy-ambiguous:v1', 1, '2028-01-01T00:00:00Z', '2029-01-01T00:00:00Z', 'Asia/Shanghai', 'active')`).run();
+  db.prepare(`INSERT INTO benchmark_definitions
+    (benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type, scope_type, scope_reference,
+     direction, source, version, internal_revision, effective_start_utc, effective_end_utc, source_timezone, status)
+    VALUES ('BENCH-AMBIGUOUS', '多 active 定义二', 'manual_benchmark', 'metric', '%', 'month', 'organization', 'OU-001',
+     'higher_better', '人工', 'legacy-ambiguous:v2', 2, '2029-01-01T00:00:00Z', '2030-01-01T00:00:00Z', 'Asia/Shanghai', 'active')`).run();
+  assert(ambiguousFirst.lastInsertRowid);
+
   const invalidFile = writeCsvUpload('target-invalid.csv', TARGET_HEADERS, [
-    createTargetRow({ 对标编码: 'NOT-FOUND', 目标版本: 'missing-target:v1' }),
-    createTargetRow({ 对标编码: 'BENCH-INACTIVE', 对标定义版本: 'inactive-benchmark:v1', 目标版本: 'inactive-target:v1' }),
-    createTargetRow({ 对标编码: 'BENCH-RANGE', 目标值: 85, 下限值: '', 上限值: '', 目标版本: 'invalid-range:v1' }),
-    createTargetRow({ 对标编码: 'BENCH-LOWER', 目标值: 'not-number', 目标版本: 'invalid-number:v1' }),
-    createTargetRow({ 对标编码: 'BENCH-INTERNAL', 对标定义版本: 'internal-benchmark:v1', 目标版本: 'internal-target:v1' }),
-    createTargetRow({ 对标编码: 'BENCH-HIGHER', 目标版本: 'forged-target:v1', '参考期开始时间（UTC）': '2025-01-01T00:00:00Z', 固化值: 90, 来源数据摘要: 'sha256:fake', 是否固化: 1 })
+    createTargetRow({ 对标编码: 'NOT-FOUND' }),
+    createTargetRow({ 对标编码: 'BENCH-INACTIVE' }),
+    createTargetRow({ 对标编码: 'BENCH-AMBIGUOUS' }),
+    createTargetRow({ 对标编码: 'BENCH-RANGE', 目标值: 85, 下限值: '', 上限值: '' }),
+    createTargetRow({ 对标编码: 'BENCH-LOWER', 目标值: 'not-number' }),
+    createTargetRow({ 对标编码: 'BENCH-INTERNAL' }),
+    createTargetRow({ 对标编码: 'BENCH-HIGHER', '参考期开始时间（UTC）': '2025-01-01T00:00:00Z', 固化值: 90, 来源数据摘要: 'sha256:fake', 是否固化: 1 })
   ]);
   const invalid = previewEnergyBenchmarkTargetImport(invalidFile, options);
   const codes = new Set(invalid.auditIssues.map((issue) => issue.code));
-  ['BENCHMARK_DEFINITION_NOT_FOUND', 'BENCHMARK_DEFINITION_INACTIVE', 'INVALID_BENCHMARK_TARGET_RANGE',
-    'INVALID_BENCHMARK_TARGET_NUMBER', 'INTERNAL_HISTORY_BENCHMARK_TARGET_IMPORT_FORBIDDEN',
+  ['BENCHMARK_ACTIVE_DEFINITION_NOT_FOUND', 'BENCHMARK_ACTIVE_DEFINITION_AMBIGUOUS',
+    'INVALID_BENCHMARK_TARGET_RANGE', 'INVALID_BENCHMARK_TARGET_NUMBER',
+    'INTERNAL_HISTORY_BENCHMARK_TARGET_IMPORT_FORBIDDEN',
     'BENCHMARK_INTERNAL_SNAPSHOT_FIELDS_FORBIDDEN'].forEach((code) => assert(codes.has(code), `缺少 ${code}`));
+  const ambiguousIssue = invalid.auditIssues.find((issue) => issue.code === 'BENCHMARK_ACTIVE_DEFINITION_AMBIGUOUS');
+  assert.strictEqual(JSON.parse(ambiguousIssue.rawValue).definitionIds.length, 2);
 
   const duplicate = previewEnergyBenchmarkTargetImport(
     writeCsvUpload('target-duplicate.csv', TARGET_HEADERS, [createTargetRow()]), options
@@ -458,11 +664,12 @@ function testBenchmarkTargetRules(db, options) {
   assert.strictEqual(duplicate.summary.skipped, 1);
   assert(duplicate.auditIssues.some((issue) => issue.code === 'DUPLICATE_BENCHMARK_TARGET_SKIPPED'));
 
-  const conflict = previewEnergyBenchmarkTargetImport(
-    writeCsvUpload('target-conflict.csv', TARGET_HEADERS, [createTargetRow({ 目标值: 121 })]), options
+  const changedTarget = previewEnergyBenchmarkTargetImport(
+    writeCsvUpload('target-changed.csv', TARGET_HEADERS, [createTargetRow({ 目标值: 121 })]), options
   );
-  assert.strictEqual(conflict.summary.blocked, 1);
-  assert(conflict.auditIssues.some((issue) => issue.code === 'BENCHMARK_TARGET_UNIQUE_KEY_CONFLICT'));
+  assert.strictEqual(changedTarget.summary.wouldImport, 1);
+  assert.strictEqual(changedTarget.candidateRows[0].internalRevision, 2);
+  assert.strictEqual(changedTarget.candidateRows[0].version, 'benchmark-target-internal-revision:v2');
 }
 
 /** 验证 SHA、签名、摘要、候选见证、确认、备份、风险和 stale 门槛。 */
@@ -536,9 +743,9 @@ async function testPersistedDescriptorBinding(db, baseOptions) {
   ];
   for (let index = 0; index < cases.length; index += 1) {
     const [fieldName, forgedValue, expectedCode] = cases[index];
+    const beforeCount = Number(db.prepare('SELECT COUNT(*) AS total FROM benchmark_targets').get().total);
     const preview = previewEnergyBenchmarkTargetImport(writeCsvUpload(`descriptor-${index}.csv`, TARGET_HEADERS, [createTargetRow({
-      目标值: 130 + index,
-      目标版本: `descriptor-target-${index}:v1`
+      目标值: 130 + index
     })]), baseOptions);
     const batchRow = db.prepare('SELECT audit_context_json AS auditContextJson FROM import_batches WHERE id = ?').get(preview.batchId);
     const auditContext = JSON.parse(batchRow.auditContextJson);
@@ -551,14 +758,14 @@ async function testPersistedDescriptorBinding(db, baseOptions) {
     }));
     assert.strictEqual(error.details.code, expectedCode);
     assert.strictEqual(backupCalls, 0, `${fieldName} 失配不得进入备份。`);
-    assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM benchmark_targets WHERE version = ?').get(`descriptor-target-${index}:v1`).total, 0);
+    assert.strictEqual(Number(db.prepare('SELECT COUNT(*) AS total FROM benchmark_targets').get().total), beforeCount);
   }
 }
 
 /** 验证两个 benchmark 批次不可串用，错误 descriptor 不得污染合法批次，且旧 standards 模板 ID 被拒绝。 */
 async function testDescriptorIsolation(db, options) {
   const definitionFile = writeCsvUpload('cross-definition.csv', DEFINITION_HEADERS, [createDefinitionRow({
-    对标编码: 'BENCH-CROSS', 版本: 'cross-benchmark:v1', '生效开始时间（UTC）': '2028-01-01T00:00:00Z',
+    对标编码: 'BENCH-CROSS', '生效开始时间（UTC）': '2028-01-01T00:00:00Z',
     '生效结束时间（UTC）': '2029-01-01T00:00:00Z'
   })]);
   const definitionPreview = previewEnergyBenchmarkDefinitionImport(definitionFile, options);
@@ -578,9 +785,9 @@ async function testDescriptorIsolation(db, options) {
   assert.strictEqual(getImportAuditBatchDetail(definitionPreview.batchId, { db }).auditPhase, 'execute');
 
   const targetFile = writeCsvUpload('cross-target.csv', TARGET_HEADERS, [createTargetRow({
-    对标编码: 'BENCH-CROSS', 对标定义版本: 'cross-benchmark:v1', 目标值: 88,
-    目标版本: 'cross-target:v1'
+    对标编码: 'BENCH-CROSS', 目标值: 88
   })]);
+  const targetCountBeforeWrongExecute = Number(db.prepare('SELECT COUNT(*) AS total FROM benchmark_targets').get().total);
   const targetPreview = previewEnergyBenchmarkTargetImport(targetFile, options);
   const targetBody = createExecuteBody(targetPreview);
   targetBody.confirmText = '确认导入能效对标标准';
@@ -591,7 +798,7 @@ async function testDescriptorIsolation(db, options) {
   assert.strictEqual(targetAfterWrongExecute.auditContext.templateType, 'energy-benchmark-targets');
   assert.strictEqual(targetAfterWrongExecute.auditContext.operation, 'energy-benchmark-target-import');
   assert.strictEqual(targetAfterWrongExecute.auditContext.recordKind, 'benchmark_target');
-  assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM benchmark_targets WHERE version = 'cross-target:v1'").get().total, 0);
+  assert.strictEqual(Number(db.prepare('SELECT COUNT(*) AS total FROM benchmark_targets').get().total), targetCountBeforeWrongExecute);
 
   const targetResult = await executeEnergyBenchmarkTargetImport(createExecuteBody(targetPreview), options);
   assert.strictEqual(targetResult.imported, 1, '目标批次被错误定义 execute 调用后仍必须可以正常执行。');
@@ -662,6 +869,8 @@ async function testRollbackBoundaries(db, baseOptions) {
     testCsvHeaderSafety(options);
     await testPreviewExecuteAndTraceability(db, options);
     await testConversionFactorRules(db, options);
+    await testLegacyBenchmarkHeaders(db, options);
+    await testCompatibilityVersionFallbackAndPreviewStability(db, options);
     testBenchmarkDefinitionRules(db, options);
     testBenchmarkTargetRules(db, options);
     await testSecurityGates(db, options);

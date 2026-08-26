@@ -8,6 +8,7 @@ import {
   flattenMenus,
   getUnauthenticatedLoginLocation,
   isBusinessRouteMenu,
+  projectDynamicRouteContract,
   resolveLoginRedirect
 } from '../utils/navigationRoutes.js';
 
@@ -41,6 +42,25 @@ assert.equal(isBusinessRouteMenu({ menuType: 'menu', routePath: '/' }), false);
 assert.equal(isBusinessRouteMenu({ menuType: 'menu', routePath: '/login' }), false);
 assert.equal(isBusinessRouteMenu({ menuType: 'menu', routePath: '/register' }), false);
 assert.equal(findFirstAuthorizedBusinessPath(menuTree), '/energy/statistics', '父目录不能抢占首个真实授权业务页面。');
+
+// N7 view-only 账号由服务端投影的 /carbon 页面必须形成可信动态路由合同。
+const ghgViewOnlyMenu = {
+  id: 60,
+  menuType: 'menu',
+  menuName: '碳核算',
+  routePath: '/carbon',
+  component: 'carbon/index',
+  permissionCode: null,
+  children: []
+};
+assert.deepEqual(projectDynamicRouteContract(ghgViewOnlyMenu), {
+  path: '/carbon',
+  name: 'menu-60',
+  componentKey: 'carbon/index',
+  meta: { title: '碳核算', permission: null }
+});
+assert.equal(projectDynamicRouteContract({ ...ghgViewOnlyMenu, menuType: 'button' }), null,
+  '按钮本身不得被注册为动态页面。');
 
 // 历史重复目录必须合并成一个有效节点，且不同子项不能在前端兜底时丢失。
 const dedupedTree = dedupeMenuTree([
@@ -132,7 +152,8 @@ assert.match(routerSource, /if \(!router\.hasRoute\(record\.name\)\)/);
 assert.match(routerSource, /dynamicRouteNames\.add\(record\.name\)/);
 assert.match(routerSource, /dynamicRouteNames\.clear\(\)/);
 assert.match(routerSource, /usePermissionStore\(\)\.reset\(\)/);
-assert.match(routerSource, /if \(!isBusinessRouteMenu\(menu\)\) return null/);
+assert.match(routerSource, /const routeContract = projectDynamicRouteContract\(menu\)/);
+assert.match(routerSource, /componentMap\[routeContract\.componentKey\]/);
 assert.match(routerSource, /catch \{\s*resetDynamicRoutes\(\);\s*await user\.logout\(false\)/);
 // bootstrap 期间事件只清理状态，由守卫保留原 to.fullPath；稳定页面失效时携带当前地址跳登录。
 assert.match(routerSource, /let activeBootstrapCount = 0/);

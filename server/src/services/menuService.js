@@ -43,5 +43,54 @@ function dedupeVisibleMenuRows(rows = []) {
     return true;
   });
 }
-function getUserMenus(userId) { const db = openDatabase(); try { const rows = db.prepare(`SELECT DISTINCT m.id, m.parent_id AS parentId, m.menu_type AS menuType, m.menu_name AS menuName, m.route_path AS routePath, m.component, m.permission_code AS permissionCode, m.icon, m.sort_order AS sortOrder, m.visible, m.status, m.is_builtin AS isBuiltin, m.created_at AS createdAt, m.updated_at AS updatedAt FROM sys_menus m JOIN sys_role_menus rm ON rm.menu_id = m.id JOIN sys_user_roles ur ON ur.role_id = rm.role_id JOIN sys_roles r ON r.id = ur.role_id WHERE ur.user_id = ? AND m.status = 'active' AND m.visible = 1 AND r.status = 'active' ORDER BY COALESCE(m.parent_id, 0), m.sort_order, m.id`).all(userId).map(map); return buildTree(dedupeVisibleMenuRows(rows.filter((row) => row.menuType !== 'button'))); } finally { db.close(); } }
+
+// 按父级、排序值和菜单 ID 恢复稳定下发顺序，祖先投影不得改变既有菜单排序。
+function compareVisibleMenuRows(left, right) {
+  const parentDifference = Number(left?.parentId || 0) - Number(right?.parentId || 0);
+  if (parentDifference !== 0) return parentDifference;
+  const sortDifference = Number(left?.sortOrder || 0) - Number(right?.sortOrder || 0);
+  if (sortDifference !== 0) return sortDifference;
+  return Number(left?.id || 0) - Number(right?.id || 0);
+}
+
+// 收集已授权按钮的完整结构祖先；缺失、隐藏、停用、按钮父级或循环链一律 fail-closed。
+function collectAuthorizedButtonAncestors(buttonRow, visibleMenuById) {
+  const ancestorRows = [];
+  const visitedMenuIds = new Set([Number(buttonRow?.id)]);
+  let parentId = buttonRow?.parentId;
+  while (parentId !== null && parentId !== undefined) {
+    const numericParentId = Number(parentId);
+    if (!Number.isSafeInteger(numericParentId)
+      || numericParentId < 1
+      || visitedMenuIds.has(numericParentId)) return [];
+    const parentRow = visibleMenuById.get(numericParentId);
+    if (!parentRow || parentRow.menuType === 'button') return [];
+    ancestorRows.unshift(parentRow);
+    visitedMenuIds.add(numericParentId);
+    parentId = parentRow.parentId;
+  }
+  return ancestorRows;
+}
+
+// 仅为已显式授权的 active/visible 按钮投影结构祖先，不新增角色权限或兄弟按钮授权。
+function projectAuthorizedMenuRows(authorizedRows = [], visibleRows = []) {
+  const visibleMenuById = new Map(visibleRows.map((row) => [Number(row.id), row]));
+  const projectedRows = authorizedRows.filter((row) => row.menuType !== 'button');
+  authorizedRows.filter((row) => row.menuType === 'button').forEach((buttonRow) => {
+    projectedRows.push(...collectAuthorizedButtonAncestors(buttonRow, visibleMenuById));
+  });
+  return dedupeVisibleMenuRows(projectedRows.sort(compareVisibleMenuRows));
+}
+
+// 返回当前用户可见菜单树；按钮本身不下发，仅在安全祖先链完整时投影其页面结构。
+function getUserMenus(userId) {
+  const db = openDatabase();
+  try {
+    const authorizedRows = db.prepare(`SELECT DISTINCT m.id, m.parent_id AS parentId, m.menu_type AS menuType, m.menu_name AS menuName, m.route_path AS routePath, m.component, m.permission_code AS permissionCode, m.icon, m.sort_order AS sortOrder, m.visible, m.status, m.is_builtin AS isBuiltin, m.created_at AS createdAt, m.updated_at AS updatedAt FROM sys_menus m JOIN sys_role_menus rm ON rm.menu_id = m.id JOIN sys_user_roles ur ON ur.role_id = rm.role_id JOIN sys_roles r ON r.id = ur.role_id WHERE ur.user_id = ? AND m.status = 'active' AND m.visible = 1 AND r.status = 'active' ORDER BY COALESCE(m.parent_id, 0), m.sort_order, m.id`).all(userId).map(map);
+    const visibleRows = db.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType, menu_name AS menuName, route_path AS routePath, component, permission_code AS permissionCode, icon, sort_order AS sortOrder, visible, status, is_builtin AS isBuiltin, created_at AS createdAt, updated_at AS updatedAt FROM sys_menus WHERE status = 'active' AND visible = 1 ORDER BY COALESCE(parent_id, 0), sort_order, id`).all().map(map);
+    return buildTree(projectAuthorizedMenuRows(authorizedRows, visibleRows));
+  } finally {
+    db.close();
+  }
+}
 module.exports = { createMenu, deleteMenu, getMenu: (menuId) => { const db = openDatabase(); try { return getMenuDb(db, id(menuId)); } finally { db.close(); } }, getUserMenus, listMenus, setMenuStatus, updateMenu };

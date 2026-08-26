@@ -7,7 +7,11 @@ const {
   ENERGY_FLOW_NODE_TYPES,
   ENERGY_FLOW_SOURCE_TYPES,
   isIanaTimeZone,
-  isStrictUtcIso
+  normalizeEnergyFlowKey,
+  normalizeEnergyFlowModelVersionKey,
+  normalizeEnergyFlowUtcSecond,
+  validateAndNormalizeEnergyFlowIdentityCode,
+  validateAndNormalizeEnergyFlowModelVersion
 } = require('./energyAnalysisContracts');
 const {
   calculateEnergyFlowNodeDifference,
@@ -35,8 +39,6 @@ const MAX_ANALYSIS_EDGES = 2000;
 const MAX_EXPLICIT_RECORD_IDS = 500;
 // 月份输入格式。
 const MONTH_PATTERN = /^(\d{4})-(0[1-9]|1[0-2])$/;
-// 模型编码、节点编码、边编码和版本允许的稳定字符集合。
-const IDENTITY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 // 差额率计算使用的零值容差。
 const BALANCE_ZERO_TOLERANCE = 1e-9;
 
@@ -268,18 +270,41 @@ function normalizeOptionalStatus(value) {
 }
 
 /**
- * 校验稳定业务编码或版本文本。
- * @param {*} value 原始值。
+ * 使用模型版本共享合同校验模型版本，并保留 trim 后显示值。
+ * @param {*} value 原始版本。
  * @param {string} fieldName 字段名。
- * @returns {string} 合法文本。
+ * @returns {string} 合法模型版本。
  */
-function normalizeIdentity(value, fieldName) {
-  const text = normalizeText(value);
-  if (!text) throw badRequest(`${fieldName} 为必填项。`, { code: 'REQUIRED_FIELD_MISSING', fieldName });
-  if (!IDENTITY_PATTERN.test(text)) {
-    throw badRequest(`${fieldName} 格式无效。`, { code: 'INVALID_ENERGY_FLOW_IDENTITY', fieldName });
+function normalizeModelVersion(value, fieldName) {
+  const validation = validateAndNormalizeEnergyFlowModelVersion(value);
+  if (!validation.valid) {
+    throw badRequest(
+      validation.errorCode === 'REQUIRED_FIELD_MISSING'
+        ? `${fieldName} 为必填项。`
+        : `${fieldName} 格式无效。`,
+      { code: validation.errorCode, fieldName }
+    );
   }
-  return text;
+  return validation.value;
+}
+
+/**
+ * 使用共享合同校验模型、节点和边稳定编码，并保留 trim 后显示值。
+ * @param {*} value 原始编码。
+ * @param {string} fieldName 字段名。
+ * @returns {string} 合法稳定编码。
+ */
+function normalizeIdentityCode(value, fieldName) {
+  const validation = validateAndNormalizeEnergyFlowIdentityCode(value);
+  if (!validation.valid) {
+    throw badRequest(
+      validation.errorCode === 'REQUIRED_FIELD_MISSING'
+        ? `${fieldName} 为必填项。`
+        : `${fieldName} 格式无效。`,
+      { code: validation.errorCode, fieldName }
+    );
+  }
+  return validation.value;
 }
 
 /**
@@ -291,13 +316,13 @@ function normalizeIdentity(value, fieldName) {
  * @returns {{startUtc:string,endUtc:string,startMs:number,endMs:number}} 时间范围。
  */
 function normalizeUtcRange(startValue, endValue, startField = 'startUtc', endField = 'endUtc') {
-  const startUtc = normalizeText(startValue);
-  const endUtc = normalizeText(endValue);
-  if (!isStrictUtcIso(startUtc)) {
-    throw badRequest(`${startField} 必须是严格 UTC Z 时间。`, { code: 'INVALID_START_UTC', fieldName: startField });
+  const startUtc = normalizeEnergyFlowUtcSecond(normalizeText(startValue));
+  const endUtc = normalizeEnergyFlowUtcSecond(normalizeText(endValue));
+  if (!startUtc) {
+    throw badRequest(`${startField} 必须是严格 UTC Z 秒精度时间；仅允许将 .000Z 无损规范为 Z。`, { code: 'INVALID_START_UTC', fieldName: startField });
   }
-  if (!isStrictUtcIso(endUtc)) {
-    throw badRequest(`${endField} 必须是严格 UTC Z 时间。`, { code: 'INVALID_END_UTC', fieldName: endField });
+  if (!endUtc) {
+    throw badRequest(`${endField} 必须是严格 UTC Z 秒精度时间；仅允许将 .000Z 无损规范为 Z。`, { code: 'INVALID_END_UTC', fieldName: endField });
   }
   const startMs = Date.parse(startUtc);
   const endMs = Date.parse(endUtc);
@@ -723,8 +748,14 @@ function listEnergyFlowModels(query = {}, options = {}) {
   const where = [];
   const params = { limit: pagination.pageSize, offset: pagination.offset };
   if (status) { where.push('model.status = @status'); params.status = status; }
-  if (modelCode) { where.push('model.model_code = @modelCode'); params.modelCode = modelCode; }
-  if (version) { where.push('model.version = @version'); params.version = version; }
+  if (modelCode) {
+    where.push('normalize_energy_flow_key(model.model_code) = normalize_energy_flow_key(@modelCode)');
+    params.modelCode = modelCode;
+  }
+  if (version) {
+    where.push('normalize_energy_flow_key(model.version) = normalize_energy_flow_key(@version)');
+    params.version = version;
+  }
   if (keyword) {
     where.push('(model.model_code LIKE @keyword OR model.model_name LIKE @keyword OR model.source LIKE @keyword OR COALESCE(model.document_no, \'\') LIKE @keyword)');
     params.keyword = `%${keyword}%`;
@@ -765,20 +796,45 @@ function getEnergyFlowModel(modelId, options = {}) {
  * @returns {object} 规范载荷。
  */
 function normalizeModelPayload(input = {}, existing = null) {
-  const modelCode = existing ? existing.modelCode : normalizeIdentity(input.modelCode, 'modelCode');
-  const version = existing ? existing.version : normalizeIdentity(input.version, 'version');
-  if (existing && input.modelCode !== undefined && normalizeIdentity(input.modelCode, 'modelCode') !== existing.modelCode) {
+  const modelCode = existing ? existing.modelCode : normalizeIdentityCode(input.modelCode, 'modelCode');
+  const version = existing ? existing.version : normalizeModelVersion(input.version, 'version');
+  const requestedEffectiveStartUtc = input.effectiveStartUtc === undefined
+    ? existing?.effectiveStartUtc
+    : normalizeText(input.effectiveStartUtc);
+  const requestedEffectiveEndUtc = input.effectiveEndUtc === undefined
+    ? existing?.effectiveEndUtc
+    : normalizeText(input.effectiveEndUtc);
+  const effectiveRange = normalizeUtcRange(
+    requestedEffectiveStartUtc,
+    requestedEffectiveEndUtc,
+    'effectiveStartUtc',
+    'effectiveEndUtc'
+  );
+  const effectiveStartUtc = effectiveRange.startUtc;
+  const effectiveEndUtc = effectiveRange.endUtc;
+  if (existing && input.modelCode !== undefined && normalizeIdentityCode(input.modelCode, 'modelCode') !== existing.modelCode) {
     throw badRequest('模型编码是版本追溯标识，创建后不可修改；请新建模型版本。', { code: 'ENERGY_FLOW_MODEL_IDENTITY_IMMUTABLE', fieldName: 'modelCode' });
   }
-  if (existing && input.version !== undefined && normalizeIdentity(input.version, 'version') !== existing.version) {
-    throw badRequest('模型版本创建后不可修改；请新建模型版本。', { code: 'ENERGY_FLOW_MODEL_IDENTITY_IMMUTABLE', fieldName: 'version' });
+  if (existing && input.version !== undefined) {
+    const requestedVersion = validateAndNormalizeEnergyFlowModelVersion(input.version);
+    if (!requestedVersion.valid) {
+      throw badRequest(
+        requestedVersion.errorCode === 'REQUIRED_FIELD_MISSING'
+          ? 'version 为必填项。'
+          : 'version 格式无效。',
+        { code: requestedVersion.errorCode, fieldName: 'version' }
+      );
+    }
+    if (requestedVersion.key !== normalizeEnergyFlowModelVersionKey(existing.version)) {
+      throw badRequest('模型版本创建后不可修改；请新建模型版本。', { code: 'ENERGY_FLOW_MODEL_IDENTITY_IMMUTABLE', fieldName: 'version' });
+    }
   }
   if (existing) {
     const immutableFields = [
       ['source', input.source === undefined ? undefined : normalizeText(input.source), existing.source],
       ['documentNo', input.documentNo === undefined ? undefined : normalizeText(input.documentNo), existing.documentNo],
-      ['effectiveStartUtc', input.effectiveStartUtc === undefined ? undefined : normalizeText(input.effectiveStartUtc), existing.effectiveStartUtc],
-      ['effectiveEndUtc', input.effectiveEndUtc === undefined ? undefined : normalizeText(input.effectiveEndUtc), existing.effectiveEndUtc],
+      ['effectiveStartUtc', input.effectiveStartUtc === undefined ? undefined : effectiveStartUtc, existing.effectiveStartUtc],
+      ['effectiveEndUtc', input.effectiveEndUtc === undefined ? undefined : effectiveEndUtc, existing.effectiveEndUtc],
       ['sourceTimeZone', input.sourceTimeZone === undefined ? undefined : normalizeText(input.sourceTimeZone), existing.sourceTimeZone]
     ];
     const changedField = immutableFields.find(([_fieldName, nextValue, currentValue]) => nextValue !== undefined && nextValue !== currentValue);
@@ -793,9 +849,6 @@ function normalizeModelPayload(input = {}, existing = null) {
   const source = normalizeText(input.source) || existing?.source;
   if (!modelName) throw badRequest('modelName 为必填项。', { code: 'REQUIRED_FIELD_MISSING', fieldName: 'modelName' });
   if (!source) throw badRequest('source 为必填项。', { code: 'REQUIRED_FIELD_MISSING', fieldName: 'source' });
-  const effectiveStartUtc = normalizeText(input.effectiveStartUtc) || existing?.effectiveStartUtc;
-  const effectiveEndUtc = normalizeText(input.effectiveEndUtc) || existing?.effectiveEndUtc;
-  normalizeUtcRange(effectiveStartUtc, effectiveEndUtc, 'effectiveStartUtc', 'effectiveEndUtc');
   const sourceTimeZone = normalizeText(input.sourceTimeZone) || existing?.sourceTimeZone;
   if (!isIanaTimeZone(sourceTimeZone)) {
     throw badRequest('sourceTimeZone 必须是有效 IANA 时区。', { code: 'INVALID_SOURCE_TIME_ZONE', fieldName: 'sourceTimeZone' });
@@ -826,13 +879,19 @@ function createEnergyFlowModel(input = {}, options = {}) {
   const databaseContext = openServiceDatabase(options);
   try {
     return executeBusinessWrite(databaseContext.db, options, () => {
-      const duplicate = databaseContext.db.prepare('SELECT id FROM energy_flow_models WHERE model_code = ? AND version = ?').get(payload.modelCode, payload.version);
+      const duplicate = databaseContext.db.prepare(
+        `SELECT id
+         FROM energy_flow_models
+         WHERE normalize_energy_flow_key(model_code) = normalize_energy_flow_key(?)
+           AND normalize_energy_flow_key(version) = normalize_energy_flow_key(?)`
+      ).get(payload.modelCode, payload.version);
       if (duplicate) throw badRequest('相同模型编码和版本已存在。', { code: 'DUPLICATE_ENERGY_FLOW_MODEL_VERSION' });
       if (payload.status === 'active') {
         databaseContext.db.prepare(
           `UPDATE energy_flow_models
            SET status = 'inactive', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-           WHERE model_code = ? AND status = 'active'`
+           WHERE normalize_energy_flow_key(model_code) = normalize_energy_flow_key(?)
+             AND status = 'active'`
         ).run(payload.modelCode);
       }
       const result = databaseContext.db.prepare(
@@ -868,7 +927,9 @@ function updateEnergyFlowModel(modelId, input = {}, options = {}) {
         databaseContext.db.prepare(
           `UPDATE energy_flow_models
            SET status = 'inactive', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-           WHERE model_code = ? AND id <> ? AND status = 'active'`
+           WHERE normalize_energy_flow_key(model_code) = normalize_energy_flow_key(?)
+             AND id <> ?
+             AND status = 'active'`
         ).run(existing.modelCode, existing.id);
       }
       databaseContext.db.prepare(
@@ -954,7 +1015,7 @@ function resolveOptionalOrganizationId(db, value) {
  * @returns {object} 规范节点载荷。
  */
 function normalizeNodePayload(db, input = {}, existing = null) {
-  const nodeCode = input.nodeCode !== undefined ? normalizeIdentity(input.nodeCode, 'nodeCode') : existing?.nodeCode;
+  const nodeCode = input.nodeCode !== undefined ? normalizeIdentityCode(input.nodeCode, 'nodeCode') : existing?.nodeCode;
   if (!nodeCode) throw badRequest('nodeCode 为必填项。', { code: 'REQUIRED_FIELD_MISSING', fieldName: 'nodeCode' });
   const nodeName = normalizeText(input.nodeName) || existing?.nodeName;
   if (!nodeName) throw badRequest('nodeName 为必填项。', { code: 'REQUIRED_FIELD_MISSING', fieldName: 'nodeName' });
@@ -983,7 +1044,12 @@ function createEnergyFlowNode(modelId, input = {}, options = {}) {
     return executeBusinessWrite(databaseContext.db, options, () => {
       const model = requireModel(databaseContext.db, modelId);
       const payload = normalizeNodePayload(databaseContext.db, input);
-      const duplicate = databaseContext.db.prepare('SELECT id FROM energy_flow_nodes WHERE energy_flow_model_id = ? AND node_code = ?').get(model.id, payload.nodeCode);
+      const duplicate = databaseContext.db.prepare(
+        `SELECT id
+         FROM energy_flow_nodes
+         WHERE energy_flow_model_id = ?
+           AND normalize_energy_flow_key(node_code) = normalize_energy_flow_key(?)`
+      ).get(model.id, payload.nodeCode);
       if (duplicate) throw badRequest('模型内节点编码已存在。', { code: 'DUPLICATE_ENERGY_FLOW_NODE_CODE' });
       const result = databaseContext.db.prepare(
         `INSERT INTO energy_flow_nodes (
@@ -1023,7 +1089,11 @@ function updateEnergyFlowNode(modelId, nodeId, input = {}, options = {}) {
         });
       }
       const duplicate = databaseContext.db.prepare(
-        'SELECT id FROM energy_flow_nodes WHERE energy_flow_model_id = ? AND node_code = ? AND id <> ?'
+        `SELECT id
+         FROM energy_flow_nodes
+         WHERE energy_flow_model_id = ?
+           AND normalize_energy_flow_key(node_code) = normalize_energy_flow_key(?)
+           AND id <> ?`
       ).get(existing.energyFlowModelId, payload.nodeCode, existing.id);
       if (duplicate) throw badRequest('模型内节点编码已存在。', { code: 'DUPLICATE_ENERGY_FLOW_NODE_CODE' });
       databaseContext.db.prepare(
@@ -1203,7 +1273,7 @@ function normalizeSourceMappingJson(value, sourceType) {
  * @returns {object} 规范边载荷。
  */
 function normalizeEdgePayload(db, modelId, input = {}, existing = null) {
-  const edgeCode = input.edgeCode !== undefined ? normalizeIdentity(input.edgeCode, 'edgeCode') : existing?.edgeCode;
+  const edgeCode = input.edgeCode !== undefined ? normalizeIdentityCode(input.edgeCode, 'edgeCode') : existing?.edgeCode;
   if (!edgeCode) throw badRequest('edgeCode 为必填项。', { code: 'REQUIRED_FIELD_MISSING', fieldName: 'edgeCode' });
   const fromNodeId = input.fromNodeId !== undefined ? parsePositiveInteger(input.fromNodeId, 'fromNodeId', { required: true }) : existing?.fromNodeId;
   const toNodeId = input.toNodeId !== undefined ? parsePositiveInteger(input.toNodeId, 'toNodeId', { required: true }) : existing?.toNodeId;
@@ -1261,7 +1331,12 @@ function createEnergyFlowEdge(modelId, input = {}, options = {}) {
     return executeBusinessWrite(databaseContext.db, options, () => {
       const model = requireModel(databaseContext.db, modelId);
       const payload = normalizeEdgePayload(databaseContext.db, model.id, input);
-      const duplicateCode = databaseContext.db.prepare('SELECT id FROM energy_flow_edges WHERE energy_flow_model_id = ? AND edge_code = ?').get(model.id, payload.edgeCode);
+      const duplicateCode = databaseContext.db.prepare(
+        `SELECT id
+         FROM energy_flow_edges
+         WHERE energy_flow_model_id = ?
+           AND normalize_energy_flow_key(edge_code) = normalize_energy_flow_key(?)`
+      ).get(model.id, payload.edgeCode);
       if (duplicateCode) throw badRequest('模型内边编码已存在。', { code: 'DUPLICATE_ENERGY_FLOW_EDGE_CODE' });
       assertNoDuplicateEdge(databaseContext.db, model.id, payload);
       const result = databaseContext.db.prepare(
@@ -1292,7 +1367,11 @@ function updateEnergyFlowEdge(modelId, edgeId, input = {}, options = {}) {
       const existing = requireEdge(databaseContext.db, modelId, edgeId);
       const payload = normalizeEdgePayload(databaseContext.db, existing.energyFlowModelId, input, existing);
       const duplicateCode = databaseContext.db.prepare(
-        'SELECT id FROM energy_flow_edges WHERE energy_flow_model_id = ? AND edge_code = ? AND id <> ?'
+        `SELECT id
+         FROM energy_flow_edges
+         WHERE energy_flow_model_id = ?
+           AND normalize_energy_flow_key(edge_code) = normalize_energy_flow_key(?)
+           AND id <> ?`
       ).get(existing.energyFlowModelId, payload.edgeCode, existing.id);
       if (duplicateCode) throw badRequest('模型内边编码已存在。', { code: 'DUPLICATE_ENERGY_FLOW_EDGE_CODE' });
       const hasRecords = Number(existing.recordCount || 0) > 0;

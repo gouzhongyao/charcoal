@@ -200,8 +200,8 @@ async function run() {
       source: '隔离 API 测试',
       documentNo: 'FLOW-ROUTE-DOMAIN-2026',
       version: 'v1',
-      effectiveStartUtc: '2026-01-01T00:00:00Z',
-      effectiveEndUtc: '2027-01-01T00:00:00Z',
+      effectiveStartUtc: '2026-01-01T00:00:00.000Z',
+      effectiveEndUtc: '2027-01-01T00:00:00.000Z',
       sourceTimeZone: 'Asia/Shanghai',
       status: 'active',
       db: 'must-be-ignored',
@@ -210,7 +210,50 @@ async function run() {
     assertSuccess(modelResponse, 201);
     const model = modelResponse.body.data;
     assert.notStrictEqual(model.id, 999999);
+    assert.strictEqual(model.effectiveStartUtc, '2026-01-01T00:00:00Z');
+    assert.strictEqual(model.effectiveEndUtc, '2027-01-01T00:00:00Z');
     assert.strictEqual(modelResponse.body.meta.operation, 'energy-flow-model-create');
+    const invalidMillisecondModel = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models`, {
+      modelCode: 'FLOW-ROUTE-INVALID-MILLISECOND',
+      modelName: '非法毫秒路由模型',
+      source: '隔离 API 测试',
+      version: 'v1',
+      effectiveStartUtc: '2026-01-01T00:00:00.001Z',
+      effectiveEndUtc: '2027-01-01T00:00:00Z',
+      sourceTimeZone: 'Asia/Shanghai',
+      status: 'active'
+    }, adminToken);
+    assert.strictEqual(invalidMillisecondModel.status, 400, invalidMillisecondModel.text);
+    assert.strictEqual(invalidMillisecondModel.body.error.details.code, 'INVALID_START_UTC');
+    assert(!/INTERNAL_ERROR|SQLITE|CHECK constraint/i.test(invalidMillisecondModel.text));
+    const invalidVersionModel = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models`, {
+      modelCode: 'FLOW-ROUTE-INVALID-VERSION',
+      modelName: '非法版本路由模型',
+      source: '隔离 API 测试',
+      version: `V${'1'.repeat(64)}`,
+      effectiveStartUtc: '2026-01-01T00:00:00Z',
+      effectiveEndUtc: '2027-01-01T00:00:00Z',
+      sourceTimeZone: 'Asia/Shanghai',
+      status: 'active'
+    }, adminToken);
+    assert.strictEqual(invalidVersionModel.status, 400, invalidVersionModel.text);
+    assert.strictEqual(invalidVersionModel.body.error.details.code, 'INVALID_ENERGY_FLOW_MODEL_VERSION');
+    assert.strictEqual(invalidVersionModel.body.error.details.fieldName, 'version');
+    assert(!/INTERNAL_ERROR|SQLITE|CHECK constraint/i.test(invalidVersionModel.text));
+    const canonicalModelDuplicate = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models`, {
+      modelCode: 'flow-route-domain',
+      modelName: '规范等价重复模型',
+      source: '隔离 API 测试',
+      documentNo: 'FLOW-ROUTE-DOMAIN-DUPLICATE',
+      version: 'V1',
+      effectiveStartUtc: '2026-01-01T00:00:00Z',
+      effectiveEndUtc: '2027-01-01T00:00:00Z',
+      sourceTimeZone: 'Asia/Shanghai',
+      status: 'active'
+    }, adminToken);
+    assert.strictEqual(canonicalModelDuplicate.status, 400, canonicalModelDuplicate.text);
+    assert.strictEqual(canonicalModelDuplicate.body.error.details.code, 'DUPLICATE_ENERGY_FLOW_MODEL_VERSION');
+    assert(!/INTERNAL_ERROR|SQLITE|UNIQUE|ux_energy_flow/i.test(canonicalModelDuplicate.text));
 
     const sourceResponse = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models/${model.id}/nodes`, {
       nodeCode: 'SOURCE', nodeName: '来源节点', nodeType: 'source', x: 0, y: 0
@@ -222,6 +265,12 @@ async function run() {
     assertSuccess(sinkResponse, 201);
     const source = sourceResponse.body.data;
     const sink = sinkResponse.body.data;
+    const canonicalNodeDuplicate = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models/${model.id}/nodes`, {
+      nodeCode: 'source', nodeName: '规范等价重复来源节点', nodeType: 'source', x: 20, y: 0
+    }, adminToken);
+    assert.strictEqual(canonicalNodeDuplicate.status, 400, canonicalNodeDuplicate.text);
+    assert.strictEqual(canonicalNodeDuplicate.body.error.details.code, 'DUPLICATE_ENERGY_FLOW_NODE_CODE');
+    assert(!/INTERNAL_ERROR|SQLITE|UNIQUE|ux_energy_flow/i.test(canonicalNodeDuplicate.text));
 
     const edgeResponse = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models/${model.id}/edges`, {
       edgeCode: 'EDGE-ROUTE',
@@ -237,6 +286,19 @@ async function run() {
     const edge = edgeResponse.body.data;
     assert.deepStrictEqual(edge.sourceMapping, { reference: 'route:explicit-edge' });
     assert(!edgeResponse.text.includes('must-not-persist-or-return'));
+    const canonicalEdgeDuplicate = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models/${model.id}/edges`, {
+      edgeCode: 'edge-route',
+      fromNodeId: source.id,
+      toNodeId: sink.id,
+      energyTypeCode: 'electricity',
+      unit: 'kWh',
+      sourceType: 'explicit_edge_value',
+      sourceMapping: { reference: 'route:canonical-duplicate' },
+      status: 'active'
+    }, adminToken);
+    assert.strictEqual(canonicalEdgeDuplicate.status, 400, canonicalEdgeDuplicate.text);
+    assert.strictEqual(canonicalEdgeDuplicate.body.error.details.code, 'DUPLICATE_ENERGY_FLOW_EDGE_CODE');
+    assert(!/INTERNAL_ERROR|SQLITE|UNIQUE|ux_energy_flow/i.test(canonicalEdgeDuplicate.text));
     insertExplicitRecord(model.id, edge.id, 25);
 
     const models = await requestJson(server, 'GET', `${ROUTE_PREFIX}/models?pageSize=999&ignoredField=secret`, undefined, adminToken);

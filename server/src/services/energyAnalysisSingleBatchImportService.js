@@ -15,7 +15,6 @@ const {
   updateExecuteAuditResult
 } = require('./importAuditService');
 const {
-  ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
   ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY,
   authorizeEnergyAnalysisImportExecute,
   buildEnergyAnalysisImportPreviewAuditDigest,
@@ -143,7 +142,7 @@ function buildPersistedSingleBatchExecuteBody(body, batch) {
     : {};
   const candidateRows = normalizeCandidateRows(auditContext.candidateRows || []);
   const persistedWitness = {
-    backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+    backupReason: getEnergyAnalysisImportTemplate(auditContext.templateType).backupReason,
     duplicateStrategy: ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY,
     fileSha256: batch.fileSha256,
     previewSignature: batch.previewSignature,
@@ -266,7 +265,7 @@ function securePreviewResult(preview, context) {
     recordKind: context.template.recordKind,
     importTypes: [...context.template.importTypes],
     confirmText: context.template.confirmText,
-    backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+    backupReason: context.template.backupReason,
     duplicateStrategy: ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY,
     requireBackup: true,
     fileSha256: context.fileSha256,
@@ -284,13 +283,14 @@ function securePreviewResult(preview, context) {
  * @param {object} summary 统一 preview 汇总。
  * @returns {string|null} 中文错误摘要。
  */
-function buildPreviewErrorSummary(summary = {}) {
+function buildPreviewErrorSummary(summary = {}, domainName = '能源分析') {
   const parts = [];
   if (Number(summary.blocked || 0) > 0) parts.push(`${summary.blocked} 行阻断`);
   if (Number(summary.skipped || 0) > 0) parts.push(`${summary.skipped} 行跳过`);
   if (Number(summary.warnings || 0) > 0) parts.push(`${summary.warnings} 条警告`);
   if (Number(summary.errors || 0) > 0) parts.push(`${summary.errors} 条错误`);
-  return parts.length > 0 ? `能源分析导入存在 ${parts.join('、')}。` : null;
+  const safeDomainName = String(domainName || '').trim() || '能源分析';
+  return parts.length > 0 ? `${safeDomainName}导入存在 ${parts.join('、')}。` : null;
 }
 
 /**
@@ -338,7 +338,9 @@ function createEnergyAnalysisSingleBatchPreview(file, descriptor, options = {}) 
   const databaseContext = openServiceDatabase(options);
   try {
     const secret = resolveImportSecret(databaseContext.db, options);
-    const domainPreview = descriptor.buildPreview({
+    let previewBuildError = null;
+    let domainPreview;
+    const previewBuildContext = {
       db: databaseContext.db,
       buffer: safeFile.buffer,
       originalFilename: file.originalname,
@@ -346,16 +348,27 @@ function createEnergyAnalysisSingleBatchPreview(file, descriptor, options = {}) 
       fileSizeBytes: safeFile.sizeBytes,
       template,
       options
-    });
+    };
+    try {
+      domainPreview = descriptor.buildPreview(previewBuildContext);
+    } catch (error) {
+      if (descriptor.persistBuildPreviewFailures !== true || typeof descriptor.buildPreviewFailure !== 'function') {
+        throw error;
+      }
+      previewBuildError = error;
+      domainPreview = descriptor.buildPreviewFailure({ ...previewBuildContext, error });
+    }
     const preview = securePreviewResult(domainPreview, {
       template,
       fileSha256: safeFile.fileSha256,
       secret
     });
     const summary = preview.summary || {};
-    const status = Number(summary.totalRows || 0) === 0 && Number(summary.errors || 0) > 0
+    const status = previewBuildError
       ? 'failed'
-      : (Number(summary.blocked || 0) > 0 || Number(summary.skipped || 0) > 0 ? 'completed_with_errors' : 'completed');
+      : (Number(summary.totalRows || 0) === 0 && Number(summary.errors || 0) > 0
+        ? 'failed'
+        : (Number(summary.blocked || 0) > 0 || Number(summary.skipped || 0) > 0 ? 'completed_with_errors' : 'completed'));
 
     const persistPreview = () => runImmediateWriteTransaction(databaseContext.db, () => {
       const batch = createPreviewAuditBatch({
@@ -378,7 +391,7 @@ function createEnergyAnalysisSingleBatchPreview(file, descriptor, options = {}) 
           recordKind: template.recordKind,
           importTypes: [...template.importTypes],
           confirmText: template.confirmText,
-          backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+          backupReason: template.backupReason,
           duplicateStrategy: ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY,
           requireBackup: true,
           summary: preview.summary,
@@ -393,9 +406,21 @@ function createEnergyAnalysisSingleBatchPreview(file, descriptor, options = {}) 
           failureCount: Number(summary.blocked || 0),
           skippedCount: Number(summary.skipped || 0)
         },
-        errorSummary: buildPreviewErrorSummary(summary)
+        errorSummary: buildPreviewErrorSummary(summary, descriptor.domainName)
       }, { db: databaseContext.db });
       replaceImportAuditIssuesWithDatabase(databaseContext.db, batch.id, preview.auditIssues || []);
+      // 领域 preview 审计钩子仅来自服务端描述器，并与批次及问题明细共享当前事务。
+      if (typeof descriptor.persistPreviewAudit === 'function') {
+        descriptor.persistPreviewAudit({
+          db: databaseContext.db,
+          batch,
+          preview,
+          file,
+          safeFile,
+          template,
+          options
+        });
+      }
       if (options.demoContext) {
         bindDemoContextPreviewInTransaction({
           db: databaseContext.db,
@@ -408,6 +433,7 @@ function createEnergyAnalysisSingleBatchPreview(file, descriptor, options = {}) 
       return getImportAuditSummary(batch.id, { db: databaseContext.db });
     });
     const auditBatch = persistPreview();
+    if (previewBuildError) throw previewBuildError;
     return {
       ...preview,
       persistsImportBatch: true,
@@ -480,7 +506,11 @@ function authorizePersistedBatchExecute(body, batch, preview, fileBuffer, secret
 function isSafeEnergyAnalysisErrorCode(value) {
   const code = String(value || '').trim();
   return /^[A-Z][A-Z0-9_]{2,127}$/.test(code)
-    && (code.startsWith('ENERGY_ANALYSIS_') || code.startsWith('ENERGY_TIMESERIES_'));
+    && (code.startsWith('ENERGY_ANALYSIS_')
+      || code.startsWith('ENERGY_TIMESERIES_')
+      || code.startsWith('CARBON_ACTIVITY_')
+      || code.startsWith('CARBON_EMISSION_REPORT_')
+      || code.startsWith('GHG_REPORT_'));
 }
 
 /**
@@ -488,23 +518,24 @@ function isSafeEnergyAnalysisErrorCode(value) {
  * @param {string} code 稳定领域错误码。
  * @returns {string} 可进入响应与审计的安全消息。
  */
-function getSafeExecuteErrorMessage(code) {
+function getSafeExecuteErrorMessage(code, domainName = '能源分析') {
+  const safeDomainName = String(domainName || '').trim() || '能源分析';
   if (code === 'ENERGY_ANALYSIS_IMPORT_BACKUP_FAILED') {
-    return '能源分析导入备份失败，未写入业务数据。';
+    return `${safeDomainName}导入备份失败，未写入业务数据。`;
   }
   if (code === 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED') {
-    return '能源分析导入事务失败，业务数据已回滚。';
+    return `${safeDomainName}导入事务失败，业务数据已回滚。`;
   }
   if (code === 'ENERGY_ANALYSIS_IMPORT_SOURCE_OR_BATCH_INVALID') {
-    return '能源分析导入原文件或批次校验失败，未写入业务数据。';
+    return `${safeDomainName}导入原文件或批次校验失败，未写入业务数据。`;
   }
   if (code.startsWith('ENERGY_ANALYSIS_UPLOAD_')) {
-    return '能源分析导入原文件安全校验失败，未写入业务数据。';
+    return `${safeDomainName}导入原文件安全校验失败，未写入业务数据。`;
   }
-  if (code.startsWith('ENERGY_TIMESERIES_')) {
+  if (code.startsWith('ENERGY_TIMESERIES_') && safeDomainName === '能源分析') {
     return '时序能耗导入文件或模板校验失败，未写入业务数据。';
   }
-  return '能源分析导入授权校验失败，未写入业务数据。';
+  return `${safeDomainName}导入授权校验失败，未写入业务数据。`;
 }
 
 /**
@@ -512,8 +543,8 @@ function getSafeExecuteErrorMessage(code) {
  * @param {string} code 稳定领域错误码。
  * @returns {Error} 带安全消息和合适 HTTP 状态的错误。
  */
-function createSafeExecuteError(code) {
-  const message = getSafeExecuteErrorMessage(code);
+function createSafeExecuteError(code, domainName = '能源分析') {
+  const message = getSafeExecuteErrorMessage(code, domainName);
   if (code === 'ENERGY_ANALYSIS_IMPORT_BACKUP_FAILED') {
     return new AppError(code, message, { statusCode: 503, details: { code } });
   }
@@ -529,17 +560,17 @@ function createSafeExecuteError(code) {
  * @param {'preflight'|'lock'|'backup'|'write'} stage 失败阶段。
  * @returns {Error} 安全领域错误。
  */
-function normalizeSafeExecuteError(error, stage = 'preflight') {
+function normalizeSafeExecuteError(error, stage = 'preflight', domainName = '能源分析') {
   const detailCode = error?.details?.code;
   if (isSafeEnergyAnalysisErrorCode(detailCode)) {
-    return createSafeExecuteError(detailCode);
+    return createSafeExecuteError(detailCode, domainName);
   }
   const stageCode = stage === 'backup'
     ? 'ENERGY_ANALYSIS_IMPORT_BACKUP_FAILED'
     : (stage === 'lock' || stage === 'write'
       ? 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED'
       : 'ENERGY_ANALYSIS_IMPORT_SOURCE_OR_BATCH_INVALID');
-  return createSafeExecuteError(stageCode);
+  return createSafeExecuteError(stageCode, domainName);
 }
 
 /**
@@ -555,9 +586,9 @@ function markEnergyAnalysisSingleBatchFailure(requestedBatchId, descriptor, erro
   try {
     const batchId = normalizeBatchId(requestedBatchId);
     const template = getEnergyAnalysisImportTemplate(descriptor.templateType);
-    const safeError = normalizeSafeExecuteError(error, 'preflight');
+    const safeError = normalizeSafeExecuteError(error, 'preflight', descriptor.domainName);
     const safeErrorCode = safeError.details.code;
-    const safeErrorMessage = getSafeExecuteErrorMessage(safeErrorCode);
+    const safeErrorMessage = getSafeExecuteErrorMessage(safeErrorCode, descriptor.domainName);
     databaseContext = openServiceDatabase(options);
     const batch = getImportAuditBatchDetail(batchId, { db: databaseContext.db, includeIssues: false });
     if (batch.importType !== template.importTypes[0]) return;
@@ -675,7 +706,7 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
         if (trustedPersistedBatch) trustedFailureAuditBatchId = batchId;
         // 独立读连接在线备份锁前已提交快照；跳过会与当前 RESERVED 锁冲突的 checkpoint。
         backup = await createBackup({
-          reason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+          reason: template.backupReason,
           skipCheckpoint: true
         });
 
@@ -724,7 +755,7 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
           },
           executeResult,
           backup,
-          errorSummary: buildPreviewErrorSummary(summary)
+          errorSummary: buildPreviewErrorSummary(summary, descriptor.domainName)
         }, { db: databaseContext.db });
         const result = {
           ...executeResult,
@@ -759,7 +790,7 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
       if (databaseContext.shouldClose) databaseContext.db.close();
     }
   } catch (error) {
-    const safeError = normalizeSafeExecuteError(error, failureStage);
+    const safeError = normalizeSafeExecuteError(error, failureStage, descriptor?.domainName);
     if (trustedFailureAuditBatchId !== null) {
       markEnergyAnalysisSingleBatchFailure(trustedFailureAuditBatchId, descriptor || {}, safeError, options, backup);
     }

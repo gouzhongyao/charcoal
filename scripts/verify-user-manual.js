@@ -13,6 +13,14 @@ const PROJECT_STEPS_PATH = path.join(MANUAL_ROOT, '项目使用步骤.md');
 const COVERAGE_MATRIX_PATH = path.join(MANUAL_ROOT, '维护附录', '功能覆盖矩阵.md');
 // 路由文件用于动态读取当前 componentMap 标识，避免脚本维护静态页面清单。
 const ROUTER_PATH = path.join(PROJECT_ROOT, 'client', 'src', 'router', 'index.js');
+// 供应商正文路径用于校验新增台账的冻结用户契约。
+const SUPPLIER_MANUAL_PATH = path.join(MANUAL_ROOT, '08-基础台账.md');
+// 碳核算正文路径用于校验独立活动、运行、双来源防双计和 N6/N7 报告冻结契约。
+const CARBON_MANUAL_PATH = path.join(MANUAL_ROOT, '09-碳核算.md');
+// 通用导入正文路径用于校验独立活动与 N6/N7 报告受控 execute 安全边界。
+const IMPORT_AUDIT_MANUAL_PATH = path.join(MANUAL_ROOT, '05-通用导入与批次审计.md');
+// 说明书变更记录路径用于校验 N5 finding、N6 收尾和 N7-B 文档闭环状态。
+const CHANGELOG_PATH = path.join(MANUAL_ROOT, '维护附录', '变更记录.md');
 // code-helper 受控区块标识用于确认长期规则索引写在区块外。
 const CODE_HELPER_BLOCK_PATTERN = /<!-- code-helper:start -->[\s\S]*?<!-- code-helper:end -->/g;
 // 校验失败列表用于一次性汇总全部可修复问题。
@@ -25,7 +33,7 @@ const requiredManualFiles = [
   '01-本地安装启动与首次管理员.md',
   '02-登录注册与个人中心.md',
   '03-导航权限与通用操作.md',
-  '04-驾驶舱.md',
+  '04-中控.md',
   '05-通用导入与批次审计.md',
   '06-能耗统计与历史台账回填.md',
   '07-用能预算.md',
@@ -75,7 +83,7 @@ const demoParkArtifactKeys = [
 const SIDEBAR_OVERVIEW_PATH = path.join(MANUAL_ROOT, '00-侧边栏模块总览与数据链路.md');
 // 侧边栏正式模块标题用于按当前第 00 章结构逐模块定位说明内容。
 const sidebarOverviewModuleTitles = [
-  '驾驶舱',
+  '中控',
   '能源数据导入（当前菜单：能耗数据导入）',
   '能耗统计',
   '月度预算（当前页面：用能预算）',
@@ -89,6 +97,7 @@ const sidebarOverviewModuleTitles = [
   '产能单元',
   '月度产量',
   '发电自用',
+  '供应商管理',
   '碳核算',
   '预测管理',
   '用户管理',
@@ -126,6 +135,203 @@ const criticalTopicMarkers = [
   { label: '自动备份', markers: ['自动备份'] },
   { label: '备份恢复', markers: ['备份恢复'] },
   { label: '迁移占位页', markers: ['占位页', '迁移占位'] }
+];
+// 供应商正文冻结标识用于防止权限、状态、导入和删除边界在文档中回退。
+const supplierManualMarkerGroups = [
+  { label: '供应商页面入口', markers: ['/ledger/suppliers'] },
+  { label: '供应商模板 ID', markers: ['模板 ID 为 `suppliers`'] },
+  { label: '供应商导入类型', markers: ['`supplier` 导入批次'] },
+  { label: '供应商查看权限', markers: ['`ledger:suppliers:view`'] },
+  { label: '供应商创建权限', markers: ['`ledger:suppliers:create`'] },
+  { label: '供应商编辑权限', markers: ['`ledger:suppliers:update`'] },
+  { label: '供应商状态权限', markers: ['`ledger:suppliers:status`'] },
+  { label: '供应商导入预演权限', markers: ['`ledger:suppliers:import:preview`'] },
+  { label: '供应商导入执行权限', markers: ['`ledger:suppliers:import:execute`'] },
+  { label: '供应商导出权限', markers: ['`ledger:suppliers:export`'] },
+  { label: '供应商电话文本', markers: ['联系电话在数据库和前端载荷中都按 TEXT 处理'] },
+  { label: '供应商合作状态', markers: ['合作中/已踢出', '“合作中”', '“已踢出”'] },
+  { label: '供应商普通编辑状态拒绝', markers: ['普通编辑请求包含 `status` 时拒绝'] },
+  { label: '供应商无物理删除', markers: ['不提供供应商物理删除或 `DELETE` 接口'] },
+  { label: '供应商规范键重复策略', markers: ['同一文件内按规范键重复的供应商编码全部阻断'] },
+  { label: '供应商规范键筛选', markers: ['列表和导出的关键词筛选同时查询现有显示字段与该规范键'] },
+  { label: '供应商状态必填', markers: ['“合作状态”是导入必填列', '空白和未知值都明确阻断'] },
+  { label: '供应商资源上限', markers: ['单个条目声明及实际解压上限为 64 MiB', '总量上限为 128 MiB', '最多 10000000 字符'] },
+  { label: '供应商字段长度', markers: ['供应商编码 64 字符', '备注 1000 字符'] },
+  { label: '供应商受控执行', markers: ['服务端会重读上传原文件'] },
+  { label: '供应商通用删除拒绝', markers: ['通用批次删除必须拒绝供应商批次'] }
+];
+// 碳核算正文冻结标识用于防止默认来源、时间语义和防双计边界回退；必需并存项使用 allOf，近义替代表述才使用 anyOf。
+const carbonManualMarkerGroups = [
+  { label: '碳页面入口', allOf: ['路由 `/carbon`'] },
+  { label: '独立活动模板', allOf: ['模板 ID 为 `carbon-activities`', '15 列精确中文表头'] },
+  { label: '独立活动权限', allOf: ['`carbon:activities:view`', '`carbon:activities:import:preview`', '`carbon:activities:import:execute`', '`carbon:activities:calculate`', '`carbon:activities:export`'] },
+  { label: '默认独立来源', allOf: ['初始来源固定为 `independent_activity`'] },
+  { label: '旧来源初始未选择', allOf: ['没有独立活动查看权限时保持未选择'] },
+  { label: '旧来源显式选择', anyOf: ['旧来源和 `all` 都必须由用户显式选择', '显式选择 `energy_record`'] },
+  { label: 'legacy 权限隔离', allOf: ['`carbon:view`', '不能进入新 `/api/carbon/accounting`'] },
+  { label: '双来源防双计', allOf: ['两来源不可直接合计，避免双计。', '`crossSourceTotal` 固定为 `null`'] },
+  { label: '双来源独立分页', allOf: ['两个分面页码和页大小独立'] },
+  { label: '严格 all 合同', allOf: ['合同漂移', 'fail-closed'] },
+  { label: '异常状态清空', allOf: ['清空上一筛选或上一运行的结果和统计'] },
+  { label: '缺因子空值', allOf: ['`factor_missing`', '不能显示为 0'] },
+  { label: '来源墙钟合同', allOf: ['`YYYY-MM-DDTHH:mm`', '禁止把 `YYYY-MM-DDTHH:mm` 直接追加 `Z`'] },
+  { label: '严格 UTC 合同', allOf: ['`YYYY-MM-DDTHH:mm:ssZ`', '`.000Z`'] },
+  { label: 'UTC 非法状态', allOf: ['`aria-invalid`', '非法输入'] },
+  { label: '活动 execute 最小载荷', allOf: ['客户端展示的候选、签名或摘要不是受信写入来源'] },
+  { label: '活动作废乐观锁', allOf: ['`updatedAt` 作为乐观锁'] },
+  { label: '独立运行追加冻结', allOf: ['运行不会覆盖历史'] },
+  { label: '旧接口保留', allOf: ['旧 `/api/carbon/emissions*`'] },
+  { label: '真实工具待验收', allOf: ['Chrome/Edge、视觉、键盘、ARIA、窄屏和 Excel/WPS 仍待用户执行'] }
+];
+// N5 五处正式文档最低合同：分别约束正文、总览、导入审计、覆盖矩阵和变更记录，避免只更新其中一处仍通过。
+const n5ManualDocumentContracts = [
+  {
+    label: '09-碳核算.md',
+    path: CARBON_MANUAL_PATH,
+    groups: [
+      { label: '来源权限与初始状态', allOf: ['没有独立活动查看权限时保持未选择', '`carbon:view`', '不能进入新 `/api/carbon/accounting`'] },
+      { label: '请求和异常边界', allOf: ['请求世代', '清空上一筛选或上一运行的结果和统计', 'fail-closed'] }
+    ]
+  },
+  {
+    label: '00-侧边栏模块总览与数据链路.md',
+    path: SIDEBAR_OVERVIEW_PATH,
+    groups: [
+      { label: '统一结果边界', allOf: ['旧来源保持未选择', '`carbon:view`', '请求世代', 'fail-closed'] }
+    ]
+  },
+  {
+    label: '05-通用导入与批次审计.md',
+    path: IMPORT_AUDIT_MANUAL_PATH,
+    groups: [
+      { label: '独立活动 execute 安全边界', allOf: ['服务端重读原文件', '候选见证', 'stale', '写前备份', '同一事务', '回滚', 'skip'] }
+    ]
+  },
+  {
+    label: '功能覆盖矩阵.md',
+    path: COVERAGE_MATRIX_PATH,
+    groups: [
+      { label: 'N5 前端防回归', allOf: ['请求世代', 'fail-closed', 'Blob JSON', '`aria-invalid`', '`carbon:view`'] }
+    ]
+  },
+  {
+    label: '变更记录.md',
+    path: CHANGELOG_PATH,
+    groups: [
+      { label: 'N5 finding 状态', allOf: ['RF-P1-018', 'RF-P2-014', '确认关闭', '无新增 finding', 'RF-P1-021 → RF-P1-015', 'RF-P1-022 → RF-P1-014'] }
+    ]
+  }
+];
+// N6 碳核算正文冻结标识用于防止模板、公共 DTO、严格执行条件、失败清空、数值语义、导出和非联动合同回退。
+const n6CarbonManualMarkerGroups = [
+  { label: '报告模板身份', allOf: ['模板 ID 为 `carbon-emission-report`', '导入类型为 `carbon_emission_report`', '模板版本为 `1.0`', '只接受 `.xlsx`'] },
+  { label: '报告五部分顺序', allOf: ['1. `报告信息`', '2. `组织与核算边界`', '3. `报告项目`', '4. `汇总`', '5. `证据说明`'] },
+  { label: '合法边界工作表名称', allOf: ['合法名称只能是“组织与核算边界”', '不能改成带斜杠的旧名称'] },
+  { label: '报告四项权限', allOf: ['`carbon:emission-reports:view`', '`carbon:emission-reports:import:preview`', '`carbon:emission-reports:import:execute`', '`carbon:emission-reports:export`'] },
+  { label: '报告固定确认', allOf: ['确认导入碳排放报告'] },
+  { label: '报告重复编码阻断', allOf: ['同一报告编码重复导入必须阻断', '不覆盖', '不按 `skip` 跳过'] },
+  { label: '报告 stale 合同', allOf: ['HTTP 409', '`CARBON_EMISSION_REPORT_PREVIEW_STALE`', '`requiresNewPreview: true`', '页面会清空旧预演'] },
+  { label: '报告公共 HTTP DTO', allOf: ['N6 自有 preview、execute、列表、详情和批次追溯 HTTP 响应都使用显式公共 DTO 白名单', 'execute 只返回 `batchId`、`imported`、`importedIds`', '不公开或提交'] },
+  { label: '报告严格执行条件', allOf: ['六项都必须是非负安全整数', '恰有一个 item 且状态为 `wouldImport`', 'warning/error 问题数量必须与汇总完全一致'] },
+  { label: '报告 execute 失败清空', allOf: ['任何非取消 execute HTTP 失败', '清空旧预演、已提交预演世代和可执行状态', '取消或关闭确认框'] },
+  { label: '报告请求世代', allOf: ['列表、报告详情、批次追溯、模板、preview、execute 和导出均采用请求世代', '旧 response、旧 error 和旧 finally'] },
+  { label: '报告格式化数值语义', allOf: ['百分比显示 `12.50%` 时业务值保持底层 `0.125`', '文本单元格 `"1,234.50"` 不等价于合法数值单元格', '真实 0 保持 number `0`'] },
+  { label: '报告导出合同', allOf: ['`X-Exported-Row-Count`', 'Blob JSON', '数值字段保持 number 单元格'] },
+  { label: '报告非联动边界', allOf: ['碳排放报告只维护独立报告事实', '`carbon_activity_records`', '`carbon_calculation_runs`', '`carbon_accounting_results`', '`carbon_emissions`', '`carbon_factors`'] }
+];
+// N6 五处正式文档最低合同用于防止只更新正文或附录中的单一文件。
+const n6ManualDocumentContracts = [
+  {
+    label: '09-碳核算.md',
+    path: CARBON_MANUAL_PATH,
+    groups: [
+      { label: '固定工作簿与执行安全链', allOf: ['`carbon-emission-report`', '`carbon_emission_report`', '组织与核算边界', '确认导入碳排放报告', '`CARBON_EMISSION_REPORT_PREVIEW_STALE`'] },
+      { label: '公共 DTO 与严格执行条件', allOf: ['显式公共 DTO 白名单', '非负安全整数', '恰有一个 item', '任何非取消 execute HTTP 失败'] },
+      { label: '详情导出与数值边界', allOf: ['五部分详情', '`X-Exported-Row-Count`', 'Blob JSON', '不公开本地路径', '`12.50%`', '`0.125`', '`"1,234.50"`'] }
+    ]
+  },
+  {
+    label: '00-侧边栏模块总览与数据链路.md',
+    path: SIDEBAR_OVERVIEW_PATH,
+    groups: [
+      { label: '报告独立事实链', allOf: ['固定五工作表 XLSX', '五部分详情', '报告不反写活动、运行、核算结果、旧碳排或因子', '碳排放报告 -X->'] }
+    ]
+  },
+  {
+    label: '05-通用导入与批次审计.md',
+    path: IMPORT_AUDIT_MANUAL_PATH,
+    groups: [
+      { label: '报告批次权限和执行边界', allOf: ['`carbon:emission-reports:view`', '`imports:download`', '`carbon:emission-reports:export`', '`carbon_emission_report`', '服务端重读原文件', '重复编码直接阻断'] }
+    ]
+  },
+  {
+    label: '功能覆盖矩阵.md',
+    path: COVERAGE_MATRIX_PATH,
+    groups: [
+      { label: '报告权限与前端防回归', allOf: ['四项 `carbon:emission-reports:*` 权限', '请求世代', '`CARBON_EMISSION_REPORT_PREVIEW_STALE`', '公共 DTO 白名单', '非取消 execute HTTP 失败', '百分比 `12.50%` 保持 `0.125`', 'Blob JSON', '`X-Exported-Row-Count`'] }
+    ]
+  },
+  {
+    label: '变更记录.md',
+    path: CHANGELOG_PATH,
+    groups: [
+      { label: 'N6 finding 修复状态与恢复入口', allOf: ['2026-08-25：碳排放报告前端与正式说明书', '`RF-P0-018`', '`RF-P1-029`', '`RF-P1-030`', '`RF-P1-031`', '`RF-P2-021`', '`RF-P2-022`', '`RF-P2-023`', '`RF-P2-024`', '已修复待复审', 'N6 最终逐项复审与收尾', '不宣布 N6 工程节点关闭', '不开始 N7/N8/N9'] }
+    ]
+  }
+];
+// N7 碳核算正文冻结标识用于防止六表、记录类型、数值、权限、stale、公共 DTO、请求世代和隔离合同回退。
+const n7CarbonManualMarkerGroups = [
+  { label: '温室气体报告模板身份', allOf: ['模板 ID 为 `ghg-report`', '导入类型为 `ghg_report`', '模板版本为 `1.0`', '只接受 `.xlsx`'] },
+  { label: '温室气体报告六部分顺序', allOf: ['1. `报告信息`', '2. `组织边界`', '3. `运行边界`', '4. `报告项目`', '5. `汇总`', '6. `证据说明`'] },
+  { label: '温室气体报告记录类型与数值', allOf: ['`emission` 表示排放', '`removal` 表示清除', '清除不能通过负 `emission`', '必须非负', 'GWP 必须大于 0', '净 CO2e', '可以为正、零或负'] },
+  { label: '温室气体报告四项权限', allOf: ['`carbon:ghg-reports:view`', '`carbon:ghg-reports:import:preview`', '`carbon:ghg-reports:import:execute`', '`carbon:ghg-reports:export`'] },
+  { label: '温室气体报告固定确认', allOf: ['确认导入温室气体报告'] },
+  { label: '温室气体报告公共 DTO', allOf: ['显式公共 DTO 白名单', '页面不读取、信任、显示或回传', 'candidate witness'] },
+  { label: '温室气体报告严格执行条件', allOf: ['非负安全整数 number', '预演恰有一个 item', '状态为 `wouldImport`', 'warning/error', '逐项一致'] },
+  { label: '温室气体报告 stale 与失败清空', allOf: ['HTTP 409', '`GHG_REPORT_PREVIEW_STALE`', '`requiresNewPreview: true`', '任何其他非取消 execute HTTP 失败', '清空预演'] },
+  { label: '温室气体报告请求意图', allOf: ['旧 response、旧 error、旧 finally', '连续两次查看同一报告或同一批次', '独立 intent'] },
+  { label: '温室气体报告详情与导出', allOf: ['六部分详情', '`X-Exported-Row-Count`', 'Blob JSON', '底层 number', '公式注入防护'] },
+  { label: '温室气体报告权限和领域隔离', allOf: ['report-only', '不会加载无关能源类型字典', 'N6 view/export 不能放行 N7', '`ghg_report` 和 `carbon_emission_report` 都禁止通用删除', '模板 ID、导入类型、页面组件、权限、预演批次、业务表、详情结构和导出工作簿完全独立'] }
+];
+// N7 五处正式文档最低合同用于防止正文、总览、导入审计、覆盖矩阵或变更记录漏同步。
+const n7ManualDocumentContracts = [
+  {
+    label: '09-碳核算.md',
+    path: CARBON_MANUAL_PATH,
+    groups: [
+      { label: '六表、记录类型与数值边界', allOf: ['`ghg-report`', '`ghg_report`', '`emission`', '`removal`', '清除不能通过负', 'GWP 必须大于 0', '净 CO2e'] },
+      { label: '严格执行、stale 与请求世代', allOf: ['非负安全整数 number', '状态为 `wouldImport`', '`GHG_REPORT_PREVIEW_STALE`', '任何其他非取消 execute HTTP 失败', '旧 response、旧 error、旧 finally'] },
+      { label: '六部分详情、导出与隔离', allOf: ['六部分详情', '`X-Exported-Row-Count`', 'Blob JSON', 'report-only', 'N6 view/export 不能放行 N7'] }
+    ]
+  },
+  {
+    label: '00-侧边栏模块总览与数据链路.md',
+    path: SIDEBAR_OVERVIEW_PATH,
+    groups: [
+      { label: 'N7 独立报告事实链', allOf: ['N7 固定六表 XLSX', '`emission`/`removal`', 'report-only 账号不会加载能源类型字典', 'N7 温室气体报告 -X-> N6 模板', 'N6/N7 两类报告 -X->'] }
+    ]
+  },
+  {
+    label: '05-通用导入与批次审计.md',
+    path: IMPORT_AUDIT_MANUAL_PATH,
+    groups: [
+      { label: 'N7 批次权限与删除保护', allOf: ['`carbon:ghg-reports:view`', '`ghg_report`', '`imports:download`', '`carbon:ghg-reports:export`', 'N6/N7 模板错传必须阻断', '净 CO2e 可以为负', '不得使用该删除入口'] }
+    ]
+  },
+  {
+    label: '功能覆盖矩阵.md',
+    path: COVERAGE_MATRIX_PATH,
+    groups: [
+      { label: 'N7 权限、数值与前端防回归', allOf: ['N7 与 N6 完全独立且前端 fail-closed', '`GHG_REPORT_PREVIEW_STALE`', '唯一 `wouldImport`', '非负安全整数', '旧 response/error/finally', '公共 DTO 白名单', '`X-Exported-Row-Count`'] }
+    ]
+  },
+  {
+    label: '变更记录.md',
+    path: CHANGELOG_PATH,
+    groups: [
+      { label: 'N7-B 文档闭环与后续入口', allOf: ['2026-08-25：温室气体报告前端与正式说明书', 'N7-01 至 N7-08', 'N7-B 实施节点完成', 'N7 整体仍待最终独立审查与 findings 闭环', '不开始 N8/N9', '不归档'] }
+    ]
+  }
 ];
 // 中央维护规范标识用于校验用户可见变更、同步范围和占位边界已经明确。
 const maintenanceRuleMarkerGroups = [
@@ -288,6 +494,28 @@ function normalizeLocalTarget(rawTarget) {
  */
 function includesAny(content, markers) {
   return markers.some((marker) => content.includes(marker));
+}
+
+/**
+ * 判断文本是否包含一组必需标识中的全部成员。
+ * @param {string} content 待检查文本。
+ * @param {string[]} markers 必须全部命中的标识。
+ * @returns {boolean} 是否全部命中。
+ */
+function includesAll(content, markers) {
+  return markers.every((marker) => content.includes(marker));
+}
+
+/**
+ * 按 allOf/anyOf 语义校验一组文档标识；同时声明时两组都必须满足。
+ * @param {string} content 待检查文本。
+ * @param {{ allOf?: string[], anyOf?: string[] }} markerGroup 标识合同。
+ * @returns {boolean} 是否满足合同。
+ */
+function satisfiesMarkerGroup(content, markerGroup) {
+  const allOfSatisfied = !markerGroup.allOf || includesAll(content, markerGroup.allOf);
+  const anyOfSatisfied = !markerGroup.anyOf || includesAny(content, markerGroup.anyOf);
+  return allOfSatisfied && anyOfSatisfied;
 }
 
 /**
@@ -584,6 +812,114 @@ function verifyCoverageMatrix() {
 }
 
 /**
+ * 校验供应商正文保留冻结的页面、权限、状态、导入和删除边界。
+ */
+function verifySupplierManualContract() {
+  // 供应商正文文本用于逐组检查用户可见冻结契约。
+  const supplierManualContent = readText(SUPPLIER_MANUAL_PATH);
+  if (!supplierManualContent) return;
+
+  for (const supplierMarkerGroup of supplierManualMarkerGroups) {
+    if (!includesAny(supplierManualContent, supplierMarkerGroup.markers)) {
+      addFailure(`供应商使用说明缺少契约：${supplierMarkerGroup.label}`);
+    }
+  }
+}
+
+/**
+ * 校验碳核算正文保留独立活动、严格时间和双来源防双计冻结契约。
+ */
+function verifyCarbonManualContract() {
+  // 碳核算正文文本用于逐组检查 N5 用户可见冻结契约。
+  const carbonManualContent = readText(CARBON_MANUAL_PATH);
+  if (!carbonManualContent) return;
+
+  for (const carbonMarkerGroup of carbonManualMarkerGroups) {
+    if (!satisfiesMarkerGroup(carbonManualContent, carbonMarkerGroup)) {
+      addFailure(`碳核算使用说明缺少契约：${carbonMarkerGroup.label}`);
+    }
+  }
+}
+
+/**
+ * 校验 N5 同步的五处正式文档分别保留各自最低合同。
+ */
+function verifyN5ManualDocumentContracts() {
+  for (const documentContract of n5ManualDocumentContracts) {
+    // 当前文档文本：每份文档独立读取，禁止借用其他章节的标识通过。
+    const documentContent = readText(documentContract.path);
+    if (!documentContent) continue;
+    for (const markerGroup of documentContract.groups) {
+      if (!satisfiesMarkerGroup(documentContent, markerGroup)) {
+        addFailure(`${documentContract.label} 缺少 N5 最低合同：${markerGroup.label}`);
+      }
+    }
+  }
+}
+
+/**
+ * 校验碳核算正文保留 N6 模板、权限、stale、导出和非联动冻结合同。
+ */
+function verifyN6CarbonManualContract() {
+  // 碳核算正文文本用于逐组检查 N6 碳排放报告用户契约。
+  const carbonManualContent = readText(CARBON_MANUAL_PATH);
+  if (!carbonManualContent) return;
+
+  for (const markerGroup of n6CarbonManualMarkerGroups) {
+    if (!satisfiesMarkerGroup(carbonManualContent, markerGroup)) {
+      addFailure(`碳核算使用说明缺少 N6 契约：${markerGroup.label}`);
+    }
+  }
+}
+
+/**
+ * 校验 N6 同步的五处正式文档分别保留各自最低合同。
+ */
+function verifyN6ManualDocumentContracts() {
+  for (const documentContract of n6ManualDocumentContracts) {
+    // 当前文档文本用于保证 N6 每份正式文档独立满足自身合同。
+    const documentContent = readText(documentContract.path);
+    if (!documentContent) continue;
+    for (const markerGroup of documentContract.groups) {
+      if (!satisfiesMarkerGroup(documentContent, markerGroup)) {
+        addFailure(`${documentContract.label} 缺少 N6 最低合同：${markerGroup.label}`);
+      }
+    }
+  }
+}
+
+/**
+ * 校验碳核算正文保留 N7 六表、权限、数值、stale、导出和领域隔离冻结合同。
+ */
+function verifyN7CarbonManualContract() {
+  // 碳核算正文文本用于逐组检查 N7 温室气体报告用户契约。
+  const carbonManualContent = readText(CARBON_MANUAL_PATH);
+  if (!carbonManualContent) return;
+
+  for (const markerGroup of n7CarbonManualMarkerGroups) {
+    if (!satisfiesMarkerGroup(carbonManualContent, markerGroup)) {
+      addFailure(`碳核算使用说明缺少 N7 契约：${markerGroup.label}`);
+    }
+  }
+}
+
+/**
+ * 校验 N7 同步的五处正式文档分别保留各自最低合同。
+ */
+function verifyN7ManualDocumentContracts() {
+  for (const documentContract of n7ManualDocumentContracts) {
+    // 当前文档文本用于保证 N7 每份正式文档独立满足自身合同。
+    const documentContent = readText(documentContract.path);
+    if (!documentContent) continue;
+    for (const markerGroup of documentContract.groups) {
+      if (!satisfiesMarkerGroup(documentContent, markerGroup)) {
+        addFailure(`${documentContract.label} 缺少 N7 最低合同：${markerGroup.label}`);
+      }
+    }
+  }
+}
+
+/**
  * 校验说明书整体包含首次启动、数据安全和高风险操作关键主题。
  */
 function verifyCriticalTopics() {
@@ -649,6 +985,13 @@ function main() {
   verifySidebarOverviewTopics();
   verifyLocalMarkdownLinks();
   verifyCoverageMatrix();
+  verifySupplierManualContract();
+  verifyCarbonManualContract();
+  verifyN5ManualDocumentContracts();
+  verifyN6CarbonManualContract();
+  verifyN6ManualDocumentContracts();
+  verifyN7CarbonManualContract();
+  verifyN7ManualDocumentContracts();
   verifyCriticalTopics();
   verifyClaudeIndex();
   verifyRuleReferences();

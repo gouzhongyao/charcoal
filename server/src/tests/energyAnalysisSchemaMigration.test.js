@@ -14,7 +14,7 @@ process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
 process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
-// 阶段 2 必须创建的二十二张业务表。
+// 能源分析底座与 N8 canonical v2 必须创建的二十七张业务表。
 const EXPECTED_TABLES = [
   'energy_timeseries_records',
   'shift_definitions',
@@ -29,9 +29,14 @@ const EXPECTED_TABLES = [
   'benchmark_definitions',
   'benchmark_targets',
   'energy_flow_models',
+  'energy_flow_assets',
+  'energy_flow_paths',
   'energy_flow_nodes',
   'energy_flow_edges',
   'energy_flow_records',
+  'energy_flow_waste_heat_facts',
+  'energy_flow_loss_facts',
+  'energy_flow_loss_evidence',
   'energy_balance_boundaries',
   'energy_balance_items',
   'energy_balance_calculation_runs',
@@ -40,7 +45,7 @@ const EXPECTED_TABLES = [
   'energy_balance_suggestions'
 ];
 
-// import_batches 保留十类历史值、八类阶段 3 值，并新增六类配置导入值。
+// import_batches 保留历史、能源分析配置、供应商、独立碳活动、N6 碳排放报告和 N7 温室气体报告导入值。
 const EXPECTED_IMPORT_TYPES = [
   'energy_record',
   'meter_reading',
@@ -65,7 +70,12 @@ const EXPECTED_IMPORT_TYPES = [
   'strategy_rule',
   'energy_flow_model',
   'energy_balance_boundary',
-  'energy_balance_item'
+  'energy_balance_item',
+  'energy_flow_workbook',
+  'supplier',
+  'carbon_activity',
+  'carbon_emission_report',
+  'ghg_report'
 ];
 
 // 关键候选查询索引覆盖重叠事务校验、来源追溯和结果查询。
@@ -263,32 +273,41 @@ function assertBenchmarkTargetImportSourceConstraints(db, benchmarkDefinitionId,
   assert.strictEqual(sourceForeignKey.on_delete, 'NO ACTION', '删除导入批次不得级联删除或置空对标目标。');
 
   const insertTarget = db.prepare(`INSERT INTO benchmark_targets
-    (source_batch_id, source_row_number, benchmark_definition_id, target_value, version)
-    VALUES (?, ?, ?, 12, ?)`);
-  const validTargetId = insertTarget.run(sourceBatchId, 2, benchmarkDefinitionId, `${versionPrefix}:valid`).lastInsertRowid;
+    (source_batch_id, source_row_number, benchmark_definition_id, target_value, version, internal_revision)
+    VALUES (?, ?, ?, 12, ?, ?)`);
+  let nextInternalRevision = Number(db.prepare(`SELECT COALESCE(MAX(internal_revision), 0) + 1 AS nextRevision
+    FROM benchmark_targets WHERE benchmark_definition_id = ?`).get(benchmarkDefinitionId).nextRevision);
+  const insertWithRevision = (batchId, rowNumber, versionSuffix) => insertTarget.run(
+    batchId,
+    rowNumber,
+    benchmarkDefinitionId,
+    `${versionPrefix}:${versionSuffix}`,
+    nextInternalRevision++
+  );
+  const validTargetId = insertWithRevision(sourceBatchId, 2, 'valid').lastInsertRowid;
   assert(validTargetId, '有效导入来源必须可写入对标目标。');
   assertConstraintFailure(
-    () => insertTarget.run(999999999, 3, benchmarkDefinitionId, `${versionPrefix}:orphan`),
+    () => insertWithRevision(999999999, 3, 'orphan'),
     '孤儿导入批次必须被外键拒绝。'
   );
   assertConstraintFailure(
-    () => insertTarget.run(sourceBatchId, null, benchmarkDefinitionId, `${versionPrefix}:batch-only`),
+    () => insertWithRevision(sourceBatchId, null, 'batch-only'),
     '只填写导入批次必须被成对约束拒绝。'
   );
   assertConstraintFailure(
-    () => insertTarget.run(null, 4, benchmarkDefinitionId, `${versionPrefix}:row-only`),
+    () => insertWithRevision(null, 4, 'row-only'),
     '只填写来源行号必须被成对约束拒绝。'
   );
   assertConstraintFailure(
-    () => insertTarget.run(sourceBatchId, 0, benchmarkDefinitionId, `${versionPrefix}:zero-row`),
+    () => insertWithRevision(sourceBatchId, 0, 'zero-row'),
     '来源行号必须大于零。'
   );
   assertConstraintFailure(
-    () => insertTarget.run(sourceBatchId, -1, benchmarkDefinitionId, `${versionPrefix}:negative-row`),
+    () => insertWithRevision(sourceBatchId, -1, 'negative-row'),
     '来源行号不得为负数。'
   );
   assertConstraintFailure(
-    () => insertTarget.run(sourceBatchId, 1.5, benchmarkDefinitionId, `${versionPrefix}:fraction-row`),
+    () => insertWithRevision(sourceBatchId, 1.5, 'fraction-row'),
     '来源行号必须是整数。'
   );
   assertConstraintFailure(
@@ -408,13 +427,24 @@ function createLegacyDatabase(databaseFilePath) {
       VALUES (1, 2, 'energyType', '旧值', 'LEGACY_WARNING', '旧错误明细必须保留', 'warning')`).run();
     const legacyBenchmarkDefinitionId = db.prepare(`INSERT INTO benchmark_definitions
       (benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type, scope_type, scope_reference,
-       direction, source, version, effective_start_utc, effective_end_utc, source_timezone)
+       direction, source, document_no, version, effective_start_utc, effective_end_utc, source_timezone)
       VALUES ('LEGACY-BENCHMARK', '旧库人工基准', 'manual_benchmark', 'energy_intensity', 'kgce/t', 'month',
-       'organization', 'LEGACY-ORG', 'lower_better', '旧库测试', 'legacy:v1',
+       'organization', 'LEGACY-ORG', 'lower_better', '旧库测试', 'LEGACY-DOC-001',
+       'benchmark-definition-internal-revision:v3',
        '2025-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai')`).run().lastInsertRowid;
+    db.prepare(`INSERT INTO benchmark_definitions
+      (benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type, scope_type, scope_reference,
+       direction, source, document_no, version, effective_start_utc, effective_end_utc, source_timezone, status)
+      VALUES ('LEGACY-BENCHMARK', '旧库人工基准修订', 'manual_benchmark', 'energy_intensity', 'kgce/t', 'month',
+       'organization', 'LEGACY-ORG', 'lower_better', '旧库测试', 'LEGACY-DOC-002',
+       'benchmark-definition-internal-revision:v4',
+       '2027-01-01T00:00:00Z', '2028-01-01T00:00:00Z', 'Asia/Shanghai', 'inactive')`).run();
     db.prepare(`INSERT INTO benchmark_targets
-      (benchmark_definition_id, target_value, version)
-      VALUES (?, 15, 'legacy-target:v1')`).run(legacyBenchmarkDefinitionId);
+      (benchmark_definition_id, target_value, version, status)
+      VALUES (?, 15, 'benchmark-target-internal-revision:v3', 'inactive')`).run(legacyBenchmarkDefinitionId);
+    db.prepare(`INSERT INTO benchmark_targets
+      (benchmark_definition_id, target_value, version, status)
+      VALUES (?, 14, 'benchmark-target-internal-revision:v4', 'inactive')`).run(legacyBenchmarkDefinitionId);
   } finally {
     db.close();
   }
@@ -432,9 +462,9 @@ function seedBenchmarkTargetMigrationScenario(db, prefix) {
     VALUES ('energy_benchmark', ?, 'csv')`).run(`${prefix}.csv`).lastInsertRowid;
   const insertDefinition = db.prepare(`INSERT INTO benchmark_definitions
     (benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type, scope_type, scope_reference,
-     direction, source, document_no, version, effective_start_utc, effective_end_utc, source_timezone)
+     direction, source, document_no, version, internal_revision, effective_start_utc, effective_end_utc, source_timezone)
     VALUES (?, ?, ?, 'energy_intensity', 'kgce/t', 'month', 'organization', ?,
-     'lower_better', '迁移测试', ?, 'benchmark:v1', '2025-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai')`);
+     'lower_better', '迁移测试', ?, 'benchmark:v1', 1, '2025-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai')`);
   const manualDefinitionId = insertDefinition.run(
     `${prefix}-MANUAL`,
     `${prefix}人工基准`,
@@ -450,13 +480,13 @@ function seedBenchmarkTargetMigrationScenario(db, prefix) {
     null
   ).lastInsertRowid;
   const sourcedTargetId = db.prepare(`INSERT INTO benchmark_targets
-    (source_batch_id, source_row_number, benchmark_definition_id, target_value, version)
-    VALUES (?, 2, ?, 11, 'preserved:v1')`).run(sourceBatchId, manualDefinitionId).lastInsertRowid;
+    (source_batch_id, source_row_number, benchmark_definition_id, target_value, version, internal_revision)
+    VALUES (?, 2, ?, 11, 'preserved:v1', 1)`).run(sourceBatchId, manualDefinitionId).lastInsertRowid;
   const internalTargetId = db.prepare(`INSERT INTO benchmark_targets
     (benchmark_definition_id, target_value, reference_start_utc, reference_end_utc, frozen_value, frozen_at,
-     production_summary_json, source_data_digest, is_frozen, auto_refresh, version)
+     production_summary_json, source_data_digest, is_frozen, auto_refresh, version, internal_revision)
     VALUES (?, 10, '2025-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 10, '2026-01-02T00:00:00Z',
-     '{"output":100}', 'sha256:preserved', 1, 0, 'internal-preserved:v1')`).run(internalDefinitionId).lastInsertRowid;
+     '{"output":100}', 'sha256:preserved', 1, 0, 'internal-preserved:v1', 1)`).run(internalDefinitionId).lastInsertRowid;
   return { sourceBatchId, manualDefinitionId, internalTargetId, sourcedTargetId };
 }
 
@@ -522,7 +552,7 @@ try {
   const newDatabaseModule = loadDatabaseModule(newDatabasePath);
   newDatabaseModule.initDatabase();
   assert.strictEqual(newDatabaseModule.getDatabaseInfo().databasePath, newDatabasePath, '新库测试必须使用隔离 SQLite。');
-  assert.deepStrictEqual(newDatabaseModule.IMPORT_BATCH_TYPES, EXPECTED_IMPORT_TYPES, '导入类型白名单必须精确匹配历史十类、阶段 3 八类与新增六类配置导入类型。');
+  assert.deepStrictEqual(newDatabaseModule.IMPORT_BATCH_TYPES, EXPECTED_IMPORT_TYPES, '导入类型白名单必须精确匹配历史、能源分析配置、供应商、独立碳活动与碳排放报告导入类型。');
 
   const newDb = newDatabaseModule.openDatabase();
   try {
@@ -690,7 +720,7 @@ try {
 
     const flowModelId = newDb.prepare(`INSERT INTO energy_flow_models
       (model_code, model_name, source, version, effective_start_utc, effective_end_utc, source_timezone)
-      VALUES ('EA-FLOW', '隔离能流模型', '测试人工配置', 'energy-flow:v1', '2026-01-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z', 'Asia/Shanghai')`).run().lastInsertRowid;
+      VALUES ('EA-FLOW', '隔离能流模型', '测试人工配置', 'energy-flow:v1', '2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai')`).run().lastInsertRowid;
     const sourceNodeId = newDb.prepare(`INSERT INTO energy_flow_nodes
       (energy_flow_model_id, node_code, node_name, node_type, x, y)
       VALUES (?, 'source', '源节点', 'source', 10, 20)`).run(flowModelId).lastInsertRowid;
@@ -744,7 +774,7 @@ try {
       () => newDb.prepare(`INSERT INTO energy_flow_records
         (energy_flow_model_id, energy_flow_edge_id, start_utc, end_utc, source_timezone, original_unit, original_value,
          source_type, source_mapping_json, formula_version)
-        VALUES (?, ?, '2026-07-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z', 'Asia/Shanghai', 'kWh', 1,
+        VALUES (?, ?, '2026-07-01T00:00:00Z', '2026-08-01T00:00:00Z', 'Asia/Shanghai', 'kWh', 1,
          'implicit_guess', '{"reference":"bad"}', 'energy-flow:v1')`).run(flowModelId, flowEdgeId),
       '能流记录来源类型必须使用显式来源枚举。'
     );
@@ -780,23 +810,26 @@ try {
     assertConstraintFailure(
       () => newDb.prepare(`INSERT INTO benchmark_definitions
         (benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type, scope_type, scope_reference,
-         direction, source, version, effective_start_utc, effective_end_utc, source_timezone)
+         direction, source, version, internal_revision, effective_start_utc, effective_end_utc, source_timezone)
         VALUES ('EA-BAD', '非法方向', 'manual_benchmark', 'metric', '%', 'month', 'organization', 'EA-ORG',
-         'smaller', '测试', 'benchmark:v1', '2026-01-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z', 'Asia/Shanghai')`).run(),
+         'smaller', '测试', 'benchmark:v1', 1, '2026-01-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z', 'Asia/Shanghai')`).run(),
       '对标方向必须使用 lower_better/higher_better/range。'
     );
 
     // 内部历史基准必须固化，外部标准和人工基准保持可正常写入。
     const insertBenchmarkDefinition = newDb.prepare(`INSERT INTO benchmark_definitions
       (benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type, scope_type, scope_reference,
-       direction, source, document_no, version, effective_start_utc, effective_end_utc, source_timezone)
+       direction, source, document_no, version, internal_revision, effective_start_utc, effective_end_utc, source_timezone)
       VALUES (?, ?, ?, 'energy_intensity', 'kgce/t', 'month', 'organization', 'EA-ORG',
-       'lower_better', '测试', ?, 'benchmark:v1', '2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai')`);
+       'lower_better', '测试', ?, ?, 1, '2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai')`);
     const internalBenchmarkId = insertBenchmarkDefinition.run('EA-INTERNAL', '内部历史基准',
-      'internal_history_baseline', null).lastInsertRowid;
-    const manualBenchmarkId = insertBenchmarkDefinition.run('EA-MANUAL', '人工基准', 'manual_benchmark', null).lastInsertRowid;
+      'internal_history_baseline', null, 'benchmark-internal:v1').lastInsertRowid;
+    const manualBenchmarkId = insertBenchmarkDefinition.run('EA-MANUAL', '人工基准',
+      'manual_benchmark', null, 'benchmark-manual:v1').lastInsertRowid;
     const externalBenchmarkId = insertBenchmarkDefinition.run('EA-EXTERNAL', '外部标准',
-      'external_standard', 'DOC-2026').lastInsertRowid;
+      'external_standard', null, 'benchmark-external:v1').lastInsertRowid;
+    assert.strictEqual(newDb.prepare('SELECT document_no AS documentNo FROM benchmark_definitions WHERE id = ?')
+      .get(externalBenchmarkId).documentNo, null, '新库外部标准必须允许不填写文号。');
     const benchmarkTargetSql = getCreateSql(newDb, 'benchmark_targets');
     assert(benchmarkTargetSql.includes('source_batch_id'), '新库 benchmark_targets 建表定义必须包含 source_batch_id。');
     assert(benchmarkTargetSql.includes("typeof(source_row_number) = 'integer'"), '新库来源行号必须声明正整数 CHECK。');
@@ -806,24 +839,24 @@ try {
 
     const insertBenchmarkTarget = newDb.prepare(`INSERT INTO benchmark_targets
       (benchmark_definition_id, target_value, reference_start_utc, reference_end_utc, frozen_value, frozen_at,
-       production_summary_json, source_data_digest, is_frozen, auto_refresh, version)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+       production_summary_json, source_data_digest, is_frozen, auto_refresh, version, internal_revision)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     assert.throws(
       () => insertBenchmarkTarget.run(internalBenchmarkId, 10, '2025-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
-        10, '2026-01-02T00:00:00Z', '{"output":100}', 'sha256:internal', 0, 0, 'target:v1'),
+        10, '2026-01-02T00:00:00Z', '{"output":100}', 'sha256:internal', 0, 0, 'target:v1', 1),
       /internal history baseline target must be frozen and complete/,
       '内部历史基准 INSERT 必须拒绝未固化目标。'
     );
     const internalTargetId = insertBenchmarkTarget.run(internalBenchmarkId, 10,
       '2025-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 10, '2026-01-02T00:00:00Z',
-      '{"output":100}', 'sha256:internal', 1, 0, 'target:v1').lastInsertRowid;
+      '{"output":100}', 'sha256:internal', 1, 0, 'target:v1', 1).lastInsertRowid;
     assert.throws(
       () => newDb.prepare('UPDATE benchmark_targets SET auto_refresh = 1 WHERE id = ?').run(internalTargetId),
       /internal history baseline target must remain frozen and complete/,
       '内部历史基准 UPDATE 后仍须保持 auto_refresh=0。'
     );
-    insertBenchmarkTarget.run(manualBenchmarkId, 12, null, null, null, null, null, null, 0, 1, 'target:v1');
-    insertBenchmarkTarget.run(externalBenchmarkId, 8, null, null, null, null, null, null, 0, 0, 'target:v1');
+    insertBenchmarkTarget.run(manualBenchmarkId, 12, null, null, null, null, null, null, 0, 1, 'target:v1', 2);
+    insertBenchmarkTarget.run(externalBenchmarkId, 8, null, null, null, null, null, null, 0, 0, 'target:v1', 1);
     assert.throws(
       () => newDb.prepare("UPDATE benchmark_definitions SET benchmark_type = 'internal_history_baseline' WHERE id = ?")
         .run(manualBenchmarkId),
@@ -1178,12 +1211,117 @@ try {
     const legacyError = upgradedDb.prepare("SELECT * FROM import_errors WHERE batch_id = ? AND error_code = 'LEGACY_WARNING'").get(legacyBatch.id);
     assert(legacyError, 'import_batches 重建后 import_errors 必须保留。');
     assert.strictEqual(legacyError.severity, 'warning');
-    const legacyTarget = upgradedDb.prepare("SELECT * FROM benchmark_targets WHERE version = 'legacy-target:v1'").get();
-    assert(legacyTarget, '阶段 2 旧库升级后既有 benchmark_targets 数据必须保留。');
-    assert.strictEqual(legacyTarget.target_value, 15);
-    assert.strictEqual(legacyTarget.source_batch_id, null);
-    assert.strictEqual(legacyTarget.source_row_number, null);
-    const legacyBenchmarkDefinition = upgradedDb.prepare("SELECT id FROM benchmark_definitions WHERE benchmark_code = 'LEGACY-BENCHMARK'").get();
+    const legacyTargets = upgradedDb.prepare(`SELECT * FROM benchmark_targets
+      WHERE version IN ('benchmark-target-internal-revision:v3', 'benchmark-target-internal-revision:v4') ORDER BY id`).all();
+    assert.strictEqual(legacyTargets.length, 2, '阶段 2 旧库升级后既有 benchmark_targets 行数必须保留。');
+    assert.deepStrictEqual(legacyTargets.map((target) => target.target_value), [15, 14]);
+    assert(legacyTargets.every((target) => target.source_batch_id === null && target.source_row_number === null));
+    assert.deepStrictEqual(legacyTargets.map((target) => target.internal_revision), [1, 2],
+      '旧目标必须按稳定顺序回填单调正整数内部修订。');
+    const legacyDefinitions = upgradedDb.prepare(`SELECT * FROM benchmark_definitions
+      WHERE benchmark_code = 'LEGACY-BENCHMARK' ORDER BY id`).all();
+    assert.strictEqual(legacyDefinitions.length, 2, '历史定义行数和主键必须完整保留。');
+    assert.deepStrictEqual(legacyDefinitions.map((definition) => definition.version), [
+      'benchmark-definition-internal-revision:v3',
+      'benchmark-definition-internal-revision:v4'
+    ], '历史定义版本必须原样保留，即使其恰好占用未来服务端默认兼容版本。');
+    assert.deepStrictEqual(legacyDefinitions.map((definition) => definition.document_no), ['LEGACY-DOC-001', 'LEGACY-DOC-002'],
+      '历史定义文号必须原样保留。');
+    assert.deepStrictEqual(legacyDefinitions.map((definition) => definition.internal_revision), [1, 2],
+      '旧定义必须按稳定顺序回填单调正整数内部修订。');
+    const revisionSnapshot = {
+      definitions: legacyDefinitions.map((definition) => [definition.id, definition.internal_revision]),
+      targets: legacyTargets.map((target) => [target.id, target.internal_revision])
+    };
+    assert.strictEqual(legacyDatabaseModule.migrateEnergyBenchmarkInternalRevisions(upgradedDb), false,
+      '内部修订迁移重复运行不得再次改写历史数据。');
+    assert.deepStrictEqual({
+      definitions: upgradedDb.prepare(`SELECT id, internal_revision AS internalRevision FROM benchmark_definitions
+        WHERE benchmark_code = 'LEGACY-BENCHMARK' ORDER BY id`).all().map((row) => [row.id, row.internalRevision]),
+      targets: upgradedDb.prepare(`SELECT id, internal_revision AS internalRevision FROM benchmark_targets
+        WHERE version IN ('benchmark-target-internal-revision:v3', 'benchmark-target-internal-revision:v4') ORDER BY id`).all().map((row) => [row.id, row.internalRevision])
+    }, revisionSnapshot, '重复迁移后定义和目标内部修订必须保持稳定。');
+
+    upgradedDb.prepare(`INSERT INTO organization_units
+      (unit_code, unit_name, unit_path, unit_type, status)
+      VALUES ('LEGACY-ORG', '旧库对标组织', '/LEGACY-ORG', 'workshop', 'active')`).run();
+    const serviceModulePath = require.resolve('../services/energyBenchmarkService');
+    delete require.cache[serviceModulePath];
+    const {
+      createBenchmarkDefinition,
+      createBenchmarkTarget,
+      getBenchmarkDefinition,
+      getBenchmarkTarget,
+      updateBenchmarkDefinition,
+      updateBenchmarkTarget
+    } = require('../services/energyBenchmarkService');
+    const adminUser = upgradedDb.prepare('SELECT id, username FROM sys_users ORDER BY id LIMIT 1').get();
+    const serviceOptions = {
+      db: upgradedDb,
+      actor: { userId: Number(adminUser.id), username: adminUser.username, ip: '127.0.0.1' }
+    };
+    const legacySuccessorInput = {
+      benchmarkCode: 'LEGACY-BENCHMARK',
+      benchmarkName: '旧库兼容版本后继',
+      benchmarkType: 'manual_benchmark',
+      metricCode: 'energy_intensity',
+      unit: 'kgce/t',
+      periodType: 'month',
+      scopeType: 'organization',
+      scopeReference: 'LEGACY-ORG',
+      direction: 'lower_better',
+      source: '旧库迁移服务回归',
+      effectiveStartUtc: '2028-01-01T00:00:00Z',
+      effectiveEndUtc: '2029-01-01T00:00:00Z',
+      sourceTimeZone: 'Asia/Shanghai',
+      status: 'active'
+    };
+    const createdLegacySuccessor = createBenchmarkDefinition(legacySuccessorInput, serviceOptions);
+    assert.strictEqual(createdLegacySuccessor.internalRevision, 3);
+    assert.strictEqual(createdLegacySuccessor.version, 'benchmark-definition-internal-revision:v3:server-1',
+      '旧库历史 version 占用默认 v3 时，新定义必须选择确定性备用后缀。');
+    const inactiveLegacySuccessor = updateBenchmarkDefinition(createdLegacySuccessor.id, {
+      ...legacySuccessorInput,
+      benchmarkName: '旧库未生效定义后继',
+      status: 'inactive'
+    }, serviceOptions);
+    assert.strictEqual(inactiveLegacySuccessor.internalRevision, 4);
+    assert.strictEqual(inactiveLegacySuccessor.version, 'benchmark-definition-internal-revision:v4:server-1');
+    assert.strictEqual(getBenchmarkDefinition(createdLegacySuccessor.id, { db: upgradedDb }).status, 'active',
+      '旧库 active 定义创建 inactive 后继时必须继续生效。');
+
+    const legacyBenchmarkDefinition = legacyDefinitions[0];
+    const createdLegacyTarget = createBenchmarkTarget({
+      benchmarkDefinitionId: legacyBenchmarkDefinition.id,
+      targetValue: 13,
+      lowerBound: null,
+      upperBound: null,
+      status: 'active'
+    }, serviceOptions);
+    assert.strictEqual(createdLegacyTarget.internalRevision, 3);
+    assert.strictEqual(createdLegacyTarget.version, 'benchmark-target-internal-revision:v3:server-1',
+      '旧库历史 version 占用默认目标 v3 时，新目标必须选择确定性备用后缀。');
+    const inactiveLegacyTarget = updateBenchmarkTarget(createdLegacyTarget.id, {
+      targetValue: 12,
+      lowerBound: null,
+      upperBound: null,
+      status: 'inactive'
+    }, serviceOptions);
+    assert.strictEqual(inactiveLegacyTarget.internalRevision, 4);
+    assert.strictEqual(inactiveLegacyTarget.version, 'benchmark-target-internal-revision:v4:server-1');
+    assert.strictEqual(getBenchmarkTarget(createdLegacyTarget.id, { db: upgradedDb }).status, 'active',
+      '旧库 active 目标创建 inactive 后继时必须继续生效。');
+    assert.deepStrictEqual(upgradedDb.prepare(`SELECT version FROM benchmark_definitions
+      WHERE id IN (?, ?) ORDER BY id`).all(legacyDefinitions[0].id, legacyDefinitions[1].id).map((row) => row.version), [
+      'benchmark-definition-internal-revision:v3',
+      'benchmark-definition-internal-revision:v4'
+    ], '服务写入不得改写旧库历史定义 version。');
+    assert.deepStrictEqual(upgradedDb.prepare(`SELECT version FROM benchmark_targets
+      WHERE id IN (?, ?) ORDER BY id`).all(legacyTargets[0].id, legacyTargets[1].id).map((row) => row.version), [
+      'benchmark-target-internal-revision:v3',
+      'benchmark-target-internal-revision:v4'
+    ], '服务写入不得改写旧库历史目标 version。');
+
     const legacyBenchmarkBatchId = upgradedDb.prepare(
       "INSERT INTO import_batches (import_type, original_filename, file_type) VALUES ('energy_benchmark', 'benchmark.csv', 'csv')"
     ).run().lastInsertRowid;
@@ -1458,15 +1596,15 @@ try {
     );
     assert.throws(
       () => partialBenchmarkDb.prepare(`INSERT INTO benchmark_targets
-        (benchmark_definition_id, target_value, version, status)
-        VALUES (?, 1, 'bad-status:v1', 'deleted')`).run(scenario.manualDefinitionId),
+        (benchmark_definition_id, target_value, version, internal_revision, status)
+        VALUES (?, 1, 'bad-status:v1', 2, 'deleted')`).run(scenario.manualDefinitionId),
       /CHECK constraint failed/,
       '安全重建后原 status CHECK 必须保留。'
     );
     assert.throws(
       () => partialBenchmarkDb.prepare(`INSERT INTO benchmark_targets
-        (benchmark_definition_id, target_value, version)
-        VALUES (?, 1, 'preserved:v1')`).run(scenario.manualDefinitionId),
+        (benchmark_definition_id, target_value, version, internal_revision)
+        VALUES (?, 1, 'preserved:v1', 2)`).run(scenario.manualDefinitionId),
       /UNIQUE constraint failed/,
       '安全重建后原唯一约束必须保留。'
     );
@@ -1529,8 +1667,8 @@ try {
     degradeBenchmarkTargetSourceContract(orphanBenchmarkDb, orphanBenchmarkModule);
     orphanBenchmarkDb.pragma('foreign_keys = OFF');
     orphanBenchmarkDb.prepare(`INSERT INTO benchmark_targets
-      (source_batch_id, source_row_number, benchmark_definition_id, target_value, version)
-      VALUES (999999999, 9, ?, 13, 'orphan:v1')`).run(scenario.manualDefinitionId);
+      (source_batch_id, source_row_number, benchmark_definition_id, target_value, version, internal_revision)
+      VALUES (999999999, 9, ?, 13, 'orphan:v1', 2)`).run(scenario.manualDefinitionId);
     const beforeCreateSql = getCreateSql(orphanBenchmarkDb, 'benchmark_targets');
     const beforeTriggerSql = orphanBenchmarkDb.prepare(
       "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_benchmark_targets_source_insert'"

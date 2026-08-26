@@ -1,6 +1,6 @@
 <template>
   <div ref="cockpitRoot" class="dashboard-controller" :data-display-mode="appStore.immersiveMode ? 'immersive' : 'standard'">
-    <PageState v-if="!canView" description="当前账号没有查看驾驶舱的权限。请联系管理员授予 dashboard:view 权限。" />
+    <PageState v-if="!canView" description="当前账号没有查看中控的权限。请联系管理员授予 dashboard:view 权限。" />
     <ImmersiveDashboardView
       v-else-if="appStore.immersiveMode"
       :view-model="viewModel"

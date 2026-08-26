@@ -59,17 +59,21 @@ const ENERGY_ANALYSIS_TEMPLATE_IMPORT_ROUTES = Object.freeze({
   'energy-balance-configs': 'POST /api/energy-balance-imports/bundle/preview -> POST /api/energy-balance-imports/bundle/execute'
 });
 
-// 接入前已存在的十一类中央模板 ID，用于防止历史列表或下载行为回归。
-const HISTORICAL_TEMPLATE_IDS = Object.freeze([
+// 十五类基础领域中央模板 ID 用于防止既有顺序、供应商、N6 碳排放报告和 N7 温室气体报告模板入口回归。
+const BASE_TEMPLATE_IDS = Object.freeze([
   'energy-budgets',
   'energy-records',
   'meter-readings',
   'production-units',
+  'suppliers',
   'production-outputs',
   'generation-records',
   'organization-units',
   'meters',
   'carbon-factors',
+  'carbon-activities',
+  'carbon-emission-report',
+  'ghg-report',
   'prediction-configs',
   'prediction-history'
 ]);
@@ -262,16 +266,16 @@ function assertSuccessfulTemplateDownload(response, contract, format, observedAs
     const deniedToken = await login(server, 'analysis-denied', 'Password123!');
     const allowedToken = await login(server, 'analysis-allowed', 'Password123!');
 
-    // 中央列表必须保留十一类历史模板，并正式增加十三类能源分析与配置模板及其格式元数据。
+    // 中央列表必须精确保留十五类基础模板，并正式提供十三类能源分析与配置模板及其格式元数据。
     const listResponse = await request(server, 'GET', '/api/templates');
     assert.strictEqual(listResponse.status, 200);
     const listedTemplates = listResponse.body.data;
     assert.deepStrictEqual(
-      listedTemplates.slice(0, HISTORICAL_TEMPLATE_IDS.length).map((template) => template.type),
-      HISTORICAL_TEMPLATE_IDS,
-      '历史模板列表顺序和 ID 不得回归。'
+      listedTemplates.slice(0, BASE_TEMPLATE_IDS.length).map((template) => template.type),
+      BASE_TEMPLATE_IDS,
+      '基础模板列表顺序、供应商入口和 ID 不得回归。'
     );
-    assert.strictEqual(listedTemplates.length, HISTORICAL_TEMPLATE_IDS.length + ENERGY_ANALYSIS_TEMPLATE_CONTRACTS.length);
+    assert.strictEqual(listedTemplates.length, BASE_TEMPLATE_IDS.length + ENERGY_ANALYSIS_TEMPLATE_CONTRACTS.length);
     ENERGY_ANALYSIS_TEMPLATE_CONTRACTS.forEach((contract) => {
       const listed = listedTemplates.find((template) => template.type === contract.id);
       assert(listed, `${contract.id} 必须出现在中央模板列表。`);

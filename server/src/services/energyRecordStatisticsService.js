@@ -997,7 +997,7 @@ function normalizeDashboardSummaryRange(query = {}) {
 
   // 驾驶舱年度摘要禁止跨自然年，确保前端年度选择与统计口径一致。
   if (normalizedMonthStart.slice(0, 4) !== normalizedMonthEnd.slice(0, 4)) {
-    throw badRequest('驾驶舱月份范围必须位于同一自然年。', {
+    throw badRequest('中控月份范围必须位于同一自然年。', {
       code: 'INVALID_DASHBOARD_YEAR_RANGE',
       normalizedMonthStart,
       normalizedMonthEnd
@@ -1143,8 +1143,8 @@ function getDashboardSummary(query = {}, access = {}) {
     const timeScopeNotices = [];
     if (energyAuthorized) {
       timeScopeNotices.push(range.filteredByMonth
-        ? `驾驶舱能耗摘要仅统计 ${range.normalizedMonthStart} 至 ${range.normalizedMonthEnd} 的 active 能耗记录。`
-        : '驾驶舱能耗摘要统计全部月份的 active 能耗记录。');
+        ? `中控能耗摘要仅统计 ${range.normalizedMonthStart} 至 ${range.normalizedMonthEnd} 的 active 能耗记录。`
+        : '中控能耗摘要统计全部月份的 active 能耗记录。');
     }
     if (importsAuthorized) {
       timeScopeNotices.push(range.filteredByMonth
@@ -1160,7 +1160,7 @@ function getDashboardSummary(query = {}, access = {}) {
       errors,
       notices: [
         ...timeScopeNotices,
-        ...(energyAuthorized ? ['energy.totals 按能源类型和标准化单位分组，是驾驶舱能耗合计的权威字段；totalNormalizedValue 仅为旧契约兼容字段，不用于混合单位展示。'] : []),
+        ...(energyAuthorized ? ['energy.totals 按能源类型和标准化单位分组，是中控能耗合计的权威字段；totalNormalizedValue 仅为旧契约兼容字段，不用于混合单位展示。'] : []),
         '本接口不包含碳核算、预测、用能预算、计量器具聚合或伪造图表数据。'
       ]
     };

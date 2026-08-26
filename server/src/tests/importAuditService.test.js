@@ -226,6 +226,9 @@ try {
   assert.strictEqual(isGenericDeleteAllowedForImportType('energy_record'), true);
   assert.strictEqual(isGenericDeleteAllowedForImportType('production_output'), false);
   assert.strictEqual(isGenericDeleteAllowedForImportType('generation_record'), false);
+  assert.strictEqual(isGenericDeleteAllowedForImportType('supplier'), false, '未来新增但未授权的导入类型必须默认拒绝通用删除。');
+  assert.strictEqual(isGenericDeleteAllowedForImportType(''), false, '空导入类型不得回退为普通能耗。');
+  assert.strictEqual(isGenericDeleteAllowedForImportType(undefined), false, '缺失导入类型不得回退为普通能耗。');
   assert.throws(
     () => assertAuditBatchCanUseGenericDelete({ id: productionPreview.id, importType: 'production_output' }),
     /默认禁止通过通用导入批次删除接口删除/,
@@ -235,6 +238,16 @@ try {
     () => assertImportBatchCanUseGenericDelete({ id: generationPreview.id, importType: 'generation_record' }),
     /默认禁止通过通用导入批次删除接口删除/,
     'importService 通用删除 helper 也应默认禁止 generation_record。'
+  );
+  assert.throws(
+    () => assertAuditBatchCanUseGenericDelete({ id: 999, importType: 'supplier' }),
+    /通用删除仅允许普通能耗 energy_record 批次/,
+    '未来新增导入类型必须在白名单外默认拒绝。'
+  );
+  assert.throws(
+    () => assertAuditBatchCanUseGenericDelete({ id: 1000 }),
+    /通用删除仅允许普通能耗 energy_record 批次/,
+    '缺失导入类型必须默认拒绝。'
   );
 
   const db = openDatabase();

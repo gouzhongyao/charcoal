@@ -268,7 +268,7 @@ async function scenarioMaintenanceState() {
 
     let serviceDeleteError = null;
     try {
-      deleteImportBatch('1');
+      await deleteImportBatch('1');
     } catch (error) {
       serviceDeleteError = error;
     }

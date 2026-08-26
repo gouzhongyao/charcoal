@@ -235,8 +235,6 @@ async function testCentralBusinessWrite(server, adminToken) {
     scopeReference: 'CENTRAL-OU',
     direction: 'lower_better',
     source: '中央集成测试',
-    documentNo: null,
-    version: 'central-benchmark:v1',
     effectiveStartUtc: '2026-01-01T00:00:00Z',
     effectiveEndUtc: '2027-01-01T00:00:00Z',
     sourceTimeZone: 'Asia/Shanghai',

@@ -15,7 +15,7 @@ const {
 
 // Dataset 身份与版本固定进入 run/context 契约，治理语义变化时必须提升 manifest version。
 const DEMO_DATASET_ID = 'qinglan-park-v1';
-const DEMO_MANIFEST_VERSION = '1.0.0';
+const DEMO_MANIFEST_VERSION = '1.1.0';
 const DEMO_CANONICALIZATION_VERSION = 'canonical-json-v1';
 // 青岚园区演示数据统一采用稳定业务前缀，不使用数据库自增 ID。
 const DEMO_PARK_CODE_PREFIX = 'QL-';
@@ -111,8 +111,8 @@ const DEMO_PARK_ARTIFACTS = Object.freeze([
   } }),
   createArtifact({ artifactKey: '18-strategy-rules', order: 18, name: '策略规则', templateType: 'strategy-rules', formats: ['xlsx', 'csv'], requiredPermission: 'energy:analysis:config:import:preview', targetPage: '能源消费分析/策略配置', postAction: '预演并执行后核对规则版本；导入只保存需人工复核的受控规则。', dependencies: [], rows: [['QL-STRATEGY-PEAK', '峰段能耗偏高提醒', 'strategy-rule:v1', 'load-analysis:v1', 'peak_interval_energy', 'gt', 300, '', '', 'kWh/15min', 0.08, 'high', 0.95, 10, 'window_total_energy', '建议复核峰段设备错峰安排。', '青岚园区能源制度', '2025-01-01T00:00:00Z', '2027-01-01T00:00:00Z', DEMO_PARK_SOURCE_TIME_ZONE, 'active']] }),
   createArtifact({ artifactKey: '19-conversion-factors', order: 19, name: '能源折标系数', templateType: 'energy-conversion-factors', formats: ['xlsx', 'csv'], requiredPermission: 'energy:benchmarks:import:preview', targetPage: '能效对标/折标系数', postAction: '预演并导入后用于统一折标。', dependencies: [], rows: [['QL-FACTOR-ELEC-2026', 'electricity', 'kWh', 0.1229, 'kgce', 'tce', 1000, '青岚园区能源制度', 'QL-ENERGY-2026', 'electricity-factor:v1', '2025-01-01T00:00:00Z', '2027-01-01T00:00:00Z', DEMO_PARK_SOURCE_TIME_ZONE, 'active']] }),
-  createArtifact({ artifactKey: '20-benchmark-definitions', order: 20, name: '对标定义', templateType: 'energy-benchmark-definitions', formats: ['xlsx', 'csv'], requiredPermission: 'energy:benchmarks:import:preview', targetPage: '能效对标/定义', postAction: '预演并导入后再导入对应目标。', dependencies: ['03-organization-process-equipment'], rows: [['QL-BENCH-INTENSITY', '精密零件单位产品综合能耗', 'manual_benchmark', 'energy_intensity', 'kgce/t', 'month', 'organization', 'QL-WORKSHOP-A', 'lower_better', '青岚园区能源管理目标', '', 'energy-benchmark:v1', '2025-01-01T00:00:00Z', '2027-01-01T00:00:00Z', DEMO_PARK_SOURCE_TIME_ZONE, 'active']] }),
-  createArtifact({ artifactKey: '21-benchmark-targets', order: 21, name: '对标目标', templateType: 'energy-benchmark-targets', formats: ['xlsx', 'csv'], requiredPermission: 'energy:benchmarks:import:preview', targetPage: '能效对标/目标', postAction: '预演并导入后执行对标分析。', dependencies: ['20-benchmark-definitions'], rows: [['QL-BENCH-INTENSITY', 'energy-benchmark:v1', 128, '', '', '', '', '', '', '', '', '', 0, 0, 'benchmark-target:v1', 'active']] }),
+  createArtifact({ artifactKey: '20-benchmark-definitions', order: 20, name: '对标定义', templateType: 'energy-benchmark-definitions', formats: ['xlsx', 'csv'], requiredPermission: 'energy:benchmarks:import:preview', targetPage: '能效对标/定义', postAction: '预演并导入后再导入对应目标。', dependencies: ['03-organization-process-equipment'], rows: [['QL-BENCH-INTENSITY', '精密零件单位产品综合能耗', 'manual_benchmark', 'energy_intensity', 'kgce/t', 'month', 'organization', 'QL-WORKSHOP-A', 'lower_better', '青岚园区能源管理目标', '2025-01-01T00:00:00Z', '2027-01-01T00:00:00Z', DEMO_PARK_SOURCE_TIME_ZONE, 'active']] }),
+  createArtifact({ artifactKey: '21-benchmark-targets', order: 21, name: '对标目标', templateType: 'energy-benchmark-targets', formats: ['xlsx', 'csv'], requiredPermission: 'energy:benchmarks:import:preview', targetPage: '能效对标/目标', postAction: '预演并导入后执行对标分析。', dependencies: ['20-benchmark-definitions'], rows: [['QL-BENCH-INTENSITY', 128, '', '', '', '', '', '', '', '', '', 0, 0, 'active']] }),
   createArtifact({ artifactKey: '22-energy-flow-models', order: 22, name: '能流模型', templateType: 'energy-flow-models', formats: ['xlsx', 'csv'], requiredPermission: 'energy:flows:import:preview', targetPage: '能流分析/模型', postAction: '预演并导入能流模型；导入后不自动执行能流分析。', dependencies: [], rows: [['QL-FLOW-PARK', '青岚园区综合能流模型', '青岚园区能源审计', 'QL-FLOW-2026-01', 'QL-FLOW:v1', '2025-01-01T00:00:00Z', '2027-01-01T00:00:00Z', DEMO_PARK_SOURCE_TIME_ZONE, 'active']] }),
   createArtifact({ artifactKey: '23-energy-flow-nodes', order: 23, name: '能流节点', templateType: 'energy-flow-nodes', formats: ['xlsx', 'csv'], requiredPermission: 'energy:flows:import:preview', targetPage: '能流分析/节点', postAction: '预演并导入后核对节点坐标和组织关联。', dependencies: ['22-energy-flow-models', '03-organization-process-equipment'], rows: [
     ['QL-FLOW-PARK', '青岚园区综合能流模型', '青岚园区能源审计', 'QL-FLOW-2026-01', 'QL-FLOW:v1', '2025-01-01T00:00:00Z', '2027-01-01T00:00:00Z', DEMO_PARK_SOURCE_TIME_ZONE, 'QL-NODE-GRID', '电网输入', 'source', 'QL-PARK', 80, 120, 'active'],
@@ -265,14 +265,14 @@ function validateDemoParkCrossReferences() {
   getArtifactRows('18-strategy-rules').forEach((row) => validateStrictUtcRange(row[17], row[18], `策略规则 ${row[0]}`));
 
   const benchmarkDefinitionRows = getArtifactRows('20-benchmark-definitions');
-  const benchmarkVersions = new Set(benchmarkDefinitionRows.map((row) => `${row[0]}|${row[11]}`));
+  const benchmarkCodes = new Set(benchmarkDefinitionRows.map((row) => row[0]));
   benchmarkDefinitionRows.forEach((row) => {
     assertManifestCondition(organizationCodes.has(row[7]), `对标定义引用的组织不存在：${row[7]}`);
-    validateStrictUtcRange(row[12], row[13], `对标定义 ${row[0]}`);
+    validateStrictUtcRange(row[10], row[11], `对标定义 ${row[0]}`);
   });
   getArtifactRows('21-benchmark-targets').forEach((row) => {
-    assertManifestCondition(benchmarkVersions.has(`${row[0]}|${row[1]}`), `对标目标引用的定义版本不存在：${row[0]}|${row[1]}`);
-    assertManifestCondition(!row[5] && !row[6], `普通对标目标不得伪造内部历史参考期：${row[0]}`);
+    assertManifestCondition(benchmarkCodes.has(row[0]), `对标目标引用的定义不存在：${row[0]}`);
+    assertManifestCondition(!row[4] && !row[5], `普通对标目标不得伪造内部历史参考期：${row[0]}`);
   });
 
   const flowModelRows = getArtifactRows('22-energy-flow-models');
@@ -330,6 +330,7 @@ function listDemoParkArtifacts() {
       requiredPermission: registration?.permissions.download || artifact.requiredPermission,
       handlerKey: registration?.handlerKey || null,
       mode: registration?.mode || null,
+      downloadLifecycle: registration?.downloadLifecycle || null,
       permissions: registration ? { ...registration.permissions } : null,
       routes: registration
         ? Object.fromEntries(Object.entries(registration.routes).map(([key, values]) => [key, [...values]]))

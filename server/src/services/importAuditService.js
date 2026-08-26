@@ -25,10 +25,15 @@ const AUDIT_IMPORT_TYPES = Object.freeze([
   'energy_flow_edge',
   'energy_flow_record',
   'energy_balance_boundary',
-  'energy_balance_item'
+  'energy_balance_item',
+  'energy_flow_workbook',
+  'supplier',
+  'carbon_activity',
+  'carbon_emission_report',
+  'ghg_report'
 ]);
-// 由领域服务维护生命周期和追溯的批次禁止走通用删除入口。
-const GENERIC_DELETE_FORBIDDEN_IMPORT_TYPES = Object.freeze([...AUDIT_IMPORT_TYPES, 'meter_reading']);
+// 通用导入批次删除白名单用于默认拒绝未知和特殊领域类型。
+const GENERIC_DELETE_ALLOWED_IMPORT_TYPES = Object.freeze(['energy_record']);
 const IMPORT_BATCH_STATUSES = Object.freeze(['pending', 'processing', 'completed', 'completed_with_errors', 'failed', 'cancelled']);
 const IMPORT_AUDIT_PHASES = Object.freeze(['preview', 'execute']);
 const IMPORT_FILE_TYPES = Object.freeze(['xlsx', 'xls', 'csv']);
@@ -626,19 +631,20 @@ function getImportAuditSummary(batchId, options = {}) {
 }
 
 function isGenericDeleteAllowedForImportType(importType) {
-  const normalized = String(importType || 'energy_record').trim();
-  return !GENERIC_DELETE_FORBIDDEN_IMPORT_TYPES.includes(normalized);
+  // 标准化后的导入类型用于严格匹配唯一允许的普通能耗类型。
+  const normalizedImportType = String(importType || '').trim();
+  return GENERIC_DELETE_ALLOWED_IMPORT_TYPES.includes(normalizedImportType);
 }
 
 function assertAuditBatchCanUseGenericDelete(batch = {}) {
-  const importType = batch.importType || batch.import_type || 'energy_record';
+  // 批次导入类型用于严格执行白名单，缺失类型也按不安全类型拒绝。
+  const importType = batch.importType || batch.import_type || '';
   if (!isGenericDeleteAllowedForImportType(importType)) {
-    throw badRequest('该导入批次类型默认禁止通过通用导入批次删除接口删除；请先单独确认审计追溯、业务记录和原文件清理策略。', {
+    throw badRequest('该导入批次类型默认禁止通过通用导入批次删除接口删除；通用删除仅允许普通能耗 energy_record 批次。', {
       code: 'IMPORT_AUDIT_GENERIC_DELETE_FORBIDDEN',
       batchId: batch.id,
       importType,
-      forbiddenImportTypes: GENERIC_DELETE_FORBIDDEN_IMPORT_TYPES,
-      allowedGenericDeleteImportTypes: ['energy_record']
+      allowedGenericDeleteImportTypes: GENERIC_DELETE_ALLOWED_IMPORT_TYPES
     });
   }
   return true;
@@ -646,7 +652,7 @@ function assertAuditBatchCanUseGenericDelete(batch = {}) {
 
 module.exports = {
   AUDIT_IMPORT_TYPES,
-  GENERIC_DELETE_FORBIDDEN_IMPORT_TYPES,
+  GENERIC_DELETE_ALLOWED_IMPORT_TYPES,
   assertAuditBatchCanUseGenericDelete,
   createPreviewAuditBatch: recordPreviewAuditBatch,
   getImportAuditBatchDetail,
@@ -654,6 +660,7 @@ module.exports = {
   isGenericDeleteAllowedForImportType,
   mapImportAuditIssue,
   parseStoredAuditJson,
+  projectBackupAuditMetadata,
   recordPreviewAuditBatch,
   replaceImportAuditIssues,
   replaceImportAuditIssuesWithDatabase,

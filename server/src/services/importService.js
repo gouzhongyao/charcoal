@@ -3,9 +3,16 @@ const crypto = require('crypto');
 const path = require('path');
 const { openDatabase, uploadsDir } = require('../db/database');
 const { assertWritableAllowed } = require('./maintenanceState');
-const { badRequest, notFound } = require('../utils/errors');
+const { getUserPermissions, isSuperAdmin } = require('./authService');
+const { AppError, badRequest, notFound } = require('../utils/errors');
 const { decodeUploadOriginalName } = require('../utils/filenameEncoding');
-const { assertAuditBatchCanUseGenericDelete, getImportAuditBatchDetail, parseStoredAuditJson } = require('./importAuditService');
+const {
+  assertAuditBatchCanUseGenericDelete,
+  getImportAuditBatchDetail,
+  parseStoredAuditJson,
+  projectBackupAuditMetadata
+} = require('./importAuditService');
+const backupService = require('./backupService');
 const { assertSupportedImportFile, parseImportFile } = require('./import/parser');
 const { buildEnergyTypeIndex, detectEnergyImportTemplateMismatch, validateAndNormalizeRow } = require('./import/normalization');
 const { findLedgerAssociationsForImportRecord, loadActiveLedgerIndexes } = require('./ledgerService');
@@ -13,6 +20,12 @@ const { findLedgerAssociationsForImportRecord, loadActiveLedgerIndexes } = requi
 const MAX_PAGE_SIZE = 500;
 const ENERGY_RECORD_IMPORT_TYPE = 'energy_record';
 const METER_READING_IMPORT_TYPE = 'meter_reading';
+// 导入批次删除备份原因用于生成可识别且受控的恢复快照。
+const IMPORT_BATCH_DELETE_BACKUP_REASON = 'import-batch-delete';
+// 导入批次删除操作编码用于持久化审计检索。
+const IMPORT_BATCH_DELETE_OPERATION = 'imports.batch.delete';
+// 导入批次删除审计对象类型用于统一标识被删除的批次。
+const IMPORT_BATCH_DELETE_TARGET_TYPE = 'import_batch';
 // 中央批次列表支持的导入类型与中文展示标签。
 const IMPORT_TYPE_LABELS = Object.freeze({
   energy_record: '能耗数据导入',
@@ -35,9 +48,34 @@ const IMPORT_TYPE_LABELS = Object.freeze({
   energy_benchmark: '能效对标导入',
   energy_flow_node: '能流节点导入',
   energy_flow_edge: '能流边导入',
-  energy_flow_record: '显式边值导入'
+  energy_flow_record: '显式边值导入',
+  energy_flow_workbook: '完整能流工作簿导入',
+  carbon_activity: '独立碳活动导入',
+  carbon_emission_report: '碳排放报告导入',
+  ghg_report: '温室气体报告导入'
 });
 const IMPORT_TYPE_VALUES = Object.freeze(Object.keys(IMPORT_TYPE_LABELS));
+// 特殊领域批次在通用导入查询入口仍需叠加领域权限，未知操作默认拒绝。
+const IMPORT_TYPE_DOMAIN_PERMISSIONS = Object.freeze({
+  energy_flow_workbook: Object.freeze({
+    view: 'energy:flows:view',
+    download: 'energy:flows:view'
+  }),
+  carbon_emission_report: Object.freeze({
+    view: 'carbon:emission-reports:view',
+    download: 'carbon:emission-reports:export'
+  }),
+  ghg_report: Object.freeze({
+    view: 'carbon:ghg-reports:view',
+    download: 'carbon:ghg-reports:export'
+  })
+});
+// 两类独立报告批次都必须在通用导入查询中使用显式安全 DTO。
+const RESTRICTED_REPORT_IMPORT_TYPES = Object.freeze(new Set([
+  'carbon_emission_report',
+  'ghg_report',
+  'energy_flow_workbook'
+]));
 
 function getNow() {
   return new Date().toISOString();
@@ -75,6 +113,79 @@ function getImportTypeLabel(importType) {
   return IMPORT_TYPE_LABELS[importType] || importType || IMPORT_TYPE_LABELS[ENERGY_RECORD_IMPORT_TYPE];
 }
 
+/** 返回通用导入入口针对特殊领域批次需要叠加的权限。 */
+function getImportTypeDomainPermission(importType, operation) {
+  const domainPermissions = IMPORT_TYPE_DOMAIN_PERMISSIONS[String(importType || '').trim()];
+  if (!domainPermissions) return null;
+  if (!Object.prototype.hasOwnProperty.call(domainPermissions, operation)) {
+    throw new AppError('IMPORT_BATCH_DOMAIN_OPERATION_FORBIDDEN', '该导入批次操作未配置领域权限，已默认拒绝。', {
+      statusCode: 403,
+      details: { operation }
+    });
+  }
+  return domainPermissions[operation];
+}
+
+/** 计算当前用户在通用列表中必须隐藏的特殊领域导入类型。 */
+function getRestrictedImportTypesForUser(userId, operation = 'view') {
+  if (isSuperAdmin(userId)) return [];
+  const grantedPermissions = new Set(getUserPermissions(userId));
+  return Object.keys(IMPORT_TYPE_DOMAIN_PERMISSIONS).filter((importType) => {
+    const requiredPermission = getImportTypeDomainPermission(importType, operation);
+    const requiredPermissions = Array.isArray(requiredPermission) ? requiredPermission : [requiredPermission];
+    return !requiredPermissions.every((permission) => grantedPermissions.has(permission));
+  });
+}
+
+/** 对详情、错误和原文件下载叠加特殊领域权限。 */
+function assertImportBatchDomainPermission(batchId, userId, operation = 'view') {
+  const numericBatchId = parseBatchId(batchId);
+  const db = openDatabase();
+  let batch;
+  try {
+    batch = db.prepare('SELECT id, import_type AS importType FROM import_batches WHERE id = ?').get(numericBatchId);
+  } finally {
+    db.close();
+  }
+  if (!batch) throw notFound('导入批次不存在。', { batchId: numericBatchId });
+  const requiredPermission = getImportTypeDomainPermission(batch.importType, operation);
+  if (!requiredPermission || isSuperAdmin(userId)) return batch;
+  const grantedPermissions = new Set(getUserPermissions(userId));
+  const requiredPermissions = Array.isArray(requiredPermission) ? requiredPermission : [requiredPermission];
+  if (!requiredPermissions.every((permission) => grantedPermissions.has(permission))) {
+    throw new AppError('FORBIDDEN', '当前账号没有访问该领域导入批次的权限。', {
+      statusCode: 403,
+      details: { requiredPermissions, mode: 'all' }
+    });
+  }
+  return batch;
+}
+
+/** 投影独立报告批次在通用列表中的安全字段，移除摘要和内部见证。 */
+function projectRestrictedReportBatchListRow(row) {
+  return {
+    id: row.id,
+    importType: row.importType,
+    importTypeLabel: row.importTypeLabel,
+    originalFilename: row.originalFilename,
+    displayFilename: row.displayFilename,
+    fileType: row.fileType,
+    fileSizeBytes: row.fileSizeBytes,
+    status: row.status,
+    auditPhase: row.auditPhase,
+    totalRows: row.totalRows,
+    successCount: row.successCount,
+    failureCount: row.failureCount,
+    skippedCount: row.skippedCount,
+    hasBackup: Boolean(row.hasBackup),
+    startedAt: row.startedAt,
+    finishedAt: row.finishedAt,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    errorSummary: row.errorSummary
+  };
+}
+
 function normalizeImportBatchRow(row) {
   if (!row || typeof row !== 'object') {
     return row;
@@ -91,7 +202,8 @@ function normalizeImportBatchRow(row) {
 }
 
 function assertImportBatchCanUseGenericDelete(batch) {
-  const importType = batch?.importType || ENERGY_RECORD_IMPORT_TYPE;
+  // 批次导入类型用于在通用审计白名单前保留抄表领域的明确错误提示。
+  const importType = batch?.importType || batch?.import_type || '';
   if (importType === METER_READING_IMPORT_TYPE) {
     throw badRequest('抄表导入批次禁止通过通用导入批次删除接口删除；请走抄表批次作废/追溯策略，避免 meter_reading_records.source_batch_id 追溯链路丢失。', {
       code: 'METER_READING_IMPORT_BATCH_DELETE_FORBIDDEN',
@@ -549,11 +661,52 @@ function getImportIssueSummaryRows(db, batchId) {
   ).all(batchId);
 }
 
+/** 构造独立报告批次通用详情安全 DTO，不透出内部文件名、摘要、签名或候选见证。 */
+function projectRestrictedReportBatchDetail(detail, issueSummary, numericBatchId) {
+  const normalizedDetail = normalizeImportBatchRow(detail);
+  return {
+    id: normalizedDetail.id,
+    importType: normalizedDetail.importType,
+    importTypeLabel: normalizedDetail.importTypeLabel,
+    originalFilename: normalizedDetail.originalFilename,
+    displayFilename: normalizedDetail.displayFilename,
+    fileType: normalizedDetail.fileType,
+    fileSizeBytes: normalizedDetail.fileSizeBytes,
+    status: normalizedDetail.status,
+    auditPhase: normalizedDetail.auditPhase,
+    counts: {
+      totalRows: normalizedDetail.totalRows,
+      successCount: normalizedDetail.successCount,
+      failureCount: normalizedDetail.failureCount,
+      skippedCount: normalizedDetail.skippedCount
+    },
+    issueCounts: normalizedDetail.issueCounts,
+    issueSummary,
+    errorSummary: normalizedDetail.errorSummary,
+    startedAt: normalizedDetail.startedAt,
+    finishedAt: normalizedDetail.finishedAt,
+    createdAt: normalizedDetail.createdAt,
+    updatedAt: normalizedDetail.updatedAt,
+    download: {
+      available: Boolean(detail.storedFilename),
+      url: `/api/imports/batches/${numericBatchId}/download`,
+      originalFilename: normalizedDetail.originalFilename,
+      fileType: normalizedDetail.fileType,
+      fileSizeBytes: normalizedDetail.fileSizeBytes
+    },
+    errorsUrl: `/api/imports/batches/${numericBatchId}/errors`
+  };
+}
+
 function getImportBatchQueryDetail(batchId) {
   const numericBatchId = parseBatchId(batchId);
   const detail = getImportAuditBatchDetail(numericBatchId, { includeIssues: false });
   const db = openDatabase();
   try {
+    const issueSummary = getImportIssueSummaryRows(db, numericBatchId);
+    if (RESTRICTED_REPORT_IMPORT_TYPES.has(detail.importType)) {
+      return projectRestrictedReportBatchDetail(detail, issueSummary, numericBatchId);
+    }
     return {
       ...normalizeImportBatchRow(detail),
       counts: {
@@ -562,7 +715,7 @@ function getImportBatchQueryDetail(batchId) {
         failureCount: detail.failureCount,
         skippedCount: detail.skippedCount
       },
-      issueSummary: getImportIssueSummaryRows(db, numericBatchId),
+      issueSummary,
       download: {
         available: Boolean(detail.storedFilename),
         url: `/api/imports/batches/${numericBatchId}/download`,
@@ -578,7 +731,7 @@ function getImportBatchQueryDetail(batchId) {
   }
 }
 
-function listImportBatches(query = {}) {
+function listImportBatches(query = {}, options = {}) {
   const { page, pageSize, offset } = parsePagination(query, { pageSize: 20, maxPageSize: 100 });
   const where = [];
   const params = {};
@@ -603,6 +756,17 @@ function listImportBatches(query = {}) {
   if (query.createdAtEnd) {
     where.push('created_at <= @createdAtEnd');
     params.createdAtEnd = query.createdAtEnd;
+  }
+  const excludedImportTypes = Array.isArray(options.excludedImportTypes)
+    ? [...new Set(options.excludedImportTypes.map((value) => String(value || '').trim()).filter(Boolean))]
+    : [];
+  if (excludedImportTypes.length > 0) {
+    const placeholders = excludedImportTypes.map((excludedImportType, index) => {
+      const parameterName = `excludedImportType${index}`;
+      params[parameterName] = excludedImportType;
+      return `@${parameterName}`;
+    });
+    where.push(`import_type NOT IN (${placeholders.join(', ')})`);
   }
 
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
@@ -637,56 +801,190 @@ function listImportBatches(query = {}) {
        LIMIT @pageSize OFFSET @offset`
     ).all({ ...params, pageSize, offset });
 
-    return { rows: rows.map(normalizeImportBatchRow), pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } };
+    const projectedRows = rows.map(normalizeImportBatchRow).map((row) => (
+      RESTRICTED_REPORT_IMPORT_TYPES.has(row.importType) ? projectRestrictedReportBatchListRow(row) : row
+    ));
+    return { rows: projectedRows, pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } };
   } finally {
     db.close();
   }
 }
 
-function deleteImportBatch(batchId) {
+/**
+ * 校验批次删除审计操作者，确保持久化审计可追溯到已认证用户。
+ * @param {object} options 删除服务选项。
+ * @returns {{ userId: number, username: string, displayName: string|null, ip: string|null }} 标准化操作者。
+ */
+function requireImportBatchDeleteActor(options = {}) {
+  // 原始操作者用于读取路由传入的认证上下文。
+  const sourceActor = options.actor || {};
+  // 数字用户 ID 用于写入操作审计外键。
+  const userId = Number(sourceActor.userId);
+  if (!Number.isSafeInteger(userId) || userId <= 0 || !String(sourceActor.username || '').trim()) {
+    throw badRequest('删除导入批次缺少合法的已认证操作者。', {
+      code: 'IMPORT_BATCH_DELETE_ACTOR_REQUIRED'
+    });
+  }
+  return {
+    userId,
+    username: String(sourceActor.username).trim(),
+    displayName: sourceActor.displayName === undefined || sourceActor.displayName === null
+      ? null
+      : String(sourceActor.displayName),
+    ip: sourceActor.ip === undefined || sourceActor.ip === null ? null : String(sourceActor.ip)
+  };
+}
+
+/**
+ * 构造删除前备份失败的稳定公开错误，避免原生异常详情进入 development HTTP 响应。
+ * @returns {AppError} 不含本机路径和底层错误消息的应用错误。
+ */
+function createImportBatchDeleteBackupFailedError() {
+  return new AppError(
+    'IMPORT_BATCH_DELETE_BACKUP_FAILED',
+    '删除前备份失败，已拒绝删除。',
+    {
+      statusCode: 500,
+      details: null
+    }
+  );
+}
+
+/**
+ * 在批次删除事务内写入持久化操作审计，审计失败会使业务删除整体回滚。
+ * @param {object} db 当前 SQLite 事务连接。
+ * @param {object} actor 标准化操作者。
+ * @param {number} batchId 被删除批次 ID。
+ * @param {object} detail 删除结果与恢复信息。
+ * @param {object} options 删除服务选项。
+ */
+function insertImportBatchDeleteAudit(db, actor, batchId, detail, options = {}) {
+  if (typeof options.beforeAuditInsert === 'function') {
+    options.beforeAuditInsert({
+      db,
+      operation: IMPORT_BATCH_DELETE_OPERATION,
+      targetType: IMPORT_BATCH_DELETE_TARGET_TYPE,
+      targetId: batchId,
+      detail
+    });
+  }
+  db.prepare(
+    `INSERT INTO sys_operation_logs
+       (user_id, operation, target_type, target_id, detail_json, ip)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(
+    actor.userId,
+    IMPORT_BATCH_DELETE_OPERATION,
+    IMPORT_BATCH_DELETE_TARGET_TYPE,
+    String(batchId),
+    JSON.stringify(detail),
+    actor.ip
+  );
+}
+
+/**
+ * 删除普通能耗导入批次，并在删除前创建备份、在同一事务记录操作审计。
+ * @param {string|number} batchId 导入批次 ID。
+ * @param {object} options 操作者、备份服务和测试故障注入选项。
+ * @returns {Promise<object>} 删除计数、安全备份标识和影响说明。
+ */
+async function deleteImportBatch(batchId, options = {}) {
   assertWritableAllowed('imports:delete-batch:service');
+  // 数字批次 ID 用于所有事务内查询和审计目标标识。
   const numericBatchId = parseBatchId(batchId);
+  // 标准化操作者用于保证删除成功时一定存在可追溯审计。
+  const actor = requireImportBatchDeleteActor(options);
+  // 可注入备份创建方法仅用于隔离测试故障，不改变生产默认服务。
+  const createBackup = options.createBackup || backupService.createBackup;
+  // 业务数据库连接用于锁定目标、删除业务数据并原子写审计。
   const db = openDatabase();
   try {
-    const transaction = db.transaction(() => {
-      const batch = db.prepare('SELECT id, import_type AS importType, original_filename AS originalFilename FROM import_batches WHERE id = ?').get(numericBatchId);
-      if (!batch) {
-        throw notFound('导入批次不存在。', { batchId: numericBatchId });
-      }
-      assertImportBatchCanUseGenericDelete(batch);
+    db.exec('BEGIN IMMEDIATE');
+    // 锁内批次快照用于避免校验后目标类型或文件信息发生变化。
+    const batch = db.prepare(
+      `SELECT id, import_type AS importType, original_filename AS originalFilename
+       FROM import_batches
+       WHERE id = ?`
+    ).get(numericBatchId);
+    if (!batch) {
+      throw notFound('导入批次不存在。', { batchId: numericBatchId });
+    }
+    assertImportBatchCanUseGenericDelete(batch);
 
-      const deletedErrors = db.prepare('SELECT COUNT(*) AS total FROM import_errors WHERE batch_id = ?').get(numericBatchId).total;
-      const deletedCarbonEmissions = db.prepare(
-        `SELECT COUNT(*) AS total
-         FROM carbon_emissions
-         WHERE energy_record_id IN (
-           SELECT id FROM energy_records WHERE source_batch_id = ?
-         )`
-      ).get(numericBatchId).total;
-      db.prepare(
-        `DELETE FROM carbon_emissions
-         WHERE energy_record_id IN (
-           SELECT id FROM energy_records WHERE source_batch_id = ?
-         )`
-      ).run(numericBatchId);
+    // 原始备份结果只在服务内使用，随后投影为不含绝对路径的安全元数据。
+    let rawBackup;
+    try {
+      rawBackup = await createBackup({
+        reason: IMPORT_BATCH_DELETE_BACKUP_REASON,
+        skipCheckpoint: true
+      });
+    } catch {
+      throw createImportBatchDeleteBackupFailedError();
+    }
+    // 安全备份元数据用于 API 响应和持久化审计，禁止泄漏数据库或备份目录绝对路径。
+    const backup = projectBackupAuditMetadata(rawBackup);
+    if (!backup || !String(backup.backupName || '').trim()) {
+      throw badRequest('删除前备份未返回可追溯的备份标识，已拒绝删除。', {
+        code: 'IMPORT_BATCH_DELETE_BACKUP_IDENTIFIER_REQUIRED'
+      });
+    }
 
-      const deletedEnergyRecords = db.prepare('DELETE FROM energy_records WHERE source_batch_id = ?').run(numericBatchId).changes;
-      db.prepare('DELETE FROM import_errors WHERE batch_id = ?').run(numericBatchId);
-      db.prepare('DELETE FROM import_batches WHERE id = ?').run(numericBatchId);
+    // 删除错误数量在删除前统计，用于响应和持久审计。
+    const deletedErrors = db.prepare('SELECT COUNT(*) AS total FROM import_errors WHERE batch_id = ?').get(numericBatchId).total;
+    // 关联旧碳结果数量在删除前统计，随后按既有顺序优先删除。
+    const deletedCarbonEmissions = db.prepare(
+      `SELECT COUNT(*) AS total
+       FROM carbon_emissions
+       WHERE energy_record_id IN (
+         SELECT id FROM energy_records WHERE source_batch_id = ?
+       )`
+    ).get(numericBatchId).total;
+    db.prepare(
+      `DELETE FROM carbon_emissions
+       WHERE energy_record_id IN (
+         SELECT id FROM energy_records WHERE source_batch_id = ?
+       )`
+    ).run(numericBatchId);
 
-      return {
-        batchId: numericBatchId,
-        originalFilename: decodeUploadOriginalName(batch.originalFilename),
-        deletedEnergyRecords,
-        deletedErrors,
-        deletedCarbonEmissions,
-        deletedImportBatches: 1,
-        deletedStoredFile: false,
-        predictionImpact: '历史能耗记录已变化，既有预测运行和结果不会自动删除；如需反映最新数据，请重新创建预测运行。'
-      };
-    });
+    // 删除能耗记录数量来自实际变更行数，避免只依赖批次成功计数。
+    const deletedEnergyRecords = db.prepare('DELETE FROM energy_records WHERE source_batch_id = ?').run(numericBatchId).changes;
+    db.prepare('DELETE FROM import_errors WHERE batch_id = ?').run(numericBatchId);
+    db.prepare('DELETE FROM import_batches WHERE id = ?').run(numericBatchId);
 
-    return transaction();
+    // 解码后的原文件名用于用户提示和审计，不包含本地存储路径。
+    const originalFilename = decodeUploadOriginalName(batch.originalFilename);
+    // 恢复说明用于明确备份只能由管理员按高风险恢复流程处理。
+    const recoveryInformation = `删除前备份为 ${backup.backupName}；如需恢复，请由具备备份恢复权限的管理员按整库恢复流程处理。`;
+    // 预测影响说明用于固定“不自动删除预测运行和结果”的领域边界。
+    const predictionImpact = '历史能耗记录已变化，既有预测运行和结果不会自动删除；如需反映最新数据，请重新创建预测运行。';
+    // 删除结果用于 API 响应和审计详情的同源数据。
+    const result = {
+      batchId: numericBatchId,
+      importType: batch.importType,
+      originalFilename,
+      deletedEnergyRecords,
+      deletedErrors,
+      deletedCarbonEmissions,
+      deletedImportBatches: 1,
+      deletedStoredFile: false,
+      backup,
+      recoveryInformation,
+      predictionImpact
+    };
+    // 审计详情记录操作者、批次、原文件、删除计数、备份标识和恢复边界。
+    const auditDetail = {
+      actorUsername: actor.username,
+      actorDisplayName: actor.displayName,
+      ...result
+    };
+    insertImportBatchDeleteAudit(db, actor, numericBatchId, auditDetail, options);
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    if (db.inTransaction) {
+      db.exec('ROLLBACK');
+    }
+    throw error;
   } finally {
     db.close();
   }
@@ -886,13 +1184,17 @@ function listEnergyRecords(query = {}) {
 
 module.exports = {
   ENERGY_RECORD_IMPORT_TYPE,
+  IMPORT_TYPE_DOMAIN_PERMISSIONS,
   METER_READING_IMPORT_TYPE,
   assertImportBatchCanUseGenericDelete,
+  assertImportBatchDomainPermission,
   createImportBatchFromUpload,
   deleteImportBatch,
   getImportBatchFileDownload,
   getImportBatchQueryDetail,
+  getImportTypeDomainPermission,
   getImportTypeLabel,
+  getRestrictedImportTypesForUser,
   listEnergyRecords,
   listImportBatches,
   listImportErrors,

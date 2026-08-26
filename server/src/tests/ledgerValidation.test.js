@@ -557,6 +557,7 @@ try {
   const meterFile = writeCsv('meters.csv', [
     'meter_code,meter_name,meter_type,energy_type_code,organization_unit_code,online_status,gateway_id,multiplier,allow_manual_reading,flow_direction,install_location,status,remark',
     'MT-1,一车间电表,electricity,electricity,UT-1,unknown,GW-1,1.5,1,input,配电室,active,成功行',
+    'MT-GAS,天然气表,natural_gas,natural_gas,ROOT,unknown,GW-GAS,1,1,input,动力站,active,能源编码别名应归一为 gas 类型',
     'EXIST-M,已存在电表,electricity,electricity,ROOT,unknown,,1,1,input,配电室,active,数据库重复应 skip',
     'MT-1,文件重复电表,electricity,electricity,UT-1,unknown,,1,1,input,配电室,active,同文件重复应 skip',
     'MT-BAD-ENERGY,未知能源表,electricity,missing_energy,UT-1,unknown,,1,1,input,配电室,active,能源类型不存在应失败',
@@ -568,8 +569,8 @@ try {
   assert.deepStrictEqual(meterBatch.summary, {
     batchId: meterBatch.id,
     status: 'completed_with_errors',
-    totalRows: 5,
-    successCount: 1,
+    totalRows: 6,
+    successCount: 2,
     failureCount: 2,
     skippedCount: 2,
     validationErrorCount: 2
@@ -578,6 +579,11 @@ try {
   assert(getErrorCodes(meterBatch).includes('DUPLICATE_METER_CODE_IN_FILE_SKIPPED'), '计量器具导入应记录同文件重复 skip warning。');
   assert(getErrorCodes(meterBatch).includes('UNKNOWN_ENERGY_TYPE'), '计量器具导入应记录能源类型不存在错误。');
   assert(getErrorCodes(meterBatch).includes('UNKNOWN_ORGANIZATION_UNIT'), '计量器具导入应记录用能单元不存在错误。');
+  // 核对计量器具导入只把 natural_gas 类型别名归一为 schema 允许的 gas。
+  const dbForImportedMeterAlias = openDatabase();
+  const importedGasMeter = dbForImportedMeterAlias.prepare("SELECT meter_type AS meterType FROM meter_devices WHERE meter_code = 'MT-GAS'").get();
+  dbForImportedMeterAlias.close();
+  assert.deepStrictEqual(importedGasMeter, { meterType: 'gas' }, 'natural_gas 计量器具导入别名必须持久化为 gas。');
 
   const meterExport = exportMeters({ format: 'csv', organizationUnitId: String(importedUnit.id) });
   assert.strictEqual(meterExport.format, 'csv');

@@ -58,11 +58,11 @@ export function resolveDashboardSummaryDomainState(domain = {}) {
     return createDashboardPanelState(DASHBOARD_PANEL_STATUS.FORBIDDEN);
   }
   if (domain?.authorized !== true) {
-    return createDashboardPanelState(DASHBOARD_PANEL_STATUS.ERROR, null, '驾驶舱摘要缺少明确的领域授权状态。');
+    return createDashboardPanelState(DASHBOARD_PANEL_STATUS.ERROR, null, '中控摘要缺少明确的领域授权状态。');
   }
   if (domain?.status === 'available') return createDashboardPanelState(DASHBOARD_PANEL_STATUS.SUCCESS);
   if (domain?.status === 'empty') return createDashboardPanelState(DASHBOARD_PANEL_STATUS.EMPTY);
-  return createDashboardPanelState(DASHBOARD_PANEL_STATUS.ERROR, null, '驾驶舱摘要返回了无法识别的领域状态。');
+  return createDashboardPanelState(DASHBOARD_PANEL_STATUS.ERROR, null, '中控摘要返回了无法识别的领域状态。');
 }
 
 /** 判断响应请求版本是否仍是当前版本，防止旧年度响应覆盖新筛选。 */

@@ -54,7 +54,8 @@ const EXPECTED_TEMPLATES = [
   ['energy-flow-models', 'energy-flow-model-import', 'energy_flow_model', ['energy_flow_model'], '确认导入能流模型', false],
   ['energy-flow-nodes', 'energy-flow-node-import', 'energy_flow_node', ['energy_flow_node'], '确认导入能流节点', false],
   ['energy-flow-edges', 'energy-flow-edge-bundle-import', 'energy_flow_edge_record_bundle', ['energy_flow_edge', 'energy_flow_record'], '确认导入能流边及显式边值', true],
-  ['energy-balance-configs', 'energy-balance-config-bundle-import', 'energy_balance_config_bundle', ['energy_balance_boundary', 'energy_balance_item'], '确认导入平衡边界及九角色项目', true]
+  ['energy-balance-configs', 'energy-balance-config-bundle-import', 'energy_balance_config_bundle', ['energy_balance_boundary', 'energy_balance_item'], '确认导入平衡边界及九角色项目', true],
+  ['suppliers', 'supplier-import', 'supplier', ['supplier'], '确认导入供应商台账', true]
 ];
 
 /**
@@ -180,7 +181,10 @@ function testTemplateContracts() {
   );
   ENERGY_ANALYSIS_IMPORT_TEMPLATES.forEach((template) => {
     assert.strictEqual(template.id, template.templateType);
-    assert.strictEqual(template.backupReason, 'energy-analysis-import');
+    assert.strictEqual(
+      template.backupReason,
+      template.id === 'suppliers' ? 'supplier-import' : 'energy-analysis-import'
+    );
     assert.strictEqual(Object.isFrozen(template), true);
     assert.strictEqual(Object.isFrozen(template.importTypes), true);
     assert.strictEqual(Object.isFrozen(template.targetTables), true);

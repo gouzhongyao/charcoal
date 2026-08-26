@@ -44,7 +44,8 @@ try {
     'dashboard:view', 'imports:view', 'energy:records:view', 'energy:budget:view',
     'ledger:units:view', 'ledger:meters:view', 'ledger:readings:view',
     'ledger:production-unit:view', 'ledger:production-output:view', 'ledger:generation:view',
-    'carbon:emissions:view', 'carbon:factors:view', 'prediction:config:view', 'prediction:run:view', 'prediction:result:view', 'system:backup:view'
+    'ledger:suppliers:view', 'carbon:emissions:view', 'carbon:factors:view',
+    'prediction:config:view', 'prediction:run:view', 'prediction:result:view', 'system:backup:view'
   ].forEach((permissionCode) => assert(adminProfile.permissions.includes(permissionCode), `超级管理员应拥有 ${permissionCode}`));
   const adminMenus = getUserMenus(signedIn.user.id);
   const menuByPath = new Map(adminMenus.map((menu) => [menu.routePath, menu]));
@@ -57,10 +58,12 @@ try {
   assert.strictEqual(importMenu.permissionCode, 'imports:view');
   assert.strictEqual(menuByPath.has('/imports'), false, '能耗数据导入不得保留顶层菜单。');
   assert.strictEqual(energyMenus.find((menu) => menu.routePath === '/energy/statistics').permissionCode, 'energy:records:view');
-  assert.strictEqual(menuByPath.get('/ledger').children.length, 6, '基础台账应包含五个既有台账二级菜单和发电自用菜单。');
+  assert.strictEqual(menuByPath.get('/ledger').children.length, 7, '基础台账应包含五个既有台账二级菜单、发电自用和供应商菜单。');
   const generationMenu = menuByPath.get('/ledger').children.find((menu) => menu.routePath === '/ledger/generation');
   assert.strictEqual(generationMenu.component, 'ledger/generation/index');
   assert.strictEqual(generationMenu.permissionCode, 'ledger:generation:view');
+  assert.strictEqual(menuByPath.get('/ledger').children.find((menu) => menu.routePath === '/ledger/suppliers').component, 'ledger/suppliers/index');
+  assert.strictEqual(menuByPath.get('/ledger').children.find((menu) => menu.routePath === '/ledger/suppliers').permissionCode, 'ledger:suppliers:view');
   assert.strictEqual(menuByPath.get('/system').children.find((menu) => menu.routePath === '/system/backups').component, 'system/backups/index');
   const legacyDb = openDatabase();
   const importMenuBeforeMigration = legacyDb.prepare("SELECT id FROM sys_menus WHERE permission_code = 'imports:view'").get();

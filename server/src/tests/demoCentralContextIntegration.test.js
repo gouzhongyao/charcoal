@@ -6,7 +6,6 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
-const XLSX = require('xlsx');
 
 // 中央 context 集成测试只使用系统临时目录中的隔离 SQLite、上传和备份目录。
 const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'charcoal-demo-central-context-'));
@@ -21,11 +20,8 @@ process.env.NODE_ENV = 'test';
 const { initDatabase, openDatabase } = require('../db/database');
 const { app } = require('../index');
 const { login } = require('../services/authService');
-const { createDemoContext, sha256Buffer } = require('../services/demoContextService');
+const { sha256Buffer } = require('../services/demoContextService');
 const { getDemoArtifactRegistration } = require('../services/demoArtifactRegistry');
-const { generateDemoParkArtifact } = require('../services/demoParkDatasetService');
-const { getOrCreateActiveDemoDatasetRun } = require('../services/demoRunService');
-const { toggleDemoRuntime } = require('../services/demoRuntimeService');
 const { getImportAuditBatchDetail } = require('../services/importAuditService');
 
 // 四组中央 context 代表性测试定义。
@@ -37,8 +33,7 @@ const TEST_CASES = Object.freeze([
     executePath: '/api/energy-analysis/imports/shift-definitions/execute',
     expectedRoles: ['primary'],
     expectedImportTypes: ['shift_definition'],
-    expectedBusinessTable: 'shift_definitions',
-    mutation: Object.freeze({ sheetName: '班次定义', cellAddress: 'B2', suffix: '（中央 context）' })
+    expectedBusinessTable: 'shift_definitions'
   }),
   Object.freeze({
     label: 'Benchmark 单批次',
@@ -47,8 +42,7 @@ const TEST_CASES = Object.freeze([
     executePath: '/api/energy-benchmarks/imports/conversion-factors/execute',
     expectedRoles: ['primary'],
     expectedImportTypes: ['energy_conversion_factor'],
-    expectedBusinessTable: 'energy_conversion_factors',
-    mutation: Object.freeze({ sheetName: '能源折标系数', cellAddress: 'H2', suffix: '（中央 context）' })
+    expectedBusinessTable: 'energy_conversion_factors'
   }),
   Object.freeze({
     label: 'Flow bundle',
@@ -57,8 +51,7 @@ const TEST_CASES = Object.freeze([
     executePath: '/api/energy-flow-imports/bundle/execute',
     expectedRoles: ['edge', 'record'],
     expectedImportTypes: ['energy_flow_edge', 'energy_flow_record'],
-    expectedBusinessTable: null,
-    mutation: Object.freeze({ sheetName: '显式边值', cellAddress: 'I2', suffix: ':central-context' })
+    expectedBusinessTable: null
   }),
   Object.freeze({
     label: 'Balance bundle',
@@ -67,8 +60,7 @@ const TEST_CASES = Object.freeze([
     executePath: '/api/energy-balance-imports/bundle/execute',
     expectedRoles: ['boundary', 'item'],
     expectedImportTypes: ['energy_balance_boundary', 'energy_balance_item'],
-    expectedBusinessTable: null,
-    mutation: Object.freeze({ sheetName: '平衡边界', cellAddress: 'B2', suffix: '（中央 context）' })
+    expectedBusinessTable: null
   })
 ]);
 
@@ -122,21 +114,6 @@ function requestMultipart(server, pathname, token, demoContextToken, filename, b
   });
 }
 
-/** 修改 generateDemoParkArtifact 产出的合法 XLSX 单元格，使上传 SHA 与下载 artifact SHA 不同。 */
-function mutateGeneratedWorkbook(generated, mutation) {
-  const workbook = XLSX.read(generated.buffer, { type: 'buffer', cellDates: false });
-  const worksheet = workbook.Sheets[mutation.sheetName];
-  assert(worksheet, `演示 artifact 缺少工作表 ${mutation.sheetName}`);
-  const cell = worksheet[mutation.cellAddress];
-  assert(cell && cell.v !== undefined, `演示 artifact 缺少单元格 ${mutation.sheetName}!${mutation.cellAddress}`);
-  const originalValue = String(cell.v);
-  cell.v = `${originalValue}${mutation.suffix}`;
-  cell.t = 's';
-  const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-  assert.notStrictEqual(sha256Buffer(buffer), sha256Buffer(generated.buffer), '修改后的合法工作簿 SHA 必须变化。');
-  return buffer;
-}
-
 /** 创建具备四组下载、预演和执行权限的真实非超级管理员账号。 */
 function createAuthorizedUser() {
   const db = openDatabase();
@@ -152,7 +129,7 @@ function createAuthorizedUser() {
       VALUES ('demo-central-context-role', '中央 context 集成角色', 'active', 0, ?, ?)`)
       .run(now, now).lastInsertRowid);
     db.prepare('INSERT INTO sys_user_roles (user_id, role_id, created_at) VALUES (?, ?, ?)').run(userId, roleId, now);
-    const permissionCodes = new Set();
+    const permissionCodes = new Set(['system:demo:download']);
     TEST_CASES.forEach((testCase) => {
       const registration = getDemoArtifactRegistration(testCase.artifactKey);
       assert(registration, `缺少 artifact 注册 ${testCase.artifactKey}`);
@@ -208,6 +185,37 @@ function readContextState(contextId) {
     const bindings = db.prepare(`SELECT import_batch_id AS batchId, batch_role AS batchRole
       FROM demo_run_import_batches WHERE context_id = ? ORDER BY batch_role, import_batch_id`).all(contextId);
     return { context, bindings };
+  } finally {
+    db.close();
+  }
+}
+
+/** 根据下载响应中的一次性 token 读取隔离库 context 主键与状态。 */
+function readContextStateByToken(token) {
+  const tokenHash = crypto.createHash('sha256').update(token, 'utf8').digest('hex');
+  const db = openDatabase();
+  let contextId;
+  try {
+    const row = db.prepare('SELECT context_id AS contextId FROM demo_import_contexts WHERE token_hash = ?').get(tokenHash);
+    assert(row, '真实下载必须在隔离库签发可查询的 context。');
+    contextId = row.contextId;
+  } finally {
+    db.close();
+  }
+  return { contextId, ...readContextState(contextId) };
+}
+
+/** 读取 managed 下载自动激活后的 runtime、run、context 与专用审计摘要。 */
+function readManagedDownloadGovernance() {
+  const db = openDatabase();
+  try {
+    return {
+      runtime: db.prepare(`SELECT enabled, runtime_epoch AS runtimeEpoch, revision, change_reason AS changeReason
+        FROM demo_runtime_settings WHERE id = 1`).get(),
+      runCount: db.prepare("SELECT COUNT(*) AS total FROM demo_dataset_runs WHERE status = 'active'").get().total,
+      contextCount: db.prepare('SELECT COUNT(*) AS total FROM demo_import_contexts').get().total,
+      autoEnableAuditCount: db.prepare("SELECT COUNT(*) AS total FROM sys_operation_logs WHERE operation = 'system.demo.runtime.auto-enable'").get().total
+    };
   } finally {
     db.close();
   }
@@ -307,32 +315,37 @@ function assertDatabaseEffects(testCase, preview, userId) {
   }
 }
 
-/** 执行一组中央 context 真实 HTTP preview/execute 集成测试。 */
-async function runCase(server, token, userId, runId, testCase) {
+/** 从真实 managed 下载开始执行一组中央 context HTTP preview/execute 集成测试。 */
+async function runCase(server, token, userId, testCase) {
   const registration = getDemoArtifactRegistration(testCase.artifactKey);
-  const generated = generateDemoParkArtifact(testCase.artifactKey, 'xlsx');
-  assert(generated, `${testCase.label} 必须由 generateDemoParkArtifact 生成。`);
-  const artifactSha = sha256Buffer(generated.buffer);
-  const uploadBuffer = mutateGeneratedWorkbook(generated, testCase.mutation);
-  const uploadSha = sha256Buffer(uploadBuffer);
-  assert.notStrictEqual(uploadSha, artifactSha, `${testCase.label} 上传 SHA 必须不同于下载 artifact SHA。`);
+  assert(registration, `${testCase.label} 必须存在 artifact 注册。`);
 
-  const issued = createDemoContext({
-    userId,
-    runId,
-    artifactKey: testCase.artifactKey,
-    handlerKey: registration.handlerKey,
-    artifactFileSha256: artifactSha
-  });
-  assert.strictEqual(readContextState(issued.contextId).context.status, 'issued');
+  const downloadResponse = await request(
+    server,
+    'GET',
+    `/api/templates/demo-park/${testCase.artifactKey}.xlsx`,
+    { token }
+  );
+  assert.strictEqual(downloadResponse.status, 200, `${testCase.label} 下载失败：${downloadResponse.text}`);
+  assert(downloadResponse.buffer.length > 0, `${testCase.label} 下载文件不能为空。`);
+  const issuedToken = String(downloadResponse.headers['x-demo-context'] || '');
+  const artifactSha = sha256Buffer(downloadResponse.buffer);
+  assert(/^[A-Za-z0-9_-]{43}$/.test(issuedToken), `${testCase.label} 必须返回一次性 X-Demo-Context。`);
+  assert.strictEqual(downloadResponse.headers['x-demo-artifact-key'], testCase.artifactKey);
+  assert.strictEqual(downloadResponse.headers['x-demo-handler-key'], registration.handlerKey);
+  assert.strictEqual(downloadResponse.headers['x-demo-artifact-sha256'], artifactSha);
+
+  const issued = readContextStateByToken(issuedToken);
+  assert.strictEqual(issued.context.status, 'issued');
+  assert.strictEqual(issued.context.artifactFileSha256, artifactSha);
 
   const previewResponse = await requestMultipart(
     server,
     testCase.previewPath,
     token,
-    issued.token,
-    generated.asciiFileName,
-    uploadBuffer
+    issuedToken,
+    `${testCase.artifactKey}.xlsx`,
+    downloadResponse.buffer
   );
   assert.strictEqual(previewResponse.status, 200, `${testCase.label} preview 失败：${previewResponse.text}`);
   const preview = previewResponse.body.data;
@@ -342,18 +355,17 @@ async function runCase(server, token, userId, runId, testCase) {
   const afterPreview = readContextState(issued.contextId);
   assert.strictEqual(afterPreview.context.status, 'previewed', `${testCase.label} context 必须 issued→previewed。`);
   assert.strictEqual(afterPreview.context.artifactFileSha256, artifactSha);
-  assert.strictEqual(afterPreview.context.uploadFileSha256, uploadSha);
-  assert.notStrictEqual(afterPreview.context.uploadFileSha256, afterPreview.context.artifactFileSha256);
+  assert.strictEqual(afterPreview.context.uploadFileSha256, artifactSha);
   assert.strictEqual(afterPreview.context.previewDigest, preview.previewAuditDigest);
   assert(afterPreview.context.previewedAt);
   assert.deepStrictEqual(afterPreview.bindings.map((binding) => binding.batchRole).sort(), [...testCase.expectedRoles].sort());
   assert.deepStrictEqual(afterPreview.bindings.map((binding) => binding.batchId).sort((a, b) => a - b), getPreviewBatchIds(testCase, preview).sort((a, b) => a - b));
 
-  await assertPersistentFileReread(server, token, issued.token, testCase, preview, issued.contextId);
+  await assertPersistentFileReread(server, token, issuedToken, testCase, preview, issued.contextId);
 
   const executeResponse = await request(server, 'POST', testCase.executePath, {
     token,
-    headers: { 'X-Demo-Context': issued.token },
+    headers: { 'X-Demo-Context': issuedToken },
     body: buildExecuteBody(testCase, preview)
   });
   assert.strictEqual(executeResponse.status, 200, `${testCase.label} execute 失败：${executeResponse.text}`);
@@ -376,16 +388,29 @@ async function runCase(server, token, userId, runId, testCase) {
     initDatabase();
     const authorizedUser = createAuthorizedUser();
     seedBundleDependencies();
-    toggleDemoRuntime({ enabled: true, actorUserId: authorizedUser.userId, actorIp: '127.0.0.1' });
-    const run = getOrCreateActiveDemoDatasetRun({ actorUserId: authorizedUser.userId });
+    const initialGovernance = readManagedDownloadGovernance();
+    assert.strictEqual(initialGovernance.runtime.enabled, 0, 'managed 下载前 runtime 必须保持初始关闭。');
+    assert.strictEqual(initialGovernance.runCount, 0, 'managed 下载前不得预建 active run。');
+    assert.strictEqual(initialGovernance.contextCount, 0, 'managed 下载前不得预签发 context。');
+    assert.strictEqual(initialGovernance.autoEnableAuditCount, 0, 'managed 下载前不得存在自动激活审计。');
+
     const token = login({ username: authorizedUser.username, password: authorizedUser.password }).token;
     server = await new Promise((resolve) => {
       const instance = app.listen(0, '127.0.0.1', () => resolve(instance));
     });
 
     for (const testCase of TEST_CASES) {
-      await runCase(server, token, authorizedUser.userId, run.runId, testCase);
+      await runCase(server, token, authorizedUser.userId, testCase);
     }
+
+    const finalGovernance = readManagedDownloadGovernance();
+    assert.strictEqual(finalGovernance.runtime.enabled, 1, '首个 managed 下载必须自动开启 runtime。');
+    assert.strictEqual(finalGovernance.runtime.changeReason, 'managed_download_auto_enable');
+    assert.strictEqual(finalGovernance.runtime.runtimeEpoch, initialGovernance.runtime.runtimeEpoch + 1);
+    assert.strictEqual(finalGovernance.runtime.revision, initialGovernance.runtime.revision + 1);
+    assert.strictEqual(finalGovernance.runCount, 1, '四次 managed 下载必须复用同一 active run。');
+    assert.strictEqual(finalGovernance.contextCount, TEST_CASES.length, '每个真实下载必须只签发一个 context。');
+    assert.strictEqual(finalGovernance.autoEnableAuditCount, 1, '重复 managed 下载不得重复自动激活或重复审计。');
 
     console.log('demo central context integration tests passed');
   } finally {

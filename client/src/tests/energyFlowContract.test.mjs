@@ -20,14 +20,13 @@ for (const endpoint of [
   '/models/${modelId}/nodes',
   '/models/${modelId}/edges',
   '/models/${modelId}/topology',
-  '/models/${modelId}/analysis',
-  '/models/preview',
-  '/models/execute',
-  '/nodes/preview',
-  '/nodes/execute',
-  '/bundle/preview',
-  '/bundle/execute'
+  '/models/${modelId}/analysis'
 ]) assert(apiSource.includes(endpoint), `API 应包含 ${endpoint}`);
+for (const routeSegment of ["routeSegment: 'models'", "routeSegment: 'nodes'", "routeSegment: 'bundle'"]) {
+  assert(apiSource.includes(routeSegment), `API 应声明受控导入路由 ${routeSegment}`);
+}
+assert(apiSource.includes('${ENERGY_FLOW_IMPORT_BASE_URL}/${contract.routeSegment}/preview'), 'API 应通过固定映射构造 preview 路由。');
+assert(apiSource.includes('${ENERGY_FLOW_IMPORT_BASE_URL}/${contract.routeSegment}/execute'), 'API 应通过固定映射构造 execute 路由。');
 for (const method of ["method: 'post'", "method: 'put'", "method: 'patch'"]) assert(apiSource.includes(method), `API 应包含 ${method}`);
 assert(apiSource.includes("data.append('file', file)"), '导入上传字段必须固定为 file。');
 assert(apiSource.includes("import { download, query, request } from '@/api/http';"), '能流模板和示例下载必须复用共享 HTTP download。');

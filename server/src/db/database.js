@@ -5,6 +5,17 @@ const {
   databaseAdmissionBlocked: createDatabaseAdmissionBlockedError,
   databasePoisoned: createDatabasePoisonedError
 } = require('../utils/errors');
+const {
+  buildSupplierCodeKey,
+  normalizeSupplierCodeDisplay
+} = require('../services/supplierContracts');
+const {
+  isEnergyFlowUtcSecond,
+  normalizeEnergyFlowKey,
+  normalizeEnergyFlowUtcSecond,
+  validateAndNormalizeEnergyFlowIdentityCode
+} = require('../services/energyAnalysisContracts');
+const { isStrictWallClockMinute } = require('../services/sourceWallClockService');
 
 const dataDir = process.env.DATA_DIR || path.resolve(__dirname, '../../../data');
 const uploadsDir = process.env.UPLOADS_DIR || path.join(dataDir, 'uploads');
@@ -26,7 +37,6 @@ const DATABASE_RESTORE_MARKER_VERSION = 1;
 const DATABASE_RESTORE_MARKER_PHASE = 'prepared';
 const DATABASE_RESTORE_MARKER_NAME = '.restore-in-progress.json';
 const DATABASE_RESTORE_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-
 // 导入批次保留全部历史类型，并为阶段 3 预留八类能源分析导入。
 const IMPORT_BATCH_TYPES = Object.freeze([
   'energy_record',
@@ -52,7 +62,12 @@ const IMPORT_BATCH_TYPES = Object.freeze([
   'strategy_rule',
   'energy_flow_model',
   'energy_balance_boundary',
-  'energy_balance_item'
+  'energy_balance_item',
+  'energy_flow_workbook',
+  'supplier',
+  'carbon_activity',
+  'carbon_emission_report',
+  'ghg_report'
 ]);
 
 // import_batches 重建 SQL 使用统一白名单，避免 schema 与旧库迁移枚举漂移。
@@ -61,6 +76,333 @@ const IMPORT_BATCH_TYPES_SQL = IMPORT_BATCH_TYPES.map((importType) => `'${import
 // 能源分析 schema 片段标记用于独立幂等迁移和失败回滚测试。
 const ENERGY_ANALYSIS_SCHEMA_START_MARKER = '-- ENERGY_ANALYSIS_SCHEMA_START';
 const ENERGY_ANALYSIS_SCHEMA_END_MARKER = '-- ENERGY_ANALYSIS_SCHEMA_END';
+
+// N8 canonical v2 九表、显式索引和空触发器集合共同构成完整结构指纹。
+const ENERGY_FLOW_TABLE_INDEXES = Object.freeze({
+  energy_flow_models: Object.freeze([
+    'ux_energy_flow_models_business_key',
+    'idx_energy_flow_models_effective',
+    'idx_energy_flow_models_batch'
+  ]),
+  energy_flow_assets: Object.freeze([
+    'ux_energy_flow_assets_code',
+    'idx_energy_flow_assets_model_type',
+    'idx_energy_flow_assets_batch'
+  ]),
+  energy_flow_paths: Object.freeze([
+    'ux_energy_flow_paths_code',
+    'idx_energy_flow_paths_model_status',
+    'idx_energy_flow_paths_batch'
+  ]),
+  energy_flow_nodes: Object.freeze([
+    'ux_energy_flow_nodes_code',
+    'idx_energy_flow_nodes_model_type',
+    'idx_energy_flow_nodes_asset',
+    'idx_energy_flow_nodes_batch'
+  ]),
+  energy_flow_edges: Object.freeze([
+    'ux_energy_flow_edges_code',
+    'ux_energy_flow_edges_path_sequence',
+    'idx_energy_flow_edges_model_type',
+    'idx_energy_flow_edges_path',
+    'idx_energy_flow_edges_batch'
+  ]),
+  energy_flow_records: Object.freeze([
+    'ux_energy_flow_records_code',
+    'idx_energy_flow_records_edge_range',
+    'idx_energy_flow_records_node_range',
+    'idx_energy_flow_records_model_stage',
+    'idx_energy_flow_records_path',
+    'idx_energy_flow_records_asset',
+    'idx_energy_flow_records_batch'
+  ]),
+  energy_flow_waste_heat_facts: Object.freeze([
+    'ux_energy_flow_waste_heat_code',
+    'ux_energy_flow_waste_heat_active_record',
+    'idx_energy_flow_waste_heat_model_role',
+    'idx_energy_flow_waste_heat_batch'
+  ]),
+  energy_flow_loss_facts: Object.freeze([
+    'ux_energy_flow_loss_facts_code',
+    'ux_energy_flow_loss_facts_active_record',
+    'idx_energy_flow_loss_facts_model_role',
+    'idx_energy_flow_loss_facts_batch'
+  ]),
+  energy_flow_loss_evidence: Object.freeze([
+    'ux_energy_flow_loss_evidence_code',
+    'ux_energy_flow_loss_evidence_active_benchmark',
+    'idx_energy_flow_loss_evidence_fact_role',
+    'idx_energy_flow_loss_evidence_range',
+    'idx_energy_flow_loss_evidence_batch'
+  ])
+});
+const ENERGY_FLOW_TABLES = Object.freeze(Object.keys(ENERGY_FLOW_TABLE_INDEXES));
+const ENERGY_FLOW_LEGACY_V1_TABLES = Object.freeze([
+  'energy_flow_models',
+  'energy_flow_nodes',
+  'energy_flow_edges',
+  'energy_flow_records'
+]);
+const ENERGY_FLOW_EXPECTED_TRIGGERS = Object.freeze([]);
+
+// 已知 v1 指纹仅用于机械迁移；任何列、约束、索引或触发器漂移都不得按已知旧库猜测处理。
+const ENERGY_FLOW_LEGACY_V1_SCHEMA_SQL = `CREATE TABLE energy_flow_models (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  model_code TEXT NOT NULL,
+  model_name TEXT NOT NULL,
+  source TEXT NOT NULL,
+  document_no TEXT,
+  version TEXT NOT NULL,
+  effective_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_start_utc) = 1),
+  effective_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE (model_code, version),
+  CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc))
+);
+CREATE TABLE energy_flow_nodes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  energy_flow_model_id INTEGER NOT NULL,
+  node_code TEXT NOT NULL,
+  node_name TEXT NOT NULL,
+  node_type TEXT NOT NULL CHECK (node_type IN ('source', 'process', 'storage', 'sink', 'loss', 'boundary')),
+  organization_unit_id INTEGER,
+  x REAL NOT NULL,
+  y REAL NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_flow_model_id) REFERENCES energy_flow_models(id) ON DELETE CASCADE,
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE SET NULL,
+  UNIQUE (energy_flow_model_id, node_code),
+  UNIQUE (energy_flow_model_id, id)
+);
+CREATE TABLE energy_flow_edges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  energy_flow_model_id INTEGER NOT NULL,
+  edge_code TEXT NOT NULL,
+  from_node_id INTEGER NOT NULL,
+  to_node_id INTEGER NOT NULL,
+  energy_type_id INTEGER NOT NULL,
+  unit TEXT NOT NULL,
+  source_type TEXT NOT NULL CHECK (source_type IN ('timeseries', 'monthly_energy', 'generation', 'explicit_edge_value')),
+  source_mapping_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_flow_model_id) REFERENCES energy_flow_models(id) ON DELETE CASCADE,
+  FOREIGN KEY (energy_flow_model_id, from_node_id) REFERENCES energy_flow_nodes(energy_flow_model_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (energy_flow_model_id, to_node_id) REFERENCES energy_flow_nodes(energy_flow_model_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+  UNIQUE (energy_flow_model_id, edge_code),
+  UNIQUE (energy_flow_model_id, id),
+  CHECK (from_node_id <> to_node_id),
+  CHECK (
+    CASE WHEN json_valid(source_mapping_json) = 1 THEN
+      json_type(source_mapping_json) = 'object'
+      AND typeof(json_extract(source_mapping_json, '$.reference')) = 'text'
+      AND trim(json_extract(source_mapping_json, '$.reference')) <> ''
+    ELSE 0 END
+  )
+);
+CREATE TABLE energy_flow_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  energy_flow_model_id INTEGER NOT NULL,
+  energy_flow_edge_id INTEGER NOT NULL,
+  start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(start_utc) = 1),
+  end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  original_unit TEXT NOT NULL,
+  original_value REAL NOT NULL CHECK (original_value >= 0),
+  source_type TEXT NOT NULL CHECK (source_type IN ('timeseries', 'monthly_energy', 'generation', 'explicit_edge_value')),
+  source_mapping_json TEXT NOT NULL,
+  formula_version TEXT NOT NULL,
+  record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
+  void_reason TEXT,
+  voided_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  FOREIGN KEY (energy_flow_model_id) REFERENCES energy_flow_models(id) ON DELETE RESTRICT,
+  FOREIGN KEY (energy_flow_model_id, energy_flow_edge_id) REFERENCES energy_flow_edges(energy_flow_model_id, id) ON DELETE RESTRICT,
+  CHECK (unixepoch(start_utc) < unixepoch(end_utc)),
+  CHECK (
+    CASE WHEN json_valid(source_mapping_json) = 1 THEN
+      json_type(source_mapping_json) = 'object'
+      AND typeof(json_extract(source_mapping_json, '$.reference')) = 'text'
+      AND trim(json_extract(source_mapping_json, '$.reference')) <> ''
+    ELSE 0 END
+  ),
+  CHECK (
+    (record_status = 'active' AND void_reason IS NULL AND voided_at IS NULL)
+    OR (
+      record_status = 'void'
+      AND trim(COALESCE(void_reason, '')) <> ''
+      AND is_strict_utc_iso(voided_at) = 1
+    )
+  )
+);
+CREATE INDEX idx_energy_flow_models_effective ON energy_flow_models(status, effective_start_utc, effective_end_utc);
+CREATE INDEX idx_energy_flow_nodes_model_type ON energy_flow_nodes(energy_flow_model_id, node_type, status);
+CREATE INDEX idx_energy_flow_nodes_batch ON energy_flow_nodes(source_batch_id);
+CREATE INDEX idx_energy_flow_edges_model_type ON energy_flow_edges(energy_flow_model_id, source_type, status);
+CREATE INDEX idx_energy_flow_edges_batch ON energy_flow_edges(source_batch_id);
+CREATE INDEX idx_energy_flow_records_edge_range ON energy_flow_records(energy_flow_edge_id, record_status, start_utc, end_utc);
+CREATE INDEX idx_energy_flow_records_batch ON energy_flow_records(source_batch_id);`;
+const ENERGY_FLOW_LEGACY_V1_TABLE_INDEXES = Object.freeze({
+  energy_flow_models: Object.freeze(['idx_energy_flow_models_effective']),
+  energy_flow_nodes: Object.freeze(['idx_energy_flow_nodes_model_type', 'idx_energy_flow_nodes_batch']),
+  energy_flow_edges: Object.freeze(['idx_energy_flow_edges_model_type', 'idx_energy_flow_edges_batch']),
+  energy_flow_records: Object.freeze(['idx_energy_flow_records_edge_range', 'idx_energy_flow_records_batch'])
+});
+const ENERGY_FLOW_LEGACY_V1_COLUMNS = Object.freeze({
+  energy_flow_models: Object.freeze([
+    'id', 'model_code', 'model_name', 'source', 'document_no', 'version',
+    'effective_start_utc', 'effective_end_utc', 'source_timezone', 'status', 'created_at', 'updated_at'
+  ]),
+  energy_flow_nodes: Object.freeze([
+    'id', 'source_batch_id', 'source_row_number', 'energy_flow_model_id', 'node_code',
+    'node_name', 'node_type', 'organization_unit_id', 'x', 'y', 'status', 'created_at', 'updated_at'
+  ]),
+  energy_flow_edges: Object.freeze([
+    'id', 'source_batch_id', 'source_row_number', 'energy_flow_model_id', 'edge_code',
+    'from_node_id', 'to_node_id', 'energy_type_id', 'unit', 'source_type',
+    'source_mapping_json', 'status', 'created_at', 'updated_at'
+  ]),
+  energy_flow_records: Object.freeze([
+    'id', 'source_batch_id', 'source_row_number', 'energy_flow_model_id', 'energy_flow_edge_id',
+    'start_utc', 'end_utc', 'source_timezone', 'original_unit', 'original_value', 'source_type',
+    'source_mapping_json', 'formula_version', 'record_status', 'void_reason', 'voided_at',
+    'created_at', 'updated_at'
+  ])
+});
+
+// 独立碳活动 schema 片段标记用于新旧库一致的幂等迁移和失败回滚测试。
+const CARBON_ACTIVITY_SCHEMA_START_MARKER = '-- CARBON_ACTIVITY_SCHEMA_START';
+const CARBON_ACTIVITY_SCHEMA_END_MARKER = '-- CARBON_ACTIVITY_SCHEMA_END';
+
+// 碳排放报告 schema 片段及五表 canonical contract 用于旧库安全幂等迁移。
+const CARBON_EMISSION_REPORT_SCHEMA_START_MARKER = '-- CARBON_EMISSION_REPORT_SCHEMA_START';
+const CARBON_EMISSION_REPORT_SCHEMA_END_MARKER = '-- CARBON_EMISSION_REPORT_SCHEMA_END';
+const CARBON_EMISSION_REPORT_TABLE_INDEXES = Object.freeze({
+  carbon_emission_reports: Object.freeze([
+    'idx_carbon_emission_reports_period',
+    'idx_carbon_emission_reports_organization',
+    'idx_carbon_emission_reports_batch'
+  ]),
+  carbon_emission_report_boundaries: Object.freeze(['idx_carbon_emission_report_boundaries_report']),
+  carbon_emission_report_evidence: Object.freeze(['idx_carbon_emission_report_evidence_report']),
+  carbon_emission_report_items: Object.freeze([
+    'idx_carbon_emission_report_items_filters',
+    'idx_carbon_emission_report_items_evidence'
+  ]),
+  carbon_emission_report_summaries: Object.freeze(['idx_carbon_emission_report_summaries_report'])
+});
+const CARBON_EMISSION_REPORT_TABLES = Object.freeze(Object.keys(CARBON_EMISSION_REPORT_TABLE_INDEXES));
+
+// 温室气体报告 schema 片段及六表 canonical contract 用于旧库安全幂等迁移。
+const GHG_REPORT_SCHEMA_START_MARKER = '-- GHG_REPORT_SCHEMA_START';
+const GHG_REPORT_SCHEMA_END_MARKER = '-- GHG_REPORT_SCHEMA_END';
+const GHG_REPORT_TABLE_INDEXES = Object.freeze({
+  ghg_reports: Object.freeze([
+    'idx_ghg_reports_period',
+    'idx_ghg_reports_organization',
+    'idx_ghg_reports_batch'
+  ]),
+  ghg_report_organization_boundaries: Object.freeze(['idx_ghg_report_organization_boundaries_report']),
+  ghg_report_operational_boundaries: Object.freeze(['idx_ghg_report_operational_boundaries_report']),
+  ghg_report_evidence: Object.freeze(['idx_ghg_report_evidence_report']),
+  ghg_report_items: Object.freeze([
+    'idx_ghg_report_items_filters',
+    'idx_ghg_report_items_evidence'
+  ]),
+  ghg_report_summaries: Object.freeze(['idx_ghg_report_summaries_report'])
+});
+const GHG_REPORT_TABLES = Object.freeze(Object.keys(GHG_REPORT_TABLE_INDEXES));
+// N7 六表 canonical contract 不包含任何触发器，防止旧库同名表通过隐式副作用写入其他领域。
+const GHG_REPORT_EXPECTED_TRIGGERS = Object.freeze([]);
+
+// 独立核算运行与结果表的 canonical contract 用于安全识别 N5-A 空骨架，禁止伪造已有历史。
+const CARBON_ACCOUNTING_TABLE_CONTRACTS = Object.freeze({
+  carbon_calculation_runs: {
+    columns: [
+      'id', 'run_code', 'snapshot_schema_version', 'source_type', 'status', 'calculation_method',
+      'start_utc', 'end_utc', 'activity_filter_json', 'actor_snapshot_json',
+      'activity_snapshot_digest', 'activity_count', 'result_count', 'calculated_count',
+      'factor_missing_count', 'emission_totals_json', 'created_by', 'started_at',
+      'completed_at', 'created_at'
+    ],
+    sqlTokens: [
+      'snapshot_schema_version = 1', "source_type = 'independent_activity'", "status = 'completed'",
+      "calculation_method = 'standard-factor'", "json_extract(activity_filter_json, '$.version') = 1",
+      "json_extract(actor_snapshot_json, '$.version') = 1", 'result_count = activity_count',
+      'calculated_count + factor_missing_count = result_count', 'REFERENCES sys_users(id)'
+    ],
+    foreignKeys: [
+      { from: 'created_by', table: 'sys_users', to: 'id', onDelete: 'SET NULL' }
+    ],
+    indexes: {
+      idx_carbon_calculation_runs_status_created: {
+        unique: false,
+        columns: ['source_type', 'status', 'completed_at', 'id'],
+        descending: [false, false, true, true]
+      },
+      idx_carbon_calculation_runs_period: {
+        unique: false,
+        columns: ['start_utc', 'end_utc', 'completed_at'],
+        descending: [false, false, true]
+      }
+    }
+  },
+  carbon_accounting_results: {
+    columns: [
+      'id', 'calculation_run_id', 'snapshot_schema_version', 'source_type', 'activity_record_id',
+      'carbon_factor_id', 'emission_scope', 'activity_category', 'organization_unit_id',
+      'energy_type_id', 'activity_start_wall_clock', 'activity_end_wall_clock',
+      'activity_start_utc', 'activity_end_utc', 'activity_value', 'activity_unit',
+      'requested_region', 'factor_year', 'factor_value', 'factor_unit', 'emission_value',
+      'emission_unit', 'status', 'missing_reason', 'calculation_basis', 'match_priority',
+      'activity_snapshot_json', 'organization_snapshot_json', 'energy_type_snapshot_json',
+      'factor_snapshot_json', 'matching_snapshot_json', 'formula_snapshot_json', 'created_at'
+    ],
+    sqlTokens: [
+      'snapshot_schema_version = 1', "source_type = 'independent_activity'",
+      "status IN ('calculated', 'factor_missing')", 'UNIQUE (calculation_run_id, activity_record_id)',
+      'REFERENCES carbon_calculation_runs(id)', "status = 'factor_missing'",
+      'emission_unit IS NULL', 'factor_snapshot_json IS NULL',
+      "json_extract(activity_snapshot_json, '$.version') = 1",
+      "json_extract(matching_snapshot_json, '$.version') = 1",
+      "json_extract(formula_snapshot_json, '$.version') = 1"
+    ],
+    foreignKeys: [
+      { from: 'calculation_run_id', table: 'carbon_calculation_runs', to: 'id', onDelete: 'CASCADE' }
+    ],
+    indexes: {
+      idx_carbon_accounting_results_activity: {
+        unique: false,
+        columns: ['activity_record_id', 'calculation_run_id']
+      },
+      idx_carbon_accounting_results_run_status: {
+        unique: false,
+        columns: ['calculation_run_id', 'status', 'id']
+      },
+      idx_carbon_accounting_results_filters: {
+        unique: false,
+        columns: ['calculation_run_id', 'emission_scope', 'organization_unit_id', 'energy_type_id', 'status']
+      }
+    }
+  }
+});
 
 // 演示治理 schema 片段标记用于旧库在完整 schema 执行前安全补齐治理表和外键依赖。
 const DEMO_GOVERNANCE_SCHEMA_START_MARKER = '-- DEMO_GOVERNANCE_SCHEMA_START';
@@ -432,6 +774,43 @@ END;`;
 // 两个规范来源触发器在迁移事务中统一创建。
 const BENCHMARK_TARGET_SOURCE_TRIGGERS_SQL = `${BENCHMARK_TARGET_SOURCE_INSERT_TRIGGER_SQL}\n\n${BENCHMARK_TARGET_SOURCE_UPDATE_TRIGGER_SQL}`;
 
+// 对标定义迁移使用 canonical 临时表，保留历史文号和兼容版本但解除外部标准文号必填约束。
+const BENCHMARK_DEFINITIONS_INTERNAL_REVISION_TABLE_SQL = `CREATE TABLE benchmark_definitions__migration_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  benchmark_code TEXT NOT NULL,
+  benchmark_name TEXT NOT NULL,
+  benchmark_type TEXT NOT NULL CHECK (benchmark_type IN ('external_standard', 'manual_benchmark', 'internal_history_baseline')),
+  metric_code TEXT NOT NULL,
+  unit TEXT NOT NULL,
+  period_type TEXT NOT NULL,
+  scope_type TEXT NOT NULL,
+  scope_reference TEXT NOT NULL,
+  direction TEXT NOT NULL CHECK (direction IN ('lower_better', 'higher_better', 'range')),
+  source TEXT NOT NULL,
+  document_no TEXT,
+  version TEXT NOT NULL,
+  internal_revision INTEGER NOT NULL CHECK (
+    typeof(internal_revision) = 'integer' AND internal_revision >= 1
+  ),
+  effective_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_start_utc) = 1),
+  effective_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_end_utc) = 1),
+  source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+  UNIQUE (benchmark_code, version),
+  CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc))
+);`;
+
+// 内部修订唯一索引在新库和历史库使用同一稳定名称。
+const BENCHMARK_INTERNAL_REVISION_INDEXES_SQL = `CREATE UNIQUE INDEX IF NOT EXISTS ux_benchmark_definitions_internal_revision
+  ON benchmark_definitions(benchmark_code, internal_revision);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_benchmark_targets_internal_revision
+  ON benchmark_targets(benchmark_definition_id, internal_revision);`;
+
 // 严格 UTC ISO 时间戳格式与阶段 1 契约保持一致。
 const STRICT_UTC_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 
@@ -556,6 +935,27 @@ const ENERGY_BUDGETS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS energy_budgets (
 CREATE INDEX IF NOT EXISTS idx_energy_budgets_month_type_status ON energy_budgets(period_month, energy_type_id, status);
 CREATE INDEX IF NOT EXISTS idx_energy_budgets_scope_status ON energy_budgets(organization_scope, status);
 CREATE INDEX IF NOT EXISTS idx_energy_budgets_batch ON energy_budgets(source_batch_id);`;
+
+// 供应商基础台账建表和索引分离，便于旧库安全重建规范编码键。
+const SUPPLIER_TABLE_SQL = `CREATE TABLE IF NOT EXISTS suppliers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  supplier_code TEXT NOT NULL,
+  supplier_code_key TEXT NOT NULL UNIQUE,
+  supplier_name TEXT NOT NULL,
+  address TEXT,
+  contact_person TEXT,
+  contact_phone TEXT,
+  remarks TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+  source_batch_id INTEGER,
+  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL
+);`;
+const SUPPLIER_INDEXES_SQL = `CREATE INDEX IF NOT EXISTS idx_suppliers_status_name ON suppliers(status, supplier_name, id);
+CREATE INDEX IF NOT EXISTS idx_suppliers_batch ON suppliers(source_batch_id);`;
+const SUPPLIER_TABLES_SQL = `${SUPPLIER_TABLE_SQL}\n${SUPPLIER_INDEXES_SQL}`;
 
 const PRODUCTION_TABLES_SQL = `CREATE TABLE IF NOT EXISTS production_units (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -901,6 +1301,12 @@ function isValidIanaTimezone(value) {
   }
 }
 
+/** 判断 N8 稳定编码是否符合共享的显示值、ASCII 和规范键合同。 */
+function isValidEnergyFlowCode(value) {
+  const validation = validateAndNormalizeEnergyFlowIdentityCode(value);
+  return validation.valid && validation.value === value;
+}
+
 /**
  * 判断 UTC 时间戳是否精确落在整分钟边界。
  * @param {*} value 待验证值。
@@ -979,8 +1385,23 @@ function registerEnergyAnalysisSqliteFunctions(db) {
   db.function('is_valid_iana_timezone', { deterministic: true }, (value) => (
     isValidIanaTimezone(value) ? 1 : 0
   ));
+  db.function('normalize_energy_flow_key', { deterministic: true }, normalizeEnergyFlowKey);
+  db.function('is_energy_flow_utc_second', { deterministic: true }, (value) => (
+    isEnergyFlowUtcSecond(value) ? 1 : 0
+  ));
+  db.function(
+    'normalize_energy_flow_utc_second',
+    { deterministic: true },
+    normalizeEnergyFlowUtcSecond
+  );
+  db.function('is_valid_energy_flow_code', { deterministic: true }, (value) => (
+    isValidEnergyFlowCode(value) ? 1 : 0
+  ));
   db.function('is_utc_minute_boundary', { deterministic: true }, (value) => (
     isUtcMinuteBoundary(value) ? 1 : 0
+  ));
+  db.function('is_strict_wall_clock_minute', { deterministic: true }, (value) => (
+    isStrictWallClockMinute(value) ? 1 : 0
   ));
   db.function('is_valid_factor_versions_json', { deterministic: true }, (value) => (
     isValidFactorVersionsJson(value) ? 1 : 0
@@ -1140,8 +1561,342 @@ function extractEnergyAnalysisSchemaSql(schemaText) {
   return schemaText.slice(startIndex + ENERGY_ANALYSIS_SCHEMA_START_MARKER.length, endIndex).trim();
 }
 
+/** 返回指定 N8 表挂载的全部触发器名称，canonical 集合固定为空。 */
+function getEnergyFlowTableTriggers(db, tableName) {
+  if (!ENERGY_FLOW_TABLES.includes(tableName)) return [];
+  return db.prepare(`SELECT name FROM sqlite_master
+    WHERE type = 'trigger' AND tbl_name = ? ORDER BY name`).all(tableName)
+    .map((row) => row.name);
+}
+
+/** 返回指定表由 CREATE INDEX 显式建立的索引名称，忽略 SQLite 自动唯一索引。 */
+function getEnergyFlowExplicitIndexNames(db, tableName) {
+  if (!getTableCreateSql(db, tableName)) return [];
+  return db.prepare(`PRAGMA index_list(${quoteSqlIdentifier(tableName)})`).all()
+    .filter((index) => index.origin === 'c')
+    .map((index) => index.name)
+    .sort();
+}
+
+/** 判断 N8 表的 CREATE、列属性、外键、CHECK、UNIQUE、显式索引和触发器是否完整 canonical。 */
+function energyFlowTableIsCanonical(db, tableName, energyAnalysisSql = null) {
+  if (!ENERGY_FLOW_TABLES.includes(tableName)) return false;
+  const createTableSql = getTableCreateSql(db, tableName);
+  if (!createTableSql) return false;
+  const canonicalSql = energyAnalysisSql || extractEnergyAnalysisSchemaSql(fs.readFileSync(schemaPath, 'utf8'));
+  const expectedTableSql = extractNamedCreateStatement(canonicalSql, 'table', tableName);
+  if (!expectedTableSql
+    || normalizeCanonicalCreateFingerprint(createTableSql) !== normalizeCanonicalCreateFingerprint(expectedTableSql)) {
+    return false;
+  }
+
+  const triggerNames = getEnergyFlowTableTriggers(db, tableName);
+  if (JSON.stringify(triggerNames) !== JSON.stringify(ENERGY_FLOW_EXPECTED_TRIGGERS)) return false;
+
+  const expectedIndexNames = [...ENERGY_FLOW_TABLE_INDEXES[tableName]].sort();
+  if (JSON.stringify(getEnergyFlowExplicitIndexNames(db, tableName)) !== JSON.stringify(expectedIndexNames)) return false;
+  return expectedIndexNames.every((indexName) => {
+    const actualIndexSql = db.prepare(`SELECT sql FROM sqlite_master
+      WHERE type = 'index' AND name = ? AND tbl_name = ?`).get(indexName, tableName)?.sql;
+    const expectedIndexSql = extractNamedCreateStatement(canonicalSql, 'index', indexName);
+    return Boolean(actualIndexSql && expectedIndexSql)
+      && normalizeCanonicalCreateFingerprint(actualIndexSql) === normalizeCanonicalCreateFingerprint(expectedIndexSql);
+  });
+}
+
+/** 判断当前四张旧表是否精确匹配项目已知 energy-flow v1 指纹。 */
+function energyFlowLegacyV1IsCanonical(db) {
+  return ENERGY_FLOW_LEGACY_V1_TABLES.every((tableName) => {
+    const actualTableSql = getTableCreateSql(db, tableName);
+    const expectedTableSql = extractNamedCreateStatement(ENERGY_FLOW_LEGACY_V1_SCHEMA_SQL, 'table', tableName);
+    if (!actualTableSql || !expectedTableSql
+      || normalizeCanonicalCreateFingerprint(actualTableSql) !== normalizeCanonicalCreateFingerprint(expectedTableSql)) {
+      return false;
+    }
+    if (JSON.stringify(getTableColumns(db, tableName)) !== JSON.stringify(ENERGY_FLOW_LEGACY_V1_COLUMNS[tableName])) {
+      return false;
+    }
+    if (getEnergyFlowTableTriggers(db, tableName).length > 0) return false;
+    const expectedIndexNames = [...ENERGY_FLOW_LEGACY_V1_TABLE_INDEXES[tableName]].sort();
+    if (JSON.stringify(getEnergyFlowExplicitIndexNames(db, tableName)) !== JSON.stringify(expectedIndexNames)) return false;
+    return expectedIndexNames.every((indexName) => {
+      const actualIndexSql = db.prepare(`SELECT sql FROM sqlite_master
+        WHERE type = 'index' AND name = ? AND tbl_name = ?`).get(indexName, tableName)?.sql;
+      const expectedIndexSql = extractNamedCreateStatement(ENERGY_FLOW_LEGACY_V1_SCHEMA_SQL, 'index', indexName);
+      return Boolean(actualIndexSql && expectedIndexSql)
+        && normalizeCanonicalCreateFingerprint(actualIndexSql) === normalizeCanonicalCreateFingerprint(expectedIndexSql);
+    });
+  }) && ENERGY_FLOW_TABLES
+    .filter((tableName) => !ENERGY_FLOW_LEGACY_V1_TABLES.includes(tableName))
+    .every((tableName) => !getTableCreateSql(db, tableName)
+      || Number(db.prepare(`SELECT COUNT(*) AS total FROM ${quoteSqlIdentifier(tableName)}`).get().total) === 0);
+}
+
+/** 返回 N8 九表作为子表或父表时涉及的全部全库外键违规。 */
+function getEnergyFlowForeignKeyViolations(db) {
+  return db.prepare('PRAGMA foreign_key_check').all()
+    .filter((violation) => (
+      ENERGY_FLOW_TABLES.includes(violation.table)
+      || ENERGY_FLOW_TABLES.includes(violation.parent)
+    ))
+    .map((violation) => ({
+      childTable: violation.table,
+      rowId: violation.rowid,
+      parentTable: violation.parent,
+      foreignKeyId: violation.fkid
+    }));
+}
+
+/** 创建不含本机路径、SQL 或原生驱动信息的稳定 N8 迁移错误。 */
+function createEnergyFlowMigrationError(code, message, details = undefined) {
+  const error = new Error(message);
+  error.code = code;
+  if (details !== undefined) error.details = details;
+  return error;
+}
+
+// v1 迁移摘要只允许下列业务时间发生 `.000Z` 到 `Z` 的无损规范化。
+const ENERGY_FLOW_LEGACY_UTC_SECOND_COLUMNS = Object.freeze({
+  energy_flow_models: Object.freeze(['effective_start_utc', 'effective_end_utc']),
+  energy_flow_records: Object.freeze(['start_utc', 'end_utc', 'voided_at'])
+});
+
 /**
- * 在单一事务内幂等创建能源分析表和索引，失败时回滚本次全部 DDL。
+ * 为 N8 v1 迁移摘要规范允许等价的零毫秒业务时间，其余字段逐值保留。
+ * @param {string} tableName 历史表名。
+ * @param {object[]} rows 历史行。
+ * @returns {object[]} 摘要行。
+ */
+function normalizeEnergyFlowLegacySnapshotRows(tableName, rows) {
+  const utcColumns = ENERGY_FLOW_LEGACY_UTC_SECOND_COLUMNS[tableName] || [];
+  if (utcColumns.length === 0) {
+    return rows;
+  }
+  return rows.map((row) => {
+    const normalizedRow = { ...row };
+    utcColumns.forEach((columnName) => {
+      if (normalizedRow[columnName] !== null && normalizedRow[columnName] !== undefined) {
+        normalizedRow[columnName] = normalizeEnergyFlowUtcSecond(normalizedRow[columnName]);
+      }
+    });
+    return normalizedRow;
+  });
+}
+
+/** 读取表的稳定历史快照摘要，用于迁移前后核对主键、行数和全部 v1 值。 */
+function buildEnergyFlowLegacySnapshot(db, tableName, columns = ENERGY_FLOW_LEGACY_V1_COLUMNS[tableName]) {
+  const rows = db.prepare(`SELECT ${columns.map(quoteSqlIdentifier).join(', ')}
+    FROM ${quoteSqlIdentifier(tableName)} ORDER BY id`).all();
+  const snapshotRows = normalizeEnergyFlowLegacySnapshotRows(tableName, rows);
+  return {
+    rowCount: rows.length,
+    primaryKeys: rows.map((row) => row.id),
+    digest: crypto.createHash('sha256').update(JSON.stringify(snapshotRows)).digest('hex')
+  };
+}
+
+/** 在复制前验证 v1 稳定键和新 canonical 上限，冲突时拒绝自动修补或猜测。 */
+function assertEnergyFlowLegacyDataCanMigrate(db) {
+  const invalidCounts = {
+    models: Number(db.prepare(`SELECT COUNT(*) AS total FROM energy_flow_models
+      WHERE is_valid_energy_flow_code(model_code) <> 1
+        OR length(trim(model_name)) NOT BETWEEN 1 AND 300
+        OR length(trim(source)) NOT BETWEEN 1 AND 1000
+        OR (document_no IS NOT NULL AND length(trim(document_no)) NOT BETWEEN 1 AND 300)
+        OR length(trim(version)) NOT BETWEEN 1 AND 64
+        OR normalize_energy_flow_utc_second(effective_start_utc) IS NULL
+        OR normalize_energy_flow_utc_second(effective_end_utc) IS NULL
+        OR length(trim(source_timezone)) NOT BETWEEN 1 AND 100`).get().total),
+    nodes: Number(db.prepare(`SELECT COUNT(*) AS total FROM energy_flow_nodes
+      WHERE is_valid_energy_flow_code(node_code) <> 1
+        OR length(trim(node_name)) NOT BETWEEN 1 AND 300
+        OR abs(x) > 1000000000 OR abs(y) > 1000000000
+        OR (source_row_number IS NOT NULL AND (typeof(source_row_number) <> 'integer' OR source_row_number < 1))`).get().total),
+    edges: Number(db.prepare(`SELECT COUNT(*) AS total FROM energy_flow_edges
+      WHERE is_valid_energy_flow_code(edge_code) <> 1
+        OR length(trim(unit)) NOT BETWEEN 1 AND 100
+        OR (source_row_number IS NOT NULL AND (typeof(source_row_number) <> 'integer' OR source_row_number < 1))`).get().total),
+    records: Number(db.prepare(`SELECT COUNT(*) AS total FROM energy_flow_records
+      WHERE length(trim(original_unit)) NOT BETWEEN 1 AND 100
+        OR abs(original_value) > 1000000000000000
+        OR normalize_energy_flow_utc_second(start_utc) IS NULL
+        OR normalize_energy_flow_utc_second(end_utc) IS NULL
+        OR (voided_at IS NOT NULL AND normalize_energy_flow_utc_second(voided_at) IS NULL)
+        OR length(trim(source_timezone)) NOT BETWEEN 1 AND 100
+        OR (source_row_number IS NOT NULL AND (typeof(source_row_number) <> 'integer' OR source_row_number < 1))`).get().total)
+  };
+  const normalizedCollisions = {
+    models: Number(db.prepare(`SELECT COUNT(*) AS total FROM (
+      SELECT normalize_energy_flow_key(model_code), normalize_energy_flow_key(version)
+      FROM energy_flow_models GROUP BY 1, 2 HAVING COUNT(*) > 1
+    )`).get().total),
+    nodes: Number(db.prepare(`SELECT COUNT(*) AS total FROM (
+      SELECT energy_flow_model_id, normalize_energy_flow_key(node_code)
+      FROM energy_flow_nodes GROUP BY 1, 2 HAVING COUNT(*) > 1
+    )`).get().total),
+    edges: Number(db.prepare(`SELECT COUNT(*) AS total FROM (
+      SELECT energy_flow_model_id, normalize_energy_flow_key(edge_code)
+      FROM energy_flow_edges GROUP BY 1, 2 HAVING COUNT(*) > 1
+    )`).get().total)
+  };
+  if (Object.values(invalidCounts).some((count) => count > 0)
+    || Object.values(normalizedCollisions).some((count) => count > 0)) {
+    throw createEnergyFlowMigrationError(
+      'N8_ENERGY_FLOW_LEGACY_CONFLICT',
+      '能流 v1 历史数据与 canonical v2 稳定约束冲突，拒绝自动修补。',
+      { invalidCounts, normalizedCollisions }
+    );
+  }
+}
+
+/** 按外键依赖逆序删除 N8 九表；空骨架和迁移临时重建均使用同一顺序。 */
+function dropEnergyFlowTables(db) {
+  [
+    'energy_flow_loss_evidence',
+    'energy_flow_loss_facts',
+    'energy_flow_waste_heat_facts',
+    'energy_flow_records',
+    'energy_flow_edges',
+    'energy_flow_nodes',
+    'energy_flow_paths',
+    'energy_flow_assets',
+    'energy_flow_models'
+  ].forEach((tableName) => db.exec(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(tableName)}`));
+}
+
+/** 将已知 v1 四表机械复制到 canonical v2，不推断路径、阶段、资产、记录编码或能源类型。 */
+function migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql) {
+  assertEnergyFlowLegacyDataCanMigrate(db);
+  const beforeSnapshots = Object.fromEntries(ENERGY_FLOW_LEGACY_V1_TABLES.map((tableName) => (
+    [tableName, buildEnergyFlowLegacySnapshot(db, tableName)]
+  )));
+
+  ENERGY_FLOW_LEGACY_V1_TABLES.forEach((tableName) => {
+    db.exec(`DROP TABLE IF EXISTS temp.${quoteSqlIdentifier(`${tableName}__n8_v1`)};
+      CREATE TEMP TABLE ${quoteSqlIdentifier(`${tableName}__n8_v1`)} AS
+      SELECT * FROM main.${quoteSqlIdentifier(tableName)} ORDER BY id;`);
+  });
+  dropEnergyFlowTables(db);
+  db.exec(energyAnalysisSql);
+
+  db.exec(`INSERT INTO energy_flow_models (
+      id, source_batch_id, source_row_number, model_code, model_name, source, document_no, version,
+      effective_start_wall_clock, effective_end_wall_clock, effective_start_utc, effective_end_utc,
+      source_timezone, classification_status, source_mode, status, created_at, updated_at
+    )
+    SELECT id, NULL, NULL, model_code, model_name, source, document_no, version,
+      NULL, NULL, normalize_energy_flow_utc_second(effective_start_utc),
+      normalize_energy_flow_utc_second(effective_end_utc), source_timezone,
+      'legacy_unclassified', 'legacy_explicit_sources', status, created_at, updated_at
+    FROM temp.energy_flow_models__n8_v1 ORDER BY id;
+    INSERT INTO energy_flow_nodes (
+      id, source_batch_id, source_row_number, energy_flow_model_id, energy_flow_asset_id,
+      node_code, node_name, node_type, stage_code, organization_unit_id, x, y,
+      status, created_at, updated_at
+    )
+    SELECT id, source_batch_id, source_row_number, energy_flow_model_id, NULL,
+      node_code, node_name, node_type, NULL, organization_unit_id, x, y,
+      status, created_at, updated_at
+    FROM temp.energy_flow_nodes__n8_v1 ORDER BY id;
+    INSERT INTO energy_flow_edges (
+      id, source_batch_id, source_row_number, energy_flow_model_id, energy_flow_path_id,
+      path_sequence, edge_code, from_node_id, to_node_id, energy_type_id, unit,
+      source_type, source_reference, source_mapping_json, status, created_at, updated_at
+    )
+    SELECT id, source_batch_id, source_row_number, energy_flow_model_id, NULL,
+      NULL, edge_code, from_node_id, to_node_id, energy_type_id, unit,
+      source_type, NULL, source_mapping_json, status, created_at, updated_at
+    FROM temp.energy_flow_edges__n8_v1 ORDER BY id;
+    INSERT INTO energy_flow_records (
+      id, source_batch_id, source_row_number, energy_flow_model_id, record_code, record_role,
+      energy_flow_edge_id, energy_flow_node_id, energy_flow_path_id, energy_flow_asset_id,
+      stage_code, energy_type_id, start_wall_clock, end_wall_clock, start_utc, end_utc,
+      source_timezone, original_unit, original_value, source_type, source_reference,
+      source_mapping_json, formula_version, record_status, void_reason, voided_at,
+      created_at, updated_at
+    )
+    SELECT id, source_batch_id, source_row_number, energy_flow_model_id, NULL, NULL,
+      energy_flow_edge_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+      normalize_energy_flow_utc_second(start_utc), normalize_energy_flow_utc_second(end_utc),
+      source_timezone, original_unit, original_value, source_type, NULL,
+      source_mapping_json, formula_version, record_status, void_reason,
+      CASE WHEN voided_at IS NULL THEN NULL ELSE normalize_energy_flow_utc_second(voided_at) END,
+      created_at, updated_at
+    FROM temp.energy_flow_records__n8_v1 ORDER BY id;`);
+
+  const afterSnapshots = Object.fromEntries(ENERGY_FLOW_LEGACY_V1_TABLES.map((tableName) => (
+    [tableName, buildEnergyFlowLegacySnapshot(db, tableName)]
+  )));
+  const snapshotMismatch = ENERGY_FLOW_LEGACY_V1_TABLES.some((tableName) => (
+    JSON.stringify(beforeSnapshots[tableName]) !== JSON.stringify(afterSnapshots[tableName])
+  ));
+  const legacyClassificationCount = Number(db.prepare(`SELECT COUNT(*) AS total FROM energy_flow_models
+    WHERE classification_status <> 'legacy_unclassified' OR source_mode <> 'legacy_explicit_sources'
+      OR source_batch_id IS NOT NULL OR source_row_number IS NOT NULL
+      OR effective_start_wall_clock IS NOT NULL OR effective_end_wall_clock IS NOT NULL`).get().total);
+  const inferredFieldCount = Number(db.prepare(`SELECT
+      (SELECT COUNT(*) FROM energy_flow_nodes WHERE energy_flow_asset_id IS NOT NULL OR stage_code IS NOT NULL)
+      + (SELECT COUNT(*) FROM energy_flow_edges WHERE energy_flow_path_id IS NOT NULL OR path_sequence IS NOT NULL OR source_reference IS NOT NULL)
+      + (SELECT COUNT(*) FROM energy_flow_records WHERE record_code IS NOT NULL OR record_role IS NOT NULL
+          OR energy_flow_node_id IS NOT NULL OR energy_flow_path_id IS NOT NULL OR energy_flow_asset_id IS NOT NULL
+          OR stage_code IS NOT NULL OR energy_type_id IS NOT NULL OR start_wall_clock IS NOT NULL
+          OR end_wall_clock IS NOT NULL OR source_reference IS NOT NULL) AS total`).get().total);
+  if (snapshotMismatch || legacyClassificationCount > 0 || inferredFieldCount > 0) {
+    throw createEnergyFlowMigrationError(
+      'N8_ENERGY_FLOW_MIGRATION_VALIDATION_FAILED',
+      '能流 v1 迁移后的历史值或 legacy 边界校验失败。'
+    );
+  }
+  ENERGY_FLOW_LEGACY_V1_TABLES.forEach((tableName) => {
+    db.exec(`DROP TABLE temp.${quoteSqlIdentifier(`${tableName}__n8_v1`)}`);
+  });
+  return true;
+}
+
+/** 非 canonical N8 结构仅允许空骨架重建或精确 v1 机械迁移，其他历史结构全部 fail-closed。 */
+function migrateEnergyFlowTables(db, energyAnalysisSql) {
+  const nonCanonicalTables = ENERGY_FLOW_TABLES.filter((tableName) => (
+    !energyFlowTableIsCanonical(db, tableName, energyAnalysisSql)
+  ));
+  if (nonCanonicalTables.length === 0) return false;
+
+  const populatedTables = ENERGY_FLOW_TABLES.filter((tableName) => {
+    if (!getTableCreateSql(db, tableName)) return false;
+    return Number(db.prepare(`SELECT COUNT(*) AS total FROM ${quoteSqlIdentifier(tableName)}`).get().total) > 0;
+  });
+  if (energyFlowLegacyV1IsCanonical(db)) {
+    try {
+      return migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql);
+    } catch (error) {
+      if (String(error?.code || '').startsWith('N8_ENERGY_FLOW_')) throw error;
+      throw createEnergyFlowMigrationError(
+        'N8_ENERGY_FLOW_LEGACY_CONFLICT',
+        '能流 v1 历史数据无法无损迁移到 canonical v2。'
+      );
+    }
+  }
+
+  if (populatedTables.length > 0) {
+    const unknownTriggers = ENERGY_FLOW_TABLES.flatMap((tableName) => (
+      getEnergyFlowTableTriggers(db, tableName).map((triggerName) => ({ tableName, triggerName }))
+    ));
+    const explicitIndexes = Object.fromEntries(ENERGY_FLOW_TABLES
+      .filter((tableName) => getTableCreateSql(db, tableName))
+      .map((tableName) => [tableName, getEnergyFlowExplicitIndexNames(db, tableName)]));
+    throw createEnergyFlowMigrationError(
+      'N8_ENERGY_FLOW_NON_CANONICAL_DATA',
+      '能流历史表含业务数据且结构不属于已知 v1 或 canonical v2，拒绝自动迁移。',
+      { populatedTables, nonCanonicalTables, unknownTriggers, explicitIndexes }
+    );
+  }
+
+  dropEnergyFlowTables(db);
+  db.exec(energyAnalysisSql);
+  return true;
+}
+
+/**
+ * 在单一事务内幂等创建能源分析表，并安全升级 N8 能流 canonical v2。
  * @param {object} db SQLite 数据库连接。
  * @param {string} schemaText 完整 schema 文本。
  * @returns {boolean} 调用前是否缺少能源分析主表。
@@ -1149,8 +1904,419 @@ function extractEnergyAnalysisSchemaSql(schemaText) {
 function ensureEnergyAnalysisTables(db, schemaText = fs.readFileSync(schemaPath, 'utf8')) {
   const tableExisted = Boolean(getTableCreateSql(db, 'energy_timeseries_records'));
   const energyAnalysisSql = extractEnergyAnalysisSchemaSql(schemaText);
-  db.transaction(() => {
+  runForeignKeySafeMigration(db, () => {
+    const existingViolations = getEnergyFlowForeignKeyViolations(db);
+    if (existingViolations.length > 0) {
+      throw createEnergyFlowMigrationError(
+        'N8_ENERGY_FLOW_FOREIGN_KEY_CHECK_FAILED',
+        '能流 canonical 迁移前外键检查失败。',
+        { foreignKeyViolations: existingViolations }
+      );
+    }
+    migrateEnergyFlowTables(db, energyAnalysisSql);
     db.exec(energyAnalysisSql);
+    const invalidTables = ENERGY_FLOW_TABLES.filter((tableName) => (
+      !energyFlowTableIsCanonical(db, tableName, energyAnalysisSql)
+    ));
+    if (invalidTables.length > 0) {
+      throw createEnergyFlowMigrationError(
+        'N8_ENERGY_FLOW_MIGRATION_VALIDATION_FAILED',
+        '能流表结构不符合 canonical v2 合同。',
+        { invalidTables }
+      );
+    }
+    const foreignKeyViolations = getEnergyFlowForeignKeyViolations(db);
+    if (foreignKeyViolations.length > 0) {
+      throw createEnergyFlowMigrationError(
+        'N8_ENERGY_FLOW_FOREIGN_KEY_CHECK_FAILED',
+        '能流 canonical 迁移后外键检查失败。',
+        { foreignKeyViolations }
+      );
+    }
+  });
+  return !tableExisted;
+}
+
+/**
+ * 从完整 schema 中提取独立碳活动建表片段。
+ * @param {string} schemaText 完整 schema 文本。
+ * @returns {string} 独立碳活动建表和索引 SQL。
+ */
+function extractCarbonActivitySchemaSql(schemaText) {
+  const startIndex = schemaText.indexOf(CARBON_ACTIVITY_SCHEMA_START_MARKER);
+  const endIndex = schemaText.indexOf(CARBON_ACTIVITY_SCHEMA_END_MARKER);
+  const hasDuplicateMarker = startIndex !== schemaText.lastIndexOf(CARBON_ACTIVITY_SCHEMA_START_MARKER)
+    || endIndex !== schemaText.lastIndexOf(CARBON_ACTIVITY_SCHEMA_END_MARKER);
+  if (startIndex < 0 || endIndex <= startIndex || hasDuplicateMarker) {
+    throw new Error('独立碳活动 schema 迁移片段标记缺失、重复或顺序错误。');
+  }
+  return schemaText.slice(startIndex + CARBON_ACTIVITY_SCHEMA_START_MARKER.length, endIndex).trim();
+}
+
+/** 从 schema 片段提取单条 CREATE TABLE/INDEX 语句，保留完整约束用于稳定指纹。 */
+function extractNamedCreateStatement(schemaSql, objectType, objectName) {
+  const escapedName = String(objectName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const objectTypePattern = objectType === 'index' ? '(?:unique\\s+)?index' : objectType;
+  const prefixPattern = new RegExp(
+    `create\\s+${objectTypePattern}\\s+(?:if\\s+not\\s+exists\\s+)?${escapedName}\\b`,
+    'i'
+  );
+  const match = prefixPattern.exec(schemaSql);
+  if (!match) return '';
+  let parenthesisDepth = 0;
+  let quoteCharacter = null;
+  for (let index = match.index; index < schemaSql.length; index += 1) {
+    const character = schemaSql[index];
+    if (quoteCharacter) {
+      if (character === quoteCharacter) {
+        if (schemaSql[index + 1] === quoteCharacter) {
+          index += 1;
+        } else {
+          quoteCharacter = null;
+        }
+      }
+      continue;
+    }
+    if (character === "'" || character === '"' || character === '`') {
+      quoteCharacter = character;
+    } else if (character === '(') {
+      parenthesisDepth += 1;
+    } else if (character === ')') {
+      parenthesisDepth -= 1;
+    } else if (character === ';' && parenthesisDepth === 0) {
+      return schemaSql.slice(match.index, index + 1);
+    }
+  }
+  return '';
+}
+
+/** 规范化 canonical CREATE 指纹，并忽略 SQLite 对 IF NOT EXISTS 的存储差异。 */
+function normalizeCanonicalCreateFingerprint(sql) {
+  return normalizeSqlContractText(sql)
+    .replace(/^create table if not exists /, 'create table ')
+    .replace(/^create index if not exists /, 'create index ')
+    .replace(/^create unique index if not exists /, 'create unique index ');
+}
+
+/** 验证外键字段、目标表/列和 ON DELETE 行为均与 canonical 结构一致。 */
+function carbonAccountingForeignKeysAreCanonical(db, tableName, expectedForeignKeys = []) {
+  const actualForeignKeys = db.prepare(`PRAGMA foreign_key_list(${quoteSqlIdentifier(tableName)})`).all()
+    .map((foreignKey) => ({
+      from: foreignKey.from,
+      table: foreignKey.table,
+      to: foreignKey.to,
+      onDelete: String(foreignKey.on_delete || '').toUpperCase()
+    }))
+    .sort((left, right) => `${left.from}:${left.table}:${left.to}`.localeCompare(`${right.from}:${right.table}:${right.to}`));
+  const normalizedExpected = expectedForeignKeys
+    .map((foreignKey) => ({ ...foreignKey, onDelete: String(foreignKey.onDelete).toUpperCase() }))
+    .sort((left, right) => `${left.from}:${left.table}:${left.to}`.localeCompare(`${right.from}:${right.table}:${right.to}`));
+  return JSON.stringify(actualForeignKeys) === JSON.stringify(normalizedExpected);
+}
+
+/** 判断独立核算运行或结果表是否完整匹配 canonical CREATE、外键和索引合同。 */
+function carbonAccountingTableIsCanonical(db, tableName, carbonActivitySql = null) {
+  const contract = CARBON_ACCOUNTING_TABLE_CONTRACTS[tableName];
+  const createTableSql = getTableCreateSql(db, tableName);
+  if (!contract || !createTableSql) return false;
+  const canonicalSql = carbonActivitySql || extractCarbonActivitySchemaSql(fs.readFileSync(schemaPath, 'utf8'));
+  const expectedTableSql = extractNamedCreateStatement(canonicalSql, 'table', tableName);
+  if (!expectedTableSql
+    || normalizeCanonicalCreateFingerprint(createTableSql) !== normalizeCanonicalCreateFingerprint(expectedTableSql)) {
+    return false;
+  }
+  const columns = getTableColumns(db, tableName);
+  if (columns.length !== contract.columns.length
+    || columns.some((columnName, index) => columnName !== contract.columns[index])) return false;
+  if (!carbonAccountingForeignKeysAreCanonical(db, tableName, contract.foreignKeys)) return false;
+  return Object.entries(contract.indexes).every(([indexName, indexContract]) => {
+    if (!demoGovernanceIndexIsCanonical(db, tableName, indexName, indexContract)) return false;
+    const actualIndexSql = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`).get(indexName)?.sql;
+    const expectedIndexSql = extractNamedCreateStatement(canonicalSql, 'index', indexName);
+    return Boolean(actualIndexSql && expectedIndexSql)
+      && normalizeCanonicalCreateFingerprint(actualIndexSql) === normalizeCanonicalCreateFingerprint(expectedIndexSql);
+  });
+}
+
+/**
+ * 将无业务数据的 N5-A 非 canonical 骨架替换为最终结构；已有运行或结果时必须安全失败。
+ * @param {object} db SQLite 数据库连接。
+ * @param {string} carbonActivitySql 独立碳活动完整 schema 片段。
+ * @returns {boolean} 是否执行骨架重建。
+ */
+function migrateCarbonAccountingRunTables(db, carbonActivitySql) {
+  const accountingTables = Object.keys(CARBON_ACCOUNTING_TABLE_CONTRACTS);
+  const nonCanonicalTables = accountingTables.filter((tableName) => (
+    !carbonAccountingTableIsCanonical(db, tableName, carbonActivitySql)
+  ));
+  if (nonCanonicalTables.length === 0) return false;
+
+  const populatedTables = accountingTables.filter((tableName) => {
+    if (!getTableCreateSql(db, tableName)) return false;
+    return Number(db.prepare(`SELECT COUNT(*) AS total FROM ${quoteSqlIdentifier(tableName)}`).get().total || 0) > 0;
+  });
+  if (populatedTables.length > 0) {
+    const error = new Error(`独立碳核算旧骨架含历史数据且结构不规范，拒绝自动迁移：${populatedTables.join(', ')}`);
+    error.code = 'CARBON_ACCOUNTING_NON_CANONICAL_DATA';
+    error.details = { populatedTables };
+    throw error;
+  }
+
+  db.exec('DROP TABLE IF EXISTS carbon_accounting_results');
+  db.exec('DROP TABLE IF EXISTS carbon_calculation_runs');
+  db.exec(carbonActivitySql);
+  const invalidTables = accountingTables.filter((tableName) => (
+    !carbonAccountingTableIsCanonical(db, tableName, carbonActivitySql)
+  ));
+  if (invalidTables.length > 0) {
+    throw new Error(`独立碳核算表结构不符合 canonical contract：${invalidTables.join(', ')}`);
+  }
+  return true;
+}
+
+/**
+ * 在单一事务内幂等创建独立碳活动事实，并安全升级空的计算运行与结果骨架。
+ * @param {object} db SQLite 数据库连接。
+ * @param {string} schemaText 完整 schema 文本。
+ * @returns {boolean} 调用前是否缺少独立碳活动主表。
+ */
+function ensureCarbonActivityTables(db, schemaText = fs.readFileSync(schemaPath, 'utf8')) {
+  const tableExisted = Boolean(getTableCreateSql(db, 'carbon_activity_records'));
+  const carbonActivitySql = extractCarbonActivitySchemaSql(schemaText);
+  db.transaction(() => {
+    migrateCarbonAccountingRunTables(db, carbonActivitySql);
+    db.exec(carbonActivitySql);
+  })();
+  return !tableExisted;
+}
+
+/** 从完整 schema 中提取碳排放报告五表和索引片段。 */
+function extractCarbonEmissionReportSchemaSql(schemaText) {
+  const startIndex = schemaText.indexOf(CARBON_EMISSION_REPORT_SCHEMA_START_MARKER);
+  const endIndex = schemaText.indexOf(CARBON_EMISSION_REPORT_SCHEMA_END_MARKER);
+  const hasDuplicateMarker = startIndex !== schemaText.lastIndexOf(CARBON_EMISSION_REPORT_SCHEMA_START_MARKER)
+    || endIndex !== schemaText.lastIndexOf(CARBON_EMISSION_REPORT_SCHEMA_END_MARKER);
+  if (startIndex < 0 || endIndex <= startIndex || hasDuplicateMarker) {
+    throw new Error('碳排放报告 schema 迁移片段标记缺失、重复或顺序错误。');
+  }
+  return schemaText.slice(startIndex + CARBON_EMISSION_REPORT_SCHEMA_START_MARKER.length, endIndex).trim();
+}
+
+/** 判断碳排放报告表及其显式索引是否完整匹配 canonical CREATE 指纹。 */
+function carbonEmissionReportTableIsCanonical(db, tableName, reportSchemaSql = null) {
+  if (!CARBON_EMISSION_REPORT_TABLES.includes(tableName)) return false;
+  const createTableSql = getTableCreateSql(db, tableName);
+  if (!createTableSql) return false;
+  const canonicalSql = reportSchemaSql || extractCarbonEmissionReportSchemaSql(fs.readFileSync(schemaPath, 'utf8'));
+  const expectedTableSql = extractNamedCreateStatement(canonicalSql, 'table', tableName);
+  if (!expectedTableSql
+    || normalizeCanonicalCreateFingerprint(createTableSql) !== normalizeCanonicalCreateFingerprint(expectedTableSql)) {
+    return false;
+  }
+  return CARBON_EMISSION_REPORT_TABLE_INDEXES[tableName].every((indexName) => {
+    const actualIndexSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?")
+      .get(indexName, tableName)?.sql;
+    const expectedIndexSql = extractNamedCreateStatement(canonicalSql, 'index', indexName);
+    return Boolean(actualIndexSql && expectedIndexSql)
+      && normalizeCanonicalCreateFingerprint(actualIndexSql) === normalizeCanonicalCreateFingerprint(expectedIndexSql);
+  });
+}
+
+/** 非 canonical 报告表仅在全部为空时允许整体重建；任何历史业务行都必须 fail-closed。 */
+function migrateCarbonEmissionReportTables(db, reportSchemaSql) {
+  const nonCanonicalTables = CARBON_EMISSION_REPORT_TABLES.filter((tableName) => (
+    !carbonEmissionReportTableIsCanonical(db, tableName, reportSchemaSql)
+  ));
+  if (nonCanonicalTables.length === 0) return false;
+
+  const populatedTables = CARBON_EMISSION_REPORT_TABLES.filter((tableName) => {
+    if (!getTableCreateSql(db, tableName)) return false;
+    return Number(db.prepare(`SELECT COUNT(*) AS total FROM ${quoteSqlIdentifier(tableName)}`).get().total || 0) > 0;
+  });
+  if (populatedTables.length > 0) {
+    const error = new Error(`碳排放报告旧骨架含历史数据且结构不规范，拒绝自动迁移：${populatedTables.join(', ')}`);
+    error.code = 'CARBON_EMISSION_REPORT_NON_CANONICAL_DATA';
+    error.details = { populatedTables, nonCanonicalTables };
+    throw error;
+  }
+
+  [
+    'carbon_emission_report_summaries',
+    'carbon_emission_report_items',
+    'carbon_emission_report_evidence',
+    'carbon_emission_report_boundaries',
+    'carbon_emission_reports'
+  ].forEach((tableName) => db.exec(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(tableName)}`));
+  db.exec(reportSchemaSql);
+  const invalidTables = CARBON_EMISSION_REPORT_TABLES.filter((tableName) => (
+    !carbonEmissionReportTableIsCanonical(db, tableName, reportSchemaSql)
+  ));
+  if (invalidTables.length > 0) {
+    throw new Error(`碳排放报告表结构不符合 canonical contract：${invalidTables.join(', ')}`);
+  }
+  return true;
+}
+
+/** 返回 N6 五表作为子表或父表时涉及的全部外键违规。 */
+function getCarbonEmissionReportForeignKeyViolations(db) {
+  return db.prepare('PRAGMA foreign_key_check').all()
+    .filter((violation) => (
+      CARBON_EMISSION_REPORT_TABLES.includes(violation.table)
+      || CARBON_EMISSION_REPORT_TABLES.includes(violation.parent)
+    ))
+    .map((violation) => ({
+      childTable: violation.table,
+      rowId: violation.rowid,
+      parentTable: violation.parent,
+      foreignKeyId: violation.fkid
+    }));
+}
+
+/** 在单一事务中幂等创建或安全升级碳排放报告五表，并验证全部出向和入向报告外键。 */
+function ensureCarbonEmissionReportTables(db, schemaText = fs.readFileSync(schemaPath, 'utf8')) {
+  const tableExisted = Boolean(getTableCreateSql(db, 'carbon_emission_reports'));
+  const reportSchemaSql = extractCarbonEmissionReportSchemaSql(schemaText);
+  db.transaction(() => {
+    const existingViolations = getCarbonEmissionReportForeignKeyViolations(db);
+    if (existingViolations.length > 0) {
+      const error = new Error('碳排放报告表迁移前外键检查失败。');
+      error.code = 'CARBON_EMISSION_REPORT_FOREIGN_KEY_CHECK_FAILED';
+      error.details = { foreignKeyViolations: existingViolations };
+      throw error;
+    }
+    migrateCarbonEmissionReportTables(db, reportSchemaSql);
+    db.exec(reportSchemaSql);
+    const foreignKeyViolations = getCarbonEmissionReportForeignKeyViolations(db);
+    if (foreignKeyViolations.length > 0) {
+      const error = new Error('碳排放报告表迁移后外键检查失败。');
+      error.code = 'CARBON_EMISSION_REPORT_FOREIGN_KEY_CHECK_FAILED';
+      error.details = { foreignKeyViolations };
+      throw error;
+    }
+  })();
+  return !tableExisted;
+}
+
+/** 从完整 schema 中提取温室气体报告六表和索引片段。 */
+function extractGhgReportSchemaSql(schemaText) {
+  const startIndex = schemaText.indexOf(GHG_REPORT_SCHEMA_START_MARKER);
+  const endIndex = schemaText.indexOf(GHG_REPORT_SCHEMA_END_MARKER);
+  const hasDuplicateMarker = startIndex !== schemaText.lastIndexOf(GHG_REPORT_SCHEMA_START_MARKER)
+    || endIndex !== schemaText.lastIndexOf(GHG_REPORT_SCHEMA_END_MARKER);
+  if (startIndex < 0 || endIndex <= startIndex || hasDuplicateMarker) {
+    throw new Error('温室气体报告 schema 迁移片段标记缺失、重复或顺序错误。');
+  }
+  return schemaText.slice(startIndex + GHG_REPORT_SCHEMA_START_MARKER.length, endIndex).trim();
+}
+
+/** 返回挂载到指定 N7 表的显式触发器名称，canonical contract 预期集合固定为空。 */
+function getGhgReportTableTriggers(db, tableName) {
+  if (!GHG_REPORT_TABLES.includes(tableName)) return [];
+  return db.prepare(`SELECT name FROM sqlite_master
+    WHERE type = 'trigger' AND tbl_name = ? ORDER BY name`).all(tableName)
+    .map((row) => row.name);
+}
+
+/** 判断温室气体报告表、显式索引及空触发器集合是否完整匹配 canonical CREATE 指纹。 */
+function ghgReportTableIsCanonical(db, tableName, reportSchemaSql = null) {
+  if (!GHG_REPORT_TABLES.includes(tableName)) return false;
+  const createTableSql = getTableCreateSql(db, tableName);
+  if (!createTableSql) return false;
+  const canonicalSql = reportSchemaSql || extractGhgReportSchemaSql(fs.readFileSync(schemaPath, 'utf8'));
+  const expectedTableSql = extractNamedCreateStatement(canonicalSql, 'table', tableName);
+  if (!expectedTableSql
+    || normalizeCanonicalCreateFingerprint(createTableSql) !== normalizeCanonicalCreateFingerprint(expectedTableSql)) {
+    return false;
+  }
+  const triggers = getGhgReportTableTriggers(db, tableName);
+  if (triggers.length !== GHG_REPORT_EXPECTED_TRIGGERS.length
+    || triggers.some((triggerName, index) => triggerName !== GHG_REPORT_EXPECTED_TRIGGERS[index])) {
+    return false;
+  }
+  return GHG_REPORT_TABLE_INDEXES[tableName].every((indexName) => {
+    const actualIndexSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?")
+      .get(indexName, tableName)?.sql;
+    const expectedIndexSql = extractNamedCreateStatement(canonicalSql, 'index', indexName);
+    return Boolean(actualIndexSql && expectedIndexSql)
+      && normalizeCanonicalCreateFingerprint(actualIndexSql) === normalizeCanonicalCreateFingerprint(expectedIndexSql);
+  });
+}
+
+/** 非 canonical 温室气体报告表仅在全部为空时允许整体重建；任何历史业务行都必须 fail-closed。 */
+function migrateGhgReportTables(db, reportSchemaSql) {
+  const nonCanonicalTables = GHG_REPORT_TABLES.filter((tableName) => (
+    !ghgReportTableIsCanonical(db, tableName, reportSchemaSql)
+  ));
+  if (nonCanonicalTables.length === 0) return false;
+
+  const populatedTables = GHG_REPORT_TABLES.filter((tableName) => {
+    if (!getTableCreateSql(db, tableName)) return false;
+    return Number(db.prepare(`SELECT COUNT(*) AS total FROM ${quoteSqlIdentifier(tableName)}`).get().total || 0) > 0;
+  });
+  if (populatedTables.length > 0) {
+    const unknownTriggers = GHG_REPORT_TABLES.flatMap((tableName) => (
+      getGhgReportTableTriggers(db, tableName).map((triggerName) => ({ tableName, triggerName }))
+    ));
+    const error = new Error(`温室气体报告旧骨架含历史数据且结构不规范，拒绝自动迁移：${populatedTables.join(', ')}`);
+    error.code = 'GHG_REPORT_NON_CANONICAL_DATA';
+    error.details = { populatedTables, nonCanonicalTables, unknownTriggers };
+    throw error;
+  }
+
+  [
+    'ghg_report_summaries',
+    'ghg_report_items',
+    'ghg_report_evidence',
+    'ghg_report_operational_boundaries',
+    'ghg_report_organization_boundaries',
+    'ghg_reports'
+  ].forEach((tableName) => db.exec(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(tableName)}`));
+  db.exec(reportSchemaSql);
+  const invalidTables = GHG_REPORT_TABLES.filter((tableName) => (
+    !ghgReportTableIsCanonical(db, tableName, reportSchemaSql)
+  ));
+  if (invalidTables.length > 0) {
+    throw new Error(`温室气体报告表结构不符合 canonical contract：${invalidTables.join(', ')}`);
+  }
+  return true;
+}
+
+/** 返回 N7 六表作为子表或父表时涉及的全部外键违规。 */
+function getGhgReportForeignKeyViolations(db) {
+  return db.prepare('PRAGMA foreign_key_check').all()
+    .filter((violation) => (
+      GHG_REPORT_TABLES.includes(violation.table)
+      || GHG_REPORT_TABLES.includes(violation.parent)
+    ))
+    .map((violation) => ({
+      childTable: violation.table,
+      rowId: violation.rowid,
+      parentTable: violation.parent,
+      foreignKeyId: violation.fkid
+    }));
+}
+
+/** 在单一事务中幂等创建或安全升级温室气体报告六表，并验证全部出向和入向报告外键。 */
+function ensureGhgReportTables(db, schemaText = fs.readFileSync(schemaPath, 'utf8')) {
+  const tableExisted = Boolean(getTableCreateSql(db, 'ghg_reports'));
+  const reportSchemaSql = extractGhgReportSchemaSql(schemaText);
+  db.transaction(() => {
+    const existingViolations = getGhgReportForeignKeyViolations(db);
+    if (existingViolations.length > 0) {
+      const error = new Error('温室气体报告表迁移前外键检查失败。');
+      error.code = 'GHG_REPORT_FOREIGN_KEY_CHECK_FAILED';
+      error.details = { foreignKeyViolations: existingViolations };
+      throw error;
+    }
+    migrateGhgReportTables(db, reportSchemaSql);
+    db.exec(reportSchemaSql);
+    const foreignKeyViolations = getGhgReportForeignKeyViolations(db);
+    if (foreignKeyViolations.length > 0) {
+      const error = new Error('温室气体报告表迁移后外键检查失败。');
+      error.code = 'GHG_REPORT_FOREIGN_KEY_CHECK_FAILED';
+      error.details = { foreignKeyViolations };
+      throw error;
+    }
   })();
   return !tableExisted;
 }
@@ -1216,18 +2382,206 @@ function demoGovernanceTableStructureIsCanonical(db, tableName) {
 }
 
 /**
- * 规范化 schema 契约文本，忽略引号与空白差异但保留列顺序和谓词语义。
+ * 规范化 schema 契约文本：仅折叠 SQL 语法空白和标识符差异，逐字节保留字符串字面量。
  * @param {string} sql SQL 文本。
  * @returns {string} 规范化 SQL。
  */
 function normalizeSqlContractText(sql) {
-  return String(sql || '')
-    .replace(/["`\[\]]/g, '')
-    .replace(/\s+/g, ' ')
-    .replace(/\s*([(),=<>])\s*/g, '$1')
-    .replace(/;\s*$/g, '')
-    .trim()
-    .toLowerCase();
+  const source = String(sql || '');
+  const tokens = [];
+  const multiCharacterOperators = Object.freeze([
+    '->>', '||', '<<', '>>', '<=', '>=', '==', '!=', '<>', '->'
+  ]);
+
+  /**
+   * 判断字符是否可作为 SQLite 普通标识符首字符。
+   * @param {string|undefined} character 待判断字符。
+   * @returns {boolean} 是否为标识符首字符。
+   */
+  function isIdentifierStart(character) {
+    return typeof character === 'string' && /^[\p{L}_]$/u.test(character);
+  }
+
+  /**
+   * 判断字符是否可作为 SQLite 普通标识符后续字符。
+   * @param {string|undefined} character 待判断字符。
+   * @returns {boolean} 是否为标识符后续字符。
+   */
+  function isIdentifierPart(character) {
+    return typeof character === 'string' && /^[\p{L}\p{N}_$]$/u.test(character);
+  }
+
+  /**
+   * 把不同 SQLite 标识符引号统一为无引号简单标识符或双引号复杂标识符。
+   * @param {string} identifier 标识符内容。
+   * @returns {string} canonical 标识符。
+   */
+  function normalizeQuotedIdentifier(identifier) {
+    const normalizedIdentifier = identifier.toLowerCase();
+    if (/^[\p{L}_][\p{L}\p{N}_$]*$/u.test(normalizedIdentifier)) {
+      return normalizedIdentifier;
+    }
+    return `"${normalizedIdentifier.replace(/"/g, '""')}"`;
+  }
+
+  /**
+   * 从指定位置读取单引号字符串，逐字节保留内容和转义。
+   * @param {number} startIndex 起始单引号位置。
+   * @returns {{token:string,nextIndex:number,terminated:boolean}} 字符串词元、下一位置和闭合状态。
+   */
+  function readStringLiteral(startIndex) {
+    let index = startIndex + 1;
+    let literal = "'";
+    let terminated = false;
+    while (index < source.length) {
+      literal += source[index];
+      if (source[index] === "'") {
+        if (source[index + 1] === "'") {
+          literal += source[index + 1];
+          index += 2;
+          continue;
+        }
+        index += 1;
+        terminated = true;
+        break;
+      }
+      index += 1;
+    }
+    return { token: literal, nextIndex: index, terminated };
+  }
+
+  /**
+   * 从指定位置读取 SQLite 数值词元，保留小数点和指数内部边界。
+   * @param {number} startIndex 数值起始位置。
+   * @returns {{token:string,nextIndex:number}} 数值词元和下一位置。
+   */
+  function readNumericToken(startIndex) {
+    let index = startIndex;
+    if (source[index] === '0' && /[xX]/.test(source[index + 1] || '')) {
+      index += 2;
+      while (index < source.length && /[0-9A-Fa-f_]/.test(source[index])) index += 1;
+      return { token: source.slice(startIndex, index).toLowerCase(), nextIndex: index };
+    }
+    if (source[index] === '.') index += 1;
+    while (index < source.length && /[0-9_]/.test(source[index])) index += 1;
+    if (source[index] === '.') {
+      index += 1;
+      while (index < source.length && /[0-9_]/.test(source[index])) index += 1;
+    }
+    const exponentStart = index;
+    if (/[eE]/.test(source[index] || '')) {
+      let exponentIndex = index + 1;
+      if (source[exponentIndex] === '+' || source[exponentIndex] === '-') exponentIndex += 1;
+      const digitStart = exponentIndex;
+      while (exponentIndex < source.length && /[0-9_]/.test(source[exponentIndex])) exponentIndex += 1;
+      if (exponentIndex > digitStart) index = exponentIndex;
+      else index = exponentStart;
+    }
+    return { token: source.slice(startIndex, index).toLowerCase(), nextIndex: index };
+  }
+
+  for (let index = 0; index < source.length;) {
+    const character = source[index];
+    const nextCharacter = source[index + 1];
+
+    if (/\s/.test(character)) {
+      index += 1;
+      continue;
+    }
+    if (character === '-' && nextCharacter === '-') {
+      index += 2;
+      while (index < source.length && source[index] !== '\n' && source[index] !== '\r') index += 1;
+      continue;
+    }
+    if (character === '/' && nextCharacter === '*') {
+      const commentEnd = source.indexOf('*/', index + 2);
+      index = commentEnd === -1 ? source.length : commentEnd + 2;
+      continue;
+    }
+    if ((character === 'x' || character === 'X') && nextCharacter === "'") {
+      const literal = readStringLiteral(index + 1);
+      const literalBody = literal.token.endsWith("'")
+        ? literal.token.slice(1, -1)
+        : null;
+      const isValidBlob = literal.terminated
+        && literalBody !== null
+        && /^[0-9A-Fa-f]*$/.test(literalBody)
+        && literalBody.length % 2 === 0;
+      if (isValidBlob) {
+        tokens.push(`x'${literalBody.toUpperCase()}'`);
+      } else {
+        // 非法 BLOB 按原始字节保留，避免与合法 BLOB、其他非法写法或普通字符串假等价。
+        tokens.push(source.slice(index, literal.nextIndex));
+      }
+      index = literal.nextIndex;
+      continue;
+    }
+    if (character === "'") {
+      const literal = readStringLiteral(index);
+      tokens.push(literal.token);
+      index = literal.nextIndex;
+      continue;
+    }
+    if (character === '"' || character === '`' || character === '[') {
+      const closingCharacter = character === '[' ? ']' : character;
+      let identifier = '';
+      index += 1;
+      while (index < source.length) {
+        if (source[index] === closingCharacter) {
+          if (source[index + 1] === closingCharacter) {
+            identifier += closingCharacter;
+            index += 2;
+            continue;
+          }
+          index += 1;
+          break;
+        }
+        identifier += source[index];
+        index += 1;
+      }
+      tokens.push(normalizeQuotedIdentifier(identifier));
+      continue;
+    }
+    if (/\d/.test(character) || (character === '.' && /\d/.test(nextCharacter || ''))) {
+      const numericToken = readNumericToken(index);
+      tokens.push(numericToken.token);
+      index = numericToken.nextIndex;
+      continue;
+    }
+    if (isIdentifierStart(character)) {
+      let identifierEnd = index + 1;
+      while (identifierEnd < source.length && isIdentifierPart(source[identifierEnd])) identifierEnd += 1;
+      tokens.push(source.slice(index, identifierEnd).toLowerCase());
+      index = identifierEnd;
+      continue;
+    }
+    if (character === '?' && /\d/.test(nextCharacter || '')) {
+      let parameterEnd = index + 2;
+      while (parameterEnd < source.length && /\d/.test(source[parameterEnd])) parameterEnd += 1;
+      tokens.push(source.slice(index, parameterEnd));
+      index = parameterEnd;
+      continue;
+    }
+    if ([':', '@', '$'].includes(character) && isIdentifierStart(nextCharacter)) {
+      let parameterEnd = index + 2;
+      while (parameterEnd < source.length && isIdentifierPart(source[parameterEnd])) parameterEnd += 1;
+      // 命名参数名在 SQLite 中按原始字节保留，:Name 与 :name 不得假等价。
+      tokens.push(`${character}${source.slice(index + 1, parameterEnd)}`);
+      index = parameterEnd;
+      continue;
+    }
+    const operator = multiCharacterOperators.find((candidate) => source.startsWith(candidate, index));
+    if (operator) {
+      tokens.push(operator);
+      index += operator.length;
+      continue;
+    }
+    tokens.push(character.toLowerCase());
+    index += 1;
+  }
+
+  while (tokens[tokens.length - 1] === ';') tokens.pop();
+  return tokens.join(' ');
 }
 
 /**
@@ -1250,6 +2604,14 @@ function demoGovernanceIndexIsCanonical(db, tableName, indexName, contract) {
     .map((column) => column.name);
   if (indexColumns.length !== contract.columns.length
     || indexColumns.some((columnName, index) => columnName !== contract.columns[index])) return false;
+  if (Array.isArray(contract.descending)) {
+    const descendingFlags = db.prepare(`PRAGMA index_xinfo(${quoteSqlIdentifier(indexName)})`).all()
+      .filter((column) => Number(column.key) === 1)
+      .sort((left, right) => left.seqno - right.seqno)
+      .map((column) => Boolean(column.desc));
+    if (descendingFlags.length !== contract.descending.length
+      || descendingFlags.some((isDescending, index) => isDescending !== contract.descending[index])) return false;
+  }
   const normalizedIndexSql = normalizeSqlContractText(indexRow.sql);
   const whereMatch = normalizedIndexSql.match(/\bwhere\b([\s\S]*)$/);
   const actualWhere = whereMatch ? whereMatch[1].trim() : null;
@@ -2302,6 +3664,206 @@ function rebuildBenchmarkTargetsSourceForeignKey(db, createTableSql) {
 }
 
 /**
+ * 查找所有通过外键引用 benchmark_definitions 的非系统表。
+ * @param {object} db SQLite 数据库连接。
+ * @returns {string[]} 排序后的引用表名。
+ */
+function getBenchmarkDefinitionsInboundForeignKeyTables(db) {
+  const tableNames = db.prepare(`SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name NOT GLOB 'sqlite_*' AND name <> 'benchmark_definitions'
+    ORDER BY name`).all().map((table) => table.name);
+  return tableNames.filter((tableName) => db.prepare(
+    `PRAGMA foreign_key_list(${quoteSqlIdentifier(tableName)})`
+  ).all().some((foreignKey) => String(foreignKey.table || '').toLowerCase() === 'benchmark_definitions'));
+}
+
+/**
+ * 判断旧定义表是否仍包含外部标准文号必填约束。
+ * @param {string} createTableSql 建表 SQL。
+ * @returns {boolean} 是否仍有旧约束。
+ */
+function benchmarkDefinitionsRequireExternalDocumentNo(createTableSql) {
+  const normalizedSql = normalizeSqlContractText(createTableSql);
+  const legacyConstraintSql = normalizeSqlContractText(
+    "benchmark_type <> 'external_standard' OR document_no IS NOT NULL"
+  );
+  return normalizedSql.includes(legacyConstraintSql);
+}
+
+/**
+ * 校验内部修订列中的正整数和业务键唯一性，禁止静默改写已迁移结果。
+ * @param {object} db SQLite 数据库连接。
+ * @param {string} tableName 表名。
+ * @param {string} businessKeyColumn 业务键字段。
+ */
+function validateBenchmarkInternalRevisions(db, tableName, businessKeyColumn) {
+  const invalidRow = db.prepare(`SELECT id FROM ${quoteSqlIdentifier(tableName)}
+    WHERE typeof(internal_revision) <> 'integer' OR internal_revision < 1 LIMIT 1`).get();
+  if (invalidRow) {
+    throw new Error(`${tableName} 存在非法内部修订，记录 ID：${invalidRow.id}`);
+  }
+  const duplicateRow = db.prepare(`SELECT ${quoteSqlIdentifier(businessKeyColumn)} AS businessKey,
+      internal_revision AS internalRevision, COUNT(*) AS count
+    FROM ${quoteSqlIdentifier(tableName)}
+    GROUP BY ${quoteSqlIdentifier(businessKeyColumn)}, internal_revision
+    HAVING COUNT(*) > 1 LIMIT 1`).get();
+  if (duplicateRow) {
+    throw new Error(`${tableName} 存在重复内部修订：${JSON.stringify(duplicateRow)}`);
+  }
+}
+
+/**
+ * 安全重建对标定义表，保留主键、行数、历史文号、历史版本、索引和触发器。
+ * @param {object} db SQLite 数据库连接。
+ * @param {boolean} hasInternalRevision 旧表是否已有内部修订。
+ */
+function rebuildBenchmarkDefinitionsForInternalRevision(db, hasInternalRevision) {
+  const canonicalColumns = [
+    'id', 'source_batch_id', 'source_row_number', 'benchmark_code', 'benchmark_name',
+    'benchmark_type', 'metric_code', 'unit', 'period_type', 'scope_type', 'scope_reference',
+    'direction', 'source', 'document_no', 'version', 'internal_revision', 'effective_start_utc',
+    'effective_end_utc', 'source_timezone', 'status', 'created_at', 'updated_at'
+  ];
+  const requiredLegacyColumns = canonicalColumns.filter((columnName) => (
+    !['source_batch_id', 'source_row_number', 'internal_revision'].includes(columnName)
+  ));
+  const existingColumns = getTableColumns(db, 'benchmark_definitions');
+  const unsupportedColumns = existingColumns.filter((columnName) => !canonicalColumns.includes(columnName));
+  const missingRequiredColumns = requiredLegacyColumns.filter((columnName) => !existingColumns.includes(columnName));
+  if (unsupportedColumns.length > 0 || missingRequiredColumns.length > 0) {
+    throw new Error(`benchmark_definitions 字段集合无法安全重建：${JSON.stringify({ unsupportedColumns, missingRequiredColumns })}`);
+  }
+
+  const inboundTables = getBenchmarkDefinitionsInboundForeignKeyTables(db);
+  const unsupportedInboundTables = inboundTables.filter((tableName) => tableName !== 'benchmark_targets');
+  if (unsupportedInboundTables.length > 0) {
+    throw new Error(`benchmark_definitions 存在未知入向外键引用，禁止自动重建；引用表：${JSON.stringify(unsupportedInboundTables)}`);
+  }
+
+  const historicalSnapshot = db.prepare(`SELECT id, document_no AS documentNo, version
+    FROM benchmark_definitions ORDER BY id`).all();
+  const targetSnapshot = getTableCreateSql(db, 'benchmark_targets')
+    ? db.prepare('SELECT id, benchmark_definition_id AS benchmarkDefinitionId FROM benchmark_targets ORDER BY id').all()
+    : [];
+  const explicitIndexes = db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'index' AND tbl_name = 'benchmark_definitions' AND sql IS NOT NULL
+    ORDER BY name`).all().filter((index) => index.name !== 'ux_benchmark_definitions_internal_revision');
+  const tableTriggers = db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'trigger' AND tbl_name = 'benchmark_definitions' ORDER BY name`).all();
+  const dependentTriggers = db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'trigger' AND tbl_name <> 'benchmark_definitions'
+      AND instr(lower(COALESCE(sql, '')), 'benchmark_definitions') > 0
+    ORDER BY name`).all();
+  const sourceBatchExpression = existingColumns.includes('source_batch_id') ? 'source_batch_id' : 'NULL';
+  const sourceRowExpression = existingColumns.includes('source_row_number') ? 'source_row_number' : 'NULL';
+  const revisionExpression = hasInternalRevision
+    ? 'internal_revision'
+    : `ROW_NUMBER() OVER (
+        PARTITION BY benchmark_code ORDER BY created_at, id
+      )`;
+
+  db.exec('DROP TABLE IF EXISTS benchmark_definitions__migration_new');
+  db.exec(BENCHMARK_DEFINITIONS_INTERNAL_REVISION_TABLE_SQL);
+  db.exec(`INSERT INTO benchmark_definitions__migration_new (
+    id, source_batch_id, source_row_number, benchmark_code, benchmark_name, benchmark_type,
+    metric_code, unit, period_type, scope_type, scope_reference, direction, source, document_no,
+    version, internal_revision, effective_start_utc, effective_end_utc, source_timezone, status,
+    created_at, updated_at
+  ) SELECT
+    id, ${sourceBatchExpression}, ${sourceRowExpression}, benchmark_code, benchmark_name, benchmark_type,
+    metric_code, unit, period_type, scope_type, scope_reference, direction, source, document_no,
+    version, ${revisionExpression}, effective_start_utc, effective_end_utc, source_timezone, status,
+    created_at, updated_at
+  FROM benchmark_definitions`);
+  dependentTriggers.forEach((trigger) => db.exec(`DROP TRIGGER ${quoteSqlIdentifier(trigger.name)}`));
+  db.exec('DROP TABLE benchmark_definitions');
+  db.exec('ALTER TABLE benchmark_definitions__migration_new RENAME TO benchmark_definitions');
+  explicitIndexes.forEach((index) => db.exec(index.sql));
+  tableTriggers.forEach((trigger) => db.exec(trigger.sql));
+  dependentTriggers.forEach((trigger) => db.exec(trigger.sql));
+
+  const migratedSnapshot = db.prepare(`SELECT id, document_no AS documentNo, version
+    FROM benchmark_definitions ORDER BY id`).all();
+  if (JSON.stringify(migratedSnapshot) !== JSON.stringify(historicalSnapshot)) {
+    throw new Error('benchmark_definitions 重建后主键、历史文号或历史版本校验失败。');
+  }
+  if (getTableCreateSql(db, 'benchmark_targets')) {
+    const migratedTargetSnapshot = db.prepare(`SELECT id, benchmark_definition_id AS benchmarkDefinitionId
+      FROM benchmark_targets ORDER BY id`).all();
+    if (JSON.stringify(migratedTargetSnapshot) !== JSON.stringify(targetSnapshot)) {
+      throw new Error('benchmark_definitions 重建后目标主键或定义外键值发生变化。');
+    }
+    const definitionForeignKeys = db.prepare('PRAGMA foreign_key_list(benchmark_targets)').all()
+      .filter((foreignKey) => foreignKey.from === 'benchmark_definition_id');
+    if (definitionForeignKeys.length !== 1
+      || definitionForeignKeys[0].table !== 'benchmark_definitions'
+      || definitionForeignKeys[0].to !== 'id') {
+      throw new Error('benchmark_definitions 重建后 benchmark_targets 定义外键不符合契约。');
+    }
+  }
+}
+
+/**
+ * 为历史能效对标数据稳定回填内部修订，并解除外部标准文号必填约束。
+ * @param {object} db SQLite 数据库连接。
+ * @returns {boolean} 是否修改了表结构或历史修订。
+ */
+function migrateEnergyBenchmarkInternalRevisions(db) {
+  const definitionSql = getTableCreateSql(db, 'benchmark_definitions');
+  const targetSql = getTableCreateSql(db, 'benchmark_targets');
+  if (!definitionSql && !targetSql) return false;
+
+  let changed = false;
+  db.transaction(() => {
+    if (definitionSql) {
+      const definitionColumns = getTableColumns(db, 'benchmark_definitions');
+      const hasDefinitionRevision = definitionColumns.includes('internal_revision');
+      if (hasDefinitionRevision) {
+        validateBenchmarkInternalRevisions(db, 'benchmark_definitions', 'benchmark_code');
+      }
+      if (!hasDefinitionRevision || benchmarkDefinitionsRequireExternalDocumentNo(definitionSql)) {
+        rebuildBenchmarkDefinitionsForInternalRevision(db, hasDefinitionRevision);
+        changed = true;
+      }
+      validateBenchmarkInternalRevisions(db, 'benchmark_definitions', 'benchmark_code');
+    }
+
+    if (targetSql) {
+      const targetColumns = getTableColumns(db, 'benchmark_targets');
+      if (!targetColumns.includes('internal_revision')) {
+        db.exec(`ALTER TABLE benchmark_targets ADD COLUMN internal_revision INTEGER NOT NULL DEFAULT 1
+          CHECK (typeof(internal_revision) = 'integer' AND internal_revision >= 1)`);
+        db.exec(`WITH ranked AS (
+          SELECT id, ROW_NUMBER() OVER (
+            PARTITION BY benchmark_definition_id ORDER BY created_at, id
+          ) AS internal_revision
+          FROM benchmark_targets
+        )
+        UPDATE benchmark_targets SET internal_revision = (
+          SELECT ranked.internal_revision FROM ranked WHERE ranked.id = benchmark_targets.id
+        )`);
+        changed = true;
+      }
+      validateBenchmarkInternalRevisions(db, 'benchmark_targets', 'benchmark_definition_id');
+    }
+
+    if (getTableCreateSql(db, 'benchmark_definitions') && getTableCreateSql(db, 'benchmark_targets')) {
+      db.exec(BENCHMARK_INTERNAL_REVISION_INDEXES_SQL);
+    }
+    const definitionViolations = getTableCreateSql(db, 'benchmark_definitions')
+      ? db.prepare('PRAGMA foreign_key_check(benchmark_definitions)').all()
+      : [];
+    const targetViolations = getTableCreateSql(db, 'benchmark_targets')
+      ? db.prepare('PRAGMA foreign_key_check(benchmark_targets)').all()
+      : [];
+    if (definitionViolations.length > 0 || targetViolations.length > 0) {
+      throw new Error(`能效对标内部修订迁移后外键检查失败：${JSON.stringify({ definitionViolations, targetViolations })}`);
+    }
+  })();
+  return changed;
+}
+
+/**
  * 为阶段 2 旧库补充或修复对标目标导入来源列、外键、索引和成对约束触发器。
  * @param {object} db SQLite 数据库连接。
  * @param {string} triggerSql 来源一致性触发器 SQL，可用于隔离回滚验证。
@@ -2356,6 +3918,129 @@ function migrateBenchmarkTargetsImportSourceColumns(db, triggerSql = BENCHMARK_T
   return changed;
 }
 
+/** 检查 suppliers 的规范键是否由单列唯一约束保护。 */
+function supplierCodeKeyHasUniqueConstraint(db) {
+  return db.prepare("SELECT name, partial FROM pragma_index_list('suppliers') WHERE [unique] = 1").all()
+    .some((indexRow) => {
+      if (Number(indexRow.partial || 0) !== 0) return false;
+      const columns = db.prepare(`SELECT name FROM pragma_index_info('${String(indexRow.name).replace(/'/g, "''")}') ORDER BY seqno`).all();
+      return columns.length === 1 && columns[0].name === 'supplier_code_key';
+    });
+}
+
+/** 计算历史编码规范键并在碰撞时阻断迁移，禁止静默合并供应商。 */
+function normalizeHistoricalSupplierCodes(rows) {
+  const seenByKey = new Map();
+  return rows.map((row) => {
+    const supplierCode = normalizeSupplierCodeDisplay(row.supplierCode);
+    const supplierCodeKey = buildSupplierCodeKey(supplierCode);
+    if (!supplierCodeKey) {
+      const error = new Error(`供应商 ${row.id} 的历史编码为空，无法安全升级规范键。`);
+      error.code = 'SUPPLIER_CODE_KEY_MIGRATION_INVALID';
+      throw error;
+    }
+    const existing = seenByKey.get(supplierCodeKey);
+    if (existing) {
+      const error = new Error(`供应商编码规范键迁移冲突：${existing.supplierCode} 与 ${supplierCode}。`);
+      error.code = 'SUPPLIER_CODE_KEY_MIGRATION_CONFLICT';
+      error.details = {
+        supplierCodeKey,
+        supplierIds: [existing.id, Number(row.id)],
+        supplierCodes: [existing.supplierCode, supplierCode]
+      };
+      throw error;
+    }
+    const normalized = {
+      ...row,
+      id: Number(row.id),
+      storedSupplierCode: row.supplierCode,
+      supplierCode,
+      supplierCodeKey
+    };
+    seenByKey.set(supplierCodeKey, normalized);
+    return normalized;
+  });
+}
+
+/** 将旧 suppliers 表安全升级为显示编码与服务端规范键双字段结构。 */
+function migrateSupplierCodeKeys(db) {
+  if (!getTableCreateSql(db, 'suppliers')) {
+    db.exec(SUPPLIER_TABLES_SQL);
+    return true;
+  }
+
+  const columnRows = db.prepare("SELECT name, [notnull] AS isNotNull FROM pragma_table_info('suppliers')").all();
+  const columnNames = new Set(columnRows.map((column) => column.name));
+  const hasCodeKeyColumn = columnNames.has('supplier_code_key');
+  const rows = db.prepare(`SELECT id,
+    supplier_code AS supplierCode,
+    ${hasCodeKeyColumn ? 'supplier_code_key' : 'NULL'} AS storedSupplierCodeKey,
+    supplier_name AS supplierName,
+    address,
+    contact_person AS contactPerson,
+    contact_phone AS contactPhone,
+    remarks,
+    status,
+    source_batch_id AS sourceBatchId,
+    source_row_number AS sourceRowNumber,
+    created_at AS createdAt,
+    updated_at AS updatedAt
+    FROM suppliers ORDER BY id`).all();
+  const normalizedRows = normalizeHistoricalSupplierCodes(rows);
+  const codeKeyColumn = columnRows.find((column) => column.name === 'supplier_code_key');
+  const structureRequiresRebuild = !codeKeyColumn
+    || Number(codeKeyColumn.isNotNull) !== 1
+    || !supplierCodeKeyHasUniqueConstraint(db);
+  const dataRequiresRebuild = normalizedRows.some((row) => (
+    row.storedSupplierCode !== row.supplierCode
+      || row.storedSupplierCodeKey !== row.supplierCodeKey
+  ));
+
+  if (!structureRequiresRebuild && !dataRequiresRebuild) {
+    db.exec(SUPPLIER_INDEXES_SQL);
+    return false;
+  }
+  if (getTableCreateSql(db, 'suppliers_code_key_legacy')) {
+    const error = new Error('检测到未完成的供应商规范键迁移临时表，已阻断自动覆盖。');
+    error.code = 'SUPPLIER_CODE_KEY_MIGRATION_TEMP_TABLE_EXISTS';
+    throw error;
+  }
+
+  db.exec('ALTER TABLE suppliers RENAME TO suppliers_code_key_legacy');
+  db.exec(SUPPLIER_TABLE_SQL);
+  const insert = db.prepare(`INSERT INTO suppliers
+    (id, supplier_code, supplier_code_key, supplier_name, address, contact_person,
+     contact_phone, remarks, status, source_batch_id, source_row_number, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  normalizedRows.forEach((row) => {
+    insert.run(
+      row.id,
+      row.supplierCode,
+      row.supplierCodeKey,
+      row.supplierName,
+      row.address,
+      row.contactPerson,
+      row.contactPhone,
+      row.remarks,
+      row.status,
+      row.sourceBatchId,
+      row.sourceRowNumber,
+      row.createdAt,
+      row.updatedAt
+    );
+  });
+  db.exec('DROP TABLE suppliers_code_key_legacy');
+  db.exec(SUPPLIER_INDEXES_SQL);
+  const foreignKeyViolations = db.prepare('PRAGMA foreign_key_check(suppliers)').all();
+  if (foreignKeyViolations.length > 0) {
+    const error = new Error('供应商规范键迁移后外键检查失败。');
+    error.code = 'SUPPLIER_CODE_KEY_MIGRATION_FOREIGN_KEY_INVALID';
+    error.details = { violations: foreignKeyViolations };
+    throw error;
+  }
+  return true;
+}
+
 function migrateEnergyRecordLedgerColumns(db) {
   const createTableSql = getTableCreateSql(db, 'energy_records');
   if (!createTableSql) {
@@ -2363,6 +4048,7 @@ function migrateEnergyRecordLedgerColumns(db) {
   }
 
   db.exec(LEDGER_TABLES_SQL);
+  db.exec(SUPPLIER_TABLES_SQL);
   db.exec(PRODUCTION_TABLES_SQL);
   const addedImportType = addColumnIfMissing(
     db,
@@ -2495,6 +4181,14 @@ const DEMO_GOVERNANCE_PERMISSION_CODES = new Set([
   'system:demo:cleanup:execute'
 ]);
 
+// N7 四项权限行必须保持固定按钮合同；同码非 canonical 历史行必须 fail-closed，禁止继承其普通角色授权。
+const GHG_REPORT_PERMISSION_MENU_CONTRACTS = Object.freeze([
+  Object.freeze({ permissionCode: 'carbon:ghg-reports:view', menuName: '温室气体报告查看', sortOrder: 612 }),
+  Object.freeze({ permissionCode: 'carbon:ghg-reports:import:preview', menuName: '温室气体报告导入预演', sortOrder: 613 }),
+  Object.freeze({ permissionCode: 'carbon:ghg-reports:import:execute', menuName: '温室气体报告导入执行', sortOrder: 614 }),
+  Object.freeze({ permissionCode: 'carbon:ghg-reports:export', menuName: '温室气体报告导出', sortOrder: 615 })
+]);
+
 // 每项最后两个值依次为父菜单 route_path、是否在动态菜单可见；普通 user 保持个人资料最小权限。
 const RBAC_MENU_SEEDS = [
   ['directory', '系统管理', '/system', null, null, 'Setting', 100, null],
@@ -2508,11 +4202,14 @@ const RBAC_MENU_SEEDS = [
   ['button', '演示清理预演', null, null, 'system:demo:cleanup:preview', null, 1503, '/system/demo-data'],
   ['button', '演示清理执行', null, null, 'system:demo:cleanup:execute', null, 1504, '/system/demo-data'],
   ['menu', '个人中心', '/profile', 'profile/index', 'system:profile:update', 'UserFilled', 10, null, 0],
-  ['menu', '驾驶舱', '/dashboard', 'dashboard/index', 'dashboard:view', 'DataBoard', 20, null],
+  ['menu', '中控', '/dashboard', 'dashboard/index', 'dashboard:view', 'DataBoard', 20, null],
   ['directory', '能耗管理', '/energy', null, null, 'TrendCharts', 40, null],
   ['menu', '能耗统计', '/energy/statistics', 'energy/statistics/index', 'energy:records:view', 'Histogram', 41, '/energy'],
   ['menu', '用能预算', '/energy/budgets', 'energy/budgets/index', 'energy:budget:view', 'Wallet', 42, '/energy'],
   ['menu', '能耗数据导入', '/imports', 'imports/index', 'imports:view', 'UploadFilled', 43, '/energy'],
+  ['button', '上传普通能耗', null, null, 'imports:create', null, 1, '/imports'],
+  ['button', '删除普通能耗批次', null, null, 'imports:delete', null, 2, '/imports'],
+  ['button', '下载导入原文件', null, null, 'imports:download', null, 3, '/imports'],
   ['menu', '能源消费分析', '/energy/analysis', 'energy/analysis/index', 'energy:analysis:view', 'DataAnalysis', 44, '/energy'],
   ['button', '分析配置查看', null, null, 'energy:analysis:config:view', null, 4401, '/energy/analysis'],
   ['button', '排班配置维护', null, null, 'energy:analysis:shift:manage', null, 4402, '/energy/analysis'],
@@ -2550,11 +4247,32 @@ const RBAC_MENU_SEEDS = [
   ['menu', '生产单元', '/ledger/production-units', 'ledger/production-units/index', 'ledger:production-unit:view', 'Box', 54, '/ledger'],
   ['menu', '月度产量', '/ledger/production-output', 'ledger/production-output/index', 'ledger:production-output:view', 'Tickets', 55, '/ledger'],
   ['menu', '发电自用', '/ledger/generation', 'ledger/generation/index', 'ledger:generation:view', 'Lightning', 56, '/ledger'],
+  ['menu', '供应商管理', '/ledger/suppliers', 'ledger/suppliers/index', 'ledger:suppliers:view', 'Van', 57, '/ledger'],
+  ['button', '供应商新增', null, null, 'ledger:suppliers:create', null, 571, '/ledger/suppliers'],
+  ['button', '供应商编辑', null, null, 'ledger:suppliers:update', null, 572, '/ledger/suppliers'],
+  ['button', '供应商合作状态', null, null, 'ledger:suppliers:status', null, 573, '/ledger/suppliers'],
+  ['button', '供应商导入预演', null, null, 'ledger:suppliers:import:preview', null, 574, '/ledger/suppliers'],
+  ['button', '供应商导入执行', null, null, 'ledger:suppliers:import:execute', null, 575, '/ledger/suppliers'],
+  ['button', '供应商导出', null, null, 'ledger:suppliers:export', null, 576, '/ledger/suppliers'],
   ['button', '产能单元模板下载', null, null, 'ledger:production:template', null, 541, '/ledger/production-units'],
   ['button', '产能单元导入', null, null, 'ledger:production:import', null, 542, '/ledger/production-units'],
   ['button', '产能单元导出', null, null, 'ledger:production:export', null, 543, '/ledger/production-units'],
   ['menu', '碳核算', '/carbon', 'carbon/index', 'carbon:emissions:view', 'WindPower', 60, null],
   ['button', '碳因子查看', null, null, 'carbon:factors:view', null, 601, '/carbon'],
+  ['button', '旧能耗碳排放导出', null, null, 'carbon:emissions:export', null, 607, '/carbon'],
+  ['button', '独立碳活动查看', null, null, 'carbon:activities:view', null, 602, '/carbon'],
+  ['button', '独立碳活动导入预演', null, null, 'carbon:activities:import:preview', null, 603, '/carbon'],
+  ['button', '独立碳活动导入执行', null, null, 'carbon:activities:import:execute', null, 604, '/carbon'],
+  ['button', '独立碳活动计算', null, null, 'carbon:activities:calculate', null, 605, '/carbon'],
+  ['button', '独立碳活动导出', null, null, 'carbon:activities:export', null, 606, '/carbon'],
+  ['button', '碳排放报告查看', null, null, 'carbon:emission-reports:view', null, 608, '/carbon'],
+  ['button', '碳排放报告导入预演', null, null, 'carbon:emission-reports:import:preview', null, 609, '/carbon'],
+  ['button', '碳排放报告导入执行', null, null, 'carbon:emission-reports:import:execute', null, 610, '/carbon'],
+  ['button', '碳排放报告导出', null, null, 'carbon:emission-reports:export', null, 611, '/carbon'],
+  ['button', '温室气体报告查看', null, null, 'carbon:ghg-reports:view', null, 612, '/carbon'],
+  ['button', '温室气体报告导入预演', null, null, 'carbon:ghg-reports:import:preview', null, 613, '/carbon'],
+  ['button', '温室气体报告导入执行', null, null, 'carbon:ghg-reports:import:execute', null, 614, '/carbon'],
+  ['button', '温室气体报告导出', null, null, 'carbon:ghg-reports:export', null, 615, '/carbon'],
 
   ['menu', '预测管理', '/predictions', 'predictions/index', 'prediction:config:view', 'DataAnalysis', 70, null],
   ['button', '预测配置新增', null, null, 'prediction:config:create', null, 702, '/predictions'],
@@ -2622,6 +4340,8 @@ function migrateLegacyViewMenuPermission(db, migration, timestamp = new Date().t
   db.prepare('UPDATE sys_menus SET permission_code = NULL, updated_at = ? WHERE id = ?').run(timestamp, canonicalMenu.id);
   db.prepare('UPDATE sys_menus SET permission_code = ?, updated_at = ? WHERE id = ?')
     .run(migration.permissionCode, timestamp, legacyMenu.id);
+  // 新版细分按钮可能已挂到临时 canonical 页面，删除前必须迁移到保留的旧页面 ID。
+  db.prepare('UPDATE sys_menus SET parent_id = ? WHERE parent_id = ?').run(legacyMenu.id, canonicalMenu.id);
   db.prepare('DELETE FROM sys_role_menus WHERE menu_id = ?').run(canonicalMenu.id);
   db.prepare('DELETE FROM sys_menus WHERE id = ?').run(canonicalMenu.id);
   return true;
@@ -2629,6 +4349,69 @@ function migrateLegacyViewMenuPermission(db, migration, timestamp = new Date().t
 
 function migrateLegacyViewMenuPermissions(db, timestamp = new Date().toISOString()) {
   return RBAC_LEGACY_VIEW_MIGRATIONS.reduce((changed, migration) => migrateLegacyViewMenuPermission(db, migration, timestamp) || changed, false);
+}
+
+/**
+ * 将 /carbon 页面导航与 emissions 查看权限拆分：保留最早父菜单 ID，并把历史角色授权复制到独立按钮。
+ * @param {object} db SQLite 数据库连接。
+ * @param {string} timestamp 迁移时间。
+ * @returns {boolean} 是否发生变更。
+ */
+function migrateCarbonMenuPermissionStructure(db, timestamp = new Date().toISOString()) {
+  const carbonMenus = db.prepare(`SELECT id, permission_code AS permissionCode
+    FROM sys_menus WHERE route_path = '/carbon' AND menu_type = 'menu' ORDER BY id`).all();
+  if (carbonMenus.length === 0) return false;
+  const parentMenuId = carbonMenus[0].id;
+  let changed = false;
+  // 仅迁移拆分前真正由旧 emissions/carbon:view 页面承载的角色；父页面已无权限后不得把后续 activity-only 导航授权扩成 emissions 权限。
+  const legacyEmissionsRoleGrants = carbonMenus
+    .filter((menu) => ['carbon:view', 'carbon:emissions:view'].includes(menu.permissionCode))
+    .flatMap((menu) => db.prepare(`SELECT role_id AS roleId, created_at AS createdAt
+      FROM sys_role_menus WHERE menu_id = ?`).all(menu.id));
+  const grantFromMenu = db.prepare(`INSERT OR IGNORE INTO sys_role_menus (role_id, menu_id, created_at)
+    SELECT role_id, ?, created_at FROM sys_role_menus WHERE menu_id = ?`);
+  carbonMenus.slice(1).forEach((duplicateMenu) => {
+    grantFromMenu.run(parentMenuId, duplicateMenu.id);
+    db.prepare('UPDATE sys_menus SET parent_id = ? WHERE parent_id = ?').run(parentMenuId, duplicateMenu.id);
+    db.prepare('UPDATE sys_menus SET permission_code = NULL, updated_at = ? WHERE id = ?')
+      .run(timestamp, duplicateMenu.id);
+    db.prepare('DELETE FROM sys_role_menus WHERE menu_id = ?').run(duplicateMenu.id);
+    db.prepare('DELETE FROM sys_menus WHERE id = ?').run(duplicateMenu.id);
+    changed = true;
+  });
+
+  const parentMenu = db.prepare('SELECT permission_code AS permissionCode FROM sys_menus WHERE id = ?').get(parentMenuId);
+  if (parentMenu.permissionCode !== null) {
+    db.prepare('UPDATE sys_menus SET permission_code = NULL, updated_at = ? WHERE id = ?')
+      .run(timestamp, parentMenuId);
+    changed = true;
+  }
+  let emissionsButton = db.prepare("SELECT id FROM sys_menus WHERE permission_code = 'carbon:emissions:view'").get();
+  if (!emissionsButton) {
+    emissionsButton = {
+      id: db.prepare(`INSERT INTO sys_menus
+        (parent_id, menu_type, menu_name, route_path, component, permission_code, icon,
+         sort_order, visible, status, is_builtin, created_at, updated_at)
+        VALUES (?, 'button', '碳排放查看', NULL, NULL, 'carbon:emissions:view', NULL,
+          600, 1, 'active', 1, ?, ?)`).run(parentMenuId, timestamp, timestamp).lastInsertRowid
+    };
+    changed = true;
+  } else {
+    const normalizeResult = db.prepare(`UPDATE sys_menus
+      SET parent_id = ?, menu_type = 'button', menu_name = '碳排放查看', route_path = NULL,
+        component = NULL, icon = NULL, sort_order = 600, visible = 1, status = 'active',
+        is_builtin = 1, updated_at = ?
+      WHERE id = ? AND (parent_id IS NOT ? OR menu_type <> 'button' OR menu_name <> '碳排放查看'
+        OR route_path IS NOT NULL OR component IS NOT NULL OR sort_order <> 600 OR status <> 'active')`)
+      .run(parentMenuId, timestamp, emissionsButton.id, parentMenuId);
+    changed = normalizeResult.changes > 0 || changed;
+  }
+  const grantLegacyEmissionsRole = db.prepare(`INSERT OR IGNORE INTO sys_role_menus
+    (role_id, menu_id, created_at) VALUES (?, ?, ?)`);
+  legacyEmissionsRoleGrants.forEach((roleGrant) => {
+    grantLegacyEmissionsRole.run(roleGrant.roleId, emissionsButton.id, roleGrant.createdAt || timestamp);
+  });
+  return changed;
 }
 
 function migrateLegacyImportMenuPermission(db, timestamp = new Date().toISOString()) {
@@ -2652,15 +4435,15 @@ function migrateLegacyImportMenuPermission(db, timestamp = new Date().toISOStrin
   return true;
 }
 
-// 将历史 /dashboard 菜单名称幂等升级为“驾驶舱”，只更新名称并保留原菜单身份与授权。
+// 将历史 /dashboard 菜单名称幂等升级为“中控”，只更新名称并保留原菜单身份与授权。
 function migrateDashboardMenuName(db, timestamp = new Date().toISOString()) {
-  const dashboardResult = db.prepare(`UPDATE sys_menus SET menu_name = '驾驶舱', updated_at = ?
-    WHERE route_path = '/dashboard' AND menu_name <> '驾驶舱'`).run(timestamp);
+  const dashboardResult = db.prepare(`UPDATE sys_menus SET menu_name = '中控', updated_at = ?
+    WHERE route_path = '/dashboard' AND menu_name <> '中控'`).run(timestamp);
   return dashboardResult.changes > 0;
 }
 
 function migrateNavigationMenuStructure(db, timestamp = new Date().toISOString()) {
-  // 驾驶舱更名迁移必须先复用旧菜单 ID，避免角色关联或动态路由契约变化。
+  // 中控更名迁移必须先复用旧菜单 ID，避免角色关联或动态路由契约变化。
   const dashboardChanged = migrateDashboardMenuName(db, timestamp);
   // 个人中心保留权限与角色关联，但只能通过固定路由和右上角用户菜单访问。
   const profileResult = db.prepare(`UPDATE sys_menus SET visible = 0, updated_at = ?
@@ -2708,6 +4491,58 @@ function dedupeBuiltinDirectoryMenus(db) {
   return changed;
 }
 
+/** 补齐缺失的 N7 权限按钮，并对同权限码旧行执行严格 canonical 碰撞校验。 */
+function ensureCanonicalGhgReportPermissionMenus(db, timestamp = new Date().toISOString()) {
+  const carbonParent = db.prepare(`SELECT id FROM sys_menus
+    WHERE route_path = '/carbon' AND menu_type = 'menu' ORDER BY id LIMIT 1`).get();
+  if (!carbonParent) {
+    const error = new Error('温室气体报告权限种子缺少 canonical /carbon 父菜单。');
+    error.code = 'GHG_REPORT_PERMISSION_PARENT_MISSING';
+    throw error;
+  }
+  const insertPermissionMenu = db.prepare(`INSERT INTO sys_menus
+    (parent_id, menu_type, menu_name, route_path, component, permission_code, icon,
+     sort_order, visible, status, is_builtin, created_at, updated_at)
+    VALUES (?, 'button', ?, NULL, NULL, ?, NULL, ?, 1, 'active', 1, ?, ?)`);
+  GHG_REPORT_PERMISSION_MENU_CONTRACTS.forEach((contract) => {
+    let menu = db.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType,
+      menu_name AS menuName, route_path AS routePath, component, icon,
+      sort_order AS sortOrder, visible, status, is_builtin AS isBuiltin
+      FROM sys_menus WHERE permission_code = ?`).get(contract.permissionCode);
+    if (!menu) {
+      const result = insertPermissionMenu.run(
+        carbonParent.id,
+        contract.menuName,
+        contract.permissionCode,
+        contract.sortOrder,
+        timestamp,
+        timestamp
+      );
+      menu = db.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType,
+        menu_name AS menuName, route_path AS routePath, component, icon,
+        sort_order AS sortOrder, visible, status, is_builtin AS isBuiltin
+        FROM sys_menus WHERE id = ?`).get(result.lastInsertRowid);
+    }
+    const invalidFields = [];
+    if (menu.parentId !== carbonParent.id) invalidFields.push('parent_id');
+    if (menu.menuType !== 'button') invalidFields.push('menu_type');
+    if (menu.menuName !== contract.menuName) invalidFields.push('menu_name');
+    if (menu.routePath !== null) invalidFields.push('route_path');
+    if (menu.component !== null) invalidFields.push('component');
+    if (menu.icon !== null) invalidFields.push('icon');
+    if (menu.sortOrder !== contract.sortOrder) invalidFields.push('sort_order');
+    if (menu.visible !== 1) invalidFields.push('visible');
+    if (menu.status !== 'active') invalidFields.push('status');
+    if (menu.isBuiltin !== 1) invalidFields.push('is_builtin');
+    if (invalidFields.length > 0) {
+      const error = new Error(`温室气体报告权限码存在非 canonical 历史行：${contract.permissionCode}`);
+      error.code = 'GHG_REPORT_PERMISSION_MENU_COLLISION';
+      error.details = { permissionCode: contract.permissionCode, invalidFields };
+      throw error;
+    }
+  });
+}
+
 function ensureRbacSeedData(db) {
   const bcrypt = require('bcryptjs');
   const now = new Date().toISOString();
@@ -2751,7 +4586,9 @@ function ensureRbacSeedData(db) {
       }
     });
     migrateLegacyViewMenuPermissions(db, now);
+    migrateCarbonMenuPermissionStructure(db, now);
     migrateNavigationMenuStructure(db, now);
+    ensureCanonicalGhgReportPermissionMenus(db, now);
 
     const adminRole = db.prepare("SELECT id FROM sys_roles WHERE role_code = 'super_admin'").get();
     const userRole = db.prepare("SELECT id FROM sys_roles WHERE role_code = 'user'").get();
@@ -2818,14 +4655,19 @@ function initDatabase(options = {}) {
       migrateImportAuditSourceColumns(db);
       migrateEnergyRecordLedgerColumns(db);
       migrateImportBatchesImportTypeCheck(db);
+      migrateSupplierCodeKeys(db);
       migrateGenerationRecordsDataSourceCheck(db);
       migrateEnergyBudgetImportSourceColumns(db);
       ensureEnergyBudgetsTable(db);
       migratePredictionRunsStatusCheck(db);
       ensurePredictionConfigsTable(db);
       migrateBenchmarkTargetsImportSourceColumns(db);
+      migrateEnergyBenchmarkInternalRevisions(db);
       migrateEnergyBalanceCalculationRuns(db);
       ensureEnergyAnalysisTables(db, schema);
+      ensureCarbonActivityTables(db, schema);
+      ensureCarbonEmissionReportTables(db, schema);
+      ensureGhgReportTables(db, schema);
       db.exec('DROP INDEX IF EXISTS ux_carbon_emissions_record_method');
       prepareDemoGovernanceTablesForMigration(db);
       db.exec(transactionalSchema);
@@ -2872,8 +4714,15 @@ module.exports = {
   buildCarbonEmissionsStatusMigrationSql,
   buildGenerationRecordsDataSourceMigrationSql,
   buildImportBatchesImportTypeMigrationSql,
+  carbonAccountingTableIsCanonical,
+  carbonEmissionReportTableIsCanonical,
   carbonEmissionsStatusCheckAllowsSuperseded,
+  energyFlowTableIsCanonical,
+  ghgReportTableIsCanonical,
   ensureLocalDataDirectories,
+  ensureCarbonActivityTables,
+  ensureCarbonEmissionReportTables,
+  ensureGhgReportTables,
   ensureEnergyBudgetsTable,
   ensureEnergyAnalysisTables,
   ensureDemoGovernanceTables,
@@ -2888,6 +4737,11 @@ module.exports = {
   importBatchesImportTypeCheckAllowsLedgerTypes,
   initDatabase,
   migrateBenchmarkTargetsImportSourceColumns,
+  migrateCarbonAccountingRunTables,
+  migrateCarbonEmissionReportTables,
+  migrateEnergyFlowTables,
+  migrateGhgReportTables,
+  migrateEnergyBenchmarkInternalRevisions,
   migrateCarbonEmissionsStatusCheck,
   migrateDemoImportContextsV2: migrateDemoImportContextsV4,
   migrateDemoImportContextsV3: migrateDemoImportContextsV4,
@@ -2902,7 +4756,10 @@ module.exports = {
   migrateImportAuditSourceColumns,
   migratePredictionRunsStatusCheck,
   migrateImportBatchesImportTypeCheck,
+  migrateCarbonMenuPermissionStructure,
   migrateLegacyImportMenuPermission,
+  migrateSupplierCodeKeys,
+  normalizeSqlContractText,
   openDatabase,
   poisonDatabaseAdmission,
   unblockDatabaseAdmission

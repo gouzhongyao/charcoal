@@ -1,9 +1,37 @@
 import { download, query, request } from '@/api/http';
+import {
+  downloadManagedDemoArtifact,
+  executeManagedDemoImport,
+  previewManagedDemoImport
+} from '@/api/demoData';
 
 // 能源消费分析统一 API 根路径。
 const ANALYSIS_ROOT = '/energy-analysis';
 // 受控导入统一 API 根路径。
 const IMPORT_ROOT = '/energy-analysis/imports';
+// 六类中央 context artifact 与真实导入 handler 的唯一前端映射。
+const ANALYSIS_DEMO_IMPORTS = Object.freeze({
+  'shift-definitions': Object.freeze({ artifactKey: '13-shift-definitions', handlerKey: 'shift-definitions-import' }),
+  'shift-schedules': Object.freeze({ artifactKey: '14-shift-schedules', handlerKey: 'shift-schedules-import' }),
+  timeseries: Object.freeze({ artifactKey: '15-energy-timeseries', handlerKey: 'energy-timeseries-import' }),
+  'device-states': Object.freeze({ artifactKey: '16-device-states', handlerKey: 'device-states-import' }),
+  'tou-schemes': Object.freeze({ artifactKey: '17-tou-schemes', handlerKey: 'tou-schemes-import' }),
+  'strategy-rules': Object.freeze({ artifactKey: '18-strategy-rules', handlerKey: 'strategy-rules-import' })
+});
+
+/** 严格读取能源分析 demo 导入契约，禁止调用方猜测 handler。 */
+function analysisDemoImport(type) {
+  const contract = ANALYSIS_DEMO_IMPORTS[type];
+  if (!contract) throw new Error('不支持的能源分析演示导入类型。');
+  return contract;
+}
+
+/** 按 artifact key 读取能源分析 demo 导入契约。 */
+function analysisDemoArtifact(artifactKey) {
+  const contract = Object.values(ANALYSIS_DEMO_IMPORTS).find((item) => item.artifactKey === artifactKey);
+  if (!contract) throw new Error('不支持的能源分析演示 artifact。');
+  return contract;
+}
 
 /** 发起只读 GET 请求。 */
 const get = (url, params = {}) => request({ url, params: query(params) });
@@ -72,21 +100,35 @@ export function downloadEnergyAnalysisImportTemplate(templateType, extension = '
   );
 }
 
-/** 下载受领域权限保护的青岚园区能源分析示例。 */
+/** 下载受领域权限保护的青岚园区能源分析示例并保存托管 context。 */
 export function downloadEnergyAnalysisDemoArtifact(artifactKey, extension = 'xlsx') {
   const safeExtension = extension === 'csv' ? 'csv' : 'xlsx';
-  return download(
+  analysisDemoArtifact(artifactKey);
+  return downloadManagedDemoArtifact(
     { url: `/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}` },
     `青岚园区能源分析示例.${safeExtension}`
   );
 }
 
-/** 上传文件并创建服务端受控预演批次；会保存文件与导入审计、不写目标领域记录，且受维护态限制。 */
+/** 上传文件并创建服务端受控预演批次；原始下载文件匹配时附加托管 context。 */
 export function previewEnergyAnalysisImport(type, file) {
   const data = new FormData();
   data.append('file', file);
-  return request({ method: 'post', url: `${IMPORT_ROOT}/${type}/preview`, data });
+  const contract = analysisDemoImport(type);
+  return previewManagedDemoImport(
+    { method: 'post', url: `${IMPORT_ROOT}/${type}/preview`, data },
+    contract.artifactKey,
+    contract.handlerKey,
+    file
+  );
 }
 
-/** 使用完整服务端见证执行受控导入。 */
-export const executeEnergyAnalysisImport = (type, data) => post(`${IMPORT_ROOT}/${type}/execute`, data);
+/** 使用完整服务端见证执行受控导入，并在成功后清理一次性 context。 */
+export function executeEnergyAnalysisImport(type, data) {
+  const contract = analysisDemoImport(type);
+  return executeManagedDemoImport(
+    { method: 'post', url: `${IMPORT_ROOT}/${type}/execute`, data },
+    contract.artifactKey,
+    contract.handlerKey
+  );
+}

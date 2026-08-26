@@ -4,6 +4,11 @@ const path = require('path');
 const { TextDecoder } = require('util');
 const { parse: parseCsv } = require('csv-parse/sync');
 const XLSX = require('xlsx');
+const {
+  ENERGY_FLOW_WORKBOOK_HEADERS,
+  ENERGY_FLOW_WORKBOOK_TEMPLATE_TYPE,
+  buildEnergyFlowWorkbookExamples
+} = require('./energyFlowWorkbookContracts');
 
 // CSV 模板必须按严格 UTF-8 解码，拒绝非法字节和本地编码误读。
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
@@ -120,18 +125,47 @@ function createColumn(
 }
 
 /**
+ * 创建一个仅用于旧模板识别的弃用标题，命中后明确告警且不映射业务值。
+ * @param {string} name 旧中文列名。
+ * @param {string[]} aliases 旧列别名。
+ * @param {string} message 中文弃用说明。
+ * @returns {object} 冻结后的弃用标题定义。
+ */
+function createDeprecatedHeader(name, aliases, message) {
+  return Object.freeze({
+    name,
+    aliases: Object.freeze([...new Set([name, ...aliases])]),
+    message
+  });
+}
+
+/**
  * 创建工作表定义并冻结标题顺序。
  * @param {string} name 中文工作表名称。
  * @param {object[]} columns 有序列定义。
+ * @param {object[]} deprecatedHeaders 一个发布周期内兼容识别的旧标题。
  * @returns {object} 工作表定义。
  */
-function createSheet(name, columns) {
-  // 工作表标题严格由列定义顺序生成。
+function createSheet(name, columns, deprecatedHeaders = []) {
+  // 工作表标题严格由列定义顺序生成；弃用标题不进入新模板。
   const headers = columns.map((column) => column.name);
   return Object.freeze({
     name,
     columns: Object.freeze(columns),
-    headers: Object.freeze(headers)
+    headers: Object.freeze(headers),
+    deprecatedHeaders: Object.freeze(deprecatedHeaders)
+  });
+}
+
+/** 创建固定六表工作簿工作表，保留多行示例但不开放表头别名。 */
+function createStrictWorkbookSheet(name, headers, exampleRows) {
+  const columns = headers.map((header, index) => createColumn(header, `fixedColumn${index + 1}`, [], true, '固定工作簿列，标题与顺序不得更改。', exampleRows[0]?.[index] ?? ''));
+  return Object.freeze({
+    name,
+    columns: Object.freeze(columns),
+    headers: Object.freeze([...headers]),
+    deprecatedHeaders: Object.freeze([]),
+    exampleRows: Object.freeze(exampleRows.map((row) => Object.freeze([...row])))
   });
 }
 
@@ -329,13 +363,14 @@ const ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS = Object.freeze(Object.assign(Object.
         createColumn('范围类型', 'scopeType', ['适用范围类型', 'scope_type'], true, '填写组织、行业或产品等范围类型。', 'organization'),
         createColumn('范围标识', 'scopeReference', ['适用范围', '范围引用', 'scope', 'scopeRef', 'scope_ref', 'scope_reference'], true, '填写可追溯范围标识。', 'OU-001', ['范围标只', 'scopereferenc']),
         createColumn('指标方向', 'direction', ['比较方向', 'benchmarkDirection', 'benchmark_direction'], true, '填写 lower_better、higher_better 或 range。', 'lower_better', ['指标方问', 'directio']),
-        createColumn('来源', 'source', ['标准来源', '标杆来源'], true, '填写标准、标杆或内部计算来源。', '行业标准'),
-        createColumn('文号', 'documentNo', ['来源文号', '标准文号', 'documentNumber', 'document_number', 'document_no'], false, '外部标准可填写来源文号。', 'GB/T-EXAMPLE'),
-        createColumn('版本', 'version', ['对标版本', 'benchmarkVersion', 'benchmark_version'], true, '填写对标定义版本。', 'energy-benchmark:v1'),
+        createColumn('来源', 'source', ['标准来源', '标杆来源'], true, '填写标准或标杆来源。', '行业标准'),
         createColumn('生效开始时间（UTC）', 'effectiveStartUtc', ['有效开始时间', '生效开始', 'effectiveFrom', 'effective_from', 'effective_start_utc'], true, '填写定义有效期开始时间。', '2026-01-01T00:00:00Z'),
         createColumn('生效结束时间（UTC）', 'effectiveEndUtc', ['有效结束时间', '生效结束', 'effectiveTo', 'effective_to', 'effective_end_utc'], true, '填写定义有效期结束时间。', '2027-01-01T00:00:00Z'),
         createColumn('来源时区', 'sourceTimeZone', ['时区', 'IANA时区', 'timezone', 'time_zone', 'sourceTimezone', 'source_timezone'], true, '填写 IANA 来源时区。', 'Asia/Shanghai', ['来源时曲', 'sourcetimezon']),
         createColumn('状态', 'status', ['启用状态', '记录状态', 'recordStatus', 'record_status'], false, '填写 active 或 inactive。', 'active')
+      ], [
+        createDeprecatedHeader('文号', ['documentNo', '来源文号', '标准文号', 'documentNumber', 'document_number', 'document_no'], '旧模板文号列已弃用，列值将被忽略；用户不再维护对标文号。'),
+        createDeprecatedHeader('版本', ['version', '对标版本', 'benchmarkVersion', 'benchmark_version'], '旧模板定义版本列已弃用，列值将被忽略；内部修订和兼容版本由服务端生成。')
       ])
     ])
   }),
@@ -347,8 +382,7 @@ const ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS = Object.freeze(Object.assign(Object.
     formats: Object.freeze(['xlsx', 'csv']),
     sheets: Object.freeze([
       createSheet('对标目标', [
-        createColumn('对标编码', 'benchmarkCode', ['标准编码', '标杆编码', 'code', 'benchmark_code'], true, '填写已维护的对标编码。', 'BENCH-ENERGY-001', ['对标编玛', 'benchmarkcod']),
-        createColumn('对标定义版本', 'benchmarkVersion', ['定义版本', 'benchmark_definition_version', 'definitionVersion', 'definition_version'], true, '填写被引用对标定义版本。', 'energy-benchmark:v1'),
+        createColumn('对标编码', 'benchmarkCode', ['标准编码', '标杆编码', 'code', 'benchmark_code'], true, '填写唯一 active 定义的对标编码。', 'BENCH-ENERGY-001', ['对标编玛', 'benchmarkcod']),
         createColumn('目标值', 'targetValue', ['标准值', '标杆值', 'value', 'target_value'], false, '非区间方向填写单一目标值。', 120),
         createColumn('下限值', 'lowerBound', ['范围下限', '最小值', 'lower', 'minValue', 'min_value', 'lower_bound'], false, 'range 方向填写下限值。', ''),
         createColumn('上限值', 'upperBound', ['范围上限', '最大值', 'upper', 'maxValue', 'max_value', 'upper_bound'], false, 'range 方向填写上限值。', ''),
@@ -361,9 +395,27 @@ const ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS = Object.freeze(Object.assign(Object.
         createColumn('来源数据摘要', 'sourceDataDigest', ['数据摘要', '来源摘要', 'digest', 'sourceDigest', 'source_digest', 'source_data_digest'], false, '填写内部基准来源数据摘要。', ''),
         createColumn('是否固化', 'isFrozen', ['固化', '冻结标识', 'frozen', 'is_frozen'], false, '填写 0/1 或等价布尔值。', 0),
         createColumn('是否自动刷新', 'autoRefresh', ['自动刷新', 'auto_refresh'], false, '填写 0/1 或等价布尔值。', 0),
-        createColumn('目标版本', 'version', ['版本', 'targetVersion', 'target_version'], true, '填写目标记录版本。', 'benchmark-target:v1', ['目标版木', 'versio']),
         createColumn('状态', 'status', ['启用状态', '记录状态', 'recordStatus', 'record_status'], false, '填写 active 或 inactive。', 'active')
+      ], [
+        createDeprecatedHeader('对标定义版本', ['benchmarkVersion', '定义版本', 'benchmark_definition_version', 'definitionVersion', 'definition_version'], '旧模板对标定义版本列已弃用，列值将被忽略；目标仅按对标编码匹配唯一 active 定义。'),
+        createDeprecatedHeader('目标版本', ['version', '版本', 'targetVersion', 'target_version'], '旧模板目标版本列已弃用，列值将被忽略；内部修订和兼容版本由服务端生成。')
       ])
+    ])
+  }),
+  [ENERGY_FLOW_WORKBOOK_TEMPLATE_TYPE]: Object.freeze({
+    id: ENERGY_FLOW_WORKBOOK_TEMPLATE_TYPE,
+    name: '完整能流工作簿模板',
+    baseFileName: '完整能流工作簿模板',
+    asciiBaseFileName: 'energy-flow-workbook-template',
+    templateVersion: '1.0',
+    formats: Object.freeze(['xlsx']),
+    sheets: Object.freeze([
+      createStrictWorkbookSheet('模型', ENERGY_FLOW_WORKBOOK_HEADERS.模型, buildEnergyFlowWorkbookExamples().模型),
+      createStrictWorkbookSheet('设备资产与节点', ENERGY_FLOW_WORKBOOK_HEADERS.设备资产与节点, buildEnergyFlowWorkbookExamples().设备资产与节点),
+      createStrictWorkbookSheet('有向边', ENERGY_FLOW_WORKBOOK_HEADERS.有向边, buildEnergyFlowWorkbookExamples().有向边),
+      createStrictWorkbookSheet('期间流量', ENERGY_FLOW_WORKBOOK_HEADERS.期间流量, buildEnergyFlowWorkbookExamples().期间流量),
+      createStrictWorkbookSheet('余热事实', ENERGY_FLOW_WORKBOOK_HEADERS.余热事实, buildEnergyFlowWorkbookExamples().余热事实),
+      createStrictWorkbookSheet('损耗证据', ENERGY_FLOW_WORKBOOK_HEADERS.损耗证据, buildEnergyFlowWorkbookExamples().损耗证据)
     ])
   }),
   'energy-flow-models': Object.freeze({
@@ -626,6 +678,8 @@ function buildSheetHeaderIndexes(sheet) {
   const aliasIndex = new Map();
   // 明确拼写错误索引只覆盖静态列举项，不做模糊猜测。
   const typoIndex = new Map();
+  // 弃用标题只生成 warning，绝不进入业务字段映射。
+  const deprecatedIndex = new Map();
   sheet.columns.forEach((column) => {
     column.aliases.forEach((alias) => {
       const normalizedAlias = normalizeTemplateHeader(alias);
@@ -648,7 +702,15 @@ function buildSheetHeaderIndexes(sheet) {
       }
     });
   });
-  return { aliasIndex, typoIndex };
+  (sheet.deprecatedHeaders || []).forEach((deprecatedHeader) => {
+    deprecatedHeader.aliases.forEach((alias) => {
+      const normalizedAlias = normalizeTemplateHeader(alias);
+      if (normalizedAlias && !aliasIndex.has(normalizedAlias)) {
+        deprecatedIndex.set(normalizedAlias, deprecatedHeader);
+      }
+    });
+  });
+  return { aliasIndex, typoIndex, deprecatedIndex };
 }
 
 /**
@@ -684,7 +746,7 @@ function validateTemplateHeaders(templateId, headers, options = {}) {
   }
   const sheet = resolveSheetDefinition(template, options.sheetName || null);
   const rawHeaders = Array.isArray(headers) ? headers.map((header) => String(header ?? '')) : [];
-  const { aliasIndex, typoIndex } = buildSheetHeaderIndexes(sheet);
+  const { aliasIndex, typoIndex, deprecatedIndex } = buildSheetHeaderIndexes(sheet);
   const rawHeaderIndexes = new Map();
   const normalizedHeaderIndexes = new Map();
   const keyIndexes = new Map();
@@ -709,6 +771,20 @@ function validateTemplateHeaders(templateId, headers, options = {}) {
 
     if (column) {
       keyIndexes.set(column.key, [...(keyIndexes.get(column.key) || []), columnIndex]);
+      return descriptor;
+    }
+
+    const deprecatedHeader = deprecatedIndex.get(normalizedHeader);
+    if (deprecatedHeader) {
+      issues.push({
+        code: 'DEPRECATED_BENCHMARK_HEADER_IGNORED',
+        severity: 'warning',
+        blocking: false,
+        sheetName: sheet.name,
+        columnIndex,
+        header: rawHeader,
+        message: deprecatedHeader.message
+      });
       return descriptor;
     }
 
@@ -961,7 +1037,7 @@ function resolveTemplateRow(templateId, inputRow, options = {}) {
     ? options.sourceRowNumber
     : (Number.isInteger(rowSourceNumber) && rowSourceNumber >= 1 ? rowSourceNumber : null);
   // 别名和拼写错误索引用于精确分类表头。
-  const { aliasIndex, typoIndex } = buildSheetHeaderIndexes(sheet);
+  const { aliasIndex, typoIndex, deprecatedIndex } = buildSheetHeaderIndexes(sheet);
   // 内部映射对象只使用 camelCase key。
   const mapped = { sourceRowNumber };
   // 字段映射保留每个内部键对应的全部来源标题。
@@ -978,6 +1054,18 @@ function resolveTemplateRow(templateId, inputRow, options = {}) {
     const normalizedHeader = normalizeTemplateHeader(rawHeader);
     const column = aliasIndex.get(normalizedHeader);
     if (!column) {
+      const deprecatedHeader = deprecatedIndex.get(normalizedHeader);
+      if (deprecatedHeader) {
+        issues.push({
+          code: 'DEPRECATED_BENCHMARK_HEADER_IGNORED',
+          severity: 'warning',
+          blocking: false,
+          sourceRowNumber,
+          header: rawHeader,
+          message: deprecatedHeader.message
+        });
+        return;
+      }
       // 仅静态列出的关键拼写错误升级为 blocking issue。
       const suspectedColumn = typoIndex.get(normalizedHeader);
       if (suspectedColumn) {
@@ -1063,7 +1151,7 @@ function renderCsvBuffer(sheet, rows = null) {
   // 未传入业务数据时继续使用冻结示例行；演示目录可注入多行数据但不得改变标题契约。
   const dataRows = Array.isArray(rows)
     ? rows
-    : [sheet.columns.map((column) => column.example)];
+    : (Array.isArray(sheet.exampleRows) ? sheet.exampleRows : [sheet.columns.map((column) => column.example)]);
   // CSV 尾部固定保留单个换行，避免尾随空格。
   const csv = [sheet.headers, ...dataRows]
     .map((row) => row.map(escapeCsvCell).join(','))
@@ -1080,7 +1168,7 @@ function buildColumnWidths(sheet, rows = null) {
   // 演示目录注入多行数据时也按真实单元格宽度计算，但仍限制最大列宽。
   const dataRows = Array.isArray(rows)
     ? rows
-    : [sheet.columns.map((column) => column.example)];
+    : (Array.isArray(sheet.exampleRows) ? sheet.exampleRows : [sheet.columns.map((column) => column.example)]);
   return sheet.columns.map((column, columnIndex) => ({
     wch: Math.min(Math.max(
       String(column.name).length + 4,
@@ -1102,7 +1190,7 @@ function renderXlsxBuffer(template, workbookRows = null) {
     // 用户可见首行只使用中文标题；演示目录可按工作表名称注入多行数据。
     const rows = workbookRows && Array.isArray(workbookRows[sheet.name])
       ? workbookRows[sheet.name]
-      : [sheet.columns.map((column) => column.example)];
+      : (Array.isArray(sheet.exampleRows) ? sheet.exampleRows : [sheet.columns.map((column) => column.example)]);
     const worksheet = XLSX.utils.aoa_to_sheet([sheet.headers, ...rows]);
     worksheet['!cols'] = buildColumnWidths(sheet, rows);
     XLSX.utils.book_append_sheet(workbook, worksheet, sheet.name);
@@ -1161,7 +1249,7 @@ function generateEnergyAnalysisTemplate(templateId, format = 'xlsx', options = {
     columnCount: sheet.columns.length,
     exampleRowCount: customWorkbookRows && Array.isArray(customWorkbookRows[sheet.name])
       ? customWorkbookRows[sheet.name].length
-      : (customRows && template.sheets.length === 1 ? customRows.length : 1)
+      : (customRows && template.sheets.length === 1 ? customRows.length : (Array.isArray(sheet.exampleRows) ? sheet.exampleRows.length : 1))
   }));
   // 单工作表兼容字段保留现有调用模型所需的 sheetName 与 headers。
   const singleSheet = template.sheets.length === 1 ? template.sheets[0] : null;

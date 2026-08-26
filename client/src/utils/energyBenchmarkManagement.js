@@ -71,7 +71,7 @@ export const ENERGY_BENCHMARK_ENTITY_COLORS = Object.freeze([
 // 服务端兼容性原因码中文说明。
 export const ENERGY_BENCHMARK_REASON_LABELS = Object.freeze({
   BENCHMARK_DEFINITION_INACTIVE: '对标定义已停用',
-  BENCHMARK_TARGET_INACTIVE: '目标版本已停用',
+  BENCHMARK_TARGET_INACTIVE: '对标目标已停用',
   BENCHMARK_ACTUAL_VALUE_MISSING: '实际值缺失或不是有限数字',
   BENCHMARK_METRIC_MISMATCH: '指标编码不一致',
   BENCHMARK_SCOPE_TYPE_MISMATCH: '范围类型不一致',
@@ -89,17 +89,17 @@ export const ENERGY_BENCHMARK_REASON_LABELS = Object.freeze({
 // 页面请求失败时使用的业务原因码中文投影；未知码仍保留服务端消息和原始码。
 export const ENERGY_BENCHMARK_REQUEST_REASON_LABELS = Object.freeze({
   BENCHMARK_DEFINITION_NOT_FOUND: '对标定义不存在或已失效',
-  BENCHMARK_TARGET_NOT_FOUND: '目标版本不存在或已失效',
+  BENCHMARK_TARGET_NOT_FOUND: '对标目标不存在或已失效',
   BENCHMARK_DEFINITION_INACTIVE: '对标定义已停用',
-  BENCHMARK_TARGET_INACTIVE: '目标版本已停用',
-  BENCHMARK_TARGET_DEFINITION_MISMATCH: '目标版本不属于当前对标定义',
+  BENCHMARK_TARGET_INACTIVE: '对标目标已停用',
+  BENCHMARK_TARGET_DEFINITION_MISMATCH: '对标目标不属于当前对标定义',
   BENCHMARK_ORGANIZATION_SCOPE_NOT_FOUND: '组织范围标识不存在',
   BENCHMARK_ORGANIZATION_SCOPE_INACTIVE: '组织范围已停用',
   BENCHMARK_ENERGY_SCOPE_NOT_FOUND: '能源范围编码不存在',
   BENCHMARK_ENERGY_SCOPE_INACTIVE: '能源范围已停用',
   BENCHMARK_PRODUCT_SCOPE_NOT_FOUND: '产品范围标识无法由当前产能主数据解析',
   BENCHMARK_PRODUCT_SCOPE_INACTIVE: '产品范围已停用',
-  BENCHMARK_TARGET_ACTIVE_CONFLICT: '同一定义已有启用目标版本',
+  BENCHMARK_TARGET_ACTIVE_CONFLICT: '同一定义已有启用目标',
   BENCHMARK_DEFINITION_ACTIVE_PERIOD_OVERLAP: '同编码启用定义的有效期发生重叠',
   BENCHMARK_ACTUALS_REQUIRED: '至少需要一个明确实际对象',
   BENCHMARK_ACTUALS_LIMIT_EXCEEDED: '实际对象数量超过服务端上限',
@@ -338,8 +338,6 @@ export function buildEnergyBenchmarkDefinitionPayload(form = {}) {
     scopeReference: String(form.scopeReference || '').trim(),
     direction: form.direction,
     source: String(form.source || '').trim(),
-    documentNo: nullableText(form.documentNo),
-    version: String(form.version || '').trim(),
     effectiveStartUtc: String(form.effectiveStartUtc || '').trim(),
     effectiveEndUtc: String(form.effectiveEndUtc || '').trim(),
     sourceTimeZone,
@@ -365,13 +363,12 @@ export function buildEnergyBenchmarkInternalHistoryPayload(form = {}) {
   };
 }
 
-/** 构造目标创建或后继版本载荷。 */
+/** 构造目标创建或调整载荷，历史技术字段和内部修订均不得由页面提交。 */
 export function buildEnergyBenchmarkTargetPayload(form = {}, includeDefinitionId = false) {
   const payload = {
     targetValue: finiteNumberOrNull(form.targetValue),
     lowerBound: finiteNumberOrNull(form.lowerBound),
     upperBound: finiteNumberOrNull(form.upperBound),
-    version: String(form.version || '').trim(),
     status: form.status || 'active'
   };
   if (includeDefinitionId) payload.benchmarkDefinitionId = finiteNumberOrNull(form.benchmarkDefinitionId);
@@ -434,7 +431,7 @@ export function buildEnergyBenchmarkAnalysisSnapshot(definitionId, targetId, act
 export function validateEnergyBenchmarkAnalysisContext({ definition = null, target = null, actualRows = [], organizationUnits = [] } = {}) {
   const errors = [];
   if (!definition || definition.status !== 'active' || !Number.isSafeInteger(Number(definition.id))) errors.push('请选择已解析且启用的对标定义。');
-  if (!target || target.status !== 'active' || Number(target.benchmarkDefinitionId) !== Number(definition?.id)) errors.push('请选择属于当前定义的启用目标版本。');
+  if (!target || target.status !== 'active' || Number(target.benchmarkDefinitionId) !== Number(definition?.id)) errors.push('请选择属于当前定义的启用目标。');
   if (target && definition?.direction === 'range') {
     if (!hasFiniteInput(target.lowerBound) || !hasFiniteInput(target.upperBound) || Number(target.lowerBound) > Number(target.upperBound)) errors.push('当前区间目标无效。');
   } else if (target && !hasFiniteInput(target.targetValue)) errors.push('当前目标值无效。');

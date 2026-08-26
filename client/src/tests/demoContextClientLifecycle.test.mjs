@@ -84,6 +84,7 @@ const originalGlobals = {
   httpAdapter: globalThis.__CHARCOAL_HTTP_TEST_ADAPTER__,
   userRequest: globalThis.__CHARCOAL_USER_REQUEST__,
   clearDemoContexts: globalThis.__CHARCOAL_CLEAR_DEMO_CONTEXTS__,
+  demoDataAdapter: globalThis.__CHARCOAL_DEMO_DATA_TEST_ADAPTER__,
   userStoreDefinition: globalThis.__CHARCOAL_USER_STORE_DEFINITION__
 };
 
@@ -172,6 +173,73 @@ const resolveApiBase = () => '/api';`;
   assertDemoContextsCleared(sessionStorage, '401 ');
   assert.deepStrictEqual(dispatchedEvents.map((event) => event.type), ['charcoal:unauthenticated'], '401 必须派发一次未认证事件。');
 
+  // 下载 403 的 JSON Blob 必须恢复服务端 error 合同，并保留 code/message/details 与中文权限提示。
+  httpAdapter.warnings.length = 0;
+  const forbiddenApiError = {
+    code: 'CARBON_EXPORT_FORBIDDEN',
+    message: '当前账号不能导出旧能耗结果。',
+    details: { sourceType: 'energy_record', requiredPermission: 'carbon:emissions:export' }
+  };
+  const forbiddenBlobError = {
+    message: 'Request failed with status code 403',
+    response: {
+      status: 403,
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+      data: new Blob([JSON.stringify({ success: false, error: forbiddenApiError })], { type: 'application/json' })
+    }
+  };
+  await assert.rejects(
+    httpAdapter.responseErrorInterceptor(forbiddenBlobError),
+    (error) => error === forbiddenBlobError
+      && error.message === forbiddenApiError.message
+      && error.apiError?.code === forbiddenApiError.code
+      && error.apiError?.details?.sourceType === 'energy_record',
+    '403 JSON Blob 必须向调用方保留完整服务端错误对象。'
+  );
+  assert.deepStrictEqual(forbiddenBlobError.response.data, { success: false, error: forbiddenApiError });
+  assert.deepStrictEqual(httpAdapter.warnings, [forbiddenApiError.message], '403 JSON Blob 必须使用服务端中文消息提示权限错误。');
+
+  // 下载 401 的 JSON Blob 解析后仍必须执行既有登录态和全部演示 context 清理。
+  localStorage.clear();
+  sessionStorage.clear();
+  localStorage.setItem('charcoal.token', 'login-token');
+  seedDemoContexts(sessionStorage);
+  const eventCountBeforeBlob401 = dispatchedEvents.length;
+  const unauthorizedBlobApiError = {
+    code: 'AUTH_SESSION_EXPIRED',
+    message: '下载会话已失效。',
+    details: { expired: true }
+  };
+  const unauthorizedBlobError = {
+    message: 'Request failed with status code 401',
+    response: {
+      status: 401,
+      headers: { 'content-type': 'application/json' },
+      data: new Blob([JSON.stringify({ success: false, error: unauthorizedBlobApiError })], { type: 'application/json' })
+    }
+  };
+  await assert.rejects(
+    httpAdapter.responseErrorInterceptor(unauthorizedBlobError),
+    (error) => error === unauthorizedBlobError
+      && error.apiError?.code === unauthorizedBlobApiError.code
+      && error.apiError?.details?.expired === true
+  );
+  assert.strictEqual(localStorage.getItem('charcoal.token'), null);
+  assertDemoContextsCleared(sessionStorage, '401 JSON Blob ');
+  assert.strictEqual(dispatchedEvents.length, eventCountBeforeBlob401 + 1);
+  assert.strictEqual(dispatchedEvents.at(-1).type, 'charcoal:unauthenticated');
+
+  // 非 JSON Blob 不读取或泄露文件正文，只保留 Axios 原始错误文案。
+  const binaryBlob = new Blob(['private binary response body'], { type: 'application/octet-stream' });
+  const binaryBlobError = {
+    message: '下载请求失败。',
+    response: { status: 500, headers: { 'content-type': 'application/octet-stream' }, data: binaryBlob }
+  };
+  await assert.rejects(
+    httpAdapter.responseErrorInterceptor(binaryBlobError),
+    (error) => error === binaryBlobError && error.message === '下载请求失败。' && error.response.data === binaryBlob && error.apiError === undefined
+  );
+
   // demo 409/410 只是业务上下文错误，不得误清理登录态或当前标签页 context。
   for (const status of [409, 410]) {
     localStorage.clear();
@@ -248,16 +316,146 @@ const resolveApiBase = () => '/api';`;
     '纯逻辑 DOM stub 必须观察到 Blob URL、链接点击、移除和 URL 回收副作用。'
   );
 
-  // 加载生产 demoData.js 的真实 clearDemoContexts，供 user action 生命周期调用。
+  // demoData 请求 adapter 记录安全降级后的真实请求，并控制托管下载响应。
+  const demoDataAdapter = {
+    requests: [],
+    downloadResult: null,
+    async download() {
+      return this.downloadResult;
+    },
+    async request(config) {
+      this.requests.push(config);
+      return { success: true, data: { accepted: true } };
+    },
+    async requestWithHeaders() {
+      return null;
+    }
+  };
+  globalThis.__CHARCOAL_DEMO_DATA_TEST_ADAPTER__ = demoDataAdapter;
+
+  // 加载生产 demoData.js 的真实生命周期函数，供安全降级和 user action 测试调用。
   let demoDataSource = await readFile(demoDataSourceUrl, 'utf8');
   demoDataSource = replaceRequired(
     demoDataSource,
-    "import { request, requestWithHeaders } from '@/api/http';",
-    'const request = async () => null; const requestWithHeaders = async () => null;',
+    "import { download, request, requestWithHeaders } from '@/api/http';",
+    `const download = (...args) => globalThis.__CHARCOAL_DEMO_DATA_TEST_ADAPTER__.download(...args);
+const request = (...args) => globalThis.__CHARCOAL_DEMO_DATA_TEST_ADAPTER__.request(...args);
+const requestWithHeaders = (...args) => globalThis.__CHARCOAL_DEMO_DATA_TEST_ADAPTER__.requestWithHeaders(...args);`,
     'demoData.js'
   );
   const demoDataModule = await import(moduleDataUrl(demoDataSource));
   globalThis.__CHARCOAL_CLEAR_DEMO_CONTEXTS__ = demoDataModule.clearDemoContexts;
+
+  // 受控 getter 必须吞掉 sessionStorage SecurityError，下载和导入继续按无 context 流程执行。
+  const safeFallbackMetadata = {
+    datasetId: 'qinglan-park-v1',
+    runId: 'run-safe-fallback',
+    artifactKey: '13-shift-definitions',
+    handlerKey: 'shift-definitions-import',
+    manifestVersion: 'v1',
+    manifestDigest: 'a'.repeat(64),
+    artifactSha256: 'b'.repeat(64),
+    contextToken: 'c'.repeat(43)
+  };
+  demoDataAdapter.downloadResult = { fileName: 'demo.xlsx', headers: {}, demo: safeFallbackMetadata };
+  const sessionStorageDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+  const sessionStorageSecurityError = new Error('浏览器策略禁止访问 sessionStorage。');
+  sessionStorageSecurityError.name = 'SecurityError';
+  Object.defineProperty(globalThis, 'sessionStorage', {
+    configurable: true,
+    get() {
+      throw sessionStorageSecurityError;
+    }
+  });
+  try {
+    const safeDownloadResult = await demoDataModule.downloadManagedDemoArtifact(
+      { method: 'get', url: '/safe-download' },
+      'demo.xlsx'
+    );
+    assert.strictEqual(safeDownloadResult.demoContextStored, false, 'sessionStorage getter 抛错时下载仍必须完成且不得虚报 context 已保存。');
+
+    demoDataAdapter.requests.length = 0;
+    const safePreviewResult = await demoDataModule.previewManagedDemoImport(
+      { method: 'post', url: '/safe-preview', data: { file: true } },
+      safeFallbackMetadata.artifactKey,
+      safeFallbackMetadata.handlerKey,
+      new Blob(['safe-preview-file'])
+    );
+    assert.strictEqual(safePreviewResult.data.accepted, true, 'sessionStorage getter 抛错时 preview 请求必须继续完成。');
+    assert.strictEqual(demoDataAdapter.requests.at(-1).demoContext, undefined, 'sessionStorage getter 抛错时 preview 不得携带 context。');
+
+    const safeExecuteResult = await demoDataModule.executeManagedDemoImport(
+      { method: 'post', url: '/safe-execute', data: { confirmed: true } },
+      safeFallbackMetadata.artifactKey,
+      safeFallbackMetadata.handlerKey
+    );
+    assert.strictEqual(safeExecuteResult.data.accepted, true, 'sessionStorage getter 抛错时 execute 请求必须继续完成。');
+    assert.strictEqual(demoDataAdapter.requests.at(-1).demoContext, undefined, 'sessionStorage getter 抛错时 execute 不得携带 context。');
+  } finally {
+    if (sessionStorageDescriptor) Object.defineProperty(globalThis, 'sessionStorage', sessionStorageDescriptor);
+    else delete globalThis.sessionStorage;
+  }
+
+  // file.arrayBuffer() 拒绝时必须安全降级，不能在摘要计算阶段中断正式 preview。
+  const arrayBufferFailureStorage = new MemoryStorage();
+  demoDataModule.storeDemoContext(safeFallbackMetadata, arrayBufferFailureStorage);
+  const arrayBufferFailureFile = new Blob(['array-buffer-failure']);
+  Object.defineProperty(arrayBufferFailureFile, 'arrayBuffer', {
+    configurable: true,
+    async value() {
+      throw new Error('arrayBuffer rejected');
+    }
+  });
+  demoDataAdapter.requests.length = 0;
+  const arrayBufferFallbackResult = await demoDataModule.previewManagedDemoImport(
+    { method: 'post', url: '/array-buffer-fallback', data: { file: true } },
+    safeFallbackMetadata.artifactKey,
+    safeFallbackMetadata.handlerKey,
+    arrayBufferFailureFile,
+    arrayBufferFailureStorage
+  );
+  assert.strictEqual(arrayBufferFallbackResult.data.accepted, true, 'arrayBuffer 拒绝时 preview 请求必须继续完成。');
+  assert.strictEqual(demoDataAdapter.requests.at(-1).demoContext, undefined, 'arrayBuffer 拒绝时不得携带 context。');
+  assert.strictEqual(
+    demoDataModule.readDemoContext(safeFallbackMetadata.artifactKey, safeFallbackMetadata.handlerKey, arrayBufferFailureStorage),
+    null,
+    'arrayBuffer 拒绝后的正式 preview 成功时必须清理 stale context。'
+  );
+
+  // crypto.subtle.digest() 拒绝时必须执行同一正式无 context 降级路径。
+  const digestFailureStorage = new MemoryStorage();
+  demoDataModule.storeDemoContext(safeFallbackMetadata, digestFailureStorage);
+  const cryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  Object.defineProperty(globalThis, 'crypto', {
+    configurable: true,
+    value: {
+      subtle: {
+        async digest() {
+          throw new Error('digest rejected');
+        }
+      }
+    }
+  });
+  try {
+    demoDataAdapter.requests.length = 0;
+    const digestFallbackResult = await demoDataModule.previewManagedDemoImport(
+      { method: 'post', url: '/digest-fallback', data: { file: true } },
+      safeFallbackMetadata.artifactKey,
+      safeFallbackMetadata.handlerKey,
+      new Blob(['digest-failure']),
+      digestFailureStorage
+    );
+    assert.strictEqual(digestFallbackResult.data.accepted, true, 'digest 拒绝时 preview 请求必须继续完成。');
+    assert.strictEqual(demoDataAdapter.requests.at(-1).demoContext, undefined, 'digest 拒绝时不得携带 context。');
+    assert.strictEqual(
+      demoDataModule.readDemoContext(safeFallbackMetadata.artifactKey, safeFallbackMetadata.handlerKey, digestFailureStorage),
+      null,
+      'digest 拒绝后的正式 preview 成功时必须清理 stale context。'
+    );
+  } finally {
+    if (cryptoDescriptor) Object.defineProperty(globalThis, 'crypto', cryptoDescriptor);
+    else delete globalThis.crypto;
+  }
 
   // Pinia 和请求 adapter 只负责构造 store/控制远程结果，logout action 本身来自生产 user.js。
   const userPiniaStub = `
@@ -341,6 +539,7 @@ const defineStore = (id, options) => {
       httpAdapter: '__CHARCOAL_HTTP_TEST_ADAPTER__',
       userRequest: '__CHARCOAL_USER_REQUEST__',
       clearDemoContexts: '__CHARCOAL_CLEAR_DEMO_CONTEXTS__',
+      demoDataAdapter: '__CHARCOAL_DEMO_DATA_TEST_ADAPTER__',
       userStoreDefinition: '__CHARCOAL_USER_STORE_DEFINITION__'
     }[name] || name;
     if (value === undefined) delete globalThis[globalName];

@@ -4,6 +4,37 @@ import { applyTrustedAuthorization, applyTrustedDemoContext, normalizeApiBase, r
 import { useAppStore } from '@/stores/app';
 
 const http = axios.create({ timeout: 20000 });
+
+// Blob 错误解析模块：下载接口也必须保留服务端 JSON 错误合同，不读取或泄露非 JSON 文件正文。
+
+/** 判断响应类型是否明确声明为 JSON。 */
+function isJsonContentType(value = '') {
+  return typeof value === 'string' && /(?:^|\/)json(?:;|$)|\+json(?:;|$)/i.test(value);
+}
+
+/**
+ * 尝试解析下载失败返回的 JSON Blob；非 JSON 或解析失败时原样返回 Blob。
+ * @param {unknown} data Axios 响应正文。
+ * @param {Record<string, unknown>} headers Axios 响应头。
+ * @returns {Promise<unknown>} JSON 对象或原响应正文。
+ */
+export async function parseJsonErrorBlob(data, headers = {}) {
+  const isBlob = typeof Blob !== 'undefined' && data instanceof Blob;
+  if (!isBlob) return data;
+
+  // 内容类型：优先使用 Blob 自身类型，同时兼容 Axios 标准化后的响应头。
+  const contentType = data.type || headers?.['content-type'] || headers?.get?.('content-type') || '';
+  if (!isJsonContentType(contentType)) return data;
+
+  try {
+    // JSON 文本仅用于结构化错误解析，解析失败时不投影正文到 message。
+    const text = await data.text();
+    return JSON.parse(text);
+  } catch {
+    return data;
+  }
+}
+
 http.interceptors.request.use((config) => {
   const requestedBase = useAppStore().apiBase || localStorage.getItem('charcoal.apiBase') || resolveApiBase();
   const baseURL = normalizeApiBase(requestedBase);
@@ -16,9 +47,15 @@ http.interceptors.response.use((response) => {
   const body = response.data;
   if (body && body.success === false) return Promise.reject(Object.assign(new Error(body.error?.message || '请求失败'), { response, apiError: body.error }));
   return response;
-}, (error) => {
+}, async (error) => {
   const status = error.response?.status;
+  if (error.response) {
+    // 下载请求声明 responseType=blob 后，错误 JSON 也会成为 Blob；先恢复统一响应合同。
+    error.response.data = await parseJsonErrorBlob(error.response.data, error.response.headers);
+  }
+  // 服务端错误投影：完整保留 code、message 和 details，供页面按真实合同展示。
   const apiError = error.response?.data?.error;
+  if (apiError && typeof apiError === 'object') error.apiError = apiError;
   error.message = apiError?.message || error.message || '网络请求失败。';
   if (status === 401) {
     localStorage.removeItem('charcoal.token');

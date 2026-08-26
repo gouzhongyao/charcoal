@@ -9,6 +9,19 @@ const RETAINED_UPLOAD_CONTEXT_BLOCKER = 'retained-upload-context-replay-not-conn
 // 阶段 2 优先接入共享 central 路由，其余直接上传链路留待阶段 3 与 ownership 同事务接入。
 const CENTRAL_CONTEXT_ARTIFACT_ORDERS = new Set(Array.from({ length: 13 }, (_value, index) => index + 13));
 const LEGACY_RETAINED_ARTIFACT_ORDERS = new Set([5, 6, 9, 10, 11, 12]);
+// 下载生命周期只允许两种受控策略，模板路由不得再按单个 artifact key 散落特例。
+const DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES = Object.freeze({
+  STATELESS_FORMAL_IMPORT: 'stateless-formal-import',
+  MANAGED_CONTEXT_AUTO_RUNTIME: 'managed-context-auto-runtime'
+});
+const DEMO_ARTIFACT_DOWNLOAD_LIFECYCLE_SET = new Set(Object.values(DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES));
+
+/** 根据服务端真实 context 接入能力确定下载生命周期。 */
+function resolveDownloadLifecycle(artifactOrder) {
+  return CENTRAL_CONTEXT_ARTIFACT_ORDERS.has(artifactOrder)
+    ? DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME
+    : DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.STATELESS_FORMAL_IMPORT;
+}
 
 /** 冻结单个 artifact 注册项及其所有嵌套对象，避免运行期改写治理契约。 */
 function defineArtifact(definition) {
@@ -22,6 +35,7 @@ function defineArtifact(definition) {
     artifactKey: definition.artifactKey,
     handlerKey: definition.handler,
     mode: definition.mode,
+    downloadLifecycle: resolveDownloadLifecycle(artifactOrder),
     templateType: definition.template,
     permissions: Object.freeze({
       download: definition.downloadPermission,
@@ -91,6 +105,17 @@ function validateDemoArtifactRegistry() {
     keys.add(artifact.artifactKey);
     if (!Array.isArray(artifact.guards)) throw new Error(`演示 artifact guards 必须显式声明：${artifact.artifactKey}`);
     if (!artifact.handlerKey || !artifact.templateType || !artifact.permissions.download) throw new Error(`演示 artifact 基础元数据缺失：${artifact.artifactKey}`);
+    if (!DEMO_ARTIFACT_DOWNLOAD_LIFECYCLE_SET.has(artifact.downloadLifecycle)) {
+      throw new Error(`演示 artifact 下载生命周期无效：${artifact.artifactKey}`);
+    }
+    if (artifact.downloadLifecycle === DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME
+      && artifact.blocker.previewExecuteContext !== null) {
+      throw new Error(`托管 context artifact 仍存在 preview/execute blocker：${artifact.artifactKey}`);
+    }
+    if (artifact.downloadLifecycle === DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.STATELESS_FORMAL_IMPORT
+      && artifact.blocker.previewExecuteContext === null) {
+      throw new Error(`无状态 artifact 不得声明中央 context 已接入：${artifact.artifactKey}`);
+    }
     batchRoleCount += artifact.batchRoles.length;
   });
   if (batchRoleCount !== 27) throw new Error(`演示 artifact batch role 总数必须为 27，当前为 ${batchRoleCount}。`);
@@ -139,6 +164,7 @@ function listDemoArtifactRegistrations() {
     artifactKey: artifact.artifactKey,
     handlerKey: artifact.handlerKey,
     mode: artifact.mode,
+    downloadLifecycle: artifact.downloadLifecycle,
     templateType: artifact.templateType,
     permissions: { ...artifact.permissions },
     routes: Object.fromEntries(Object.entries(artifact.routes).map(([key, values]) => [key, [...values]])),
@@ -153,6 +179,7 @@ function listDemoArtifactRegistrations() {
 validateDemoArtifactRegistry();
 
 module.exports = {
+  DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES,
   DEMO_ARTIFACT_REGISTRY,
   DEMO_HANDLER_KEYS,
   getDemoArtifactRegistration,

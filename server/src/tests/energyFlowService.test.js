@@ -355,6 +355,141 @@ function testConfigurationCrudAndTopology() {
 }
 
 /**
+ * 验证模型、节点和边的规范业务键在写入前返回稳定领域错误。
+ */
+function testCanonicalIdentityGuards() {
+  const electricity = getElectricityType();
+  const duplicateModel = createModel('FLOW-CANONICAL-KEY', 'v1');
+  const duplicateModelError = assertThrowsCode(
+    () => createModel('flow-canonical-key', 'V1'),
+    'DUPLICATE_ENERGY_FLOW_MODEL_VERSION'
+  );
+  assert.strictEqual(duplicateModelError.statusCode, 400);
+  assert(!/SQLITE|UNIQUE|ux_energy_flow/i.test(duplicateModelError.message));
+
+  const maxLengthVersionModel = createModel('FLOW-VERSION-LENGTH', `V${'1'.repeat(63)}`);
+  assert.strictEqual(maxLengthVersionModel.version.length, 64);
+  const invalidVersionError = assertThrowsCode(
+    () => createModel('FLOW-VERSION-LENGTH-INVALID', `V${'1'.repeat(64)}`),
+    'INVALID_ENERGY_FLOW_MODEL_VERSION'
+  );
+  assert.strictEqual(invalidVersionError.statusCode, 400);
+  assert(!/SQLITE|CHECK constraint|INTERNAL_ERROR/i.test(invalidVersionError.message));
+
+  const nfkcDb = openDatabase();
+  try {
+    nfkcDb.prepare(
+      `INSERT INTO energy_flow_models (
+         model_code, model_name, source, document_no, version,
+         effective_start_utc, effective_end_utc, source_timezone, status
+       ) VALUES ('FLOW-NFKC-VERSION', 'NFKC 旧版本模型', '隔离测试', 'DOC-NFKC', 'V１',
+         '2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai', 'active')`
+    ).run();
+  } finally {
+    nfkcDb.close();
+  }
+  assertThrowsCode(
+    () => createModel('flow-nfkc-version', 'V1'),
+    'DUPLICATE_ENERGY_FLOW_MODEL_VERSION'
+  );
+
+  const activeV1 = createModel('FLOW-CANONICAL-ACTIVE', 'v1');
+  const activeV2 = createModel('flow-canonical-active', 'v2');
+  const activeDb = openDatabase();
+  try {
+    assert.strictEqual(activeDb.prepare('SELECT status FROM energy_flow_models WHERE id = ?').pluck().get(activeV1.id), 'inactive');
+    assert.strictEqual(activeDb.prepare('SELECT status FROM energy_flow_models WHERE id = ?').pluck().get(activeV2.id), 'active');
+  } finally {
+    activeDb.close();
+  }
+
+  const source = createNode(duplicateModel.id, 'CANONICAL-SOURCE', 'source', 0);
+  const sink = createNode(duplicateModel.id, 'CANONICAL-SINK', 'sink', 100);
+  const nodeError = assertThrowsCode(
+    () => createNode(duplicateModel.id, 'canonical-source', 'source', 20),
+    'DUPLICATE_ENERGY_FLOW_NODE_CODE'
+  );
+  assert.strictEqual(nodeError.statusCode, 400);
+  const edge = createEnergyFlowEdge(duplicateModel.id, {
+    edgeCode: 'CANONICAL-EDGE',
+    fromNodeId: source.id,
+    toNodeId: sink.id,
+    energyTypeId: electricity.id,
+    unit: electricity.standardUnit,
+    sourceType: 'explicit_edge_value',
+    sourceMapping: { reference: 'canonical:edge:one' }
+  });
+  assert(edge.id > 0);
+  const edgeError = assertThrowsCode(
+    () => createEnergyFlowEdge(duplicateModel.id, {
+      edgeCode: 'canonical-edge',
+      fromNodeId: source.id,
+      toNodeId: sink.id,
+      energyTypeId: electricity.id,
+      unit: electricity.standardUnit,
+      sourceType: 'explicit_edge_value',
+      sourceMapping: { reference: 'canonical:edge:two' }
+    }),
+    'DUPLICATE_ENERGY_FLOW_EDGE_CODE'
+  );
+  assert.strictEqual(edgeError.statusCode, 400);
+  assert(!/SQLITE|UNIQUE|ux_energy_flow/i.test(edgeError.message));
+}
+
+/**
+ * 验证 N8 模型入口只持久化 UTC 秒精度，并无损折叠零毫秒。
+ */
+function testUtcSecondContract() {
+  const model = createEnergyFlowModel({
+    modelCode: 'FLOW-UTC-SECOND',
+    modelName: 'UTC 秒精度模型',
+    source: '隔离测试',
+    documentNo: 'DOC-FLOW-UTC-SECOND',
+    version: 'v1',
+    effectiveStartUtc: '2026-01-01T00:00:00.000Z',
+    effectiveEndUtc: '2027-01-01T00:00:00.000Z',
+    sourceTimeZone: 'Asia/Shanghai',
+    status: 'active'
+  });
+  assert.strictEqual(model.effectiveStartUtc, '2026-01-01T00:00:00Z');
+  assert.strictEqual(model.effectiveEndUtc, '2027-01-01T00:00:00Z');
+  const unchanged = updateEnergyFlowModel(model.id, {
+    effectiveStartUtc: '2026-01-01T00:00:00.000Z',
+    effectiveEndUtc: '2027-01-01T00:00:00.000Z'
+  });
+  assert.strictEqual(unchanged.effectiveStartUtc, '2026-01-01T00:00:00Z');
+  assert.strictEqual(unchanged.effectiveEndUtc, '2027-01-01T00:00:00Z');
+
+  const invalidStart = assertThrowsCode(
+    () => createEnergyFlowModel({
+      modelCode: 'FLOW-UTC-MILLISECOND-START',
+      modelName: '非法毫秒开始模型',
+      source: '隔离测试',
+      version: 'v1',
+      effectiveStartUtc: '2026-01-01T00:00:00.001Z',
+      effectiveEndUtc: '2027-01-01T00:00:00Z',
+      sourceTimeZone: 'Asia/Shanghai'
+    }),
+    'INVALID_START_UTC'
+  );
+  assert.strictEqual(invalidStart.statusCode, 400);
+  assert(!/SQLITE|CHECK constraint/i.test(invalidStart.message));
+  const invalidEnd = assertThrowsCode(
+    () => createEnergyFlowModel({
+      modelCode: 'FLOW-UTC-MILLISECOND-END',
+      modelName: '非法毫秒结束模型',
+      source: '隔离测试',
+      version: 'v1',
+      effectiveStartUtc: '2026-01-01T00:00:00Z',
+      effectiveEndUtc: '2027-01-01T00:00:00.001Z',
+      sourceTimeZone: 'Asia/Shanghai'
+    }),
+    'INVALID_END_UTC'
+  );
+  assert.strictEqual(invalidEnd.statusCode, 400);
+}
+
+/**
  * 测试差额守恒、储能映射、真实零、缺失和折标歧义。
  * @param {object} master 主模型测试数据。
  */
@@ -1003,6 +1138,8 @@ function run() {
   }
   testAuditActorRequired();
   const master = testConfigurationCrudAndTopology();
+  testCanonicalIdentityGuards();
+  testUtcSecondContract();
   testAnalysisQualityAndConversion(master);
   testExplicitSourceResolvers();
   testConversionFactorPeriodSegmentation();

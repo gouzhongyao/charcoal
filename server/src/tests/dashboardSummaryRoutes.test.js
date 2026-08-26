@@ -4,7 +4,7 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 
-// 驾驶舱 API 测试使用独立临时目录和 SQLite，避免影响本地业务数据。
+// 中控 API 测试使用独立临时目录和 SQLite，避免影响本地业务数据。
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'charcoal-dashboard-summary-'));
 process.env.DATA_DIR = path.join(tmpDir, 'data');
 process.env.SQLITE_PATH = path.join(process.env.DATA_DIR, 'dashboard-summary.sqlite');
@@ -23,7 +23,7 @@ const TEST_PASSWORD = 'DashboardPassword123!';
 // 能耗查看权限兼容集合与正式能耗记录路由保持一致。
 const ENERGY_VIEW_PERMISSIONS = Object.freeze(['energy:records:view', 'energy-records:view', 'energy:statistics:view']);
 
-// 通过真实 HTTP 链路验证驾驶舱认证、权限裁剪、参数校验和响应契约。
+// 通过真实 HTTP 链路验证中控认证、权限裁剪、参数校验和响应契约。
 function request(server, method, requestPath, options = {}) {
   return new Promise((resolve, reject) => {
     const rawBody = options.body === undefined ? '' : JSON.stringify(options.body);
@@ -75,13 +75,13 @@ function seedDashboardFixtures() {
     const batchId = db.prepare(`INSERT INTO import_batches (
       import_type, original_filename, file_type, status, total_rows,
       success_count, failure_count, skipped_count, duplicate_strategy
-    ) VALUES ('energy_record', '驾驶舱审计.csv', 'csv', 'completed_with_errors', 3, 1, 1, 1, 'skip')`).run().lastInsertRowid;
+    ) VALUES ('energy_record', '中控审计.csv', 'csv', 'completed_with_errors', 3, 1, 1, 1, 'skip')`).run().lastInsertRowid;
     db.prepare(`INSERT INTO import_errors (
       batch_id, row_number, field_name, raw_value, error_code, error_reason, severity
-    ) VALUES (?, 2, 'value', 'bad', 'DASHBOARD_TEST_ERROR', '驾驶舱测试错误', 'error')`).run(batchId);
+    ) VALUES (?, 2, 'value', 'bad', 'DASHBOARD_TEST_ERROR', '中控测试错误', 'error')`).run(batchId);
     db.prepare(`INSERT INTO import_errors (
       batch_id, row_number, field_name, raw_value, error_code, error_reason, severity
-    ) VALUES (?, 3, 'duplicate', 'same', 'DASHBOARD_TEST_WARNING', '驾驶舱测试警告', 'warning')`).run(batchId);
+    ) VALUES (?, 3, 'duplicate', 'same', 'DASHBOARD_TEST_WARNING', '中控测试警告', 'warning')`).run(batchId);
   } finally {
     db.close();
   }
@@ -107,13 +107,13 @@ function ensurePermissionMenu(permissionCode) {
 function createPermissionAccount(accountKey, permissionCodes) {
   const role = createRole({
     roleCode: `dashboard-${accountKey}`,
-    roleName: `驾驶舱权限测试-${accountKey}`
+    roleName: `中控权限测试-${accountKey}`
   });
   const menuIds = permissionCodes.map(ensurePermissionMenu);
   assignRoleMenus(role.id, menuIds);
   const user = createUser({
     username: `dashboard_${accountKey}`,
-    displayName: `驾驶舱测试-${accountKey}`,
+    displayName: `中控测试-${accountKey}`,
     password: TEST_PASSWORD,
     roleIds: [role.id]
   });
@@ -279,16 +279,17 @@ function findTotal(totals, energyTypeCode, normalizedUnit) {
     assert.deepStrictEqual(noDashboard.json.error.details.requiredPermissions, ['dashboard:view']);
 
     const invalidCases = [
-      ['/api/dashboard/summary?normalizedMonthStart=2025-1&normalizedMonthEnd=2025-12', 'INVALID_MONTH_FILTER'],
-      ['/api/dashboard/summary?normalizedMonthStart=2025-01&normalizedMonthEnd=2026-01', 'INVALID_DASHBOARD_YEAR_RANGE'],
-      ['/api/dashboard/summary?normalizedMonthStart=2025-12&normalizedMonthEnd=2025-01', 'INVALID_MONTH_RANGE'],
-      ['/api/dashboard/summary?normalizedMonthStart=2025-01', 'DASHBOARD_MONTH_RANGE_REQUIRED']
+      ['/api/dashboard/summary?normalizedMonthStart=2025-1&normalizedMonthEnd=2025-12', 'INVALID_MONTH_FILTER', null],
+      ['/api/dashboard/summary?normalizedMonthStart=2025-01&normalizedMonthEnd=2026-01', 'INVALID_DASHBOARD_YEAR_RANGE', '中控月份范围必须位于同一自然年。'],
+      ['/api/dashboard/summary?normalizedMonthStart=2025-12&normalizedMonthEnd=2025-01', 'INVALID_MONTH_RANGE', null],
+      ['/api/dashboard/summary?normalizedMonthStart=2025-01', 'DASHBOARD_MONTH_RANGE_REQUIRED', null]
     ];
-    for (const [requestPath, detailCode] of invalidCases) {
+    for (const [requestPath, detailCode, expectedMessage] of invalidCases) {
       const response = await request(server, 'GET', requestPath, { token: dashboardOnlyToken });
       assert.strictEqual(response.status, 400, `${requestPath} 必须返回 400。`);
       assert.strictEqual(response.json.error.code, 'BAD_REQUEST');
       assert.strictEqual(response.json.error.details.code, detailCode);
+      if (expectedMessage) assert.strictEqual(response.json.error.message, expectedMessage);
     }
 
     // 测试中使用一个历史兼容能耗权限，同时确认集合仍包含正式路由支持的全部编码。

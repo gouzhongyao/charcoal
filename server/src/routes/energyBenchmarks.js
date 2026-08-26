@@ -52,15 +52,15 @@ const TARGET_QUERY_FIELDS = Object.freeze(['page', 'pageSize', 'definitionId', '
 // 定义创建和完整修改允许的字段。
 const DEFINITION_BODY_FIELDS = Object.freeze([
   'benchmarkCode', 'benchmarkName', 'benchmarkType', 'metricCode', 'unit', 'periodType',
-  'scopeType', 'scopeReference', 'direction', 'source', 'documentNo', 'version',
-  'effectiveStartUtc', 'effectiveEndUtc', 'sourceTimeZone', 'status'
+  'scopeType', 'scopeReference', 'direction', 'source', 'effectiveStartUtc',
+  'effectiveEndUtc', 'sourceTimeZone', 'status'
 ]);
 // 目标创建允许的字段。
 const TARGET_CREATE_FIELDS = Object.freeze([
-  'benchmarkDefinitionId', 'targetValue', 'lowerBound', 'upperBound', 'version', 'status'
+  'benchmarkDefinitionId', 'targetValue', 'lowerBound', 'upperBound', 'status'
 ]);
 // 目标修改不允许更换定义归属。
-const TARGET_UPDATE_FIELDS = Object.freeze(['targetValue', 'lowerBound', 'upperBound', 'version', 'status']);
+const TARGET_UPDATE_FIELDS = Object.freeze(['targetValue', 'lowerBound', 'upperBound', 'status']);
 // 状态接口只接受状态字段。
 const STATUS_BODY_FIELDS = Object.freeze(['status']);
 // 内部历史原子接口只接受定义、参考期和显式计算范围，禁止客户端派生快照事实。
@@ -199,7 +199,7 @@ router.post('/definitions', authenticate, requirePermission(ENERGY_BENCHMARK_PER
     sendSuccess(res, createBenchmarkDefinition(body, buildBenchmarkWriteOptions(req)), { meta: { created: true } });
   }));
 
-// 修改定义不允许绕过版本和历史目标保护。
+// 修改定义由服务端创建内部后继记录并保留历史目标。
 router.put('/definitions/:definitionId', authenticate, requirePermission(ENERGY_BENCHMARK_PERMISSIONS.manage),
   requireWritable('energy-benchmarks:update-definition'), parseBenchmarkJsonBody, asyncHandler(async (req, res) => {
     const body = pickAllowedFields(req.body, DEFINITION_BODY_FIELDS, 'body');
@@ -233,21 +233,21 @@ router.get('/targets/:targetId', authenticate, requirePermission(ENERGY_BENCHMAR
   sendSuccess(res, getBenchmarkTarget(req.params.targetId));
 }));
 
-// 新增普通目标版本属于写操作。
+// 新增普通目标记录属于写操作。
 router.post('/targets', authenticate, requirePermission(ENERGY_BENCHMARK_PERMISSIONS.manage),
   requireWritable('energy-benchmarks:create-target'), parseBenchmarkJsonBody, asyncHandler(async (req, res) => {
     const body = pickAllowedFields(req.body, TARGET_CREATE_FIELDS, 'body');
     sendSuccess(res, createBenchmarkTarget(body, buildBenchmarkWriteOptions(req)), { meta: { created: true } });
   }));
 
-// 修改目标必须创建后继版本，旧版本保留用于追溯且不能更换定义归属。
+// 调整目标必须创建后继记录，原记录保留用于追溯且不能更换定义归属。
 router.put('/targets/:targetId', authenticate, requirePermission(ENERGY_BENCHMARK_PERMISSIONS.manage),
   requireWritable('energy-benchmarks:update-target'), parseBenchmarkJsonBody, asyncHandler(async (req, res) => {
     const body = pickAllowedFields(req.body, TARGET_UPDATE_FIELDS, 'body');
     sendSuccess(res, updateBenchmarkTarget(req.params.targetId, body, buildBenchmarkWriteOptions(req)));
   }));
 
-// 目标通过状态语义选择版本，不提供物理删除路由。
+// 目标通过状态语义选择当前业务记录，不提供物理删除路由。
 router.patch('/targets/:targetId/status', authenticate, requirePermission(ENERGY_BENCHMARK_PERMISSIONS.manage),
   requireWritable('energy-benchmarks:set-target-status'), parseBenchmarkJsonBody, asyncHandler(async (req, res) => {
     const body = pickAllowedFields(req.body, STATUS_BODY_FIELDS, 'body');

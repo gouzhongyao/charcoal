@@ -33,7 +33,11 @@ const {
   ENERGY_FLOW_NODE_TYPES,
   ENERGY_FLOW_SOURCE_TYPES,
   isIanaTimeZone,
-  isStrictUtcIso
+  normalizeEnergyFlowKey,
+  normalizeEnergyFlowModelVersionKey,
+  normalizeEnergyFlowUtcSecond,
+  validateAndNormalizeEnergyFlowIdentityCode,
+  validateAndNormalizeEnergyFlowModelVersion
 } = require('./energyAnalysisContracts');
 const {
   createEnergyFlowModel,
@@ -96,6 +100,79 @@ function isBlank(value) {
  */
 function normalizeText(value) {
   return isBlank(value) ? '' : String(value).trim();
+}
+
+/**
+ * 构建能流模型编码与版本的统一规范身份键。
+ * @param {*} modelCode 模型编码。
+ * @param {*} version 模型版本。
+ * @returns {string} 规范身份键。
+ */
+function buildEnergyFlowModelIdentityKey(modelCode, version) {
+  return `${normalizeEnergyFlowKey(modelCode)}\0${normalizeEnergyFlowModelVersionKey(version)}`;
+}
+
+/**
+ * 构建模型内节点或边编码的统一规范身份键。
+ * @param {*} modelId 模型 ID。
+ * @param {*} code 节点或边编码。
+ * @returns {string} 规范身份键。
+ */
+function buildEnergyFlowScopedCodeKey(modelId, code) {
+  return `${Number(modelId)}\0${normalizeEnergyFlowKey(code)}`;
+}
+
+/**
+ * 使用 CRUD 与 SQLite 共享合同校验导入身份编码，并生成稳定 preview issue。
+ * @param {*} value 原始编码。
+ * @param {number} rowNumber 物理行号。
+ * @param {string} fieldName 字段名。
+ * @returns {{value:string|null,issue:object|null}} 规范显示值和可选问题。
+ */
+function validateImportIdentityCode(value, rowNumber, fieldName) {
+  const validation = validateAndNormalizeEnergyFlowIdentityCode(value);
+  if (validation.valid) {
+    return { value: validation.value, issue: null };
+  }
+  const message = validation.errorCode === 'REQUIRED_FIELD_MISSING'
+    ? `${fieldName} 为必填项。`
+    : `${fieldName} 必须匹配 ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$。`;
+  return {
+    value: null,
+    issue: createFlowIssue(
+      rowNumber,
+      fieldName,
+      value,
+      validation.errorCode,
+      message
+    )
+  };
+}
+
+/**
+ * 使用共享模型版本合同校验导入引用，并生成稳定字段问题。
+ * @param {*} value 原始模型版本。
+ * @param {number} rowNumber 物理行号。
+ * @param {string} fieldName 字段名。
+ * @returns {{value:string|null,issue:object|null}} 规范显示值和可选问题。
+ */
+function validateImportModelVersion(value, rowNumber, fieldName) {
+  const validation = validateAndNormalizeEnergyFlowModelVersion(value);
+  if (validation.valid) {
+    return { value: validation.value, issue: null };
+  }
+  return {
+    value: null,
+    issue: createFlowIssue(
+      rowNumber,
+      fieldName,
+      value,
+      validation.errorCode,
+      validation.errorCode === 'REQUIRED_FIELD_MISSING'
+        ? `${fieldName} 为必填项。`
+        : `${fieldName} 必须匹配受控 ASCII 模型版本格式，长度为 1..64。`
+    )
+  };
 }
 
 /**
@@ -437,15 +514,21 @@ function captureModelNormalizerIssues(rowNumber, mapped) {
     };
   } catch (error) {
     const detailCode = String(error?.details?.code || '').trim();
-    const issueCode = detailCode.startsWith('ENERGY_FLOW_')
+    const issueCode = detailCode === 'REQUIRED_FIELD_MISSING'
+      || detailCode === 'INVALID_ENERGY_FLOW_IDENTITY'
+      || detailCode === 'INVALID_ENERGY_FLOW_MODEL_VERSION'
+      || detailCode.startsWith('ENERGY_FLOW_')
       ? detailCode
       : `ENERGY_FLOW_${detailCode || 'MODEL_ROW_INVALID'}`;
+    const issueFieldName = error?.details?.fieldName || error?.details?.field || null;
     return {
       value: null,
       issues: [createFlowIssue(
         rowNumber,
-        error?.details?.fieldName || error?.details?.field || null,
-        mapped,
+        issueFieldName,
+        issueFieldName && Object.prototype.hasOwnProperty.call(mapped, issueFieldName)
+          ? mapped[issueFieldName]
+          : mapped,
         issueCode,
         error?.message || '能流模型行不符合领域规则。'
       )]
@@ -457,7 +540,11 @@ function captureModelNormalizerIssues(rowNumber, mapped) {
 function buildModelBusinessSnapshot(record) {
   if (!record) return record;
   const { sourceRowNumber: _sourceRowNumber, candidateRowId: _candidateRowId, ...snapshot } = record;
-  return snapshot;
+  return {
+    ...snapshot,
+    modelCode: normalizeEnergyFlowKey(snapshot.modelCode),
+    version: normalizeEnergyFlowModelVersionKey(snapshot.version)
+  };
 }
 
 /** 判断两个能流模型业务快照是否完全一致。 */
@@ -471,7 +558,9 @@ function findExistingModel(db, record) {
     `SELECT model_code AS modelCode, model_name AS modelName, source,
             document_no AS documentNo, version, effective_start_utc AS effectiveStartUtc,
             effective_end_utc AS effectiveEndUtc, source_timezone AS sourceTimeZone, status
-       FROM energy_flow_models WHERE model_code = ? AND version = ?`
+       FROM energy_flow_models
+      WHERE normalize_energy_flow_key(model_code) = normalize_energy_flow_key(?)
+        AND normalize_energy_flow_key(version) = normalize_energy_flow_key(?)`
   ).get(record.modelCode, record.version) || null;
 }
 
@@ -481,10 +570,11 @@ function markInputModelDuplicates(rows) {
   const firstByIdentity = new Map();
   rows.forEach((row) => {
     if (!row.record || row.issues.some((issue) => issue.severity === 'error')) return;
+    const modelCodeKey = normalizeEnergyFlowKey(row.record.modelCode);
     if (row.record.status === 'active') {
-      activeByCode.set(row.record.modelCode, [...(activeByCode.get(row.record.modelCode) || []), row]);
+      activeByCode.set(modelCodeKey, [...(activeByCode.get(modelCodeKey) || []), row]);
     }
-    const identity = `${row.record.modelCode}\0${row.record.version}`;
+    const identity = buildEnergyFlowModelIdentityKey(row.record.modelCode, row.record.version);
     const first = firstByIdentity.get(identity);
     if (!first) {
       firstByIdentity.set(identity, row);
@@ -499,7 +589,7 @@ function markInputModelDuplicates(rows) {
     appendUniqueIssue(row, createFlowIssue(row.rowNumber, 'modelCode', identity, 'CONFLICTING_ENERGY_FLOW_MODEL_VERSION', '文件内相同模型编码和版本存在不同内容。'));
   });
   activeByCode.forEach((group, modelCode) => {
-    const versions = new Set(group.map((row) => row.record.version));
+    const versions = new Set(group.map((row) => normalizeEnergyFlowModelVersionKey(row.record.version)));
     if (versions.size <= 1) return;
     group.forEach((row) => appendUniqueIssue(row, createFlowIssue(row.rowNumber, 'status', { modelCode, versions: [...versions] }, 'MULTIPLE_ACTIVE_ENERGY_FLOW_MODEL_VERSIONS_IN_FILE', '同一文件内同一模型编码不能包含多个 active 版本。')));
   });
@@ -622,7 +712,7 @@ function loadNodeMasterData(db) {
             version, effective_start_utc AS effectiveStartUtc, effective_end_utc AS effectiveEndUtc,
             source_timezone AS sourceTimeZone, status
      FROM energy_flow_models`
-  ).all().map((row) => [`${row.modelCode}\0${row.version}`, row]));
+  ).all().map((row) => [buildEnergyFlowModelIdentityKey(row.modelCode, row.version), row]));
   const organizations = new Map(db.prepare(
     `SELECT id, unit_code AS code, unit_name AS name, status FROM organization_units`
   ).all().map((row) => [String(row.code), row]));
@@ -637,12 +727,19 @@ function loadNodeMasterData(db) {
  * @returns {{model:object|null,issues:object[]}} 模型解析结果。
  */
 function resolveActiveFlowModel(mapped, rowNumber, modelsByIdentity) {
-  const modelCode = normalizeText(mapped.modelCode);
-  const modelVersion = normalizeText(mapped.modelVersion);
-  const model = modelsByIdentity.get(`${modelCode}\0${modelVersion}`) || null;
-  const issues = [];
+  const modelCodeValidation = validateImportIdentityCode(mapped.modelCode, rowNumber, 'modelCode');
+  const modelCode = modelCodeValidation.value;
+  const modelVersionValidation = validateImportModelVersion(mapped.modelVersion, rowNumber, 'modelVersion');
+  const modelVersion = modelVersionValidation.value;
+  const issues = modelCodeValidation.issue ? [modelCodeValidation.issue] : [];
+  if (modelVersionValidation.issue) issues.push(modelVersionValidation.issue);
+  const model = modelCode && modelVersion
+    ? modelsByIdentity.get(buildEnergyFlowModelIdentityKey(modelCode, modelVersion)) || null
+    : null;
   if (!model) {
-    issues.push(createFlowIssue(rowNumber, 'modelCode', { modelCode, modelVersion }, 'ENERGY_FLOW_MODEL_NOT_FOUND', '指定编码和版本的能流模型不存在，不会自动创建模型。'));
+    if (!modelCodeValidation.issue && !modelVersionValidation.issue) {
+      issues.push(createFlowIssue(rowNumber, 'modelCode', { modelCode, modelVersion }, 'ENERGY_FLOW_MODEL_NOT_FOUND', '指定编码和版本的能流模型不存在，不会自动创建模型。'));
+    }
     return { model: null, issues };
   }
   if (model.status !== 'active') {
@@ -678,7 +775,9 @@ function validateEnergyFlowNodeRow(row, masterData) {
   const issues = [...(row.issues || []), ...validateRequiredFields(ENERGY_FLOW_NODE_TEMPLATE_TYPE, '能流节点', mapped, rowNumber)];
   const modelResolution = resolveActiveFlowModel(mapped, rowNumber, masterData.modelsByIdentity);
   issues.push(...modelResolution.issues);
-  const nodeCode = normalizeText(mapped.nodeCode);
+  const nodeCodeValidation = validateImportIdentityCode(mapped.nodeCode, rowNumber, 'nodeCode');
+  if (nodeCodeValidation.issue) issues.push(nodeCodeValidation.issue);
+  const nodeCode = nodeCodeValidation.value;
   const nodeName = normalizeText(mapped.nodeName);
   const nodeType = normalizeText(mapped.nodeType);
   const organizationCode = normalizeText(mapped.organizationUnitCode);
@@ -733,7 +832,7 @@ function validateEnergyFlowNodeRow(row, masterData) {
  */
 function isExactNodeFact(existing, candidate) {
   return Number(existing.energyFlowModelId) === Number(candidate.energyFlowModelId)
-    && existing.nodeCode === candidate.nodeCode
+    && normalizeEnergyFlowKey(existing.nodeCode) === normalizeEnergyFlowKey(candidate.nodeCode)
     && existing.nodeName === candidate.nodeName
     && existing.nodeType === candidate.nodeType
     && Number(existing.organizationUnitId ?? 0) === Number(candidate.organizationUnitId ?? 0)
@@ -759,7 +858,7 @@ function appendUniqueIssue(row, issue) {
 function markInputNodeDuplicates(rows) {
   const groups = new Map();
   rows.filter((row) => row.record && !row.issues.some((issue) => issue.severity === 'error')).forEach((row) => {
-    const key = `${row.record.energyFlowModelId}\0${row.record.nodeCode}`;
+    const key = buildEnergyFlowScopedCodeKey(row.record.energyFlowModelId, row.record.nodeCode);
     groups.set(key, [...(groups.get(key) || []), row]);
   });
   groups.forEach((group) => {
@@ -788,7 +887,8 @@ function markDatabaseNodeDuplicates(db, rows) {
             node_name AS nodeName, node_type AS nodeType, organization_unit_id AS organizationUnitId,
             x, y, status
      FROM energy_flow_nodes
-     WHERE energy_flow_model_id = ? AND node_code = ?`
+     WHERE energy_flow_model_id = ?
+       AND normalize_energy_flow_key(node_code) = normalize_energy_flow_key(?)`
   );
   rows.forEach((row) => {
     if (!row.record || row.skipDuplicate || row.issues.some((issue) => issue.severity === 'error')) return;
@@ -925,14 +1025,20 @@ async function executeEnergyFlowNodeImport(body = {}, options = {}) {
 function loadBundleMasterData(db) {
   const modelsByIdentity = new Map(db.prepare(
     `SELECT id, model_code AS modelCode, version, status FROM energy_flow_models`
-  ).all().map((row) => [`${row.modelCode}\0${row.version}`, row]));
+  ).all().map((row) => [buildEnergyFlowModelIdentityKey(row.modelCode, row.version), row]));
   const nodeRows = db.prepare(
     `SELECT id, energy_flow_model_id AS energyFlowModelId, node_code AS nodeCode, status
      FROM energy_flow_nodes`
   ).all();
-  const nodesByIdentity = new Map(nodeRows.map((row) => [`${row.energyFlowModelId}\0${row.nodeCode}`, row]));
+  const nodesByIdentity = new Map(nodeRows.map((row) => [
+    buildEnergyFlowScopedCodeKey(row.energyFlowModelId, row.nodeCode),
+    row
+  ]));
   const nodesByCode = new Map();
-  nodeRows.forEach((row) => nodesByCode.set(row.nodeCode, [...(nodesByCode.get(row.nodeCode) || []), row]));
+  nodeRows.forEach((row) => {
+    const nodeCodeKey = normalizeEnergyFlowKey(row.nodeCode);
+    nodesByCode.set(nodeCodeKey, [...(nodesByCode.get(nodeCodeKey) || []), row]);
+  });
   const energyTypes = new Map(db.prepare(
     `SELECT id, code, name, standard_unit AS standardUnit, is_active AS isActive FROM energy_types`
   ).all().map((row) => [String(row.code), row]));
@@ -941,7 +1047,7 @@ function loadBundleMasterData(db) {
             from_node_id AS fromNodeId, to_node_id AS toNodeId, energy_type_id AS energyTypeId,
             unit, source_type AS sourceType, source_mapping_json AS sourceMappingJson, status
      FROM energy_flow_edges`
-  ).all().map((row) => [`${row.energyFlowModelId}\0${row.edgeCode}`, row]));
+  ).all().map((row) => [buildEnergyFlowScopedCodeKey(row.energyFlowModelId, row.edgeCode), row]));
   return { modelsByIdentity, nodesByIdentity, nodesByCode, energyTypes, edgesByIdentity };
 }
 
@@ -953,12 +1059,19 @@ function loadBundleMasterData(db) {
  * @returns {{model:object|null,issues:object[]}} 模型结果。
  */
 function resolveBundleModel(mapped, rowNumber, masterData) {
-  const modelCode = normalizeText(mapped.modelCode);
-  const modelVersion = normalizeText(mapped.modelVersion);
-  const model = masterData.modelsByIdentity.get(`${modelCode}\0${modelVersion}`) || null;
-  const issues = [];
+  const modelCodeValidation = validateImportIdentityCode(mapped.modelCode, rowNumber, 'modelCode');
+  const modelCode = modelCodeValidation.value;
+  const modelVersionValidation = validateImportModelVersion(mapped.modelVersion, rowNumber, 'modelVersion');
+  const modelVersion = modelVersionValidation.value;
+  const issues = modelCodeValidation.issue ? [modelCodeValidation.issue] : [];
+  if (modelVersionValidation.issue) issues.push(modelVersionValidation.issue);
+  const model = modelCode && modelVersion
+    ? masterData.modelsByIdentity.get(buildEnergyFlowModelIdentityKey(modelCode, modelVersion)) || null
+    : null;
   if (!model) {
-    issues.push(createFlowIssue(rowNumber, 'modelCode', { modelCode, modelVersion }, 'ENERGY_FLOW_MODEL_NOT_FOUND', '指定编码和版本的能流模型不存在。'));
+    if (!modelCodeValidation.issue && !modelVersionValidation.issue) {
+      issues.push(createFlowIssue(rowNumber, 'modelCode', { modelCode, modelVersion }, 'ENERGY_FLOW_MODEL_NOT_FOUND', '指定编码和版本的能流模型不存在。'));
+    }
   } else if (model.status !== 'active') {
     issues.push(createFlowIssue(rowNumber, 'modelCode', modelCode, 'ENERGY_FLOW_MODEL_INACTIVE', '能流模型已停用。'));
   }
@@ -1022,22 +1135,33 @@ function validateEnergyFlowEdgeRow(row, masterData) {
   const issues = [...(row.issues || []), ...validateRequiredFields(ENERGY_FLOW_BUNDLE_TEMPLATE_TYPE, '能流边', mapped, rowNumber)];
   const modelResolution = resolveBundleModel(mapped, rowNumber, masterData);
   issues.push(...modelResolution.issues);
-  const edgeCode = normalizeText(mapped.edgeCode);
-  const fromNodeCode = normalizeText(mapped.fromNodeCode);
-  const toNodeCode = normalizeText(mapped.toNodeCode);
+  const edgeCodeValidation = validateImportIdentityCode(mapped.edgeCode, rowNumber, 'edgeCode');
+  const fromNodeCodeValidation = validateImportIdentityCode(mapped.fromNodeCode, rowNumber, 'fromNodeCode');
+  const toNodeCodeValidation = validateImportIdentityCode(mapped.toNodeCode, rowNumber, 'toNodeCode');
+  [edgeCodeValidation, fromNodeCodeValidation, toNodeCodeValidation].forEach((validation) => {
+    if (validation.issue) issues.push(validation.issue);
+  });
+  const edgeCode = edgeCodeValidation.value;
+  const fromNodeCode = fromNodeCodeValidation.value;
+  const toNodeCode = toNodeCodeValidation.value;
   const energyTypeCode = normalizeText(mapped.energyTypeCode);
   const unit = normalizeText(mapped.unit);
   const sourceType = normalizeText(mapped.sourceType);
   const status = normalizeText(mapped.status) || 'active';
   const modelId = modelResolution.model?.id || null;
-  const fromNode = modelId ? masterData.nodesByIdentity.get(`${modelId}\0${fromNodeCode}`) : null;
-  const toNode = modelId ? masterData.nodesByIdentity.get(`${modelId}\0${toNodeCode}`) : null;
+  const fromNode = modelId
+    ? masterData.nodesByIdentity.get(buildEnergyFlowScopedCodeKey(modelId, fromNodeCode))
+    : null;
+  const toNode = modelId
+    ? masterData.nodesByIdentity.get(buildEnergyFlowScopedCodeKey(modelId, toNodeCode))
+    : null;
   const energyType = masterData.energyTypes.get(energyTypeCode) || null;
   const sourceMapping = parseSourceMapping(mapped.sourceReference, rowNumber);
   issues.push(...sourceMapping.issues);
 
   if (fromNodeCode && !fromNode) {
-    const existsInOtherModel = (masterData.nodesByCode.get(fromNodeCode) || []).some((node) => Number(node.energyFlowModelId) !== Number(modelId));
+    const existsInOtherModel = (masterData.nodesByCode.get(normalizeEnergyFlowKey(fromNodeCode)) || [])
+      .some((node) => Number(node.energyFlowModelId) !== Number(modelId));
     issues.push(createFlowIssue(
       rowNumber,
       'fromNodeCode',
@@ -1047,7 +1171,8 @@ function validateEnergyFlowEdgeRow(row, masterData) {
     ));
   } else if (fromNode && fromNode.status !== 'active') issues.push(createFlowIssue(rowNumber, 'fromNodeCode', mapped.fromNodeCode, 'ENERGY_FLOW_FROM_NODE_INACTIVE', '起点节点已停用。'));
   if (toNodeCode && !toNode) {
-    const existsInOtherModel = (masterData.nodesByCode.get(toNodeCode) || []).some((node) => Number(node.energyFlowModelId) !== Number(modelId));
+    const existsInOtherModel = (masterData.nodesByCode.get(normalizeEnergyFlowKey(toNodeCode)) || [])
+      .some((node) => Number(node.energyFlowModelId) !== Number(modelId));
     issues.push(createFlowIssue(
       rowNumber,
       'toNodeCode',
@@ -1095,7 +1220,7 @@ function validateEnergyFlowEdgeRow(row, masterData) {
  */
 function isExactEdgeFact(existing, candidate) {
   return Number(existing.energyFlowModelId) === Number(candidate.energyFlowModelId)
-    && existing.edgeCode === candidate.edgeCode
+    && normalizeEnergyFlowKey(existing.edgeCode) === normalizeEnergyFlowKey(candidate.edgeCode)
     && Number(existing.fromNodeId) === Number(candidate.fromNodeId)
     && Number(existing.toNodeId) === Number(candidate.toNodeId)
     && Number(existing.energyTypeId) === Number(candidate.energyTypeId)
@@ -1122,7 +1247,7 @@ function buildEdgeCandidateRowId(record) {
 function markInputEdgeDuplicates(rows) {
   const groups = new Map();
   rows.filter((row) => row.record && !row.issues.some((issue) => issue.severity === 'error')).forEach((row) => {
-    const key = `${row.record.energyFlowModelId}\0${row.record.edgeCode}`;
+    const key = buildEnergyFlowScopedCodeKey(row.record.energyFlowModelId, row.record.edgeCode);
     groups.set(key, [...(groups.get(key) || []), row]);
   });
   groups.forEach((group) => {
@@ -1147,7 +1272,9 @@ function markInputEdgeDuplicates(rows) {
 function markDatabaseEdgeDuplicates(rows, masterData) {
   rows.forEach((row) => {
     if (!row.record || row.skipDuplicate || row.issues.some((issue) => issue.severity === 'error')) return;
-    const existing = masterData.edgesByIdentity.get(`${row.record.energyFlowModelId}\0${row.record.edgeCode}`);
+    const existing = masterData.edgesByIdentity.get(
+      buildEnergyFlowScopedCodeKey(row.record.energyFlowModelId, row.record.edgeCode)
+    );
     if (!existing) return;
     if (isExactEdgeFact(existing, row.record)) {
       row.skipDuplicate = true;
@@ -1172,7 +1299,10 @@ function buildPreviewEdgeReferenceIndex(edgeRows, masterData) {
     if (!row.record || row.skipDuplicate || row.issues.some((issue) => issue.severity === 'error')) return;
     const candidateRowId = buildEdgeCandidateRowId(row.record);
     row.candidateRowId = candidateRowId;
-    index.set(`${row.record.energyFlowModelId}\0${row.record.edgeCode}`, { kind: 'candidate', candidateRowId, edge: row.record });
+    index.set(
+      buildEnergyFlowScopedCodeKey(row.record.energyFlowModelId, row.record.edgeCode),
+      { kind: 'candidate', candidateRowId, edge: row.record }
+    );
   });
   return index;
 }
@@ -1190,12 +1320,20 @@ function validateEnergyFlowRecordRow(row, masterData, edgeReferenceIndex) {
   const issues = [...(row.issues || []), ...validateRequiredFields(ENERGY_FLOW_BUNDLE_TEMPLATE_TYPE, '显式边值', mapped, rowNumber)];
   const modelResolution = resolveBundleModel(mapped, rowNumber, masterData);
   issues.push(...modelResolution.issues);
-  const edgeCode = normalizeText(mapped.edgeCode);
+  const edgeCodeValidation = validateImportIdentityCode(mapped.edgeCode, rowNumber, 'edgeCode');
+  if (edgeCodeValidation.issue) issues.push(edgeCodeValidation.issue);
+  const edgeCode = edgeCodeValidation.value;
   const modelId = modelResolution.model?.id || null;
-  const edgeReference = modelId ? edgeReferenceIndex.get(`${modelId}\0${edgeCode}`) || null : null;
+  const edgeReference = modelId && edgeCode
+    ? edgeReferenceIndex.get(buildEnergyFlowScopedCodeKey(modelId, edgeCode)) || null
+    : null;
   const edge = edgeReference?.edge || null;
-  const startUtc = normalizeText(mapped.startUtc);
-  const endUtc = normalizeText(mapped.endUtc);
+  const startUtc = normalizeEnergyFlowUtcSecond(
+    normalizeText(mapped.startUtc)
+  );
+  const endUtc = normalizeEnergyFlowUtcSecond(
+    normalizeText(mapped.endUtc)
+  );
   const sourceTimeZone = normalizeText(mapped.sourceTimeZone);
   const originalUnit = normalizeText(mapped.originalUnit);
   const originalValue = isBlank(mapped.originalValue) ? null : Number(mapped.originalValue);
@@ -1204,15 +1342,15 @@ function validateEnergyFlowRecordRow(row, masterData, edgeReferenceIndex) {
   const sourceMapping = parseSourceMapping(mapped.sourceReference, rowNumber);
   issues.push(...sourceMapping.issues);
 
-  if (!edge) issues.push(createFlowIssue(rowNumber, 'edgeCode', mapped.edgeCode, 'ENERGY_FLOW_EDGE_NOT_FOUND', '指定模型下的边不存在，且文件内没有可导入候选边。'));
-  else {
+  if (!edge && !edgeCodeValidation.issue) issues.push(createFlowIssue(rowNumber, 'edgeCode', mapped.edgeCode, 'ENERGY_FLOW_EDGE_NOT_FOUND', '指定模型下的边不存在，且文件内没有可导入候选边。'));
+  else if (edge) {
     if (edge.status !== 'active') issues.push(createFlowIssue(rowNumber, 'edgeCode', mapped.edgeCode, 'ENERGY_FLOW_EDGE_INACTIVE', '显式边值只能引用 active 边。'));
     if (edge.sourceType !== 'explicit_edge_value') issues.push(createFlowIssue(rowNumber, 'edgeCode', mapped.edgeCode, 'ENERGY_FLOW_RECORD_SOURCE_TYPE_MISMATCH', '显式边值只能引用来源类型为 explicit_edge_value 的边。'));
     if (Number(edge.energyFlowModelId) !== Number(modelId)) issues.push(createFlowIssue(rowNumber, 'edgeCode', mapped.edgeCode, 'ENERGY_FLOW_RECORD_MODEL_EDGE_MISMATCH', '显式边值模型与边不一致。'));
   }
-  if (!isStrictUtcIso(startUtc)) issues.push(createFlowIssue(rowNumber, 'startUtc', mapped.startUtc, 'INVALID_START_UTC', '开始时间必须是严格 UTC Z 格式。'));
-  if (!isStrictUtcIso(endUtc)) issues.push(createFlowIssue(rowNumber, 'endUtc', mapped.endUtc, 'INVALID_END_UTC', '结束时间必须是严格 UTC Z 格式。'));
-  if (isStrictUtcIso(startUtc) && isStrictUtcIso(endUtc) && Date.parse(startUtc) >= Date.parse(endUtc)) issues.push(createFlowIssue(rowNumber, 'startUtc', { startUtc, endUtc }, 'INVALID_HALF_OPEN_RANGE', '时间区间必须满足左闭右开且开始时间早于结束时间。'));
+  if (!startUtc) issues.push(createFlowIssue(rowNumber, 'startUtc', mapped.startUtc, 'INVALID_START_UTC', '开始时间必须是严格 UTC Z 秒精度格式；仅允许将 .000Z 无损规范为 Z。'));
+  if (!endUtc) issues.push(createFlowIssue(rowNumber, 'endUtc', mapped.endUtc, 'INVALID_END_UTC', '结束时间必须是严格 UTC Z 秒精度格式；仅允许将 .000Z 无损规范为 Z。'));
+  if (startUtc && endUtc && Date.parse(startUtc) >= Date.parse(endUtc)) issues.push(createFlowIssue(rowNumber, 'startUtc', { startUtc, endUtc }, 'INVALID_HALF_OPEN_RANGE', '时间区间必须满足左闭右开且开始时间早于结束时间。'));
   if (!isIanaTimeZone(sourceTimeZone)) issues.push(createFlowIssue(rowNumber, 'sourceTimeZone', mapped.sourceTimeZone, 'INVALID_SOURCE_TIME_ZONE', '来源时区必须是有效 IANA 时区。'));
   if (!Number.isFinite(originalValue) || originalValue < 0) issues.push(createFlowIssue(rowNumber, 'originalValue', mapped.originalValue, 'INVALID_ORIGINAL_VALUE', '原始值必须是有限且大于等于 0 的数字。'));
   const energyType = edge ? [...masterData.energyTypes.values()].find((item) => Number(item.id) === Number(edge.energyTypeId)) : null;
@@ -1222,7 +1360,7 @@ function validateEnergyFlowRecordRow(row, masterData, edgeReferenceIndex) {
   if (recordStatus !== IMPORTABLE_RECORD_STATUS) issues.push(createFlowIssue(rowNumber, 'recordStatus', mapped.recordStatus, 'ENERGY_FLOW_RECORD_STATUS_UNSUPPORTED', '导入仅允许 active 显式边值；void 需要完整作废原因和作废时间。'));
 
   const record = modelResolution.model && edgeReference && edge && edge.status === 'active' && edge.sourceType === 'explicit_edge_value'
-    && isStrictUtcIso(startUtc) && isStrictUtcIso(endUtc) && Date.parse(startUtc) < Date.parse(endUtc)
+    && startUtc && endUtc && Date.parse(startUtc) < Date.parse(endUtc)
     && isIanaTimeZone(sourceTimeZone) && Number.isFinite(originalValue) && originalValue >= 0
     && energyType && isEnergyUnitCompatible(energyType, originalUnit) && sourceMapping.mappingJson
     && formulaVersion === ENERGY_FLOW_VERSION && recordStatus === IMPORTABLE_RECORD_STATUS
@@ -1257,7 +1395,7 @@ function validateEnergyFlowRecordRow(row, masterData, edgeReferenceIndex) {
 function buildRecordPeriodKey(record) {
   return stableSerialize({
     energyFlowModelId: record.energyFlowModelId,
-    edgeCode: record.edgeCode,
+    edgeCode: normalizeEnergyFlowKey(record.edgeCode),
     startUtc: record.startUtc,
     endUtc: record.endUtc,
     recordStatus: record.recordStatus
@@ -1272,7 +1410,7 @@ function buildRecordPeriodKey(record) {
  */
 function isExactRecordFact(left, right) {
   return Number(left.energyFlowModelId) === Number(right.energyFlowModelId)
-    && left.edgeCode === right.edgeCode
+    && normalizeEnergyFlowKey(left.edgeCode) === normalizeEnergyFlowKey(right.edgeCode)
     && Date.parse(left.startUtc) === Date.parse(right.startUtc)
     && Date.parse(left.endUtc) === Date.parse(right.endUtc)
     && left.sourceTimeZone === right.sourceTimeZone
@@ -1335,14 +1473,16 @@ function markDatabaseRecordDuplicates(db, rows, masterData) {
      FROM energy_flow_records AS record
      JOIN energy_flow_edges AS edge ON edge.id = record.energy_flow_edge_id
      WHERE record.energy_flow_model_id = ?
-       AND edge.edge_code = ?
+       AND normalize_energy_flow_key(edge.edge_code) = normalize_energy_flow_key(?)
        AND record.start_utc = ?
        AND record.end_utc = ?
        AND record.record_status = 'active'`
   );
   rows.forEach((row) => {
     if (!row.record || row.skipDuplicate || row.issues.some((issue) => issue.severity === 'error')) return;
-    const edgeReference = masterData.edgesByIdentity.get(`${row.record.energyFlowModelId}\0${row.record.edgeCode}`);
+    const edgeReference = masterData.edgesByIdentity.get(
+      buildEnergyFlowScopedCodeKey(row.record.energyFlowModelId, row.record.edgeCode)
+    );
     if (!edgeReference) return;
     const existingRows = selectRecords.all(row.record.energyFlowModelId, row.record.edgeCode, row.record.startUtc, row.record.endUtc);
     if (existingRows.length === 0) return;

@@ -469,7 +469,9 @@ function assertRouteContract() {
     { path: '/nodes/preview', methods: ['post'] },
     { path: '/nodes/execute', methods: ['post'] },
     { path: '/bundle/preview', methods: ['post'] },
-    { path: '/bundle/execute', methods: ['post'] }
+    { path: '/bundle/execute', methods: ['post'] },
+    { path: '/workbook/preview', methods: ['post'] },
+    { path: '/workbook/execute', methods: ['post'] }
   ]);
   assert(!routeContracts.some((item) => item.path.includes('template')), '本阶段不得新增模板路由。');
 }
@@ -551,7 +553,8 @@ async function run() {
     const modelRows = Array.from({ length: 200 }, (_unused, index) => createModelRow({
       modelCode: `FLOW-ROUTE-IMPORTED-${String(index + 1).padStart(3, '0')}`,
       modelName: `路由批量导入模型 ${index + 1}`,
-      documentNo: `FLOW-ROUTE-IMPORT-2026-${String(index + 1).padStart(3, '0')}`
+      documentNo: `FLOW-ROUTE-IMPORT-2026-${String(index + 1).padStart(3, '0')}`,
+      version: index === 199 ? `V${'1'.repeat(63)}` : 'v1'
     }));
     const validModelXlsx = createWorkbookBuffer([{
       templateType: 'energy-flow-models',
@@ -602,6 +605,80 @@ async function run() {
     } finally {
       modelAuditDatabase.close();
     }
+    const canonicalModelPreviewResponse = await requestMultipart(server, `${ROUTE_PREFIX}/models/preview`, {
+      filename: 'energy-flow-models-canonical-skip.xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      content: createWorkbookBuffer([{
+        templateType: 'energy-flow-models',
+        sheetName: '能流模型',
+        rows: [createModelRow({
+          modelCode: modelRows[0].modelCode.toLowerCase(),
+          modelName: modelRows[0].modelName,
+          documentNo: modelRows[0].documentNo,
+          version: 'V1'
+        })]
+      }])
+    }, adminToken);
+    assert.strictEqual(canonicalModelPreviewResponse.status, 200, canonicalModelPreviewResponse.text);
+    assert.strictEqual(canonicalModelPreviewResponse.body.data.expectedWouldImport, 0);
+    assert.strictEqual(canonicalModelPreviewResponse.body.data.summary.skipped, 1);
+    assert(!/INTERNAL_ERROR|SQLITE|UNIQUE|ux_energy_flow/i.test(canonicalModelPreviewResponse.text));
+    const invalidModelPreviewResponse = await requestMultipart(server, `${ROUTE_PREFIX}/models/preview`, {
+      filename: 'energy-flow-models-invalid-identity.xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      content: createWorkbookBuffer([{
+        templateType: 'energy-flow-models',
+        sheetName: '能流模型',
+        rows: [createModelRow({ modelCode: 'ＦＬＯＷ-ROUTE-INVALID' })]
+      }])
+    }, adminToken);
+    assert.strictEqual(invalidModelPreviewResponse.status, 200, invalidModelPreviewResponse.text);
+    assert.strictEqual(invalidModelPreviewResponse.body.data.expectedWouldImport, 0);
+    assert.strictEqual(invalidModelPreviewResponse.body.data.summary.blocked, 1);
+    assert(invalidModelPreviewResponse.body.data.auditIssues.some(
+      (issue) => issue.code === 'INVALID_ENERGY_FLOW_IDENTITY'
+    ));
+
+    const overLengthVersionPreviewResponse = await requestMultipart(server, `${ROUTE_PREFIX}/models/preview`, {
+      filename: 'energy-flow-models-invalid-version-length.xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      content: createWorkbookBuffer([{
+        templateType: 'energy-flow-models',
+        sheetName: '能流模型',
+        rows: [createModelRow({
+          modelCode: 'FLOW-ROUTE-INVALID-VERSION',
+          version: `V${'1'.repeat(64)}`
+        })]
+      }])
+    }, adminToken);
+    assert.strictEqual(overLengthVersionPreviewResponse.status, 200, overLengthVersionPreviewResponse.text);
+    assert.strictEqual(overLengthVersionPreviewResponse.body.data.expectedWouldImport, 0);
+    assert.strictEqual(overLengthVersionPreviewResponse.body.data.summary.blocked, 1);
+    assert.strictEqual(overLengthVersionPreviewResponse.body.data.candidateRows.length, 0);
+    assert(overLengthVersionPreviewResponse.body.data.auditIssues.some(
+      (issue) => issue.code === 'INVALID_ENERGY_FLOW_MODEL_VERSION' && issue.fieldName === 'version'
+    ));
+    const modelBackupCountBeforeBlockedVersionExecute = backupCounter.count;
+    const overLengthVersionExecuteResponse = await requestJson(
+      server,
+      'POST',
+      `${ROUTE_PREFIX}/models/execute`,
+      buildNodeExecuteBody(overLengthVersionPreviewResponse.body.data),
+      adminToken
+    );
+    assertStableClientError(overLengthVersionExecuteResponse, 'ENERGY_ANALYSIS_IMPORT_EMPTY_CANDIDATES_REJECTED');
+    assert.strictEqual(backupCounter.count, modelBackupCountBeforeBlockedVersionExecute);
+
+    const modelBackupCountBeforeBlockedExecute = backupCounter.count;
+    const invalidModelExecuteResponse = await requestJson(
+      server,
+      'POST',
+      `${ROUTE_PREFIX}/models/execute`,
+      buildNodeExecuteBody(invalidModelPreviewResponse.body.data),
+      adminToken
+    );
+    assertStableClientError(invalidModelExecuteResponse, 'ENERGY_ANALYSIS_IMPORT_EMPTY_CANDIDATES_REJECTED');
+    assert.strictEqual(backupCounter.count, modelBackupCountBeforeBlockedExecute);
     getUploadFiles().forEach((filename) => fs.unlinkSync(path.join(uploadsDir, filename)));
 
     const validNodeXlsx = createWorkbookBuffer([{
@@ -695,6 +772,23 @@ async function run() {
     assert.strictEqual(getUploadFiles().length, 0, '缺工作表失败后必须清理文件。');
     assert.strictEqual(countImportBatches(), batchCountBeforeMissingSheet, '缺工作表预检不得创建审计批次。');
 
+    const invalidNodeIdentityResponse = await requestMultipart(server, `${ROUTE_PREFIX}/nodes/preview`, {
+      filename: 'energy-flow-nodes-invalid-identity.xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      content: createWorkbookBuffer([{
+        templateType: 'energy-flow-nodes',
+        sheetName: '能流节点',
+        rows: [createNodeRow({ nodeCode: 'ＮＯＤＥ-ROUTE' })]
+      }])
+    }, adminToken);
+    assert.strictEqual(invalidNodeIdentityResponse.status, 200, invalidNodeIdentityResponse.text);
+    assert.strictEqual(invalidNodeIdentityResponse.body.data.expectedWouldImport, 0);
+    assert.strictEqual(invalidNodeIdentityResponse.body.data.summary.blocked, 1);
+    assert(invalidNodeIdentityResponse.body.data.auditIssues.some(
+      (issue) => issue.code === 'INVALID_ENERGY_FLOW_IDENTITY'
+    ));
+    getUploadFiles().forEach((filename) => fs.unlinkSync(path.join(uploadsDir, filename)));
+
     // 节点 CSV preview/execute 覆盖服务允许格式、成功保留和来源追溯。
     const nodeDefinition = getEnergyAnalysisTemplateDefinition('energy-flow-nodes').sheets[0];
     const nodeCsv = [
@@ -733,17 +827,51 @@ async function run() {
       nodeDatabase.close();
     }
 
+    const retainedUploadFilesBeforeInvalidEdge = new Set(getUploadFiles());
+    const invalidEdgeCode = 'ＥＤＧＥ-ROUTE-INVALID';
+    const invalidEdgeIdentityResponse = await requestMultipart(server, `${ROUTE_PREFIX}/bundle/preview`, {
+      filename: 'energy-flow-bundle-invalid-identity.xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      content: createBundleBuffer(
+        invalidEdgeCode,
+        '2026-01-01T00:00:00Z',
+        '2026-02-01T00:00:00Z'
+      )
+    }, adminToken);
+    assert.strictEqual(invalidEdgeIdentityResponse.status, 200, invalidEdgeIdentityResponse.text);
+    assert.strictEqual(invalidEdgeIdentityResponse.body.data.expectedWouldImport, 0);
+    assert.strictEqual(invalidEdgeIdentityResponse.body.data.edgePreview.summary.blocked, 1);
+    assert.strictEqual(invalidEdgeIdentityResponse.body.data.recordPreview.summary.blocked, 1);
+    assert(invalidEdgeIdentityResponse.body.data.auditIssues.some(
+      (issue) => issue.code === 'INVALID_ENERGY_FLOW_IDENTITY'
+    ));
+    const bundleBackupCountBeforeBlockedExecute = backupCounter.count;
+    const invalidEdgeExecuteResponse = await requestJson(
+      server,
+      'POST',
+      `${ROUTE_PREFIX}/bundle/execute`,
+      buildBundleExecuteBody(invalidEdgeIdentityResponse.body.data),
+      adminToken
+    );
+    assertStableClientError(invalidEdgeExecuteResponse, 'ENERGY_ANALYSIS_IMPORT_EMPTY_CANDIDATES_REJECTED');
+    assert.strictEqual(backupCounter.count, bundleBackupCountBeforeBlockedExecute);
+    getUploadFiles()
+      .filter((filename) => !retainedUploadFilesBeforeInvalidEdge.has(filename))
+      .forEach((filename) => fs.unlinkSync(path.join(uploadsDir, filename)));
+
     // 双批次 preview/execute 使用最小 JSON；客户端伪造候选字段不得进入服务。
     const bundlePreview = await createBundlePreview(
       server,
       adminToken,
       'bundle-success.xlsx',
       'EDGE-API-SUCCESS',
-      '2026-01-01T00:00:00Z',
-      '2026-02-01T00:00:00Z'
+      '2026-01-01T00:00:00.000Z',
+      '2026-02-01T00:00:00.000Z'
     );
     assert.notStrictEqual(bundlePreview.edgeBatchId, bundlePreview.recordBatchId);
     assert.strictEqual(bundlePreview.expectedWouldImport, 2);
+    assert.strictEqual(bundlePreview.recordPreview.candidateRows[0].startUtc, '2026-01-01T00:00:00Z');
+    assert.strictEqual(bundlePreview.recordPreview.candidateRows[0].endUtc, '2026-02-01T00:00:00Z');
     assert.strictEqual(getUploadFiles().length, 2, 'bundle preview 成功后必须保留原文件。');
     const minimalBundleBody = buildBundleExecuteBody(bundlePreview, {
       candidateRows: [{ candidateRowId: 'forged', edgeCode: 'FORGED' }],
@@ -779,6 +907,13 @@ async function run() {
       assert.strictEqual(audits[0].backupJson, audits[1].backupJson, '双批次必须记录同一备份摘要。');
       const executeResults = audits.map((batch) => JSON.parse(batch.executeResultJson));
       assert.strictEqual(executeResults[0].uploadGroupId, executeResults[1].uploadGroupId);
+      const persistedRecordRange = successDatabase.prepare(`SELECT record.start_utc AS startUtc,
+          record.end_utc AS endUtc
+        FROM energy_flow_records record
+        INNER JOIN energy_flow_edges edge ON edge.id = record.energy_flow_edge_id
+        WHERE edge.edge_code = 'EDGE-API-SUCCESS'`).get();
+      assert.strictEqual(persistedRecordRange.startUtc, '2026-01-01T00:00:00Z');
+      assert.strictEqual(persistedRecordRange.endUtc, '2026-02-01T00:00:00Z');
       assert.deepStrictEqual(successDatabase.prepare('PRAGMA foreign_key_check').all(), []);
     } finally {
       successDatabase.close();
@@ -836,7 +971,7 @@ async function run() {
         `INSERT INTO energy_flow_edges (
            energy_flow_model_id, edge_code, from_node_id, to_node_id, energy_type_id,
            unit, source_type, source_mapping_json, status
-         ) VALUES (?, 'EDGE-STALE-API', ?, ?, ?, 'kWh', 'explicit_edge_value', ?, 'active')`
+         ) VALUES (?, 'edge-stale-api', ?, ?, ?, 'kWh', 'explicit_edge_value', ?, 'active')`
       ).run(master.modelId, master.sourceNodeId, master.sinkNodeId, energyTypeId, JSON.stringify({ reference: 'explicit-edge:EDGE-STALE-API' })).lastInsertRowid);
     } finally {
       staleDatabase.close();
@@ -917,6 +1052,28 @@ async function run() {
     const transactionStates = getBatchStates([transactionPreview.edgeBatchId, transactionPreview.recordBatchId]);
     assert(transactionStates.every((batch) => batch.auditPhase === 'execute' && batch.status === 'failed'));
     assert(transactionStates.every((batch) => !String(batch.executeResultJson).includes('raw transaction failure')));
+
+    // 非零毫秒在 preview 阶段稳定阻断，不得落入 SQLite CHECK 异常或泄露数据库细节。
+    const invalidMillisecondPreviewResponse = await requestMultipart(
+      server,
+      `${ROUTE_PREFIX}/bundle/preview`,
+      {
+        filename: 'invalid-millisecond.xlsx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        content: createBundleBuffer(
+          'EDGE-INVALID-MILLISECOND-API',
+          '2026-09-01T00:00:00.001Z',
+          '2026-10-01T00:00:00Z'
+        )
+      },
+      adminToken
+    );
+    assert.strictEqual(invalidMillisecondPreviewResponse.status, 200, invalidMillisecondPreviewResponse.text);
+    assert.strictEqual(invalidMillisecondPreviewResponse.body.data.recordPreview.summary.blocked, 1);
+    assert(invalidMillisecondPreviewResponse.body.data.recordPreview.auditIssues.some(
+      (issue) => issue.code === 'INVALID_START_UTC'
+    ));
+    assert(!/INTERNAL_ERROR|SQLITE|CHECK constraint/i.test(invalidMillisecondPreviewResponse.text));
 
     console.log('energy flow import route API tests passed');
   } finally {

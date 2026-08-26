@@ -136,8 +136,6 @@ function createDefinitionInput(overrides = {}) {
     scopeReference: 'OU-BENCH',
     direction: 'lower_better',
     source: '企业自定义目标',
-    documentNo: null,
-    version: 'lower-definition:v1',
     effectiveStartUtc: '2026-01-01T00:00:00Z',
     effectiveEndUtc: '2027-01-01T00:00:00Z',
     sourceTimeZone: 'Asia/Shanghai',
@@ -158,7 +156,6 @@ function createTargetInput(definitionId, overrides = {}) {
     targetValue: 100,
     lowerBound: null,
     upperBound: null,
-    version: 'lower-target:v1',
     status: 'active',
     ...overrides
   };
@@ -190,92 +187,145 @@ function createActual(actualValue, overrides = {}) {
 }
 
 /**
- * 验证定义和目标 CRUD、启停、分页和版本保护。
+ * 验证定义和目标 CRUD、启停、分页、内部修订与历史保护。
  * @returns {{definition:object,target:object}} 基础定义和目标。
  */
 function testCrudAndStatus() {
-  const definition = createBenchmarkDefinition(createDefinitionInput());
+  const definition = createBenchmarkDefinition(createDefinitionInput({
+    documentNo: '客户端不得写入的文号',
+    version: 'client-definition:v999',
+    internalRevision: 999
+  }));
   assert.strictEqual(definition.status, 'active');
   assert.strictEqual(definition.benchmarkType, 'manual_benchmark');
+  assert.strictEqual(definition.documentNo, null, '新建定义不得写入客户端文号。');
+  assert.strictEqual(definition.internalRevision, 1);
+  assert.strictEqual(definition.version, 'benchmark-definition-internal-revision:v1');
 
   const definitionList = listBenchmarkDefinitions({ page: 1, pageSize: 10, status: 'active' });
   assert.strictEqual(definitionList.total, 1);
   assert.strictEqual(definitionList.items[0].id, definition.id);
   assert.strictEqual(captureError(() => listBenchmarkDefinitions({ pageSize: 101 })).details.code, 'BENCHMARK_INVALID_PAGE_SIZE');
 
-  const updatedDefinition = updateBenchmarkDefinition(definition.id, createDefinitionInput({ benchmarkName: '更新后的企业目标' }));
+  const updatedDefinition = updateBenchmarkDefinition(definition.id, createDefinitionInput({
+    benchmarkName: '更新后的企业目标',
+    documentNo: '客户端仍不得写入的文号',
+    version: 'client-definition:v1000',
+    internalRevision: 1000
+  }));
   assert.strictEqual(updatedDefinition.benchmarkName, '更新后的企业目标');
+  assert.strictEqual(updatedDefinition.predecessorDefinitionId, definition.id);
+  assert.strictEqual(updatedDefinition.documentNo, null);
+  assert.strictEqual(updatedDefinition.internalRevision, 2);
+  assert.strictEqual(updatedDefinition.version, 'benchmark-definition-internal-revision:v2');
+  assert.strictEqual(getBenchmarkDefinition(definition.id).status, 'inactive', '原定义必须保留并停用。');
 
-  const target = createBenchmarkTarget(createTargetInput(definition.id));
+  const target = createBenchmarkTarget(createTargetInput(updatedDefinition.id, {
+    version: 'client-target:v999',
+    targetVersion: 'client-target-version:v999',
+    internalRevision: 999
+  }));
   assert.strictEqual(target.targetValue, 100);
   assert.strictEqual(target.isFrozen, false);
-  assert.strictEqual(getBenchmarkDefinition(definition.id).targets.length, 1);
-  assert.strictEqual(getBenchmarkTarget(target.id).definition.id, definition.id);
+  assert.strictEqual(target.internalRevision, 1);
+  assert.strictEqual(target.version, 'benchmark-target-internal-revision:v1');
+  assert.strictEqual(getBenchmarkDefinition(updatedDefinition.id).targets.length, 1);
+  assert.strictEqual(getBenchmarkTarget(target.id).definition.id, updatedDefinition.id);
 
-  const targetList = listBenchmarkTargets({ definitionId: definition.id, page: 1, pageSize: 10 });
+  const targetList = listBenchmarkTargets({ definitionId: updatedDefinition.id, page: 1, pageSize: 10 });
   assert.strictEqual(targetList.total, 1);
 
   const changedTarget = updateBenchmarkTarget(target.id, {
     targetValue: 90,
     lowerBound: null,
     upperBound: null,
-    version: 'lower-target-next:v1',
+    version: 'client-target:v1000',
+    internalRevision: 1000,
     status: 'active'
   });
   assert.strictEqual(changedTarget.targetValue, 90);
   assert.strictEqual(changedTarget.predecessorTargetId, target.id);
-  assert.strictEqual(getBenchmarkTarget(target.id).status, 'inactive', '旧目标版本必须保留并停用。');
+  assert.strictEqual(changedTarget.internalRevision, 2);
+  assert.strictEqual(changedTarget.version, 'benchmark-target-internal-revision:v2');
+  assert.strictEqual(getBenchmarkTarget(target.id).status, 'inactive', '原目标必须保留并停用。');
 
-  const versionError = captureError(() => updateBenchmarkTarget(changedTarget.id, {
-    targetValue: 85,
-    version: 'lower-target-next:v1',
+  const latestTarget = updateBenchmarkTarget(changedTarget.id, {
+    targetValue: 90,
+    lowerBound: null,
+    upperBound: null,
+    version: changedTarget.version,
+    internalRevision: changedTarget.internalRevision,
     status: 'active'
-  }));
-  assert.strictEqual(versionError.details.code, 'BENCHMARK_TARGET_VERSION_CONFLICT');
+  });
+  assert.strictEqual(latestTarget.predecessorTargetId, changedTarget.id);
+  assert.strictEqual(latestTarget.internalRevision, 3);
+  assert.strictEqual(latestTarget.version, 'benchmark-target-internal-revision:v3');
+  assert.strictEqual(getBenchmarkTarget(changedTarget.id).status, 'inactive');
 
-  const definitionVersionError = captureError(() => updateBenchmarkDefinition(definition.id,
-    createDefinitionInput({ metricCode: 'changed_metric' })));
-  assert.strictEqual(definitionVersionError.details.code, 'BENCHMARK_DEFINITION_VERSION_CONFLICT');
-  assert(definitionVersionError.details.fields.includes('metricCode'));
+  const codeChange = captureError(() => updateBenchmarkDefinition(updatedDefinition.id,
+    createDefinitionInput({ benchmarkCode: 'BENCH-CLIENT-CHANGED-CODE' })));
+  assert.strictEqual(codeChange.details.code, 'BENCHMARK_DEFINITION_CODE_IMMUTABLE');
 
-  const inactiveTarget = createBenchmarkTarget(createTargetInput(definition.id, {
+  const inactiveTarget = createBenchmarkTarget(createTargetInput(updatedDefinition.id, {
     targetValue: 80,
-    version: 'lower-target-third:v1',
     status: 'inactive'
   }));
+  assert.strictEqual(inactiveTarget.internalRevision, 4);
   const activeConflict = captureError(() => setBenchmarkTargetStatus(inactiveTarget.id, 'active'));
   assert.strictEqual(activeConflict.details.code, 'BENCHMARK_TARGET_ACTIVE_CONFLICT');
 
-  assert.strictEqual(setBenchmarkTargetStatus(changedTarget.id, 'inactive').status, 'inactive');
+  assert.strictEqual(setBenchmarkTargetStatus(latestTarget.id, 'inactive').status, 'inactive');
   assert.strictEqual(setBenchmarkTargetStatus(inactiveTarget.id, 'active').status, 'active');
   assert.strictEqual(setBenchmarkTargetStatus(inactiveTarget.id, 'inactive').status, 'inactive');
-  assert.strictEqual(setBenchmarkTargetStatus(changedTarget.id, 'active').status, 'active');
+  assert.strictEqual(setBenchmarkTargetStatus(latestTarget.id, 'active').status, 'active');
 
-  assert.strictEqual(setBenchmarkDefinitionStatus(definition.id, 'inactive').status, 'inactive');
-  assert.strictEqual(setBenchmarkDefinitionStatus(definition.id, 'active').status, 'active');
+  assert.strictEqual(setBenchmarkDefinitionStatus(updatedDefinition.id, 'inactive').status, 'inactive');
+  assert.strictEqual(setBenchmarkDefinitionStatus(updatedDefinition.id, 'active').status, 'active');
 
-  const duplicateVersion = captureError(() => createBenchmarkDefinition(createDefinitionInput({
+  const nextPeriodDefinition = createBenchmarkDefinition(createDefinitionInput({
     effectiveStartUtc: '2027-01-01T00:00:00Z',
     effectiveEndUtc: '2028-01-01T00:00:00Z'
-  })));
-  assert.strictEqual(duplicateVersion.details.code, 'BENCHMARK_DEFINITION_UNIQUE_KEY_CONFLICT');
+  }));
+  assert.strictEqual(nextPeriodDefinition.internalRevision, 3);
+  assert.strictEqual(nextPeriodDefinition.version, 'benchmark-definition-internal-revision:v3');
 
   const overlap = captureError(() => createBenchmarkDefinition(createDefinitionInput({
-    version: 'lower-definition-overlap:v1',
     effectiveStartUtc: '2026-06-01T00:00:00Z',
     effectiveEndUtc: '2027-06-01T00:00:00Z'
   })));
   assert.strictEqual(overlap.details.code, 'BENCHMARK_DEFINITION_ACTIVE_PERIOD_OVERLAP');
 
+  const externalWithoutDocument = createBenchmarkDefinition(createDefinitionInput({
+    benchmarkCode: 'BENCH-EXTERNAL-NO-DOCUMENT',
+    benchmarkName: '无文号外部标准',
+    benchmarkType: 'external_standard',
+    source: '公开外部标准来源'
+  }));
+  assert.strictEqual(externalWithoutDocument.documentNo, null, '外部标准不再要求文号。');
+  assert.strictEqual(externalWithoutDocument.internalRevision, 1);
+
   const inactiveScope = captureError(() => createBenchmarkDefinition(createDefinitionInput({
     benchmarkCode: 'BENCH-INACTIVE-SCOPE',
-    version: 'inactive-scope:v1',
     scopeReference: 'OU-INACTIVE'
   })));
   assert.strictEqual(inactiveScope.details.code, 'BENCHMARK_ORGANIZATION_SCOPE_INACTIVE');
 
   const db = openDatabase();
   try {
+    const definitionHistory = db.prepare(`SELECT id, document_no AS documentNo, version, internal_revision AS internalRevision
+      FROM benchmark_definitions WHERE benchmark_code = 'BENCH-LOWER' ORDER BY internal_revision`).all();
+    assert.deepStrictEqual(definitionHistory.map((row) => row.internalRevision), [1, 2, 3]);
+    assert.deepStrictEqual(definitionHistory.map((row) => row.documentNo), [null, null, null]);
+    assert.deepStrictEqual(definitionHistory.map((row) => row.version), [
+      'benchmark-definition-internal-revision:v1',
+      'benchmark-definition-internal-revision:v2',
+      'benchmark-definition-internal-revision:v3'
+    ]);
+    const targetHistory = db.prepare(`SELECT id, version, internal_revision AS internalRevision
+      FROM benchmark_targets WHERE benchmark_definition_id = ? ORDER BY internal_revision`).all(updatedDefinition.id);
+    assert.deepStrictEqual(targetHistory.map((row) => row.internalRevision), [1, 2, 3, 4]);
+    assert.strictEqual(targetHistory.length, 4, '目标调整不得覆盖或删除历史记录。');
+
     const operationRows = db.prepare(`SELECT operation, user_id AS userId, detail_json AS detailJson
       FROM sys_operation_logs WHERE operation LIKE 'energy.benchmark.%' ORDER BY id`).all();
     const operations = new Set(operationRows.map((row) => row.operation));
@@ -297,7 +347,136 @@ function testCrudAndStatus() {
     db.close();
   }
 
-  return { definition, target: changedTarget };
+  return { definition: updatedDefinition, target: latestTarget };
+}
+
+/**
+ * 验证历史兼容版本占位时使用确定性备用后缀，且 inactive 后继不替换 active 前驱。
+ */
+function testCompatibilityVersionFallbackAndInactiveSuccessors() {
+  const definitionCode = 'BENCH-DEFINITION-VERSION-COLLISION';
+  const definitionBasePrefix = 'benchmark-definition-internal-revision';
+  const db = openDatabase();
+  try {
+    const insertDefinitionHistory = db.prepare(`INSERT INTO benchmark_definitions (
+      benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type,
+      scope_type, scope_reference, direction, source, version, internal_revision,
+      effective_start_utc, effective_end_utc, source_timezone, status
+    ) VALUES (?, ?, 'manual_benchmark', 'energy_intensity', 'kgce/t', 'month',
+      'organization', 'OU-BENCH', 'lower_better', '历史兼容测试', ?, ?, ?, ?, 'Asia/Shanghai', 'inactive')`);
+    insertDefinitionHistory.run(definitionCode, '历史定义一', `${definitionBasePrefix}:v3`, 1,
+      '2030-01-01T00:00:00Z', '2031-01-01T00:00:00Z');
+    insertDefinitionHistory.run(definitionCode, '历史定义二', `${definitionBasePrefix}:v4`, 2,
+      '2031-01-01T00:00:00Z', '2032-01-01T00:00:00Z');
+
+    const serverTwoCode = 'BENCH-DEFINITION-VERSION-SERVER-TWO';
+    insertDefinitionHistory.run(serverTwoCode, '备用后缀历史定义一', `${definitionBasePrefix}:v3`, 1,
+      '2030-01-01T00:00:00Z', '2031-01-01T00:00:00Z');
+    insertDefinitionHistory.run(serverTwoCode, '备用后缀历史定义二', `${definitionBasePrefix}:v3:server-1`, 2,
+      '2031-01-01T00:00:00Z', '2032-01-01T00:00:00Z');
+  } finally {
+    db.close();
+  }
+
+  const createdDefinition = createBenchmarkDefinition(createDefinitionInput({
+    benchmarkCode: definitionCode,
+    benchmarkName: '兼容版本冲突后的定义',
+    effectiveStartUtc: '2032-01-01T00:00:00Z',
+    effectiveEndUtc: '2033-01-01T00:00:00Z'
+  }));
+  assert.strictEqual(createdDefinition.internalRevision, 3);
+  assert.strictEqual(createdDefinition.version, `${definitionBasePrefix}:v3:server-1`);
+
+  const inactiveDefinitionSuccessor = updateBenchmarkDefinition(createdDefinition.id, createDefinitionInput({
+    benchmarkCode: definitionCode,
+    benchmarkName: '未生效定义后继',
+    effectiveStartUtc: '2032-01-01T00:00:00Z',
+    effectiveEndUtc: '2033-01-01T00:00:00Z',
+    status: 'inactive'
+  }));
+  assert.strictEqual(inactiveDefinitionSuccessor.internalRevision, 4);
+  assert.strictEqual(inactiveDefinitionSuccessor.version, `${definitionBasePrefix}:v4:server-1`);
+  assert.strictEqual(getBenchmarkDefinition(createdDefinition.id).status, 'active', 'inactive 定义后继不得停用 active 前驱。');
+  assert.strictEqual(getBenchmarkDefinition(inactiveDefinitionSuccessor.id).status, 'inactive');
+  const activeDefinitions = listBenchmarkDefinitions({ benchmarkCode: definitionCode, status: 'active' });
+  assert.strictEqual(activeDefinitions.total, 1);
+  assert.strictEqual(activeDefinitions.items[0].id, createdDefinition.id);
+
+  const serverTwoDefinition = createBenchmarkDefinition(createDefinitionInput({
+    benchmarkCode: 'BENCH-DEFINITION-VERSION-SERVER-TWO',
+    benchmarkName: '确定性第二备用后缀',
+    effectiveStartUtc: '2032-01-01T00:00:00Z',
+    effectiveEndUtc: '2033-01-01T00:00:00Z',
+    status: 'inactive'
+  }));
+  assert.strictEqual(serverTwoDefinition.internalRevision, 3);
+  assert.strictEqual(serverTwoDefinition.version, `${definitionBasePrefix}:v3:server-2`);
+
+  const targetDefinition = createBenchmarkDefinition(createDefinitionInput({
+    benchmarkCode: 'BENCH-TARGET-VERSION-COLLISION',
+    benchmarkName: '目标兼容版本冲突定义',
+    effectiveStartUtc: '2033-01-01T00:00:00Z',
+    effectiveEndUtc: '2034-01-01T00:00:00Z'
+  }));
+  const targetServerTwoDefinition = createBenchmarkDefinition(createDefinitionInput({
+    benchmarkCode: 'BENCH-TARGET-VERSION-SERVER-TWO',
+    benchmarkName: '目标第二备用后缀定义',
+    effectiveStartUtc: '2033-01-01T00:00:00Z',
+    effectiveEndUtc: '2034-01-01T00:00:00Z'
+  }));
+  const targetBasePrefix = 'benchmark-target-internal-revision';
+  const targetHistoryDb = openDatabase();
+  try {
+    const insertTargetHistory = targetHistoryDb.prepare(`INSERT INTO benchmark_targets (
+      benchmark_definition_id, target_value, version, internal_revision, status
+    ) VALUES (?, ?, ?, ?, 'inactive')`);
+    insertTargetHistory.run(targetDefinition.id, 101, `${targetBasePrefix}:v3`, 1);
+    insertTargetHistory.run(targetDefinition.id, 102, `${targetBasePrefix}:v4`, 2);
+    insertTargetHistory.run(targetServerTwoDefinition.id, 201, `${targetBasePrefix}:v3`, 1);
+    insertTargetHistory.run(targetServerTwoDefinition.id, 202, `${targetBasePrefix}:v3:server-1`, 2);
+  } finally {
+    targetHistoryDb.close();
+  }
+
+  const createdTarget = createBenchmarkTarget(createTargetInput(targetDefinition.id, { targetValue: 95 }));
+  assert.strictEqual(createdTarget.internalRevision, 3);
+  assert.strictEqual(createdTarget.version, `${targetBasePrefix}:v3:server-1`);
+  const inactiveTargetSuccessor = updateBenchmarkTarget(createdTarget.id, {
+    targetValue: 94,
+    lowerBound: null,
+    upperBound: null,
+    status: 'inactive'
+  });
+  assert.strictEqual(inactiveTargetSuccessor.internalRevision, 4);
+  assert.strictEqual(inactiveTargetSuccessor.version, `${targetBasePrefix}:v4:server-1`);
+  assert.strictEqual(getBenchmarkTarget(createdTarget.id).status, 'active', 'inactive 目标后继不得停用 active 前驱。');
+  assert.strictEqual(getBenchmarkTarget(inactiveTargetSuccessor.id).status, 'inactive');
+  const activeTargets = listBenchmarkTargets({ definitionId: targetDefinition.id, status: 'active' });
+  assert.strictEqual(activeTargets.total, 1);
+  assert.strictEqual(activeTargets.items[0].id, createdTarget.id);
+
+  const serverTwoTarget = createBenchmarkTarget(createTargetInput(targetServerTwoDefinition.id, {
+    targetValue: 203,
+    status: 'inactive'
+  }));
+  assert.strictEqual(serverTwoTarget.internalRevision, 3);
+  assert.strictEqual(serverTwoTarget.version, `${targetBasePrefix}:v3:server-2`);
+
+  const historyDb = openDatabase();
+  try {
+    assert.deepStrictEqual(historyDb.prepare(`SELECT version FROM benchmark_definitions
+      WHERE benchmark_code = ? AND internal_revision <= 2 ORDER BY internal_revision`).all(definitionCode).map((row) => row.version), [
+      `${definitionBasePrefix}:v3`,
+      `${definitionBasePrefix}:v4`
+    ], '历史定义 version 必须原样保留。');
+    assert.deepStrictEqual(historyDb.prepare(`SELECT version FROM benchmark_targets
+      WHERE benchmark_definition_id = ? AND internal_revision <= 2 ORDER BY internal_revision`).all(targetDefinition.id).map((row) => row.version), [
+      `${targetBasePrefix}:v3`,
+      `${targetBasePrefix}:v4`
+    ], '历史目标 version 必须原样保留。');
+  } finally {
+    historyDb.close();
+  }
 }
 
 /**
@@ -308,17 +487,12 @@ function testCrudAndStatus() {
  * @returns {{definition:object,target:object}} 定义和目标。
  */
 function createDirectionBenchmark(code, direction, targetValues) {
-  const versionBase = code.toLocaleLowerCase('en-US').replace(/[^a-z0-9-]/g, '-');
   const definition = createBenchmarkDefinition(createDefinitionInput({
     benchmarkCode: code,
     benchmarkName: `${code} 测试`,
-    direction,
-    version: `${versionBase}:v1`
+    direction
   }));
-  const target = createBenchmarkTarget(createTargetInput(definition.id, {
-    ...targetValues,
-    version: `${versionBase}-target:v1`
-  }));
+  const target = createBenchmarkTarget(createTargetInput(definition.id, targetValues));
   return { definition, target };
 }
 
@@ -422,12 +596,10 @@ function testEvaluationDirectionsAndCompatibility(base) {
     metricCode: 'energy_usage',
     unit: 'kWh',
     scopeType: 'energy',
-    scopeReference: 'electricity',
-    version: 'energy-definition:v1'
+    scopeReference: 'electricity'
   }));
   const energyTarget = createBenchmarkTarget(createTargetInput(energyDefinition.id, {
-    targetValue: 500,
-    version: 'energy-target:v1'
+    targetValue: 500
   }));
   const energyMismatch = evaluateEnergyBenchmark({
     definitionId: energyDefinition.id,
@@ -501,7 +673,6 @@ function createInternalHistoryInput(definitionOverrides = {}) {
       benchmarkType: 'internal_history_baseline',
       unit: 'kWh/t',
       source: '企业历史数据固化计算',
-      version: 'internal-definition:v1',
       ...definitionOverrides
     }),
     referencePeriod: {
@@ -534,13 +705,15 @@ function testInternalHistorySnapshotAndRollback() {
   assert.strictEqual(internal.target.productionSummary.totalOutput, 30);
   assert.strictEqual(internal.target.productionSummary.energyRecordCount, 2);
   assert.strictEqual(internal.target.productionSummary.outputRecordCount, 2);
-  assert.strictEqual(internal.target.version, input.definition.version, '目标版本必须由定义版本派生。');
+  assert.strictEqual(internal.definition.internalRevision, 1);
+  assert.strictEqual(internal.definition.version, 'benchmark-definition-internal-revision:v1');
+  assert.strictEqual(internal.target.internalRevision, 1);
+  assert.strictEqual(internal.target.version, 'benchmark-target-internal-revision:v1');
 
   const immutableDefinition = captureError(() => updateBenchmarkDefinition(internal.definition.id, input.definition));
   assert.strictEqual(immutableDefinition.details.code, 'INTERNAL_HISTORY_BENCHMARK_IMMUTABLE');
   const immutableTarget = captureError(() => updateBenchmarkTarget(internal.target.id, {
     targetValue: 99,
-    version: 'internal-target:v1',
     status: 'active'
   }));
   assert.strictEqual(immutableTarget.details.code, 'INTERNAL_HISTORY_BENCHMARK_TARGET_IMMUTABLE');
@@ -548,8 +721,7 @@ function testInternalHistorySnapshotAndRollback() {
   ['frozenValue', 'sampleCount', 'productionSummary', 'sourceDataDigest', 'frozenAt'].forEach((fieldName) => {
     const forbidden = captureError(() => createInternalHistoryBenchmark({
       ...createInternalHistoryInput({
-        benchmarkCode: `BENCH-FORBIDDEN-${fieldName.toUpperCase()}`,
-        version: `forbidden-${fieldName.toLowerCase()}:v1`
+        benchmarkCode: `BENCH-FORBIDDEN-${fieldName.toUpperCase()}`
       }),
       [fieldName]: fieldName === 'sampleCount' ? 2 : 'client-derived'
     }));
@@ -562,22 +734,19 @@ function testInternalHistorySnapshotAndRollback() {
   const unsupportedMetric = captureError(() => createInternalHistoryBenchmark(createInternalHistoryInput({
     benchmarkCode: 'BENCH-INTERNAL-UNSUPPORTED',
     metricCode: 'energy_usage',
-    unit: 'kWh',
-    version: 'internal-unsupported:v1'
+    unit: 'kWh'
   })));
   assert.strictEqual(unsupportedMetric.details.code, 'INTERNAL_BASELINE_METRIC_UNSUPPORTED');
 
   const missingActor = captureError(() => createBenchmarkDefinitionService(createDefinitionInput({
-    benchmarkCode: 'BENCH-NO-ACTOR',
-    version: 'no-actor:v1'
+    benchmarkCode: 'BENCH-NO-ACTOR'
   })));
   assert.strictEqual(missingActor.details.code, 'ENERGY_BENCHMARK_AUDIT_ACTOR_REQUIRED');
 
   const db = openDatabase();
   try {
     const aprilInput = createInternalHistoryInput({
-      benchmarkCode: 'BENCH-INTERNAL-MISSING-ENERGY',
-      version: 'internal-missing-energy:v1'
+      benchmarkCode: 'BENCH-INTERNAL-MISSING-ENERGY'
     });
     aprilInput.referencePeriod = {
       startUtc: '2025-04-01T00:00:00Z',
@@ -595,8 +764,7 @@ function testInternalHistorySnapshotAndRollback() {
       VALUES (?, ?, '2025-04', '2025-04', ?, 50, ?, 50, 'benchmark-history-2025-04', 'active')`)
       .run(energyType.id, organization.id, energyType.standardUnit, energyType.standardUnit);
     const missingProductionInput = createInternalHistoryInput({
-      benchmarkCode: 'BENCH-INTERNAL-MISSING-PRODUCTION',
-      version: 'internal-missing-production:v1'
+      benchmarkCode: 'BENCH-INTERNAL-MISSING-PRODUCTION'
     });
     missingProductionInput.referencePeriod = aprilInput.referencePeriod;
     const missingProduction = captureError(() => createInternalHistoryBenchmark(missingProductionInput, { db }));
@@ -611,8 +779,7 @@ function testInternalHistorySnapshotAndRollback() {
       VALUES (?, ?, '2025-05', '2025-05', 'kgce', 50, 'kgce', 50,
        'benchmark-history-2025-05-invalid-unit', 'active')`).run(energyType.id, organization.id);
     const incompatibleUnitInput = createInternalHistoryInput({
-      benchmarkCode: 'BENCH-INTERNAL-INCOMPATIBLE-FACT',
-      version: 'internal-incompatible-fact:v1'
+      benchmarkCode: 'BENCH-INTERNAL-INCOMPATIBLE-FACT'
     });
     incompatibleUnitInput.referencePeriod = {
       startUtc: '2025-05-01T00:00:00Z',
@@ -634,8 +801,7 @@ function testInternalHistorySnapshotAndRollback() {
     const beforeTargets = Number(db.prepare('SELECT COUNT(*) AS count FROM benchmark_targets').get().count);
     const beforeAudits = Number(db.prepare('SELECT COUNT(*) AS count FROM sys_operation_logs').get().count);
     assert.throws(() => createInternalHistoryBenchmark(createInternalHistoryInput({
-      benchmarkCode: 'BENCH-INTERNAL-ROLLBACK',
-      version: 'internal-rollback:v1'
+      benchmarkCode: 'BENCH-INTERNAL-ROLLBACK'
     }), {
       db,
       afterAuditInsert: () => {
@@ -658,6 +824,7 @@ function run() {
     initDatabase();
     seedMasterData();
     const base = testCrudAndStatus();
+    testCompatibilityVersionFallbackAndInactiveSuccessors();
     testEvaluationDirectionsAndCompatibility(base);
     testRankingQualificationAndExport(base);
     testInternalHistorySnapshotAndRollback();

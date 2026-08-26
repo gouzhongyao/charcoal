@@ -72,7 +72,9 @@ function getImportContract() {
     },
     deletion: {
       route: 'DELETE /api/imports/batches/:batchId',
-      scope: '删除指定批次、该批次错误明细、该批次导入的能耗记录，以及这些能耗记录关联的碳排放结果；上传原件暂不物理删除。',
+      allowedImportTypes: ['energy_record'],
+      scope: '仅删除普通能耗批次、该批次错误明细、该批次导入的能耗记录，以及这些能耗记录关联的碳排放结果；上传原件不物理删除。',
+      safety: '删除前强制创建 SQLite 备份，备份失败拒绝删除；业务删除和持久化操作审计在同一事务内提交。',
       predictionPolicy: '既有预测运行和结果不自动删除；删除历史数据后如需反映最新口径，请重新创建预测运行。'
     },
     persistence: {
@@ -185,7 +187,7 @@ function getApiContract() {
       importContract: 'GET /api/imports/contract 或 GET /api/dictionaries/import-contract',
       templates: 'GET /api/templates 查询可下载模板；GET /api/templates/:templateType.xlsx 下载推荐 Excel 模板；GET /api/templates/:templateType.csv 保留 UTF-8 BOM CSV 兼容模板',
       backups: 'GET /api/system/backups 列出备份；POST /api/system/backups 创建备份；GET /api/system/backups/:backupName/download 受控下载；POST /api/system/backups/:backupName/restore 恢复并自动创建 pre-restore 备份；DELETE /api/system/backups/:backupName 删除指定备份文件',
-      importBatches: 'POST /api/imports/batches 创建导入批次并执行默认 skip 导入闭环；GET /api/imports/batches 查询批次；DELETE /api/imports/batches/:batchId 删除指定批次及其关联错误、能耗记录和碳排放结果',
+      importBatches: 'POST /api/imports/batches 创建导入批次并执行默认 skip 导入闭环；GET /api/imports/batches 查询批次；DELETE /api/imports/batches/:batchId 仅删除普通 energy_record 批次及其关联错误、能耗记录和旧碳排放结果，并在删除前强制备份、同事务记录操作审计',
       organizationUnits: 'GET/POST/PUT/DELETE /api/organization/units 基础台账用能单元 CRUD；POST /api/organization/units/import 导入；GET /api/organization/units/export?format=xlsx|csv 导出当前筛选结果；DELETE 返回停用结果',
       meters: 'GET/POST/PUT/DELETE /api/meters 计量器具 CRUD；POST /api/meters/import 导入；GET /api/meters/export?format=xlsx|csv 导出当前筛选结果；DELETE 返回停用结果；在线状态和网关 ID 仅为台账字段',
       meterReadings: 'GET/POST/PUT/DELETE /api/meter-readings；POST /api/meter-readings/import 导入抄表；GET /api/meter-readings/export 导出当前筛选结果；抄表不自动进入 energy_records',

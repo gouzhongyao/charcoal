@@ -39,12 +39,12 @@ const FACTOR_HEADERS = Object.freeze([
 ]);
 const DEFINITION_HEADERS = Object.freeze([
   '对标编码', '对标名称', '对标类型', '指标编码', '指标单位', '周期类型', '范围类型', '范围标识',
-  '指标方向', '来源', '文号', '版本', '生效开始时间（UTC）', '生效结束时间（UTC）', '来源时区', '状态'
+  '指标方向', '来源', '生效开始时间（UTC）', '生效结束时间（UTC）', '来源时区', '状态'
 ]);
 const TARGET_HEADERS = Object.freeze([
-  '对标编码', '对标定义版本', '目标值', '下限值', '上限值', '参考期开始时间（UTC）',
+  '对标编码', '目标值', '下限值', '上限值', '参考期开始时间（UTC）',
   '参考期结束时间（UTC）', '固化值', '固化时间（UTC）', '样本数量', '产量摘要 JSON',
-  '来源数据摘要', '是否固化', '是否自动刷新', '目标版本', '状态'
+  '来源数据摘要', '是否固化', '是否自动刷新', '状态'
 ]);
 
 /** 转义 CSV 单元格。 */
@@ -88,8 +88,8 @@ function createDefinitionRow(overrides = {}) {
   return {
     对标编码: 'ROUTE-BENCH', 对标名称: '路由单位产品能耗基准', 对标类型: 'external_standard',
     指标编码: 'energy_intensity', 指标单位: 'kgce/t', 周期类型: 'month', 范围类型: 'organization',
-    范围标识: 'OU-ROUTE', 指标方向: 'lower_better', 来源: '行业标准', 文号: 'GB/ROUTE',
-    版本: 'route-benchmark:v1', '生效开始时间（UTC）': '2026-01-01T00:00:00Z',
+    范围标识: 'OU-ROUTE', 指标方向: 'lower_better', 来源: '行业标准',
+    '生效开始时间（UTC）': '2026-01-01T00:00:00Z',
     '生效结束时间（UTC）': '2027-01-01T00:00:00Z', 来源时区: 'Asia/Shanghai', 状态: 'active', ...overrides
   };
 }
@@ -97,10 +97,10 @@ function createDefinitionRow(overrides = {}) {
 /** 创建合法对标目标行。 */
 function createTargetRow(overrides = {}) {
   return {
-    对标编码: 'ROUTE-BENCH', 对标定义版本: 'route-benchmark:v1', 目标值: 120,
+    对标编码: 'ROUTE-BENCH', 目标值: 120,
     下限值: '', 上限值: '', '参考期开始时间（UTC）': '', '参考期结束时间（UTC）': '', 固化值: '',
     '固化时间（UTC）': '', 样本数量: '', '产量摘要 JSON': '', 来源数据摘要: '', 是否固化: 0,
-    是否自动刷新: 0, 目标版本: 'route-target:v1', 状态: 'active', ...overrides
+    是否自动刷新: 0, 状态: 'active', ...overrides
   };
 }
 
@@ -283,11 +283,11 @@ function seedMasterData() {
     db.prepare(
       `INSERT INTO benchmark_definitions (
          benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type,
-         scope_type, scope_reference, direction, source, version,
+         scope_type, scope_reference, direction, source, version, internal_revision,
          effective_start_utc, effective_end_utc, source_timezone, status
        ) VALUES (
          'ROUTE-INTERNAL', '内部历史基准', 'internal_history_baseline', 'energy_intensity', 'kgce/t', 'month',
-         'organization', 'OU-ROUTE', 'lower_better', '内部计算', 'route-internal:v1',
+         'organization', 'OU-ROUTE', 'lower_better', '内部计算', 'route-internal:v1', 1,
          '2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai', 'active'
        )`
     ).run();
@@ -436,11 +436,26 @@ async function testSuccessfulImports(server, adminToken) {
   const db = openDatabase();
   try {
     const factor = db.prepare("SELECT source_batch_id AS batchId FROM energy_conversion_factors WHERE factor_code = 'ROUTE-FACTOR'").get();
-    const definition = db.prepare("SELECT source_batch_id AS batchId FROM benchmark_definitions WHERE benchmark_code = 'ROUTE-BENCH'").get();
-    const target = db.prepare("SELECT source_batch_id AS batchId FROM benchmark_targets WHERE version = 'route-target:v1'").get();
+    const definition = db.prepare(
+      "SELECT id, source_batch_id AS batchId, version, internal_revision AS internalRevision FROM benchmark_definitions WHERE benchmark_code = 'ROUTE-BENCH'"
+    ).get();
+    const target = db.prepare(
+      `SELECT source_batch_id AS batchId, version, internal_revision AS internalRevision
+       FROM benchmark_targets
+       WHERE benchmark_definition_id = ? AND source_batch_id = ?`
+    ).get(definition.id, targetPreview.batchId);
     assert.deepStrictEqual(factor, { batchId: factorPreview.batchId });
-    assert.deepStrictEqual(definition, { batchId: definitionPreview.batchId });
-    assert.deepStrictEqual(target, { batchId: targetPreview.batchId });
+    assert.deepStrictEqual(definition, {
+      id: definition.id,
+      batchId: definitionPreview.batchId,
+      version: 'benchmark-definition-internal-revision:v1',
+      internalRevision: 1
+    });
+    assert.deepStrictEqual(target, {
+      batchId: targetPreview.batchId,
+      version: 'benchmark-target-internal-revision:v1',
+      internalRevision: 1
+    });
     [factorPreview, definitionPreview, targetPreview].forEach((preview) => {
       const audit = getImportAuditBatchDetail(preview.batchId, { db });
       assert.strictEqual(audit.auditPhase, 'execute');
@@ -515,14 +530,14 @@ async function createPreview(server, adminToken, type, suffix) {
   if (type === 'definition') {
     return assertSuccessfulPreview(await requestMultipart(server, `${ROUTE_BASE}/definitions/preview`, {
       filename: `definition-${unique}.csv`, content: buildCsv(DEFINITION_HEADERS, [createDefinitionRow({
-        对标编码: `BENCH-${unique}`, 对标名称: `对标定义 ${unique}`, 版本: `benchmark-${unique.toLowerCase()}:v1`,
+        对标编码: `BENCH-${unique}`, 对标名称: `对标定义 ${unique}`,
         '生效开始时间（UTC）': '2028-01-01T00:00:00Z', '生效结束时间（UTC）': '2029-01-01T00:00:00Z'
       })])
     }, adminToken), 'energy_benchmark', 'energy-benchmark-definitions');
   }
   return assertSuccessfulPreview(await requestMultipart(server, `${ROUTE_BASE}/targets/preview`, {
     filename: `target-${unique}.csv`, content: buildCsv(TARGET_HEADERS, [createTargetRow({
-      目标值: 130 + unique.length, 目标版本: `target-${unique.toLowerCase()}:v1`
+      目标值: 130 + unique.length
     })])
   }, adminToken), 'energy_benchmark', 'energy-benchmark-targets');
 }
@@ -553,7 +568,7 @@ async function testDefinitionTargetRouteIsolation(server, adminToken) {
 
   const targetPreview = assertSuccessfulPreview(await requestMultipart(server, `${ROUTE_BASE}/targets/preview`, {
     filename: 'target-cross.csv', content: buildCsv(TARGET_HEADERS, [createTargetRow({
-      对标编码: 'BENCH-cross', 对标定义版本: 'benchmark-cross:v1', 目标值: 88, 目标版本: 'target-cross-route:v1'
+      对标编码: 'BENCH-cross', 目标值: 88
     })])
   }, adminToken), 'energy_benchmark', 'energy-benchmark-targets');
   const wrongTargetResponse = await requestJson(server, 'POST', `${ROUTE_BASE}/definitions/execute`, createMinimalExecuteBody(targetPreview, {
@@ -568,7 +583,12 @@ async function testDefinitionTargetRouteIsolation(server, adminToken) {
     assert.strictEqual(audit.importType, 'energy_benchmark');
     assert.strictEqual(audit.auditPhase, 'preview');
     assert.strictEqual(audit.executeResult, null);
-    assert.strictEqual(targetDb.prepare("SELECT COUNT(*) AS total FROM benchmark_targets WHERE version = 'target-cross-route:v1'").get().total, 0);
+    assert.strictEqual(targetDb.prepare(
+      `SELECT COUNT(*) AS total
+       FROM benchmark_targets target
+       INNER JOIN benchmark_definitions definition ON definition.id = target.benchmark_definition_id
+       WHERE definition.benchmark_code = 'BENCH-cross'`
+    ).get().total, 0);
   } finally {
     targetDb.close();
   }
@@ -703,7 +723,7 @@ async function testBlockedCandidateApiBoundaries(server, adminToken) {
 
   const forgedDefinitionResponse = await requestMultipart(server, `${ROUTE_BASE}/definitions/preview`, {
     filename: 'definition-internal-forged.csv', content: buildCsv(DEFINITION_HEADERS, [createDefinitionRow({
-      对标编码: 'FORGED-INTERNAL-DEFINITION', 对标类型: 'internal_history_baseline', 版本: 'forged-internal:v1'
+      对标编码: 'FORGED-INTERNAL-DEFINITION', 对标类型: 'internal_history_baseline'
     })])
   }, adminToken);
   assert.strictEqual(forgedDefinitionResponse.status, 200);
@@ -716,7 +736,7 @@ async function testBlockedCandidateApiBoundaries(server, adminToken) {
 
   const forgedTargetResponse = await requestMultipart(server, `${ROUTE_BASE}/targets/preview`, {
     filename: 'target-internal-forged.csv', content: buildCsv(TARGET_HEADERS, [createTargetRow({
-      对标编码: 'ROUTE-INTERNAL', 对标定义版本: 'route-internal:v1', 目标版本: 'forged-target:v1',
+      对标编码: 'ROUTE-INTERNAL',
       '参考期开始时间（UTC）': '2025-01-01T00:00:00Z', 固化值: 99, 来源数据摘要: 'sha256:forged', 是否固化: 1
     })])
   }, adminToken);
@@ -733,7 +753,12 @@ async function testBlockedCandidateApiBoundaries(server, adminToken) {
   try {
     assert.strictEqual(checkDb.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code = 'MS-ROUTE-CANDIDATE'").get().total, 0);
     assert.strictEqual(checkDb.prepare("SELECT COUNT(*) AS total FROM benchmark_definitions WHERE benchmark_code = 'FORGED-INTERNAL-DEFINITION'").get().total, 0);
-    assert.strictEqual(checkDb.prepare("SELECT COUNT(*) AS total FROM benchmark_targets WHERE version = 'forged-target:v1'").get().total, 0);
+    assert.strictEqual(checkDb.prepare(
+      `SELECT COUNT(*) AS total
+       FROM benchmark_targets target
+       INNER JOIN benchmark_definitions definition ON definition.id = target.benchmark_definition_id
+       WHERE definition.benchmark_code = 'ROUTE-INTERNAL'`
+    ).get().total, 0);
   } finally {
     checkDb.close();
   }

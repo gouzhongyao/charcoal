@@ -29,8 +29,22 @@ assert.match(dashboardSource, /<ImmersiveDashboardView\s+v-else-if="appStore\.im
 assert.match(dashboardSource, /<StandardDashboardView\s+v-else/);
 assert.doesNotMatch(dashboardSource, /v-show=/);
 assert.match(dashboardSource, /dashboard:view/);
-assert.match(standardSource, /<h1>驾驶舱<\/h1>/);
-assert.match(immersiveSource, /<h1>驾驶舱 · 园区业务大屏<\/h1>/);
+/** 唯一控制器模板源码，仅检查用户可见区域，不误伤内部技术注释。 */
+const dashboardTemplateSource = dashboardSource.match(/<template>([\s\S]*?)<\/template>/)?.[1] || '';
+/** 标准布局模板源码，仅检查用户可见区域，不误伤内部技术注释。 */
+const standardTemplateSource = standardSource.match(/<template>([\s\S]*?)<\/template>/)?.[1] || '';
+/** 沉浸布局模板源码，仅检查用户可见区域，不误伤内部技术注释。 */
+const immersiveTemplateSource = immersiveSource.match(/<template>([\s\S]*?)<\/template>/)?.[1] || '';
+assert.match(standardTemplateSource, /<h1>中控<\/h1>/);
+assert.match(immersiveTemplateSource, /<h1>中控 · 园区业务大屏<\/h1>/);
+assert.match(dashboardTemplateSource, /当前账号没有查看中控的权限。请联系管理员授予 dashboard:view 权限。/);
+assert.doesNotMatch(standardTemplateSource, /驾驶舱/);
+assert.doesNotMatch(immersiveTemplateSource, /驾驶舱/);
+assert.doesNotMatch(dashboardTemplateSource, /查看驾驶舱的权限/);
+assert.match(dashboardUtilitySource, /中控摘要缺少明确的领域授权状态。/);
+assert.match(dashboardUtilitySource, /中控摘要返回了无法识别的领域状态。/);
+assert.doesNotMatch(dashboardUtilitySource, /'驾驶舱摘要缺少明确的领域授权状态。'/);
+assert.doesNotMatch(dashboardUtilitySource, /'驾驶舱摘要返回了无法识别的领域状态。'/);
 
 // 控制器必须保留唯一年度、单位、面板、请求版本、API 与领域权限状态。
 assert.match(dashboardSource, /const selectedYear = ref\(currentYear\)/);

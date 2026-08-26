@@ -21,15 +21,33 @@ const legacyMappings = [
   ['ledger:organization:view', 'ledger:units:view', '/ledger/organization'],
   ['ledger:meter:view', 'ledger:meters:view', '/ledger/meters'],
   ['ledger:meter-reading:view', 'ledger:readings:view', '/ledger/meter-readings'],
-  ['carbon:view', 'carbon:emissions:view', '/carbon'],
   ['prediction:view', 'prediction:config:view', '/predictions']
 ];
 const expectedPermissions = [
   ...legacyMappings.map(([, permissionCode]) => permissionCode),
-  'carbon:factors:view', 'prediction:run:view', 'prediction:result:view',
+  'carbon:emissions:view', 'carbon:factors:view', 'prediction:run:view', 'prediction:result:view',
   'energy:budget:view', 'ledger:production-unit:view', 'ledger:production-output:view',
   'ledger:generation:view', 'imports:view', 'dashboard:view', 'system:backup:view',
   'system:user:view', 'system:role:view', 'system:menu:view'
+];
+// 导入中心按钮权限用于验证旧库幂等补种和普通角色不自动扩权。
+const importButtonPermissions = ['imports:create', 'imports:delete', 'imports:download'];
+// 独立碳活动冻结的五个细分权限不得从历史碳查看角色自动扩权。
+const carbonActivityPermissions = [
+  'carbon:activities:view',
+  'carbon:activities:import:preview',
+  'carbon:activities:import:execute',
+  'carbon:activities:calculate',
+  'carbon:activities:export'
+];
+// 旧能耗结果导出继续使用独立旧权限，不能随查看权限自动扩权。
+const carbonEmissionExportPermission = 'carbon:emissions:export';
+// N7 温室气体报告四项独立权限不得从历史碳查看角色或独立碳活动角色自动扩权。
+const ghgReportPermissions = [
+  'carbon:ghg-reports:view',
+  'carbon:ghg-reports:import:preview',
+  'carbon:ghg-reports:import:execute',
+  'carbon:ghg-reports:export'
 ];
 // 四个能源页面及其按钮共用的三十个权限契约。
 const energyModulePermissions = [
@@ -96,6 +114,8 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
   let sampleConfigId;
   let sampleRunId;
   let energyUserId;
+  let carbonActivityUserId;
+  let legacyCarbonMenuId;
   try {
     initDatabase();
     const db = openDatabase();
@@ -108,6 +128,11 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
     db.prepare('INSERT INTO sys_user_roles (user_id, role_id, created_at) VALUES (?, ?, ?)').run(userId, roleId, now);
     const grant = db.prepare('INSERT INTO sys_role_menus (role_id, menu_id, created_at) VALUES (?, ?, ?)');
     ['/energy', '/ledger'].forEach((routePath) => grant.run(roleId, db.prepare('SELECT id FROM sys_menus WHERE route_path = ?').get(routePath).id, now));
+    const legacyCarbonMenu = db.prepare("SELECT id FROM sys_menus WHERE route_path = '/carbon' AND menu_type = 'menu'").get();
+    assert(legacyCarbonMenu, '迁移前必须存在历史 /carbon 页面菜单。');
+    legacyCarbonMenuId = Number(legacyCarbonMenu.id);
+    db.prepare("UPDATE sys_menus SET permission_code = 'carbon:view' WHERE id = ?").run(legacyCarbonMenuId);
+    grant.run(roleId, legacyCarbonMenuId, now);
     const legacyMenuIds = new Map();
     legacyMappings.forEach(([legacyPermissionCode, permissionCode, routePath]) => {
       const menu = db.prepare('SELECT id FROM sys_menus WHERE permission_code = ?').get(permissionCode);
@@ -128,6 +153,50 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
       assert.strictEqual(menu.permissionCode, permissionCode, `${routePath} 必须升级为 canonical view permission`);
     });
     legacyMappings.forEach(([legacyPermissionCode]) => assert.strictEqual(migratedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?').get(legacyPermissionCode).total, 0));
+    assert.strictEqual(migratedDb.prepare("SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = 'carbon:view'").get().total, 0);
+    const carbonPageMenu = migratedDb.prepare(`SELECT id, permission_code AS permissionCode, menu_type AS menuType
+      FROM sys_menus WHERE route_path = '/carbon'`).get();
+    assert.strictEqual(Number(carbonPageMenu.id), legacyCarbonMenuId, '/carbon 必须保留历史 menu ID。');
+    assert.strictEqual(carbonPageMenu.permissionCode, null, '/carbon 父页面不得再直接携带细分查看权限。');
+    assert.strictEqual(carbonPageMenu.menuType, 'menu');
+    const emissionsButton = migratedDb.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType
+      FROM sys_menus WHERE permission_code = 'carbon:emissions:view'`).get();
+    assert(emissionsButton, '必须建立独立 carbon:emissions:view 按钮。');
+    assert.strictEqual(Number(emissionsButton.parentId), legacyCarbonMenuId);
+    assert.strictEqual(emissionsButton.menuType, 'button');
+    assert.strictEqual(migratedDb.prepare(`SELECT COUNT(*) AS total FROM sys_role_menus
+      WHERE role_id = ? AND menu_id = ?`).get(roleId, emissionsButton.id).total, 1,
+    '历史碳查看角色必须迁移获得 emissions 按钮。');
+    const emissionsExportButton = migratedDb.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType
+      FROM sys_menus WHERE permission_code = ?`).get(carbonEmissionExportPermission);
+    assert(emissionsExportButton, '必须建立独立 carbon:emissions:export 按钮。');
+    assert.strictEqual(Number(emissionsExportButton.parentId), legacyCarbonMenuId);
+    assert.strictEqual(emissionsExportButton.menuType, 'button');
+    assert.strictEqual(migratedDb.prepare(`SELECT COUNT(*) AS total FROM sys_role_menus
+      WHERE role_id = ? AND menu_id = ?`).get(roleId, emissionsExportButton.id).total, 0,
+    '历史碳查看角色不得自动获得旧能耗结果导出权限。');
+    carbonActivityPermissions.forEach((permissionCode) => {
+      const button = migratedDb.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType
+        FROM sys_menus WHERE permission_code = ?`).get(permissionCode);
+      assert(button, `缺少独立碳活动权限 ${permissionCode}。`);
+      assert.strictEqual(Number(button.parentId), legacyCarbonMenuId, `${permissionCode} 必须挂载在原 /carbon 页面。`);
+      assert.strictEqual(button.menuType, 'button');
+      assert.strictEqual(migratedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?').get(permissionCode).total, 1);
+      assert.strictEqual(migratedDb.prepare(`SELECT COUNT(*) AS total FROM sys_role_menus
+        WHERE role_id = ? AND menu_id = ?`).get(roleId, button.id).total, 0,
+      `历史角色不得自动获得 ${permissionCode}。`);
+    });
+    ghgReportPermissions.forEach((permissionCode) => {
+      const button = migratedDb.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType
+        FROM sys_menus WHERE permission_code = ?`).get(permissionCode);
+      assert(button, `缺少 N7 温室气体报告权限 ${permissionCode}。`);
+      assert.strictEqual(Number(button.parentId), legacyCarbonMenuId, `${permissionCode} 必须挂载在原 /carbon 页面。`);
+      assert.strictEqual(button.menuType, 'button');
+      assert.strictEqual(migratedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?').get(permissionCode).total, 1);
+      assert.strictEqual(migratedDb.prepare(`SELECT COUNT(*) AS total FROM sys_role_menus
+        WHERE role_id = ? AND menu_id = ?`).get(roleId, button.id).total, 0,
+      `历史角色不得自动获得 ${permissionCode}。`);
+    });
     const energyDirectory = migratedDb.prepare("SELECT id FROM sys_menus WHERE route_path = '/energy' AND menu_type = 'directory'").get();
     assert(energyDirectory, '能耗管理目录必须存在。');
     energyPageContracts.forEach(([routePath, component, permissionCode]) => {
@@ -149,6 +218,24 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
         `${permissionCode} 必须且只能种入一次。`
       );
     });
+    // 导入页面菜单用于确认三个操作按钮都挂载在既有 /imports 页面下。
+    const importPageMenu = migratedDb.prepare("SELECT id FROM sys_menus WHERE route_path = '/imports' AND menu_type = 'menu'").get();
+    assert(importPageMenu, '导入页面菜单必须存在。');
+    importButtonPermissions.forEach((permissionCode) => {
+      // 当前按钮菜单用于验证唯一性、父级、类型和不可见导航属性。
+      const importButtonMenu = migratedDb.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType, visible, status
+        FROM sys_menus WHERE permission_code = ?`).get(permissionCode);
+      assert(importButtonMenu, `缺少导入按钮权限 ${permissionCode}。`);
+      assert.strictEqual(importButtonMenu.parentId, importPageMenu.id, `${permissionCode} 必须挂载在 /imports 页面下。`);
+      assert.strictEqual(importButtonMenu.menuType, 'button');
+      assert.strictEqual(importButtonMenu.visible, 1);
+      assert.strictEqual(importButtonMenu.status, 'active');
+      assert.strictEqual(
+        migratedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?').get(permissionCode).total,
+        1,
+        `${permissionCode} 必须且只能种入一次。`
+      );
+    });
     const energyRoleId = migratedDb.prepare(`INSERT INTO sys_roles (role_code, role_name, status, created_at, updated_at)
       VALUES ('energy_module_operator', '能源四模块操作员', 'active', ?, ?)`).run(now, now).lastInsertRowid;
     energyUserId = migratedDb.prepare(`INSERT INTO sys_users (username, display_name, password_hash, status, created_at, updated_at)
@@ -160,6 +247,23 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
     energyModulePermissions.forEach((permissionCode) => {
       const menu = migratedDb.prepare('SELECT id FROM sys_menus WHERE permission_code = ?').get(permissionCode);
       migratedGrant.run(energyRoleId, menu.id, now);
+    });
+    const carbonActivityRoleId = migratedDb.prepare(`INSERT INTO sys_roles
+      (role_code, role_name, status, created_at, updated_at)
+      VALUES ('carbon_activity_operator', '独立碳活动操作员', 'active', ?, ?)`).run(now, now).lastInsertRowid;
+    carbonActivityUserId = migratedDb.prepare(`INSERT INTO sys_users
+      (username, display_name, password_hash, status, created_at, updated_at)
+      VALUES ('carbon-activity-operator', '独立碳活动操作员', ?, 'active', ?, ?)`)
+      .run(passwordHash, now, now).lastInsertRowid;
+    migratedDb.prepare('INSERT INTO sys_user_roles (user_id, role_id, created_at) VALUES (?, ?, ?)')
+      .run(carbonActivityUserId, carbonActivityRoleId, now);
+    migratedGrant.run(carbonActivityRoleId, legacyCarbonMenuId, now);
+    carbonActivityPermissions.forEach((permissionCode) => {
+      migratedGrant.run(
+        carbonActivityRoleId,
+        migratedDb.prepare('SELECT id FROM sys_menus WHERE permission_code = ?').get(permissionCode).id,
+        now
+      );
     });
     migratedDb.close();
 
@@ -173,6 +277,113 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
           `重复初始化不得复制 ${permissionCode}。`
         );
       });
+      importButtonPermissions.forEach((permissionCode) => {
+        assert.strictEqual(
+          repeatedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?').get(permissionCode).total,
+          1,
+          `重复初始化不得复制 ${permissionCode}。`
+        );
+      });
+      assert.strictEqual(repeatedDb.prepare("SELECT COUNT(*) AS total FROM sys_menus WHERE route_path = '/carbon'").get().total, 1);
+      assert.strictEqual(repeatedDb.prepare("SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = 'carbon:emissions:view'").get().total, 1);
+      assert.strictEqual(repeatedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?')
+        .get(carbonEmissionExportPermission).total, 1,
+      '重复初始化不得复制旧能耗结果导出权限。');
+      carbonActivityPermissions.forEach((permissionCode) => {
+        assert.strictEqual(repeatedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?').get(permissionCode).total, 1,
+          `重复初始化不得复制 ${permissionCode}。`);
+      });
+      ghgReportPermissions.forEach((permissionCode) => {
+        assert.strictEqual(repeatedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?').get(permissionCode).total, 1,
+          `重复初始化不得复制 ${permissionCode}。`);
+      });
+      // 内置角色权限计数用于确认危险删除权限只自动授予超级管理员。
+      const builtinImportPermissionCount = repeatedDb.prepare(`SELECT COUNT(*) AS total
+        FROM sys_role_menus AS role_menu
+        JOIN sys_roles AS role ON role.id = role_menu.role_id
+        JOIN sys_menus AS menu ON menu.id = role_menu.menu_id
+        WHERE role.role_code = ?
+          AND menu.permission_code IN (${importButtonPermissions.map(() => '?').join(', ')})`);
+      assert.strictEqual(
+        builtinImportPermissionCount.get('super_admin', ...importButtonPermissions).total,
+        importButtonPermissions.length,
+        '超级管理员必须获得全部导入按钮权限。'
+      );
+      assert.strictEqual(
+        builtinImportPermissionCount.get('user', ...importButtonPermissions).total,
+        0,
+        '普通内置 user 角色不得自动获得导入创建、删除或下载权限。'
+      );
+      assert.strictEqual(
+        builtinImportPermissionCount.get('legacy_viewer', ...importButtonPermissions).total,
+        0,
+        '历史查看角色不得因旧库补种自动获得导入操作权限。'
+      );
+      const builtinActivityPermissionCount = repeatedDb.prepare(`SELECT COUNT(*) AS total
+        FROM sys_role_menus AS role_menu
+        JOIN sys_roles AS role ON role.id = role_menu.role_id
+        JOIN sys_menus AS menu ON menu.id = role_menu.menu_id
+        WHERE role.role_code = ?
+          AND menu.permission_code IN (${carbonActivityPermissions.map(() => '?').join(', ')})`);
+      assert.strictEqual(
+        builtinActivityPermissionCount.get('super_admin', ...carbonActivityPermissions).total,
+        carbonActivityPermissions.length,
+        '超级管理员必须获得全部独立碳活动权限。'
+      );
+      assert.strictEqual(
+        builtinActivityPermissionCount.get('user', ...carbonActivityPermissions).total,
+        0,
+        '普通内置 user 角色不得自动获得独立碳活动权限。'
+      );
+      assert.strictEqual(
+        builtinActivityPermissionCount.get('legacy_viewer', ...carbonActivityPermissions).total,
+        0,
+        '历史碳查看角色不得自动扩权为独立碳活动角色。'
+      );
+      assert.strictEqual(
+        builtinActivityPermissionCount.get('carbon_activity_operator', ...carbonActivityPermissions).total,
+        carbonActivityPermissions.length,
+        '独立碳活动角色的显式授权必须在重复初始化后保留。'
+      );
+      const builtinGhgReportPermissionCount = repeatedDb.prepare(`SELECT COUNT(*) AS total
+        FROM sys_role_menus AS role_menu
+        JOIN sys_roles AS role ON role.id = role_menu.role_id
+        JOIN sys_menus AS menu ON menu.id = role_menu.menu_id
+        WHERE role.role_code = ?
+          AND menu.permission_code IN (${ghgReportPermissions.map(() => '?').join(', ')})`);
+      assert.strictEqual(
+        builtinGhgReportPermissionCount.get('super_admin', ...ghgReportPermissions).total,
+        ghgReportPermissions.length,
+        '超级管理员必须获得全部 N7 温室气体报告权限。'
+      );
+      assert.strictEqual(
+        builtinGhgReportPermissionCount.get('user', ...ghgReportPermissions).total,
+        0,
+        '普通内置 user 角色不得自动获得 N7 温室气体报告权限。'
+      );
+      assert.strictEqual(
+        builtinGhgReportPermissionCount.get('legacy_viewer', ...ghgReportPermissions).total,
+        0,
+        '历史碳查看角色不得自动扩权为 N7 温室气体报告角色。'
+      );
+      assert.strictEqual(
+        builtinGhgReportPermissionCount.get('carbon_activity_operator', ...ghgReportPermissions).total,
+        0,
+        '独立碳活动角色不得自动获得 N7 温室气体报告权限。'
+      );
+      const emissionExportPermissionCount = repeatedDb.prepare(`SELECT COUNT(*) AS total
+        FROM sys_role_menus AS role_menu
+        JOIN sys_roles AS role ON role.id = role_menu.role_id
+        JOIN sys_menus AS menu ON menu.id = role_menu.menu_id
+        WHERE role.role_code = ? AND menu.permission_code = ?`);
+      assert.strictEqual(emissionExportPermissionCount.get('super_admin', carbonEmissionExportPermission).total, 1,
+        '超级管理员必须获得旧能耗结果导出权限。');
+      assert.strictEqual(emissionExportPermissionCount.get('user', carbonEmissionExportPermission).total, 0,
+        '普通内置 user 角色不得自动获得旧能耗结果导出权限。');
+      assert.strictEqual(emissionExportPermissionCount.get('legacy_viewer', carbonEmissionExportPermission).total, 0,
+        '历史碳查看角色不得自动扩成旧能耗结果导出权限。');
+      assert.strictEqual(emissionExportPermissionCount.get('carbon_activity_operator', carbonEmissionExportPermission).total, 0,
+        '独立碳活动角色不得自动获得旧能耗结果导出权限。');
       assert.strictEqual(
         repeatedDb.prepare(`SELECT COUNT(*) AS total
           FROM sys_role_menus AS role_menu
@@ -224,6 +435,15 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
       assert.strictEqual(pageRoute.component, component);
       assert.strictEqual(pageRoute.parentId, energyRoutes.find((menu) => menu.routePath === '/energy').id);
     });
+    const carbonActivityProfile = getProfile(carbonActivityUserId);
+    carbonActivityPermissions.forEach((permissionCode) => {
+      assert(carbonActivityProfile.permissions.includes(permissionCode), `独立碳活动角色必须获得 ${permissionCode}。`);
+    });
+    assert(!carbonActivityProfile.permissions.includes('carbon:emissions:view'), 'activity-only 角色不得隐式获得旧排放结果查看权限。');
+    const carbonActivityRoutes = flattenMenus(getUserMenus(carbonActivityUserId));
+    const carbonActivityPage = carbonActivityRoutes.find((menu) => menu.routePath === '/carbon');
+    assert(carbonActivityPage, 'activity-only 角色必须拥有 /carbon 父页面。');
+    assert.strictEqual(Number(carbonActivityPage.id), legacyCarbonMenuId);
 
     server = await new Promise((resolve) => { const instance = app.listen(0, '127.0.0.1', () => resolve(instance)); });
     const login = await request(server, 'POST', '/api/login', { username: 'legacy-viewer', password: 'Password123!' });
@@ -262,9 +482,16 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
       const result = await request(server, 'GET', pathname, null, energyToken);
       assert.strictEqual(result.status, 200, `${pathname} 必须接受普通能源角色授权。`);
     }
+    const carbonActivityLogin = await request(server, 'POST', '/api/login', { username: 'carbon-activity-operator', password: 'Password123!' });
+    assert.strictEqual(carbonActivityLogin.status, 200);
+    assert.strictEqual((await request(server, 'GET', '/api/carbon/activities', null, carbonActivityLogin.body.data.token)).status, 200,
+      'activity-only 角色必须可访问独立碳活动列表。');
+    assert.strictEqual((await request(server, 'GET', '/api/carbon/emissions', null, carbonActivityLogin.body.data.token)).status, 403,
+      'activity-only 角色不得访问旧碳排放结果。');
     const admin = await request(server, 'POST', '/api/login', { username: 'admin', password: 'AdminPassword123!' });
     assert.strictEqual(admin.status, 200, '超级管理员登录不得回归');
     assert.strictEqual((await request(server, 'GET', '/api/carbon/emissions', null, admin.body.data.token)).status, 200, '超级管理员的查看权限不得回归');
+    assert.strictEqual((await request(server, 'GET', '/api/carbon/activities', null, admin.body.data.token)).status, 200, '超级管理员必须拥有独立碳活动查看权限。');
 
     const permissionSource = fs.readFileSync(path.join(__dirname, '../../../client/src/views/ledger/LedgerManagement.vue'), 'utf8');
     assert(permissionSource.includes("permission:'ledger:production-unit'"));
@@ -272,6 +499,6 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
     console.log('rbac menu permission migration tests passed');
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 })().catch((error) => { console.error(error); process.exitCode = 1; });

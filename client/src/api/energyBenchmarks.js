@@ -1,4 +1,9 @@
 import { download, query, request } from '@/api/http';
+import {
+  downloadManagedDemoArtifact,
+  executeManagedDemoImport,
+  previewManagedDemoImport
+} from '@/api/demoData';
 
 // 能效对标业务接口根路径。
 const ENERGY_BENCHMARK_BASE_URL = '/energy-benchmarks';
@@ -39,11 +44,11 @@ export const getAllActiveEnergyBenchmarkDefinitions = (params = {}) => getAllPag
   { ...params, status: 'active' },
   100
 );
-/** 查询对标定义及目标版本详情。 */
+/** 查询对标定义及目标历史详情。 */
 export const getEnergyBenchmarkDefinition = (definitionId) => get(`${ENERGY_BENCHMARK_BASE_URL}/definitions/${definitionId}`);
-/** 创建普通对标定义或新定义版本。 */
+/** 创建普通对标定义。 */
 export const createEnergyBenchmarkDefinition = (payload) => request({ method: 'post', url: `${ENERGY_BENCHMARK_BASE_URL}/definitions`, data: payload });
-/** 修改尚未被目标版本锁定的普通对标定义。 */
+/** 调整普通对标定义，服务端保留原记录并创建后继记录。 */
 export const updateEnergyBenchmarkDefinition = (definitionId, payload) => request({ method: 'put', url: `${ENERGY_BENCHMARK_BASE_URL}/definitions/${definitionId}`, data: payload });
 /** 启用或停用对标定义。 */
 export const updateEnergyBenchmarkDefinitionStatus = (definitionId, status) => request({ method: 'patch', url: `${ENERGY_BENCHMARK_BASE_URL}/definitions/${definitionId}/status`, data: { status } });
@@ -52,7 +57,7 @@ export const createEnergyBenchmarkInternalHistory = (payload) => request({ metho
 
 /** 查询对标目标列表。 */
 export const getEnergyBenchmarkTargets = (params = {}) => get(`${ENERGY_BENCHMARK_BASE_URL}/targets`, params);
-/** 独立读取指定定义的全部 active 目标版本，不受管理列表分页影响。 */
+/** 独立读取指定定义的全部 active 目标，不受管理列表分页影响。 */
 export const getAllActiveEnergyBenchmarkTargets = (definitionId) => getAllPages(
   (pageParams) => getEnergyBenchmarkTargets(pageParams),
   { definitionId, status: 'active' },
@@ -60,11 +65,11 @@ export const getAllActiveEnergyBenchmarkTargets = (definitionId) => getAllPages(
 );
 /** 查询对标目标及定义详情。 */
 export const getEnergyBenchmarkTarget = (targetId) => get(`${ENERGY_BENCHMARK_BASE_URL}/targets/${targetId}`);
-/** 创建普通目标版本。 */
+/** 创建普通对标目标。 */
 export const createEnergyBenchmarkTarget = (payload) => request({ method: 'post', url: `${ENERGY_BENCHMARK_BASE_URL}/targets`, data: payload });
-/** 通过后继版本修改普通目标，旧版本由服务端保留。 */
-export const versionEnergyBenchmarkTarget = (targetId, payload) => request({ method: 'put', url: `${ENERGY_BENCHMARK_BASE_URL}/targets/${targetId}`, data: payload });
-/** 启用或停用目标版本。 */
+/** 调整普通目标，服务端保留原记录并创建后继记录。 */
+export const updateEnergyBenchmarkTarget = (targetId, payload) => request({ method: 'put', url: `${ENERGY_BENCHMARK_BASE_URL}/targets/${targetId}`, data: payload });
+/** 启用或停用对标目标。 */
 export const updateEnergyBenchmarkTargetStatus = (targetId, status) => request({ method: 'patch', url: `${ENERGY_BENCHMARK_BASE_URL}/targets/${targetId}/status`, data: { status } });
 
 /** 对单个显式实际值执行能效评价。 */
@@ -78,9 +83,9 @@ export const getEnergyBenchmarkExportRows = (payload) => request({ method: 'post
 
 /** 三类能效对标导入的空白模板与青岚园区示例映射。 */
 const ENERGY_BENCHMARK_IMPORT_DOWNLOADS = Object.freeze({
-  'conversion-factors': Object.freeze({ templateType: 'energy-conversion-factors', artifactKey: '19-conversion-factors', label: '能源折标系数' }),
-  definitions: Object.freeze({ templateType: 'energy-benchmark-definitions', artifactKey: '20-benchmark-definitions', label: '对标定义' }),
-  targets: Object.freeze({ templateType: 'energy-benchmark-targets', artifactKey: '21-benchmark-targets', label: '对标目标' })
+  'conversion-factors': Object.freeze({ templateType: 'energy-conversion-factors', artifactKey: '19-conversion-factors', handlerKey: 'energy-conversion-factors-import', label: '能源折标系数' }),
+  definitions: Object.freeze({ templateType: 'energy-benchmark-definitions', artifactKey: '20-benchmark-definitions', handlerKey: 'energy-benchmark-definitions-import', label: '对标定义' }),
+  targets: Object.freeze({ templateType: 'energy-benchmark-targets', artifactKey: '21-benchmark-targets', handlerKey: 'energy-benchmark-targets-import', label: '对标目标' })
 });
 
 /** 读取当前导入类型的下载配置，拒绝浏览器端猜测其他类型。 */
@@ -96,21 +101,37 @@ export function downloadEnergyBenchmarkImportTemplate(importType) {
   return download({ url: `/templates/${config.templateType}.xlsx` }, `${config.label}导入模板.xlsx`);
 }
 
-/** 下载当前能效对标导入类型的青岚园区 XLSX 示例。 */
+/** 下载当前能效对标导入类型的青岚园区 XLSX 示例并保存托管 context。 */
 export function downloadEnergyBenchmarkDemoParkExample(importType) {
   const config = energyBenchmarkImportDownload(importType);
-  return download({ url: `/templates/demo-park/${config.artifactKey}.xlsx` }, `青岚园区示例-${config.label}.xlsx`);
+  return downloadManagedDemoArtifact(
+    { url: `/templates/demo-park/${config.artifactKey}.xlsx` },
+    `青岚园区示例-${config.label}.xlsx`
+  );
 }
 
 /** 上传文件并创建指定类型的受控导入预演。 */
 export function previewEnergyBenchmarkImport(importType, file) {
+  const config = energyBenchmarkImportDownload(importType);
   const data = new FormData();
   data.append('file', file);
-  return request({ method: 'post', url: `${ENERGY_BENCHMARK_IMPORT_BASE_URL}/${importType}/preview`, data });
+  return previewManagedDemoImport(
+    { method: 'post', url: `${ENERGY_BENCHMARK_IMPORT_BASE_URL}/${importType}/preview`, data },
+    config.artifactKey,
+    config.handlerKey,
+    file
+  );
 }
 
-/** 使用服务端持久化预演批次执行指定类型导入。 */
-export const executeEnergyBenchmarkImport = (importType, payload) => request({ method: 'post', url: `${ENERGY_BENCHMARK_IMPORT_BASE_URL}/${importType}/execute`, data: payload });
+/** 使用服务端持久化预演批次执行指定类型导入，并在成功后清理一次性 context。 */
+export function executeEnergyBenchmarkImport(importType, payload) {
+  const config = energyBenchmarkImportDownload(importType);
+  return executeManagedDemoImport(
+    { method: 'post', url: `${ENERGY_BENCHMARK_IMPORT_BASE_URL}/${importType}/execute`, data: payload },
+    config.artifactKey,
+    config.handlerKey
+  );
+}
 
 /** 读取全部 active 组织对象，供 organization 范围和实际对象按真实主数据选择。 */
 export const getAllActiveEnergyBenchmarkOrganizationUnits = () => getAllPages(

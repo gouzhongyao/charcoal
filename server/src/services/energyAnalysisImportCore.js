@@ -7,6 +7,16 @@ const { badRequest } = require('../utils/errors');
 
 // 能源分析受控导入统一备份原因。
 const ENERGY_ANALYSIS_IMPORT_BACKUP_REASON = 'energy-analysis-import';
+// 供应商受控导入使用独立备份原因，避免审计文案混入能源分析领域。
+const SUPPLIER_IMPORT_BACKUP_REASON = 'supplier-import';
+// 独立碳活动受控导入使用冻结备份原因。
+const CARBON_ACTIVITY_IMPORT_BACKUP_REASON = 'carbon-activity-import';
+// 碳排放报告受控导入使用独立冻结备份原因。
+const CARBON_EMISSION_REPORT_IMPORT_BACKUP_REASON = 'carbon-emission-report-import';
+// 温室气体报告受控导入使用独立冻结备份原因。
+const GHG_REPORT_IMPORT_BACKUP_REASON = 'ghg-report-import';
+// 完整能流工作簿受控导入使用独立冻结备份原因。
+const ENERGY_FLOW_WORKBOOK_IMPORT_BACKUP_REASON = 'energy-flow-workbook-import';
 
 // 能源分析安装级 HMAC 密钥在 app_meta 中的键名。
 const ENERGY_ANALYSIS_IMPORT_HMAC_SECRET_META_KEY = 'energy_analysis_import_hmac_secret';
@@ -196,6 +206,27 @@ const ENERGY_ANALYSIS_IMPORT_TEMPLATES = deepFreeze([
     targetTables: ['energy_flow_edges', 'energy_flow_records']
   },
   {
+    id: 'energy-flow-workbook',
+    templateType: 'energy-flow-workbook',
+    operation: 'energy-flow-workbook-import',
+    recordKind: 'energy_flow_workbook',
+    importTypes: ['energy_flow_workbook'],
+    confirmText: '确认导入完整能流工作簿',
+    backupReason: ENERGY_FLOW_WORKBOOK_IMPORT_BACKUP_REASON,
+    xlsxOnly: true,
+    targetTables: [
+      'energy_flow_models',
+      'energy_flow_assets',
+      'energy_flow_paths',
+      'energy_flow_nodes',
+      'energy_flow_edges',
+      'energy_flow_records',
+      'energy_flow_waste_heat_facts',
+      'energy_flow_loss_facts',
+      'energy_flow_loss_evidence'
+    ]
+  },
+  {
     id: 'energy-balance-configs',
     templateType: 'energy-balance-configs',
     operation: 'energy-balance-config-bundle-import',
@@ -205,6 +236,63 @@ const ENERGY_ANALYSIS_IMPORT_TEMPLATES = deepFreeze([
     backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
     xlsxOnly: true,
     targetTables: ['energy_balance_boundaries', 'energy_balance_items']
+  },
+  {
+    id: 'suppliers',
+    templateType: 'suppliers',
+    operation: 'supplier-import',
+    recordKind: 'supplier',
+    importTypes: ['supplier'],
+    confirmText: '确认导入供应商台账',
+    backupReason: SUPPLIER_IMPORT_BACKUP_REASON,
+    xlsxOnly: true,
+    targetTables: ['suppliers']
+  },
+  {
+    id: 'carbon-activities',
+    templateType: 'carbon-activities',
+    operation: 'carbon-activity-import',
+    recordKind: 'carbon_activity',
+    importTypes: ['carbon_activity'],
+    confirmText: '确认导入独立碳活动',
+    backupReason: CARBON_ACTIVITY_IMPORT_BACKUP_REASON,
+    xlsxOnly: true,
+    targetTables: ['carbon_activity_records']
+  },
+  {
+    id: 'carbon-emission-report',
+    templateType: 'carbon-emission-report',
+    operation: 'carbon-emission-report-import',
+    recordKind: 'carbon_emission_report',
+    importTypes: ['carbon_emission_report'],
+    confirmText: '确认导入碳排放报告',
+    backupReason: CARBON_EMISSION_REPORT_IMPORT_BACKUP_REASON,
+    xlsxOnly: true,
+    targetTables: [
+      'carbon_emission_reports',
+      'carbon_emission_report_boundaries',
+      'carbon_emission_report_items',
+      'carbon_emission_report_summaries',
+      'carbon_emission_report_evidence'
+    ]
+  },
+  {
+    id: 'ghg-report',
+    templateType: 'ghg-report',
+    operation: 'ghg-report-import',
+    recordKind: 'ghg_report',
+    importTypes: ['ghg_report'],
+    confirmText: '确认导入温室气体报告',
+    backupReason: GHG_REPORT_IMPORT_BACKUP_REASON,
+    xlsxOnly: true,
+    targetTables: [
+      'ghg_reports',
+      'ghg_report_organization_boundaries',
+      'ghg_report_operational_boundaries',
+      'ghg_report_items',
+      'ghg_report_summaries',
+      'ghg_report_evidence'
+    ]
   }
 ]);
 
@@ -545,8 +633,8 @@ function buildEnergyAnalysisImportSignaturePayload(input = {}) {
   if (input.confirmText !== undefined && input.confirmText !== template.confirmText) {
     throw badRequest('confirmText 与模板固定确认文本不一致。', { code: 'ENERGY_ANALYSIS_IMPORT_CONFIRM_TEXT_MISMATCH' });
   }
-  if (input.backupReason !== undefined && input.backupReason !== ENERGY_ANALYSIS_IMPORT_BACKUP_REASON) {
-    throw badRequest('backupReason 与能源分析统一备份原因不一致。', { code: 'ENERGY_ANALYSIS_IMPORT_BACKUP_REASON_MISMATCH' });
+  if (input.backupReason !== undefined && input.backupReason !== template.backupReason) {
+    throw badRequest('backupReason 与模板固定备份原因不一致。', { code: 'ENERGY_ANALYSIS_IMPORT_BACKUP_REASON_MISMATCH' });
   }
   if (input.requireBackup !== undefined && input.requireBackup !== true) {
     throw badRequest('能源分析导入签名要求 requireBackup=true。', { code: 'ENERGY_ANALYSIS_IMPORT_BACKUP_REQUIRED' });
@@ -565,7 +653,7 @@ function buildEnergyAnalysisImportSignaturePayload(input = {}) {
     targetTables: [...template.targetTables],
     confirmText: template.confirmText,
     requireBackup: true,
-    backupReason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+    backupReason: template.backupReason,
     candidateRowIds: derivedCandidateRowIds,
     candidateRows
   };
@@ -958,8 +1046,8 @@ function authorizeEnergyAnalysisImportExecute(input = {}, serverContext = {}) {
   if (input.acknowledgeSkippedRisks !== true) {
     errors.push(createValidationError('ENERGY_ANALYSIS_IMPORT_SKIPPED_RISKS_ACK_REQUIRED', 'acknowledgeSkippedRisks 必须显式为 true。'));
   }
-  if (input.backupReason !== ENERGY_ANALYSIS_IMPORT_BACKUP_REASON) {
-    errors.push(createValidationError('ENERGY_ANALYSIS_IMPORT_BACKUP_REASON_MISMATCH', 'backupReason 必须使用统一值。'));
+  if (input.backupReason !== template.backupReason) {
+    errors.push(createValidationError('ENERGY_ANALYSIS_IMPORT_BACKUP_REASON_MISMATCH', 'backupReason 必须使用模板固定值。'));
   }
   if (input.duplicateStrategy !== ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY) {
     errors.push(createValidationError('ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY_UNSUPPORTED', '仅支持 skip 重复策略。'));
@@ -1311,6 +1399,8 @@ function validateEnergyFlowBundleMetadata(bundle = {}, expected = {}) {
 }
 
 module.exports = {
+  CARBON_ACTIVITY_IMPORT_BACKUP_REASON,
+  ENERGY_FLOW_WORKBOOK_IMPORT_BACKUP_REASON,
   ENERGY_ANALYSIS_IMPORT_AUDIT_DIGEST_PREFIX,
   ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
   ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY,
@@ -1318,6 +1408,7 @@ module.exports = {
   ENERGY_ANALYSIS_IMPORT_SIGNATURE_PREFIX,
   ENERGY_ANALYSIS_IMPORT_SIGNATURE_VERSION,
   ENERGY_ANALYSIS_IMPORT_TEMPLATES,
+  SUPPLIER_IMPORT_BACKUP_REASON,
   authorizeEnergyAnalysisImportExecute,
   buildEnergyAnalysisImportPreviewAuditDigest,
   buildEnergyAnalysisImportPreviewSignature,

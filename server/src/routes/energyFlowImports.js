@@ -8,7 +8,8 @@ const { requireWritable } = require('../middleware/maintenance');
 const { requirePermission } = require('../middleware/permission');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
 const {
-  demoContextPreflight
+  demoContextPreflight,
+  rejectUnconnectedDemoContext
 } = require('../middleware/demoContext');
 const {
   ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
@@ -28,6 +29,10 @@ const {
   previewEnergyFlowModelImport,
   previewEnergyFlowNodeImport
 } = require('../services/energyFlowImportService');
+const {
+  executeEnergyFlowWorkbookImport,
+  previewEnergyFlowWorkbookImport
+} = require('../services/energyFlowWorkbookImportService');
 const { getImportAuditBatchDetail } = require('../services/importAuditService');
 const { AppError, badRequest } = require('../utils/errors');
 const { sendSuccess } = require('../utils/response');
@@ -224,6 +229,48 @@ function createPreviewHandler(previewService, preflightUpload) {
   };
 }
 
+/** 将完整工作簿上传资源错误统一映射为 413，且不创建审计批次。 */
+function normalizeWorkbookUploadError(uploadError) {
+  const normalized = normalizeUploadError(uploadError);
+  if (normalized?.code === 'IMPORT_FILE_TOO_LARGE') {
+    return new AppError('ENERGY_FLOW_WORKBOOK_UPLOAD_SIZE_EXCEEDED', '完整能流工作簿上传文件超过 10 MiB 限制。', {
+      statusCode: 413,
+      details: { code: 'ENERGY_FLOW_WORKBOOK_UPLOAD_SIZE_EXCEEDED' }
+    });
+  }
+  return normalized;
+}
+
+/** 创建完整工作簿预演处理器；已持久化的失败预演保留原文件，未持久化错误清理文件。 */
+function createWorkbookPreviewHandler() {
+  return (req, res, next) => {
+    uploadImportFile(req, res, (uploadError) => {
+      const normalizedUploadError = normalizeWorkbookUploadError(uploadError);
+      if (normalizedUploadError) {
+        cleanupUploadedImportFile(req.file);
+        next(normalizedUploadError);
+        return;
+      }
+      if (!req.file || !/\.xlsx$/iu.test(String(req.file.originalname || ''))) {
+        cleanupUploadedImportFile(req.file);
+        next(new AppError('ENERGY_FLOW_WORKBOOK_XLSX_REQUIRED', '完整能流工作簿仅支持真实 .xlsx 文件。', {
+          statusCode: 400,
+          details: { code: 'ENERGY_FLOW_WORKBOOK_XLSX_REQUIRED' }
+        }));
+        return;
+      }
+      const serviceOptions = req.demoContext ? { demoContext: buildDemoServiceContext(req) } : {};
+      Promise.resolve()
+        .then(() => previewEnergyFlowWorkbookImport(req.file, serviceOptions))
+        .then((preview) => sendSuccess(res, preview))
+        .catch((error) => {
+          cleanupUploadedImportFile(req.file);
+          next(error);
+        });
+    });
+  };
+}
+
 /**
  * 从持久化边批次恢复双批次 execute 完整性见证，忽略客户端候选、签名和文件摘要。
  * @param {object} requestBody 客户端仅含批次 ID 与确认字段的请求体。
@@ -392,6 +439,34 @@ router.post(
     preflightBundleExecute(edgeBatch, recordBatch);
     const trustedBody = buildTrustedBundleExecuteBody(requestBody, edgeBatch);
     const result = await executeEnergyFlowBundleImport(trustedBody, {
+      demoContext: buildDemoServiceContext(req)
+    });
+    sendSuccess(res, result);
+  })
+);
+
+// 固定六表完整能流工作簿单批次预演。
+router.post(
+  '/workbook/preview',
+  authenticate,
+  requirePermission(ENERGY_FLOW_IMPORT_PERMISSIONS.preview),
+  requireWritable('energy-flows:workbook-import-preview'),
+  rejectUnconnectedDemoContext,
+  createWorkbookPreviewHandler()
+);
+
+// 固定六表完整能流工作簿执行，客户端只能提交固定四字段确认请求。
+router.post(
+  '/workbook/execute',
+  authenticate,
+  requirePermission(ENERGY_FLOW_IMPORT_PERMISSIONS.execute),
+  requireWritable('energy-flows:workbook-import-execute'),
+  rejectUnconnectedDemoContext,
+  parseExecuteJsonBody,
+  asyncHandler(async (req, res) => {
+    const result = await executeEnergyFlowWorkbookImport(req.body || {}, {
+      actorUserId: req.user.id,
+      actorIp: req.ip,
       demoContext: buildDemoServiceContext(req)
     });
     sendSuccess(res, result);

@@ -3,17 +3,17 @@
     <header class="standard-header">
       <div class="standard-header__title">
         <span>LOCAL ENERGY &amp; CARBON PLATFORM</span>
-        <h1>驾驶舱</h1>
+        <h1>中控</h1>
         <p>基于本地 SQLite 已入库真实数据展示年度用能、已保存碳排、预算执行、计量器具台账和全历史导入累计。</p>
       </div>
-      <div class="standard-controls" aria-label="驾驶舱筛选与显示控制">
+      <div class="standard-controls" aria-label="中控筛选与显示控制">
         <label>
           <span>统计年度</span>
-          <el-select :model-value="viewModel.selectedYear" aria-label="选择驾驶舱统计年度" @change="emit('change-year', $event)">
+          <el-select :model-value="viewModel.selectedYear" aria-label="选择中控统计年度" @change="emit('change-year', $event)">
             <el-option v-for="year in viewModel.yearOptions" :key="year" :label="`${year} 年`" :value="year" />
           </el-select>
         </label>
-        <el-button type="primary" :loading="viewModel.annualLoading" @click="emit('refresh')">刷新驾驶舱</el-button>
+        <el-button type="primary" :loading="viewModel.annualLoading" @click="emit('refresh')">刷新中控</el-button>
         <el-button @click="emit('toggle-immersive')">大屏模式</el-button>
       </div>
       <div class="standard-meta" aria-live="polite">
@@ -23,7 +23,7 @@
       </div>
     </header>
 
-    <section class="summary-grid" aria-label="驾驶舱摘要卡片">
+    <section class="summary-grid" aria-label="中控摘要卡片">
       <article class="summary-card summary-card--energy">
         <span>年度能源用量</span>
         <template v-if="viewModel.energyPanel.status === 'success'">
@@ -78,7 +78,7 @@
       </article>
     </section>
 
-    <section class="standard-grid" aria-label="驾驶舱真实数据面板">
+    <section class="standard-grid" aria-label="中控真实数据面板">
       <CockpitPanel class="standard-span-two" title="年度用能分析" eyebrow="ENERGY ANALYSIS" description="趋势按 energyTypeCode + normalizedUnit 拆分为单一数值轴；环图只展示当前 normalizedUnit 的真实结构。" :status="viewModel.energyPanel.status" :error="viewModel.energyPanel.error" forbidden-text="需要能耗记录或能耗统计查看权限。dashboard:view 不替代领域权限。" empty-text="当前年度暂无 active 能耗记录。" wide @retry="emit('retry-energy')">
         <template #actions>
           <el-select v-if="viewModel.energyPanel.status === 'success' && viewModel.energySeries.length" :model-value="viewModel.selectedEnergySeriesKey" class="panel-select" aria-label="选择能源趋势序列" @change="emit('select-energy-series', $event)">

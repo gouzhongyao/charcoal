@@ -203,8 +203,6 @@ function createDefinitionBody(overrides = {}) {
     scopeReference: 'OU-ROUTE-BENCH',
     direction: 'lower_better',
     source: '企业自定义目标',
-    documentNo: null,
-    version: 'route-definition:v1',
     effectiveStartUtc: '2026-01-01T00:00:00Z',
     effectiveEndUtc: '2027-01-01T00:00:00Z',
     sourceTimeZone: 'Asia/Shanghai',
@@ -257,7 +255,7 @@ async function testPermissionAndMaintenance(server, tokens, definitionId, target
   const viewRead = await requestJson(server, 'GET', `${ROUTE_BASE}/definitions`, undefined, tokens.view);
   assert.strictEqual(viewRead.status, 200);
   assert.strictEqual(viewRead.body.success, true);
-  assert.strictEqual(viewRead.body.meta.total, 1);
+  assert(viewRead.body.meta.total >= 4, '查看权限必须能读取已创建的定义历史记录。');
 
   const viewWrite = await requestJson(server, 'POST', `${ROUTE_BASE}/definitions`, createDefinitionBody(), tokens.view);
   assert.strictEqual(viewWrite.status, 403);
@@ -338,10 +336,27 @@ async function testJsonParserOrder(server, tokens) {
  * @returns {Promise<{definitionId:number,targetId:number}>} 基础记录主键。
  */
 async function testCrudAndAnalysisRoutes(server, adminToken) {
+  for (const [fieldName, fieldValue] of [
+    ['documentNo', 'CLIENT-DOCUMENT'],
+    ['version', 'client-definition:v999'],
+    ['benchmarkVersion', 'client-benchmark:v999'],
+    ['targetVersion', 'client-target:v999'],
+    ['internalRevision', 999]
+  ]) {
+    const rejected = await requestJson(server, 'POST', `${ROUTE_BASE}/definitions`,
+      createDefinitionBody({ [fieldName]: fieldValue }), adminToken);
+    assert.strictEqual(rejected.status, 400);
+    assert.strictEqual(rejected.body.error.details.code, 'ENERGY_BENCHMARK_UNKNOWN_FIELDS');
+    assert(rejected.body.error.details.fields.includes(fieldName));
+  }
+
   const createDefinition = await requestJson(server, 'POST', `${ROUTE_BASE}/definitions`, createDefinitionBody(), adminToken);
   assert.strictEqual(createDefinition.status, 200);
   assert.strictEqual(createDefinition.body.success, true);
   assert.strictEqual(createDefinition.body.meta.created, true);
+  assert.strictEqual(createDefinition.body.data.documentNo, null);
+  assert.strictEqual(createDefinition.body.data.internalRevision, 1);
+  assert.strictEqual(createDefinition.body.data.version, 'benchmark-definition-internal-revision:v1');
   const definitionId = createDefinition.body.data.id;
 
   const unknownQuery = await requestJson(server, 'GET', `${ROUTE_BASE}/definitions?unknown=1`, undefined, adminToken);
@@ -351,44 +366,76 @@ async function testCrudAndAnalysisRoutes(server, adminToken) {
   const unknownBody = await requestJson(server, 'POST', `${ROUTE_BASE}/targets`, {
     benchmarkDefinitionId: definitionId,
     targetValue: 100,
-    version: 'route-target:v1',
     status: 'active',
     forgedField: true
   }, adminToken);
   assert.strictEqual(unknownBody.status, 400);
   assert.strictEqual(unknownBody.body.error.details.code, 'ENERGY_BENCHMARK_UNKNOWN_FIELDS');
 
+  for (const [fieldName, fieldValue] of [
+    ['documentNo', 'CLIENT-DOCUMENT'],
+    ['version', 'client-target:v999'],
+    ['benchmarkVersion', 'client-benchmark:v999'],
+    ['targetVersion', 'client-target-version:v999'],
+    ['internalRevision', 999]
+  ]) {
+    const rejected = await requestJson(server, 'POST', `${ROUTE_BASE}/targets`, {
+      benchmarkDefinitionId: definitionId,
+      targetValue: 100,
+      lowerBound: null,
+      upperBound: null,
+      status: 'active',
+      [fieldName]: fieldValue
+    }, adminToken);
+    assert.strictEqual(rejected.status, 400);
+    assert.strictEqual(rejected.body.error.details.code, 'ENERGY_BENCHMARK_UNKNOWN_FIELDS');
+    assert(rejected.body.error.details.fields.includes(fieldName));
+  }
+
   const createTarget = await requestJson(server, 'POST', `${ROUTE_BASE}/targets`, {
     benchmarkDefinitionId: definitionId,
     targetValue: 100,
     lowerBound: null,
     upperBound: null,
-    version: 'route-target:v1',
     status: 'active'
   }, adminToken);
   assert.strictEqual(createTarget.status, 200);
+  assert.strictEqual(createTarget.body.data.internalRevision, 1);
+  assert.strictEqual(createTarget.body.data.version, 'benchmark-target-internal-revision:v1');
   let targetId = createTarget.body.data.id;
 
   const detail = await requestJson(server, 'GET', `${ROUTE_BASE}/definitions/${definitionId}`, undefined, adminToken);
   assert.strictEqual(detail.status, 200);
   assert.strictEqual(detail.body.data.targets.length, 1);
 
-  const updateDefinition = await requestJson(server, 'PUT', `${ROUTE_BASE}/definitions/${definitionId}`,
-    createDefinitionBody({ benchmarkName: '路由更新后的目标' }), adminToken);
-  assert.strictEqual(updateDefinition.status, 200);
-  assert.strictEqual(updateDefinition.body.data.benchmarkName, '路由更新后的目标');
+  for (const [fieldName, fieldValue] of [
+    ['version', 'client-target:v1000'],
+    ['targetVersion', 'client-target-version:v1000'],
+    ['internalRevision', 1000]
+  ]) {
+    const rejected = await requestJson(server, 'PUT', `${ROUTE_BASE}/targets/${targetId}`, {
+      targetValue: 90,
+      lowerBound: null,
+      upperBound: null,
+      status: 'active',
+      [fieldName]: fieldValue
+    }, adminToken);
+    assert.strictEqual(rejected.status, 400);
+    assert.strictEqual(rejected.body.error.details.code, 'ENERGY_BENCHMARK_UNKNOWN_FIELDS');
+  }
 
   const predecessorTargetId = targetId;
   const updateTarget = await requestJson(server, 'PUT', `${ROUTE_BASE}/targets/${targetId}`, {
     targetValue: 90,
     lowerBound: null,
     upperBound: null,
-    version: 'route-target-next:v1',
     status: 'active'
   }, adminToken);
   assert.strictEqual(updateTarget.status, 200);
   assert.strictEqual(updateTarget.body.data.targetValue, 90);
   assert.strictEqual(updateTarget.body.data.predecessorTargetId, predecessorTargetId);
+  assert.strictEqual(updateTarget.body.data.internalRevision, 2);
+  assert.strictEqual(updateTarget.body.data.version, 'benchmark-target-internal-revision:v2');
   targetId = updateTarget.body.data.id;
 
   const evaluation = await requestJson(server, 'POST', `${ROUTE_BASE}/evaluate`, {
@@ -440,6 +487,35 @@ async function testCrudAndAnalysisRoutes(server, adminToken) {
   }, adminToken);
   assert.strictEqual(activeTarget.body.data.status, 'active');
 
+  const adjustmentDefinitionBody = createDefinitionBody({
+    benchmarkCode: 'ROUTE-BENCHMARK-ADJUST',
+    benchmarkName: '待调整定义',
+    effectiveStartUtc: '2028-01-01T00:00:00Z',
+    effectiveEndUtc: '2029-01-01T00:00:00Z'
+  });
+  const adjustmentDefinition = await requestJson(server, 'POST', `${ROUTE_BASE}/definitions`,
+    adjustmentDefinitionBody, adminToken);
+  assert.strictEqual(adjustmentDefinition.status, 200);
+  const adjustmentDefinitionId = adjustmentDefinition.body.data.id;
+  const updateDefinition = await requestJson(server, 'PUT', `${ROUTE_BASE}/definitions/${adjustmentDefinitionId}`,
+    { ...adjustmentDefinitionBody, benchmarkName: '路由调整后的目标' }, adminToken);
+  assert.strictEqual(updateDefinition.status, 200);
+  assert.strictEqual(updateDefinition.body.data.benchmarkName, '路由调整后的目标');
+  assert.strictEqual(updateDefinition.body.data.predecessorDefinitionId, adjustmentDefinitionId);
+  assert.strictEqual(updateDefinition.body.data.internalRevision, 2);
+  assert.strictEqual(updateDefinition.body.data.version, 'benchmark-definition-internal-revision:v2');
+
+  const externalWithoutDocument = await requestJson(server, 'POST', `${ROUTE_BASE}/definitions`, createDefinitionBody({
+    benchmarkCode: 'ROUTE-EXTERNAL-NO-DOCUMENT',
+    benchmarkName: '无文号外部标准',
+    benchmarkType: 'external_standard',
+    source: '公开外部标准来源',
+    effectiveStartUtc: '2030-01-01T00:00:00Z',
+    effectiveEndUtc: '2031-01-01T00:00:00Z'
+  }), adminToken);
+  assert.strictEqual(externalWithoutDocument.status, 200);
+  assert.strictEqual(externalWithoutDocument.body.data.documentNo, null);
+
   return { definitionId, targetId };
 }
 
@@ -451,8 +527,7 @@ async function testCrudAndAnalysisRoutes(server, adminToken) {
 async function testInternalHistoryRoute(server, adminToken) {
   const ordinaryInternal = await requestJson(server, 'POST', `${ROUTE_BASE}/definitions`, createDefinitionBody({
     benchmarkCode: 'ROUTE-INTERNAL-ORDINARY',
-    benchmarkType: 'internal_history_baseline',
-    version: 'route-internal-ordinary:v1'
+    benchmarkType: 'internal_history_baseline'
   }), adminToken);
   assert.strictEqual(ordinaryInternal.status, 400);
   assert.strictEqual(ordinaryInternal.body.error.details.code, 'INTERNAL_HISTORY_BENCHMARK_REQUIRES_SNAPSHOT');
@@ -463,8 +538,7 @@ async function testInternalHistoryRoute(server, adminToken) {
       definition: createDefinitionBody({
         benchmarkCode: `ROUTE-FORBIDDEN-${fieldName.toUpperCase()}`,
         benchmarkType: 'internal_history_baseline',
-        unit: 'kWh/t',
-        version: `route-forbidden-${fieldName.toLowerCase()}:v1`
+        unit: 'kWh/t'
       }),
       referencePeriod: {
         startUtc: '2025-01-01T00:00:00Z',
@@ -481,8 +555,7 @@ async function testInternalHistoryRoute(server, adminToken) {
     definition: createDefinitionBody({
       benchmarkCode: 'ROUTE-INTERNAL-SNAPSHOT',
       benchmarkType: 'internal_history_baseline',
-      unit: 'kWh/t',
-      version: 'route-internal-snapshot:v1'
+      unit: 'kWh/t'
     }),
     snapshot: { frozenValue: 85 }
   }, adminToken);
@@ -495,8 +568,7 @@ async function testInternalHistoryRoute(server, adminToken) {
       benchmarkName: '路由内部历史基准',
       benchmarkType: 'internal_history_baseline',
       unit: 'kWh/t',
-      source: '历史数据固化',
-      version: 'route-internal:v1'
+      source: '历史数据固化'
     }),
     referencePeriod: {
       startUtc: '2025-01-01T00:00:00Z',

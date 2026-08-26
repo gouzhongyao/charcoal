@@ -15,8 +15,19 @@ const { evaluateBenchmark, roundAnalysisValue } = require('./energyAnalysisUtils
 const BENCHMARK_STATUSES = Object.freeze(['active', 'inactive']);
 // 当前 schema 可以解析的对标适用范围。
 const BENCHMARK_SCOPE_TYPES = Object.freeze(['organization', 'energy', 'product']);
-// 版本格式与现有对标导入契约保持一致。
-const BENCHMARK_VERSION_PATTERN = /^[a-z][a-z0-9-]*:v1$/;
+// 兼容 version 仅由服务端根据内部修订和固定表配置分配，客户端不再提供或控制。
+const BENCHMARK_COMPATIBILITY_VERSION_CONFIGS = Object.freeze({
+  definition: Object.freeze({
+    prefix: 'benchmark-definition-internal-revision',
+    tableName: 'benchmark_definitions',
+    businessKeyColumn: 'benchmark_code'
+  }),
+  target: Object.freeze({
+    prefix: 'benchmark-target-internal-revision',
+    tableName: 'benchmark_targets',
+    businessKeyColumn: 'benchmark_definition_id'
+  })
+});
 // 列表查询的缺省分页和数量上限。
 const BENCHMARK_DEFAULT_PAGE_SIZE = 20;
 const BENCHMARK_MAX_PAGE_SIZE = 100;
@@ -69,6 +80,7 @@ const DEFINITION_SELECT = `SELECT
   d.source,
   d.document_no AS documentNo,
   d.version,
+  d.internal_revision AS internalRevision,
   d.effective_start_utc AS effectiveStartUtc,
   d.effective_end_utc AS effectiveEndUtc,
   d.source_timezone AS sourceTimeZone,
@@ -95,6 +107,7 @@ const TARGET_SELECT = `SELECT
   t.is_frozen AS isFrozen,
   t.auto_refresh AS autoRefresh,
   t.version,
+  t.internal_revision AS internalRevision,
   t.status,
   t.created_at AS createdAt,
   t.updated_at AS updatedAt
@@ -299,17 +312,88 @@ function requireTarget(db, targetId) {
 }
 
 /**
- * 校验版本格式。
- * @param {*} value 原始版本。
- * @param {string} fieldName 字段名。
- * @returns {string} 合法版本。
+ * 读取定义或目标的固定兼容版本配置。
+ * @param {'definition'|'target'} recordType 记录类型。
+ * @returns {{prefix:string,tableName:string,businessKeyColumn:string}} 固定配置。
  */
-function validateVersion(value, fieldName = 'version') {
-  const version = requireText(value, fieldName, 80);
-  if (!BENCHMARK_VERSION_PATTERN.test(version)) {
-    throw benchmarkError('BENCHMARK_INVALID_VERSION', `${fieldName} 必须使用 name:v1 格式。`, { field: fieldName });
+function getBenchmarkCompatibilityVersionConfig(recordType) {
+  const config = BENCHMARK_COMPATIBILITY_VERSION_CONFIGS[recordType];
+  if (!config) {
+    throw benchmarkError('BENCHMARK_INTERNAL_REVISION_INVALID', '服务端内部修订记录类型无效。', {
+      recordType
+    });
   }
-  return version;
+  return config;
+}
+
+/**
+ * 根据服务端内部修订构造兼容历史 schema 的默认 version。
+ * @param {'definition'|'target'} recordType 记录类型。
+ * @param {number} internalRevision 正整数内部修订。
+ * @returns {string} 默认兼容版本。
+ */
+function buildBenchmarkCompatibilityVersion(recordType, internalRevision) {
+  const config = getBenchmarkCompatibilityVersionConfig(recordType);
+  if (!Number.isSafeInteger(internalRevision) || internalRevision <= 0) {
+    throw benchmarkError('BENCHMARK_INTERNAL_REVISION_INVALID', '服务端内部修订生成失败。', {
+      recordType,
+      internalRevision
+    });
+  }
+  return `${config.prefix}:v${internalRevision}`;
+}
+
+/**
+ * 在当前连接边界内为内部修订分配确定性的未占用兼容 version。
+ * 默认值被历史记录占用时，依次选择首个可用的 server 正整数后缀；可选保留集合会被同步写入。
+ * @param {object} db SQLite 连接。
+ * @param {'definition'|'target'} recordType 记录类型。
+ * @param {string|number} businessKey 业务键。
+ * @param {number} internalRevision 正整数内部修订。
+ * @param {Set<string>|null} reservedVersions 当前候选已保留的兼容版本集合。
+ * @returns {string} 确定性兼容版本。
+ */
+function allocateBenchmarkCompatibilityVersion(db, recordType, businessKey, internalRevision, reservedVersions = null) {
+  const config = getBenchmarkCompatibilityVersionConfig(recordType);
+  const baseVersion = buildBenchmarkCompatibilityVersion(recordType, internalRevision);
+  const occupiedVersions = new Set(db.prepare(`SELECT version FROM ${config.tableName}
+    WHERE ${config.businessKeyColumn} = ?`).all(businessKey).map((row) => row.version));
+  const candidateVersions = reservedVersions instanceof Set ? reservedVersions : new Set();
+  let compatibilityVersion = baseVersion;
+  let serverSuffix = 0;
+  while (occupiedVersions.has(compatibilityVersion) || candidateVersions.has(compatibilityVersion)) {
+    serverSuffix += 1;
+    if (!Number.isSafeInteger(serverSuffix)) {
+      throw benchmarkError('BENCHMARK_COMPATIBILITY_VERSION_OVERFLOW', '服务端兼容版本后缀超出安全整数范围。', {
+        recordType,
+        businessKey,
+        internalRevision
+      });
+    }
+    compatibilityVersion = `${baseVersion}:server-${serverSuffix}`;
+  }
+  candidateVersions.add(compatibilityVersion);
+  return compatibilityVersion;
+}
+
+/**
+ * 在当前事务内读取业务键下一正整数内部修订。
+ * @param {object} db SQLite 连接。
+ * @param {'definition'|'target'} recordType 记录类型。
+ * @param {string|number} businessKey 业务键。
+ * @returns {number} 下一内部修订。
+ */
+function getNextBenchmarkInternalRevision(db, recordType, businessKey) {
+  const config = getBenchmarkCompatibilityVersionConfig(recordType);
+  const nextRevision = Number(db.prepare(`SELECT COALESCE(MAX(internal_revision), 0) + 1 AS nextRevision
+    FROM ${config.tableName} WHERE ${config.businessKeyColumn} = ?`).get(businessKey).nextRevision);
+  if (!Number.isSafeInteger(nextRevision) || nextRevision <= 0) {
+    throw benchmarkError('BENCHMARK_INTERNAL_REVISION_OVERFLOW', '能效对标内部修订超出安全整数范围。', {
+      recordType,
+      businessKey
+    });
+  }
+  return nextRevision;
 }
 
 /**
@@ -382,10 +466,6 @@ function normalizeDefinitionInput(db, input, allowInternal = false) {
   const scopeType = requireText(input.scopeType, 'scopeType', 40);
   const scopeReference = requireText(input.scopeReference, 'scopeReference', 200);
   const scopeMetadata = validateScopeReference(db, scopeType, scopeReference);
-  const documentNo = optionalText(input.documentNo, 'documentNo', 200);
-  if (benchmarkType === 'external_standard' && !documentNo) {
-    throw benchmarkError('MISSING_BENCHMARK_DOCUMENT_NO', '外部标准必须填写 documentNo。');
-  }
   return {
     benchmarkCode: requireText(input.benchmarkCode, 'benchmarkCode', 100),
     benchmarkName: requireText(input.benchmarkName, 'benchmarkName', 200),
@@ -397,8 +477,6 @@ function normalizeDefinitionInput(db, input, allowInternal = false) {
     scopeReference,
     direction,
     source: requireText(input.source, 'source', 300),
-    documentNo,
-    version: validateVersion(input.version),
     effectiveStartUtc: effectiveRange.startUtc,
     effectiveEndUtc: effectiveRange.endUtc,
     sourceTimeZone,
@@ -432,8 +510,12 @@ function assertDefinitionPeriodAvailable(db, definition, excludeId = null) {
  * @param {Error} error 原始错误。
  */
 function rethrowDefinitionWriteError(error) {
-  if (String(error?.message || '').includes('benchmark_definitions.benchmark_code, benchmark_definitions.version')) {
-    throw benchmarkError('BENCHMARK_DEFINITION_UNIQUE_KEY_CONFLICT', '同一对标编码和版本已存在。');
+  const message = String(error?.message || '');
+  if (message.includes('benchmark_definitions.benchmark_code, benchmark_definitions.internal_revision')) {
+    throw benchmarkError('BENCHMARK_DEFINITION_REVISION_CONFLICT', '同一对标编码的内部修订发生冲突，请重试。');
+  }
+  if (message.includes('benchmark_definitions.benchmark_code, benchmark_definitions.version')) {
+    throw benchmarkError('BENCHMARK_DEFINITION_COMPATIBILITY_VERSION_CONFLICT', '服务端兼容版本发生冲突，请重试。');
   }
   throw error;
 }
@@ -505,16 +587,20 @@ function createBenchmarkDefinition(input, options = {}) {
       requireAuditActor(options);
       const definition = normalizeDefinitionInput(db, input, false);
       assertDefinitionPeriodAvailable(db, definition);
+      const internalRevision = getNextBenchmarkInternalRevision(db, 'definition', definition.benchmarkCode);
+      const compatibilityVersion = allocateBenchmarkCompatibilityVersion(
+        db, 'definition', definition.benchmarkCode, internalRevision
+      );
       try {
         const result = db.prepare(`INSERT INTO benchmark_definitions (
           benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type,
-          scope_type, scope_reference, direction, source, document_no, version,
+          scope_type, scope_reference, direction, source, document_no, version, internal_revision,
           effective_start_utc, effective_end_utc, source_timezone, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`).run(
           definition.benchmarkCode, definition.benchmarkName, definition.benchmarkType,
           definition.metricCode, definition.unit, definition.periodType, definition.scopeType,
-          definition.scopeReference, definition.direction, definition.source, definition.documentNo,
-          definition.version, definition.effectiveStartUtc, definition.effectiveEndUtc,
+          definition.scopeReference, definition.direction, definition.source, compatibilityVersion,
+          internalRevision, definition.effectiveStartUtc, definition.effectiveEndUtc,
           definition.sourceTimeZone, definition.status
         );
         const created = requireDefinition(db, Number(result.lastInsertRowid));
@@ -545,35 +631,38 @@ function updateBenchmarkDefinition(definitionId, input, options = {}) {
         throw benchmarkError('INTERNAL_HISTORY_BENCHMARK_IMMUTABLE', '内部历史基准定义创建后不可修改，只能启用或停用。');
       }
       const definition = normalizeDefinitionInput(db, input, false);
-      const targetCount = Number(db.prepare('SELECT COUNT(*) AS count FROM benchmark_targets WHERE benchmark_definition_id = ?').get(current.id).count);
-      const immutableFields = [
-        'benchmarkCode', 'benchmarkType', 'metricCode', 'unit', 'periodType', 'scopeType',
-        'scopeReference', 'direction', 'source', 'documentNo', 'version', 'effectiveStartUtc',
-        'effectiveEndUtc', 'sourceTimeZone'
-      ];
-      const changedImmutableFields = targetCount > 0
-        ? immutableFields.filter((fieldName) => current[fieldName] !== definition[fieldName])
-        : [];
-      if (changedImmutableFields.length > 0) {
-        throw benchmarkError('BENCHMARK_DEFINITION_VERSION_CONFLICT', '定义已有目标版本，不能直接修改对标口径；请创建新定义版本。', { fields: changedImmutableFields });
+      if (definition.benchmarkCode !== current.benchmarkCode) {
+        throw benchmarkError('BENCHMARK_DEFINITION_CODE_IMMUTABLE', '调整定义时不能更换对标编码；新编码请新增定义。');
       }
       assertDefinitionPeriodAvailable(db, definition, current.id);
+      const internalRevision = getNextBenchmarkInternalRevision(db, 'definition', current.benchmarkCode);
+      const compatibilityVersion = allocateBenchmarkCompatibilityVersion(
+        db, 'definition', definition.benchmarkCode, internalRevision
+      );
+      if (current.status === 'active' && definition.status === 'active') {
+        db.prepare(`UPDATE benchmark_definitions SET status = 'inactive',
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`).run(current.id);
+      }
       try {
-        db.prepare(`UPDATE benchmark_definitions SET
-          benchmark_code = ?, benchmark_name = ?, benchmark_type = ?, metric_code = ?, unit = ?,
-          period_type = ?, scope_type = ?, scope_reference = ?, direction = ?, source = ?, document_no = ?,
-          version = ?, effective_start_utc = ?, effective_end_utc = ?, source_timezone = ?, status = ?,
-          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`).run(
+        const result = db.prepare(`INSERT INTO benchmark_definitions (
+          benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type,
+          scope_type, scope_reference, direction, source, document_no, version, internal_revision,
+          effective_start_utc, effective_end_utc, source_timezone, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
           definition.benchmarkCode, definition.benchmarkName, definition.benchmarkType,
           definition.metricCode, definition.unit, definition.periodType, definition.scopeType,
-          definition.scopeReference, definition.direction, definition.source, definition.documentNo,
-          definition.version, definition.effectiveStartUtc, definition.effectiveEndUtc,
-          definition.sourceTimeZone, definition.status, current.id
+          definition.scopeReference, definition.direction, definition.source, current.documentNo,
+          compatibilityVersion, internalRevision, definition.effectiveStartUtc,
+          definition.effectiveEndUtc, definition.sourceTimeZone, definition.status
         );
-        const updated = requireDefinition(db, current.id);
+        const successor = {
+          ...requireDefinition(db, Number(result.lastInsertRowid)),
+          predecessorDefinitionId: current.id
+        };
+        const predecessorAfter = requireDefinition(db, current.id);
         insertTransactionalAudit(db, options, ENERGY_BENCHMARK_AUDIT_OPERATIONS.definitionUpdate,
-          'benchmark_definition', updated.id, current, updated);
-        return updated;
+          'benchmark_definition', successor.id, current, { predecessor: predecessorAfter, successor });
+        return successor;
       } catch (error) {
         rethrowDefinitionWriteError(error);
       }
@@ -676,7 +765,6 @@ function normalizeTargetInput(definition, input) {
     targetValue,
     lowerBound,
     upperBound,
-    version: validateVersion(input.version),
     status
   };
 }
@@ -701,8 +789,12 @@ function assertActiveTargetAvailable(db, definitionId, status, excludeId = null)
  * @param {Error} error 原始错误。
  */
 function rethrowTargetWriteError(error) {
-  if (String(error?.message || '').includes('benchmark_targets.benchmark_definition_id, benchmark_targets.version')) {
-    throw benchmarkError('BENCHMARK_TARGET_UNIQUE_KEY_CONFLICT', '同一对标定义和目标版本已存在。');
+  const message = String(error?.message || '');
+  if (message.includes('benchmark_targets.benchmark_definition_id, benchmark_targets.internal_revision')) {
+    throw benchmarkError('BENCHMARK_TARGET_REVISION_CONFLICT', '同一对标定义的内部修订发生冲突，请重试。');
+  }
+  if (message.includes('benchmark_targets.benchmark_definition_id, benchmark_targets.version')) {
+    throw benchmarkError('BENCHMARK_TARGET_COMPATIBILITY_VERSION_CONFLICT', '服务端兼容版本发生冲突，请重试。');
   }
   throw error;
 }
@@ -721,12 +813,17 @@ function createBenchmarkTarget(input, options = {}) {
       if (definition.status !== 'active') throw benchmarkError('BENCHMARK_DEFINITION_INACTIVE', '停用定义不能新增目标。');
       const target = normalizeTargetInput(definition, input);
       assertActiveTargetAvailable(db, definition.id, target.status);
+      const internalRevision = getNextBenchmarkInternalRevision(db, 'target', definition.id);
+      const compatibilityVersion = allocateBenchmarkCompatibilityVersion(
+        db, 'target', definition.id, internalRevision
+      );
       try {
         const result = db.prepare(`INSERT INTO benchmark_targets (
           benchmark_definition_id, target_value, lower_bound, upper_bound, is_frozen,
-          auto_refresh, version, status
-        ) VALUES (?, ?, ?, ?, 0, 0, ?, ?)`).run(
-          definition.id, target.targetValue, target.lowerBound, target.upperBound, target.version, target.status
+          auto_refresh, version, internal_revision, status
+        ) VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?)`).run(
+          definition.id, target.targetValue, target.lowerBound, target.upperBound,
+          compatibilityVersion, internalRevision, target.status
         );
         const created = requireTarget(db, Number(result.lastInsertRowid));
         insertTransactionalAudit(db, options, ENERGY_BENCHMARK_AUDIT_OPERATIONS.targetCreate,
@@ -757,9 +854,10 @@ function updateBenchmarkTarget(targetId, input, options = {}) {
         throw benchmarkError('INTERNAL_HISTORY_BENCHMARK_TARGET_IMMUTABLE', '固化内部历史目标不可修改，只能启用或停用。');
       }
       const target = normalizeTargetInput(definition, input);
-      if (target.version === current.version) {
-        throw benchmarkError('BENCHMARK_TARGET_VERSION_CONFLICT', '修改目标必须提供新的版本；旧版本会保留用于追溯。');
-      }
+      const internalRevision = getNextBenchmarkInternalRevision(db, 'target', definition.id);
+      const compatibilityVersion = allocateBenchmarkCompatibilityVersion(
+        db, 'target', definition.id, internalRevision
+      );
       assertActiveTargetAvailable(db, definition.id, target.status, current.id);
       if (target.status === 'active' && current.status === 'active') {
         db.prepare(`UPDATE benchmark_targets SET status = 'inactive',
@@ -768,9 +866,10 @@ function updateBenchmarkTarget(targetId, input, options = {}) {
       try {
         const result = db.prepare(`INSERT INTO benchmark_targets (
           benchmark_definition_id, target_value, lower_bound, upper_bound, is_frozen,
-          auto_refresh, version, status
-        ) VALUES (?, ?, ?, ?, 0, 0, ?, ?)`).run(
-          definition.id, target.targetValue, target.lowerBound, target.upperBound, target.version, target.status
+          auto_refresh, version, internal_revision, status
+        ) VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?)`).run(
+          definition.id, target.targetValue, target.lowerBound, target.upperBound,
+          compatibilityVersion, internalRevision, target.status
         );
         const created = { ...requireTarget(db, Number(result.lastInsertRowid)), predecessorTargetId: current.id };
         const predecessorAfter = requireTarget(db, current.id);
@@ -1067,7 +1166,6 @@ function calculateInternalHistorySnapshot(db, definition, referencePeriod, scope
     sampleCount: referencePeriod.months.length,
     productionSummaryJson: JSON.stringify(productionSummary),
     sourceDataDigest,
-    version: definition.version,
     status: definition.status
   };
 }
@@ -1085,8 +1183,8 @@ function createInternalHistoryBenchmark(input, options = {}) {
       assertInternalBaselineAllowedFields(input, ['definition', 'referencePeriod', 'calculationScope'], 'internalHistory');
       assertInternalBaselineAllowedFields(input.definition, [
         'benchmarkCode', 'benchmarkName', 'benchmarkType', 'metricCode', 'unit', 'periodType',
-        'scopeType', 'scopeReference', 'direction', 'source', 'documentNo', 'version',
-        'effectiveStartUtc', 'effectiveEndUtc', 'sourceTimeZone', 'status'
+        'scopeType', 'scopeReference', 'direction', 'source', 'effectiveStartUtc',
+        'effectiveEndUtc', 'sourceTimeZone', 'status'
       ], 'definition');
       const definition = normalizeDefinitionInput(db, input.definition, true);
       if (definition.benchmarkType !== 'internal_history_baseline') {
@@ -1097,34 +1195,43 @@ function createInternalHistoryBenchmark(input, options = {}) {
       assertInternalCalculationCompatibility(definition, calculationScope);
       const snapshot = calculateInternalHistorySnapshot(db, definition, referencePeriod, calculationScope, options);
       assertDefinitionPeriodAvailable(db, definition);
+      const definitionRevision = getNextBenchmarkInternalRevision(db, 'definition', definition.benchmarkCode);
+      const definitionCompatibilityVersion = allocateBenchmarkCompatibilityVersion(
+        db, 'definition', definition.benchmarkCode, definitionRevision
+      );
       let definitionResult;
       try {
         definitionResult = db.prepare(`INSERT INTO benchmark_definitions (
           benchmark_code, benchmark_name, benchmark_type, metric_code, unit, period_type,
-          scope_type, scope_reference, direction, source, document_no, version,
+          scope_type, scope_reference, direction, source, document_no, version, internal_revision,
           effective_start_utc, effective_end_utc, source_timezone, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`).run(
           definition.benchmarkCode, definition.benchmarkName, definition.benchmarkType,
           definition.metricCode, definition.unit, definition.periodType, definition.scopeType,
-          definition.scopeReference, definition.direction, definition.source, definition.documentNo,
-          definition.version, definition.effectiveStartUtc, definition.effectiveEndUtc,
-          definition.sourceTimeZone, definition.status
+          definition.scopeReference, definition.direction, definition.source,
+          definitionCompatibilityVersion, definitionRevision, definition.effectiveStartUtc,
+          definition.effectiveEndUtc, definition.sourceTimeZone, definition.status
         );
       } catch (error) {
         rethrowDefinitionWriteError(error);
       }
       const definitionId = Number(definitionResult.lastInsertRowid);
       if (typeof options.afterDefinitionInsert === 'function') options.afterDefinitionInsert({ db, definitionId });
+      const targetRevision = getNextBenchmarkInternalRevision(db, 'target', definitionId);
+      const targetCompatibilityVersion = allocateBenchmarkCompatibilityVersion(
+        db, 'target', definitionId, targetRevision
+      );
       let targetResult;
       try {
         targetResult = db.prepare(`INSERT INTO benchmark_targets (
           benchmark_definition_id, target_value, lower_bound, upper_bound,
           reference_start_utc, reference_end_utc, frozen_value, frozen_at, sample_count,
-          production_summary_json, source_data_digest, is_frozen, auto_refresh, version, status
-        ) VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)`).run(
+          production_summary_json, source_data_digest, is_frozen, auto_refresh, version,
+          internal_revision, status
+        ) VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)`).run(
           definitionId, snapshot.frozenValue, snapshot.referenceStartUtc, snapshot.referenceEndUtc,
           snapshot.frozenValue, snapshot.frozenAt, snapshot.sampleCount, snapshot.productionSummaryJson,
-          snapshot.sourceDataDigest, snapshot.version, snapshot.status
+          snapshot.sourceDataDigest, targetCompatibilityVersion, targetRevision, snapshot.status
         );
       } catch (error) {
         rethrowTargetWriteError(error);
@@ -1412,6 +1519,7 @@ module.exports = {
   BENCHMARK_SCOPE_TYPES,
   BENCHMARK_STATUSES,
   ENERGY_BENCHMARK_REASON_CODES,
+  allocateBenchmarkCompatibilityVersion,
   buildBenchmarkExportRows,
   calculateBenchmarkQualificationRate,
   createBenchmarkDefinition,

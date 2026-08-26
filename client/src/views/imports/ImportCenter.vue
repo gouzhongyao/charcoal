@@ -13,7 +13,7 @@
         <header class="chart-heading"><div><h2>导入批次</h2><span>批次、错误和原文件均以服务端审计记录为准。</span></div></header>
         <el-form inline class="filter-row"><el-form-item label="类型"><el-select v-model="draftFilters.importType" clearable placeholder="全部类型"><el-option v-for="item in importTypes" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item><el-form-item label="状态"><el-select v-model="draftFilters.status" clearable placeholder="全部状态"><el-option v-for="status in batchStatuses" :key="status" :label="status" :value="status" /></el-select></el-form-item><el-form-item label="文件类型"><el-select v-model="draftFilters.fileType" clearable placeholder="全部"><el-option label="xlsx" value="xlsx" /><el-option label="xls" value="xls" /><el-option label="csv" value="csv" /></el-select></el-form-item><el-form-item><el-button :loading="loading" type="primary" @click="applyFilters">查询</el-button><el-button @click="resetFilters">重置</el-button></el-form-item></el-form>
         <PageState v-if="listError" :error="listError" @retry="loadBatches" />
-        <template v-else><el-table :data="batches" v-loading="loading" stripe><el-table-column prop="id" label="批次" width="80" /><el-table-column prop="importTypeLabel" label="导入类型" min-width="130" /><el-table-column prop="displayFilename" label="原始文件" min-width="185" show-overflow-tooltip /><el-table-column prop="status" label="状态" min-width="150" /><el-table-column label="结果" min-width="170"><template #default="{ row }">成功 {{ number(row.successCount) }} / 失败 {{ number(row.failureCount) }} / 跳过 {{ number(row.skippedCount) }}</template></el-table-column><el-table-column prop="createdAt" label="创建时间" min-width="160" /><el-table-column label="操作" width="220" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openDetail(row)">详情</el-button><el-button v-if="canDownload" link @click="downloadSource(row)">原文件</el-button><el-tooltip v-if="canDelete && !canDeleteBatch(row)" content="此批次由领域专用生命周期维护，通用导入删除已禁用以保护追溯链路。"><el-button link disabled>不可通用删除</el-button></el-tooltip><el-button v-else-if="canDelete" link type="danger" @click="confirmDelete(row)">删除批次</el-button></template></el-table-column></el-table><div class="pagination"><el-pagination v-model:current-page="page" v-model:page-size="pageSize" layout="total, sizes, prev, pager, next" :page-sizes="[20,50,100]" :total="pagination.total || 0" @current-change="loadBatches" @size-change="changePageSize" /></div></template>
+        <template v-else><el-table :data="batches" v-loading="loading" stripe><el-table-column prop="id" label="批次" width="80" /><el-table-column prop="importTypeLabel" label="导入类型" min-width="130" /><el-table-column prop="displayFilename" label="原始文件" min-width="185" show-overflow-tooltip /><el-table-column prop="status" label="状态" min-width="150" /><el-table-column label="结果" min-width="170"><template #default="{ row }">成功 {{ number(row.successCount) }} / 失败 {{ number(row.failureCount) }} / 跳过 {{ number(row.skippedCount) }}</template></el-table-column><el-table-column prop="createdAt" label="创建时间" min-width="160" /><el-table-column label="操作" width="220" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openDetail(row)">详情</el-button><el-button v-if="canDownloadBatch(row)" link @click="downloadSource(row)">原文件</el-button><el-tooltip v-if="canDelete && !canDeleteBatch(row)" content="此批次由领域专用生命周期维护，通用导入删除已禁用以保护追溯链路。"><el-button link disabled>不可通用删除</el-button></el-tooltip><el-button v-else-if="canDelete" link type="danger" @click="confirmDelete(row)">删除批次</el-button></template></el-table-column></el-table><div class="pagination"><el-pagination v-model:current-page="page" v-model:page-size="pageSize" layout="total, sizes, prev, pager, next" :page-sizes="[20,50,100]" :total="pagination.total || 0" @current-change="loadBatches" @size-change="changePageSize" /></div></template>
       </article>
 
       <el-dialog v-model="uploadOpen" title="上传能耗数据并建立批次" width="760px" destroy-on-close>
@@ -38,7 +38,16 @@ import ManagementPage from '@/components/ManagementPage.vue';
 import HelpIcon from '@/components/HelpIcon.vue';
 import PageState from '@/components/PageState.vue';
 import { createImportBatch, deleteImportBatch, downloadImportBatchFile, downloadImportTemplate, downloadMonthlyEnergyDemoParkExample, getImportBatchDetail, getImportBatchErrors, getImportBatches, getImportContract } from '@/api/imports';
-import { buildImportBatchFilters, canUseGenericImportBatchDelete, compactFieldMapping, IMPORT_BATCH_TYPE_OPTIONS } from '@/utils/specialModules';
+import {
+  availableImportBatchTypeOptions,
+  buildImportBatchDeleteConfirmation,
+  buildImportBatchDeleteSuccessMessage,
+  buildImportBatchFilters,
+  canDownloadImportBatchSource,
+  canUseGenericImportBatchDelete,
+  compactFieldMapping,
+  filterVisibleImportBatches
+} from '@/utils/specialModules';
 import { hasPermi } from '@/utils/permission';
 
 // 导入契约、批次和详情状态。
@@ -48,17 +57,19 @@ const uploadOpen = ref(false); const uploadFile = ref(null); const fieldMapping 
 const detailOpen = ref(false); const detail = ref(null); const detailLoading = ref(false); const detailError = ref(''); const errors = ref([]); const errorsLoading = ref(false); const errorPage = ref(1); const errorPagination = ref({ total: 0 });
 const safe = async (task) => { try { return { ok: true, value: await task() }; } catch (error) { return { ok: false, error }; } };
 const errorText = (result) => result?.error?.message || '接口请求失败。';
-const canView = computed(() => hasPermi('imports:view')); const canCreate = computed(() => hasPermi('imports:create')); const canDelete = computed(() => hasPermi('imports:delete')); const canDownload = computed(() => hasPermi('imports:download')); const canTemplate = computed(() => hasPermi('imports:view')); const canDemoExample = computed(() => hasPermi('imports:view'));
-const supportedFileTypes = computed(() => contract.value.supportedFileTypes || []); const maxUploadFileSize = computed(() => contract.value.maxUploadFileSize || ''); const batchStatuses = computed(() => contract.value.batchStatuses || []); const importTypes = IMPORT_BATCH_TYPE_OPTIONS; const mappingFields = computed(() => [...(contract.value.requiredFields || []), ...(contract.value.optionalFields || [])]);
+const canView = computed(() => hasPermi('imports:view')); const canCreate = computed(() => hasPermi('imports:create')); const canDelete = computed(() => hasPermi('imports:delete')); const canDownload = computed(() => hasPermi('imports:download')); const canViewCarbonEmissionReports = computed(() => hasPermi('carbon:emission-reports:view')); const canExportCarbonEmissionReports = computed(() => hasPermi('carbon:emission-reports:export')); const canViewGhgReports = computed(() => hasPermi('carbon:ghg-reports:view')); const canExportGhgReports = computed(() => hasPermi('carbon:ghg-reports:export')); const canTemplate = computed(() => hasPermi('imports:view')); const canDemoExample = computed(() => hasPermi('imports:view'));
+const supportedFileTypes = computed(() => contract.value.supportedFileTypes || []); const maxUploadFileSize = computed(() => contract.value.maxUploadFileSize || ''); const batchStatuses = computed(() => contract.value.batchStatuses || []); const importTypes = computed(() => availableImportBatchTypeOptions(canViewCarbonEmissionReports.value, canViewGhgReports.value)); const mappingFields = computed(() => [...(contract.value.requiredFields || []), ...(contract.value.optionalFields || [])]);
 
 /** 格式化导入计数。 */
 function number(value) { const input = Number(value); return Number.isFinite(input) ? new Intl.NumberFormat('zh-CN').format(input) : '0'; }
+/** 判断批次原文件是否满足通用下载及 N6、N7 各自报告导出双重权限。 */
+function canDownloadBatch(row) { return canDownloadImportBatchSource(row, { canDownload: canDownload.value, canExportCarbonEmissionReports: canExportCarbonEmissionReports.value, canExportGhgReports: canExportGhgReports.value }); }
 /** 判断批次能否使用通用删除。 */
 function canDeleteBatch(row) { return canUseGenericImportBatchDelete(row); }
 /** 读取服务端导入契约。 */
 async function loadContract() { const result = await safe(getImportContract); if (result.ok) contract.value = result.value.data || {}; else pageError.value = `导入契约读取失败：${errorText(result)}`; }
-/** 读取当前筛选下的批次审计列表。 */
-async function loadBatches() { loading.value = true; listError.value = ''; const result = await safe(() => getImportBatches(buildImportBatchFilters(appliedFilters.value, { page: page.value, pageSize: pageSize.value }))); loading.value = false; if (result.ok) { batches.value = result.value.data || []; pagination.value = result.value.meta?.pagination || {}; } else { batches.value = []; listError.value = errorText(result); } }
+/** 读取当前筛选下的批次审计列表，并按 N6、N7 精确查看权限防御性过滤。 */
+async function loadBatches() { loading.value = true; listError.value = ''; const result = await safe(() => getImportBatches(buildImportBatchFilters(appliedFilters.value, { page: page.value, pageSize: pageSize.value }))); loading.value = false; if (result.ok) { batches.value = filterVisibleImportBatches(result.value.data, canViewCarbonEmissionReports.value, canViewGhgReports.value); pagination.value = result.value.meta?.pagination || {}; } else { batches.value = []; listError.value = errorText(result); } }
 /** 应用批次筛选。 */
 function applyFilters() { appliedFilters.value = { ...draftFilters.value }; page.value = 1; loadBatches(); }
 /** 重置批次筛选。 */
@@ -83,8 +94,33 @@ async function downloadSource(row) { const result = await safe(() => downloadImp
 async function openDetail(row) { detailOpen.value = true; detail.value = null; errors.value = []; errorPage.value = 1; detailLoading.value = true; detailError.value = ''; const result = await safe(() => getImportBatchDetail(row.id)); detailLoading.value = false; if (!result.ok) { detailError.value = errorText(result); return; } detail.value = result.value.data || {}; await loadErrors(); }
 /** 分页读取当前详情的错误和 warning 明细。 */
 async function loadErrors() { if (!detail.value?.id) return; errorsLoading.value = true; const result = await safe(() => getImportBatchErrors(detail.value.id, { page: errorPage.value, pageSize: 50 })); errorsLoading.value = false; if (result.ok) { errors.value = result.value.data || []; errorPagination.value = result.value.meta?.pagination || {}; } else { pageError.value = `错误明细读取失败：${errorText(result)}`; } }
-/** 二次确认普通能耗批次删除，不将领域限制伪装成前端成功。 */
-async function confirmDelete(row) { try { await ElMessageBox.confirm(`删除普通能耗导入批次“${row.displayFilename || row.originalFilename}”？这会删除该批次能耗记录、错误明细及关联碳排结果；上传原件不由此操作物理删除。`, '确认删除导入批次', { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }); } catch { return; } const result = await safe(() => deleteImportBatch(row.id)); if (!result.ok) { ElMessage.error(`批次删除失败：${errorText(result)}`); return; } ElMessage.success('普通能耗导入批次已删除，领域受保护批次仍不允许使用本接口删除。'); await loadBatches(); }
+/** 二次确认普通能耗批次删除，完整展示预计影响、强制备份和预测非联动边界。 */
+async function confirmDelete(row) {
+  try {
+    await ElMessageBox.confirm(
+      buildImportBatchDeleteConfirmation(row),
+      '确认删除导入批次',
+      {
+        type: 'warning',
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消'
+      }
+    );
+  } catch {
+    return;
+  }
+  // 删除接口结果用于展示实际计数和不含本地路径的备份标识。
+  const result = await safe(() => deleteImportBatch(row.id));
+  if (!result.ok) {
+    ElMessage.error(`批次删除失败：${errorText(result)}`);
+    return;
+  }
+  ElMessage.success({
+    message: buildImportBatchDeleteSuccessMessage(result.value.data || {}),
+    duration: 7000
+  });
+  await loadBatches();
+}
 
 onMounted(async () => { if (!canView.value) return; await Promise.all([loadContract(), loadBatches()]); });
 </script>

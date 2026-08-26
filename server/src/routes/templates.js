@@ -1,4 +1,5 @@
 const express = require('express');
+const { openDatabase } = require('../db/database');
 const {
   TEMPLATE_REQUIRED_PERMISSIONS,
   listTemplates,
@@ -11,12 +12,17 @@ const {
   getDemoParkManifest,
   listDemoParkArtifacts
 } = require('../services/demoParkDatasetService');
-const { getDemoArtifactRegistration } = require('../services/demoArtifactRegistry');
+const {
+  DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES,
+  getDemoArtifactRegistration
+} = require('../services/demoArtifactRegistry');
 const { createDemoContext, revokeDemoContext, sha256Buffer } = require('../services/demoContextService');
 const { assertDemoRuntimeEnabled, getOrCreateActiveDemoDatasetRun } = require('../services/demoRunService');
+const { ensureDemoRuntimeEnabledForManagedDownload } = require('../services/demoRuntimeService');
 const { sendSuccess } = require('../utils/response');
-const { notFound } = require('../utils/errors');
+const { AppError, notFound } = require('../utils/errors');
 const { authenticate } = require('../middleware/auth');
+const { requireWritable } = require('../middleware/maintenance');
 const { requirePermission } = require('../middleware/permission');
 const { getUserPermissions, isSuperAdmin } = require('../services/authService');
 
@@ -37,10 +43,14 @@ const TEMPLATE_ASCII_NAMES = Object.freeze({
   'meter-readings': 'jiliang-chaobiao-template',
   'production-units': 'channeng-danyuan-template',
   'production-outputs': 'yuedu-chanliang-template',
+  suppliers: 'gongyingshang-template',
   'generation-records': 'fadian-ziyong-template',
   'organization-units': 'yongneng-danyuan-template',
   meters: 'jiliang-qiju-template',
   'carbon-factors': 'tan-yinzi-template',
+  'carbon-activities': 'carbon-activities',
+  'carbon-emission-report': 'carbon-emission-report',
+  'ghg-report': 'ghg-report',
   'prediction-configs': 'yuce-peizhi-template',
   'prediction-history': 'yuce-lishi-template'
 });
@@ -96,7 +106,27 @@ function requireTemplateDownloadPermission(req, res, next) {
   });
 }
 
-/** 演示 artifact 下载必须同时通过不可绕过的 runtime、系统演示权限和真实领域权限。 */
+/** 判断注册项是否只生成文件并沿正式无 context 导入链路继续处理。 */
+function isStatelessDemoArtifact(registration) {
+  return registration?.downloadLifecycle === DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.STATELESS_FORMAL_IMPORT;
+}
+
+/** 判断注册项是否需要惰性 runtime、active run 和一次性 context。 */
+function isManagedDemoArtifact(registration) {
+  return registration?.downloadLifecycle === DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME;
+}
+
+/** 未知下载生命周期必须 fail-closed，避免新 registry 项被静默降级为无状态文件。 */
+function assertSupportedDemoDownloadLifecycle(registration) {
+  if (!isStatelessDemoArtifact(registration) && !isManagedDemoArtifact(registration)) {
+    throw new AppError('DEMO_ARTIFACT_DOWNLOAD_LIFECYCLE_INVALID', '演示 artifact 下载生命周期未受服务端支持。', {
+      statusCode: 500,
+      details: { artifactKey: registration?.artifactKey || null }
+    });
+  }
+}
+
+/** 演示 artifact 下载必须同时通过系统演示权限和真实领域权限；托管下载额外受维护态保护。 */
 function requireDemoParkArtifactPermission(req, res, next) {
   const artifactKey = normalizeRouteTemplateType(req.params.artifactKey);
   const artifact = getDemoParkArtifact(artifactKey);
@@ -108,6 +138,12 @@ function requireDemoParkArtifactPermission(req, res, next) {
     }));
     return;
   }
+  try {
+    assertSupportedDemoDownloadLifecycle(registration);
+  } catch (error) {
+    next(error);
+    return;
+  }
   req.demoParkArtifact = artifact;
   req.demoArtifactRegistration = registration;
   authenticate(req, res, (authenticationError) => {
@@ -115,32 +151,79 @@ function requireDemoParkArtifactPermission(req, res, next) {
       next(authenticationError);
       return;
     }
-    try {
-      assertDemoRuntimeEnabled();
-    } catch (error) {
-      next(error);
-      return;
-    }
-    requirePermission('system:demo:download', registration.permissions.download)(req, res, next);
+    requirePermission('system:demo:download', registration.permissions.download)(req, res, (permissionError) => {
+      if (permissionError) {
+        next(permissionError);
+        return;
+      }
+      if (isStatelessDemoArtifact(registration)) {
+        next();
+        return;
+      }
+      requireWritable('system:demo:managed-download')(req, res, next);
+    });
   });
 }
 
-/** 发送内存生成的青岚园区演示文件；成功生成后、发送前签发 context，发送失败时撤销。 */
+/** 设置青岚示例文件的公共下载响应头，不包含任何运行期或 context 状态。 */
+function setDemoParkArtifactFileHeaders(res, result) {
+  res.setHeader('Content-Type', result.mimeType);
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, result.asciiFileName));
+  res.setHeader('Content-Length', String(result.buffer.length));
+  res.setHeader('X-Recommended-Format', 'xlsx');
+}
+
+/** 在同一 immediate 事务中完成 managed runtime、active run 与下载 context 准备。 */
+function prepareManagedDemoArtifactDownload(req, result) {
+  const db = openDatabase();
+  try {
+    return db.transaction(() => {
+      const runtime = ensureDemoRuntimeEnabledForManagedDownload({
+        actorUserId: req.user.id,
+        actorIp: req.ip,
+        artifactKey: result.artifact.artifactKey,
+        db
+      });
+      const run = getOrCreateActiveDemoDatasetRun({ actorUserId: req.user.id, db });
+      const context = createDemoContext({
+        userId: req.user.id,
+        runId: run.runId,
+        artifactKey: result.artifact.artifactKey,
+        handlerKey: req.demoArtifactRegistration.handlerKey,
+        artifactFileSha256: sha256Buffer(result.buffer),
+        db
+      });
+      return { runtime, run, context };
+    }).immediate();
+  } finally {
+    db.close();
+  }
+}
+
+/** 按 registry 生命周期发送无状态文件或签发托管 context 的演示文件。 */
 function sendDemoParkArtifact(req, res, next, format) {
   const result = generateDemoParkArtifact(req.demoParkArtifact.artifactKey, format);
   if (!result) {
     next(notFound('演示数据文件不存在', { artifactKey: req.params.artifactKey }));
     return;
   }
-  const run = getOrCreateActiveDemoDatasetRun({ actorUserId: req.user.id });
-  const artifactFileSha256 = sha256Buffer(result.buffer);
-  const context = createDemoContext({
-    userId: req.user.id,
-    runId: run.runId,
-    artifactKey: result.artifact.artifactKey,
-    handlerKey: req.demoArtifactRegistration.handlerKey,
-    artifactFileSha256
-  });
+  if (isStatelessDemoArtifact(req.demoArtifactRegistration)) {
+    try {
+      setDemoParkArtifactFileHeaders(res, result);
+      res.status(200).send(result.buffer);
+    } catch (error) {
+      next(error);
+    }
+    return;
+  }
+
+  let context;
+  try {
+    ({ context } = prepareManagedDemoArtifactDownload(req, result));
+  } catch (error) {
+    next(error);
+    return;
+  }
   let responseCompleted = false;
   const revokeIfSendFailed = () => {
     if (responseCompleted || res.writableFinished) return;
@@ -155,10 +238,7 @@ function sendDemoParkArtifact(req, res, next, format) {
   res.once('error', revokeIfSendFailed);
 
   try {
-    res.setHeader('Content-Type', result.mimeType);
-    res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, result.asciiFileName));
-    res.setHeader('Content-Length', String(result.buffer.length));
-    res.setHeader('X-Recommended-Format', 'xlsx');
+    setDemoParkArtifactFileHeaders(res, result);
     res.setHeader('X-Demo-Dataset-Id', context.datasetId);
     res.setHeader('X-Demo-Run-Id', context.runId);
     res.setHeader('X-Demo-Artifact-Key', context.artifactKey);

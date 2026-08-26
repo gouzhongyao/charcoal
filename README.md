@@ -4,13 +4,13 @@
 
 ## 完整使用说明书
 
-面向管理员和业务用户的完整安装、权限、导入、台账、核算、预测、备份恢复及故障排查说明，请从 [能碳管理平台使用说明书](docs/使用说明书/README.md) 进入。需要从空隔离库完成青岚智造园区 25 项导入、主动计算和驾驶舱验收时，直接阅读 [项目使用步骤](docs/使用说明书/项目使用步骤.md)。根 README 保留开发启动与临时演示要点，具体业务操作、风险边界和功能覆盖状态以正式使用说明书为准。
+面向管理员和业务用户的完整安装、权限、导入、台账、核算、预测、备份恢复及故障排查说明，请从 [能碳管理平台使用说明书](docs/使用说明书/README.md) 进入。需要从空隔离库完成青岚智造园区 25 项导入、主动计算和中控验收时，直接阅读 [项目使用步骤](docs/使用说明书/项目使用步骤.md)。根 README 保留开发启动与临时演示要点，具体业务操作、风险边界和功能覆盖状态以正式使用说明书为准。
 
 ## 功能概览
 
 以下仅列出已实现能力的简要分组；模块入口、数据来源、权限和非自动联动边界请查阅正式使用说明书 [第 00 章：侧边栏模块总览与数据链路](docs/使用说明书/00-侧边栏模块总览与数据链路.md)。
 
-- 总览与数据接入：驾驶舱按年度展示真实能耗、已核算碳排和预算预警；数据导入支持普通能耗模板、表格校验、字段映射、批次追溯及错误与警告明细。
+- 总览与数据接入：中控按年度展示真实能耗、已核算碳排和预算预警；数据导入支持普通能耗模板、表格校验、字段映射、批次追溯及错误与警告明细。
 - 能源管理：提供能耗统计、月度预算、能源消费分析、能效对标、能流分析以及能效平衡与优化。
 - 基础台账：维护组织/用能单元、计量器具、计量抄表、产能单元、月度产量和发电台账。
 - 碳与预测：维护碳因子并主动计算排放量，基于本地历史能耗配置和运行轻量预测。
@@ -26,24 +26,30 @@
 
 可用环境变量：
 
-| 变量 | 作用 | 默认值 |
+| 变量 | 作用 | 默认值或边界 |
 | --- | --- | --- |
-| `PORT` | 后端 API 端口 | `3002` |
+| `PORT` | 后端 API 端口，并同步决定 Vite `/api` 代理目标 | 空白时 `3002`；只接受 1—65535 的十进制整数 |
 | `DATA_DIR` | 本地数据根目录 | `data/` |
 | `UPLOADS_DIR` | 上传文件目录 | `DATA_DIR/uploads` |
 | `BACKUPS_DIR` | 备份文件目录 | `DATA_DIR/backups` |
 | `SQLITE_PATH` | SQLite 数据库文件路径 | `DATA_DIR/energy-carbon.sqlite` |
-| `CHARCOAL_ADMIN_PASSWORD` | 全新数据库首次初始化或恢复停用的内置管理员时，为内置账号 `admin` 设置的初始密码；至少 8 位 | 无默认值，触发初始化时必须设置 |
+| `CHARCOAL_ADMIN_PASSWORD` | 仅在全新数据库首次创建或恢复 inactive 内置 `admin` 时使用；至少 8 位 | 无默认值，触发对应路径时必须设置 |
 | `CORS_ALLOWED_ORIGINS` | 额外允许的前端 Origin，逗号分隔；仅接受合法 `http:` / `https:` 精确 Origin | 空 |
-| `VITE_API_BASE_URL` / `VITE_API_BASE` | 前端构建或启动时的默认 API Base；仅接受同源 `/api` 或本机回环 API 地址 | `/api` |
+| `VITE_API_BASE_URL` / `VITE_API_BASE` | 前端默认 API Base；Tunnel 模式下两个兼容变量均强制为同源 `/api` | `/api` |
+| `CLOUDFLARED_BIN` | 官方 `cloudflared` 可执行文件的完整绝对路径 | 必须填写完整绝对路径，或留空从 PATH 查找；非绝对路径会在服务启动前失败且不回退 PATH |
+| `TUNNEL_TRANSPORT_PROTOCOL` | Quick Tunnel 传输协议 | 官方值仅允许 `auto`、`quic`、`http2`；模板默认 `auto`，UDP/QUIC 不稳定的本机可改为 `http2`；启动器始终显式传入 `--protocol` |
 
-注意：后端 CORS 默认只接受本地来源，例如 `localhost`、`127.0.0.1`、`[::1]`。Cloudflare Quick Tunnel 当前推荐只把 Vite `7777` 暴露为一条公网入口，浏览器使用同源 `/api`，再由 Vite 代理到 Express `3002`；Vite 会把上游 `Origin` 固定为本地开发来源，因此随机 `trycloudflare.com` 域名变化后不需要写入 `CORS_ALLOWED_ORIGINS`，也不需要为此重启后端。`CORS_ALLOWED_ORIGINS` 仅用于绕过 Vite、由浏览器直接跨域访问 Express 的兼容场景，必须填写精确可信的 `http:` / `https:` Origin，禁止使用 `*` 或 wildcard。
+项目会自动加载根 `.env`。首次配置请从 `.env.example` 复制并只在本机维护；真实 `.env` 已忽略，不得提交。配置优先级为“终端/系统已有环境变量 > 根 `.env` > 默认值”，已有进程环境不会被 `.env` 覆盖。
+
+注意：active `admin` 不会因 `CHARCOAL_ADMIN_PASSWORD` 变化而自动轮换密码；需要改密时使用平台密码修改或重置流程。不要分享管理员明文密码。
+
+后端 CORS 默认只接受本地来源，例如 `localhost`、`127.0.0.1`、`[::1]`。Cloudflare Quick Tunnel 只把 Vite `7777` 暴露为一条公网入口，浏览器使用同源 `/api`，再由 Vite 代理到当前 `PORT` 的 Express；随机 `trycloudflare.com` 域名不需要写入 `CORS_ALLOWED_ORIGINS`。`CORS_ALLOWED_ORIGINS` 仅用于绕过 Vite、由浏览器直接跨域访问 Express 的兼容场景，必须填写精确可信的 `http:` / `https:` Origin，禁止使用 `*` 或 wildcard。
 
 ## 环境要求
 
 - Node.js 18 或更高版本。
 - npm。
-- 如需外网临时访问，可另行安装 Cloudflare Tunnel 的 `cloudflared` 或 ngrok。
+- 如需一键 Cloudflare 临时外网访问，用户需从 Cloudflare 官方渠道预安装官方 `cloudflared`，并确保 PATH 可发现，或将 `CLOUDFLARED_BIN` 设置为可执行文件的完整绝对路径；项目不会自动下载。非绝对路径会在服务启动前失败且不回退 PATH。
 
 ## 安装依赖
 
@@ -55,22 +61,17 @@ npm install
 
 ## 本地启动方式
 
-本项目的前端和后端需要分别启动。
-
-全新数据库首次启动时，系统会初始化内置管理员账号 `admin`，但不会提供默认密码。启动后端前必须通过环境变量设置至少 8 位的 `CHARCOAL_ADMIN_PASSWORD`；已有可用内置管理员时无需重复设置。PowerShell 示例：
+先复制根环境模板并在本机维护：
 
 ```powershell
-$env:CHARCOAL_ADMIN_PASSWORD = "请替换为至少8位的安全密码"
-npm run dev:server
+Copy-Item .env.example .env
 ```
 
-macOS、Linux 或 Git Bash 示例：
+项目会自动读取根 `.env`。全新数据库首次创建或恢复 inactive 内置管理员时，必须填写至少 8 位的 `CHARCOAL_ADMIN_PASSWORD`；留空会使初始化失败。用户名固定为 `admin`。已有 active `admin` 时，环境密码变化不会自动改密。
 
-```bash
-CHARCOAL_ADMIN_PASSWORD='请替换为至少8位的安全密码' npm run dev:server
-```
+本地排障时，前端和后端分别启动。
 
-终端 1：启动后端 API。若已完成管理员初始化，可直接执行：
+终端 1：启动后端 API：
 
 ```bash
 npm run dev:server
@@ -100,13 +101,17 @@ http://127.0.0.1:7777
 /api
 ```
 
-浏览器会把 `/api` 请求发送到当前页面同源地址；本地开发时由 Vite 代理到 `http://127.0.0.1:3002`。也可以在浏览器地址后显式指定同源值：
+浏览器会把 `/api` 请求发送到当前页面同源地址；本地开发时由 Vite 代理到 `http://127.0.0.1:<PORT>`。Vite 代理目标会与后端 PORT 自动同步；Vite 自身仍固定监听 `127.0.0.1:7777` 且启用 `strictPort`，端口占用时不会静默切换。也可以在浏览器地址后显式指定同源值：
 
 ```text
 http://127.0.0.1:7777/?apiBase=%2Fapi
 ```
 
-前端只接受同源 `/api` 或本机回环 API 地址，并会把可信值写入浏览器 `localStorage`。如需恢复默认值，可在页面的 API Base 输入框中改回 `/api`，或清理浏览器站点数据。
+前端只接受同源 `/api` 或本机回环 API 地址。URL 中的 `apiBase` 参数只覆盖本次页面初始化，不会自动写入浏览器 `localStorage`；它在本次初始化时优先于浏览器已保存值。只有通过顶部导航栏的 API Base 配置入口显式保存可信值，才会持久化到 `localStorage`。因此带 `?apiBase=%2Fapi` 的分享 URL 可以确保本次初始化使用 `/api`，但后续访问不带参数的地址时，仍可能恢复此前显式保存的值。如需让后续无参数访问也使用默认值，应在页面配置入口显式保存 `/api`，或清理浏览器站点数据。
+
+Vite 开发服务器启用严格文件服务边界：`server.fs.strict=true`，`server.fs.allow` 只允许 `client/` 与项目根 `node_modules/`。项目根、`data/`、真实 `.env`、SQLite、上传和备份等其他路径不得通过 `/@fs/` 读取；`/__open-in-editor` 被固定拦截为 HTTP 404，且不得触发本机编辑器。该边界降低临时开发分享风险，但 Vite 仍是开发服务器，不等同生产部署；本地或公网演示仍必须使用隔离、脱敏数据。
+
+相关自动测试通过纯配置工厂、注入式环境对象、系统临时环境文件和隔离 SQLite 验证，不读取开发者真实根 `.env`，也不以真实业务 SQLite 作为安全探针。真实浏览器和公网结果仍按手工测试执行。
 
 ## 常用访问地址
 
@@ -122,8 +127,9 @@ http://127.0.0.1:7777/?apiBase=%2Fapi
 
 | 命令 | 说明 |
 | --- | --- |
-| `npm run dev:server` | 启动 Node.js + Express 后端 |
-| `npm run dev:client` | 启动 Vite 前端，监听 `127.0.0.1:7777` |
+| `npm run dev:server` | 启动 Node.js + Express 后端；保留为本地排障入口 |
+| `npm run dev:client` | 启动 Vite 前端，固定监听 `127.0.0.1:7777`；保留为本地排障入口 |
+| `npm run dev:cloudflare` | 统一启动 Express、Vite 和一条指向 Vite 的官方 Cloudflare Quick Tunnel |
 | `npm run test:logic` | 运行纯逻辑测试 |
 | `npm run verify:special` | 运行特殊场景验证脚本 |
 | `npm run audit:summary` | 运行审计摘要脚本 |
@@ -131,8 +137,8 @@ http://127.0.0.1:7777/?apiBase=%2Fapi
 
 ## 基本使用流程
 
-1. 执行 `npm install` 安装依赖；全新库启动前设置至少 8 位的 `CHARCOAL_ADMIN_PASSWORD`。
-2. 分别执行 `npm run dev:server` 和 `npm run dev:client`，打开 `http://127.0.0.1:7777/`。
+1. 执行 `npm install`，从 `.env.example` 复制根 `.env`；全新库首次创建或 inactive 管理员恢复前填写至少 8 位的 `CHARCOAL_ADMIN_PASSWORD`。
+2. 本地排障分别执行 `npm run dev:server` 和 `npm run dev:client`，打开 `http://127.0.0.1:7777/`；临时公网演示使用 `npm run dev:cloudflare`。
 3. 日常业务操作按 [正式使用说明书](docs/使用说明书/README.md) 选择对应章节。
 4. 首次演示或完整验收必须使用隔离 `DATA_DIR`，并按 [青岚智造园区项目使用步骤](docs/使用说明书/项目使用步骤.md) 执行备份、25 项领域导入、主动计算和最终验收。
 5. 不要把所有文件交给通用导入中心：每个模板必须进入对应领域页面；普通能耗支持 `.xlsx/.xls/.csv`，新式单表受控导入通常只支持 `.xlsx/.csv`，多工作表只支持 `.xlsx`。
@@ -147,34 +153,39 @@ Cloudflare Tunnel 适合临时给同事或设备体验本地页面，也可以�
 
 ### 前置步骤
 
-先在本机启动后端和前端：
+1. 从 `.env.example` 复制并维护本机 `.env`，使用隔离、脱敏的数据目录。
+2. 用户从 Cloudflare 官方渠道预安装官方 `cloudflared`；确保 PATH 可发现，或把 `CLOUDFLARED_BIN` 设置为完整绝对路径。项目不会自动下载；非绝对路径会在服务启动前失败且不回退 PATH。
+3. `TUNNEL_TRANSPORT_PROTOCOL` 只允许 `auto`、`quic`、`http2`；模板默认 `auto`，当前网络的 UDP/QUIC 不稳定时可仅在本机 `.env` 改为 `http2`。
+4. 如本机默认配置候选中存在 `config.yml` / `config.yaml`，启动器会在服务启动前失败，只检查存在性，不读取或修改文件。
+
+### 推荐的一键 Quick Tunnel 方式
+
+在项目根的单个终端执行：
 
 ```bash
-npm run dev:server
-npm run dev:client
+npm run dev:cloudflare
 ```
 
-### 推荐的 Quick Tunnel 完整临时体验方式
+命令会统一启动 Express、Vite 和唯一一条指向 Vite `7777` 的 Quick Tunnel。`PORT` 会同时决定 Express 端口和 Vite `/api` 代理目标；Tunnel 模式强制 `VITE_API_BASE_URL`、`VITE_API_BASE` 为同源 `/api`，Host 仍固定为 `127.0.0.1`，Vite 仍固定使用 7777 `strictPort`。启动器始终显式传入配置后的 `--protocol auto|quic|http2`。
 
-只启动一条指向 Vite `7777` 的 Quick Tunnel：
+首次真实 Tunnel 前，不要直接执行一键命令。先只启动本地 Express/Vite，按第 13 章使用非敏感样本确认页面和同源 `/api/health` 为 2xx、项目根与 `data/` 的 `/@fs/` 探测为 403、`/__open-in-editor` 为 404 且不触发编辑器；任一安全探测出现 2xx 时禁止启动 Tunnel。只有本地安全预检通过后才运行一键命令；公网阶段还要使用与本机无关的固定合成绝对路径重复 403/404 验证，禁止发送 URI 编码后仍可逆的真实项目根或 editor 文件路径。
 
-```bash
-cloudflared tunnel --url http://127.0.0.1:7777 --http-host-header 127.0.0.1:7777
-```
-
-Vite 会接收公网页面及其同源 `/api` 请求，并把 `/api` 代理到本机 Express `3002`。正式分享入口使用：
+cloudflared 原始日志可能提前出现随机域名，但域名分配不代表分享链路已经可用。启动器严格按“发现合法 Quick Tunnel Origin（最多 60 秒）→ 回环 metrics `/ready` 返回 HTTP 200（最多 90 秒）→ 公网 `/api/health` 满足健康 JSON 契约（最多 90 秒）”串行判断，每次请求最多 3 秒；只有三阶段全部成功后才打印以下带 `[share]` 前缀的就绪信息：
 
 ```text
-https://<随机域名>.trycloudflare.com/?apiBase=%2Fapi
+[share] 公网 Origin：https://<随机域名>.trycloudflare.com
+[share] 完整分享 URL：https://<随机域名>.trycloudflare.com/?apiBase=%2Fapi
+[share] 公网健康地址：https://<随机域名>.trycloudflare.com/api/health
+[share] 公网链路已就绪
 ```
 
-不要把 `/login?redirect=?apiBase=%252Fapi` 当作分享入口。`%252F` 可能出现在合法的嵌套 URL 编码中，但该示例的 `redirect` 解码后缺少前导 `/`，登录逻辑会按安全规则回退到 `/`；应直接从根入口传入顶层 `apiBase=%2Fapi`。
+正式分享只使用 `[share] 完整分享 URL`，不得复制此前 cloudflared 原始日志中的随机域名。Quick Tunnel URL 随机且重启后会变化，不落盘保存。不要启动第二条 API Tunnel，不要把公网绝对地址写入 API Base、CORS 或长期配置。停止时启动器按 Tunnel → Vite → Express 清理，只处理自己拥有的 PID；不按名称或端口杀未知进程，也不承诺 SIGKILL、断电或系统崩溃时完成清理。
 
-该单隧道链路不需要把每次随机生成的公网 Origin 写入 `CORS_ALLOWED_ORIGINS`。停止并重新启动 `cloudflared` 获得新域名后，只需更新分享链接，Vite 和 Express 可保持运行，后端不需要重启。以上命令、链路说明和分享入口就是 Quick Tunnel 的必需核心步骤，不依赖克隆后可能不存在的本地补充文档。
+`npm run dev:server` 与 `npm run dev:client` 保留为本地排障和 Tunnel 前安全预检入口。当前开发机已安装并真实运行官方 cloudflared 2026.8.2：本地 Express、Vite 和同源代理已通过，但首次公网 `/api/health` 最终超时并触发清理；本轮可靠性与 Vite 公网安全边界修复后的下一节点是用户先完成本地 403/404 安全预检，只有通过后才进行真实 Tunnel 复测。不得写成公网链路已经通过。完整配置、分阶段诊断和手工验收见[第 13 章](docs/使用说明书/13-临时外网访问.md)、[第 14 章](docs/使用说明书/14-限制风险与故障排查.md)和[Cloudflare 一键手册](docs/Cloudflare临时外网访问手册.md)。
 
-### 固定域名的同源路径转发
+### 命名隧道与固定域名（不属于一键 Quick Tunnel）
 
-如果你有 Cloudflare 管理的域名，也可以使用命名隧道，把同一个域名的 `/api/*` 转发到后端，其余路径转发到前端。示例配置：
+如果你有 Cloudflare 管理的域名，也可以另行设计命名隧道，把同一个域名的 `/api/*` 转发到后端，其余路径转发到前端。该方案不由 `npm run dev:cloudflare` 创建或管理，不得把下列示例视为当前一键入口的自动配置。示例配置：
 
 ```yaml
 tunnel: energy-carbon-demo
@@ -183,7 +194,7 @@ credentials-file: C:\Users\<你的用户名>\.cloudflared\<tunnel-id>.json
 ingress:
   - hostname: energy.example.com
     path: /api/*
-    service: http://127.0.0.1:3002
+    service: http://127.0.0.1:<PORT>
   - hostname: energy.example.com
     service: http://127.0.0.1:7777
   - service: http_status:404
@@ -204,7 +215,7 @@ cloudflared tunnel run energy-carbon-demo
 https://energy.example.com/?apiBase=%2Fapi
 ```
 
-这样前端页面和 API 处于同一公网来源，可避免双随机隧道带来的跨域配置复杂度。
+这样前端页面和 API 使用同一个公网来源，可避免双随机隧道。由于该命名隧道示例让浏览器经 Cloudflare 直接访问 Express，而不是由 Vite 代理 `/api`，还必须把 `https://energy.example.com` 作为精确可信 Origin 配置到 `CORS_ALLOWED_ORIGINS`；禁止 wildcard。长期使用前还需自行完成 Cloudflare 凭据、访问控制和运维治理。
 
 ### 生产部署提醒
 
@@ -230,13 +241,13 @@ ngrok http 7777
 
 命令会输出一个 `https://*.ngrok-free.app` 或你的 ngrok 域名。该方式主要用于查看前端页面。远端浏览器默认无法访问你本机的 `127.0.0.1:3002` 后端。
 
-如果再单独执行 `ngrok http 3002` 暴露后端，并把页面 `apiBase` 指向后端 ngrok 地址，浏览器会因为前端域名和 API 域名不同而触发跨域校验。只有将前端 ngrok Origin 精确配置到后端 `CORS_ALLOWED_ORIGINS` 后，才适合可信短期演示；当前项目不会面向任意公网 Origin 自动开放 CORS。
+如果再单独执行 `ngrok http <PORT>` 暴露后端，并把页面 `apiBase` 指向后端 ngrok 地址，浏览器会因为前端域名和 API 域名不同而触发跨域校验。只有将前端 ngrok Origin 精确配置到后端 `CORS_ALLOWED_ORIGINS` 后，才适合可信短期演示；当前项目不会面向任意公网 Origin 自动开放 CORS。
 
 ### 完整体验方式
 
 ngrok 的完整外网体验同样建议走“单一公网来源”：先用反向代理把前端和后端合并到同一个本地端口，再用 ngrok 暴露该端口。路径规则应保持：
 
-- `/api/*` 转发到 `http://127.0.0.1:3002`
+- `/api/*` 转发到 `http://127.0.0.1:<PORT>`
 - 其他路径转发到 `http://127.0.0.1:7777`
 
 例如你已用本地反向代理合并到 `http://127.0.0.1:8080` 后，可执行：
@@ -267,17 +278,19 @@ https://<你的-ngrok-域名>/?apiBase=%2Fapi
 ### 前端提示无法连接本地 API
 
 1. 确认后端已启动：`npm run dev:server`。
-2. 访问 `http://127.0.0.1:3002/api/health`，确认返回成功。
-3. 检查前端页面的 API Base 是否为 `/api`，或是否被 URL 参数、浏览器 `localStorage` 改成了旧地址。
+2. 访问实际 `PORT` 对应的 `http://127.0.0.1:<PORT>/api/health`，确认返回成功。
+3. 访问 `http://127.0.0.1:7777/api/health`，确认 Vite 代理已同步到同一 PORT。
+4. 检查前端页面的 API Base 是否为 `/api`。URL 参数只影响本次初始化；无参数访问可能恢复此前通过页面配置入口保存到 `localStorage` 的旧值。
 
 ### 端口被占用
 
-- 后端默认使用 `3002`，可通过 `PORT` 调整。
-- 前端命令固定使用 `127.0.0.1:7777`，如需更换端口，需要调整 `package.json` 中的 `dev:client` 脚本。
+- 后端默认使用 `3002`，可通过合法 `PORT` 调整；Vite `/api` 代理会同步变化。
+- 前端固定使用 `127.0.0.1:7777` 和 `strictPort`，占用时明确失败，不自动换端口。
+- 先核对监听 PID 和进程身份，优先回到原终端停止；不要按名称或仅凭端口杀未知进程。
 
 ### 外网地址能打开页面，但数据加载失败
 
-Quick Tunnel 场景先确认分享链接使用 `/?apiBase=%2Fapi`，并确认 Vite `7777` 与 Express `3002` 都仍在运行。浏览器只访问一条指向 Vite 的公网隧道，同源 `/api` 由 Vite 代理到 Express；不需要为随机域名配置 `CORS_ALLOWED_ORIGINS`。只有绕过 Vite、让浏览器直接跨域访问 Express 时，才需要把调用页面的精确可信 Origin 写入该环境变量，且禁止 wildcard。
+Quick Tunnel 场景先确认日志已依次完成“公网域名已发现”“Edge 连接已就绪”“公网链路已就绪”，并且只使用同组输出中的 `[share] 完整分享 URL`；不要使用 cloudflared 原始日志中提前出现的随机域名。失败诊断会区分 HTTP 530/502、Content-Type 非 JSON、JSON 无效、健康契约不符，以及请求 Error/cause 的稳定 name/code，但不会输出响应正文、错误 message、stack、随机 URL 或敏感信息。确认 Vite `7777` 与实际 `PORT` 的 Express 都仍在运行。浏览器只访问一条指向 Vite 的公网 Tunnel，同源 `/api` 由 Vite 代理到 Express；不需要为随机域名配置 `CORS_ALLOWED_ORIGINS`。只有绕过 Vite、让浏览器直接跨域访问 Express 时，才需要把调用页面的精确可信 Origin 写入该环境变量，且禁止 wildcard。
 
 ### 导入失败或出现警告
 

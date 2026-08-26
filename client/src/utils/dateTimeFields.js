@@ -117,6 +117,15 @@ export function normalizeStrictUtcDateTime(value) {
   return result.valid ? result.value : null;
 }
 
+/**
+ * 判断一组严格 UTC 输入组件是否都处于合法状态。
+ * @param {Record<string, boolean>} validityState 字段合法性快照。
+ * @returns {boolean} 是否允许查询或提交。
+ */
+export function areStrictUtcInputsValid(validityState = {}) {
+  return Object.values(validityState).every((valid) => valid === true);
+}
+
 // 方法模块：日内分钟字段。
 
 /**

@@ -31,7 +31,7 @@ const EXPECTED_TEMPLATE_TYPES = Object.freeze([
 assert.strictEqual(validateDemoParkManifest(), true);
 assert.doesNotThrow(() => validateDemoParkManifest(), 'manifest 必须通过组织、仪表、产能、班次、能流、平衡、能源类型和有效期跨文件校验。');
 assert.strictEqual(DEMO_DATASET_ID, 'qinglan-park-v1');
-assert.strictEqual(DEMO_MANIFEST_VERSION, '1.0.0');
+assert.strictEqual(DEMO_MANIFEST_VERSION, '1.1.0');
 assert.strictEqual(DEMO_CANONICALIZATION_VERSION, 'canonical-json-v1');
 assert.strictEqual(DEMO_PARK_CODE_PREFIX, 'QL-');
 assert.strictEqual(DEMO_PARK_SOURCE_TIME_ZONE, 'Asia/Shanghai');
@@ -43,7 +43,7 @@ assert.strictEqual(
   JSON.stringify(canonicalizeJsonValue({ z: 1, a: { y: 2, b: 3 } })),
   JSON.stringify(canonicalizeJsonValue({ a: { b: 3, y: 2 }, z: 1 }))
 );
-assert.strictEqual(getDemoParkManifestDigest(), '87daf9dccf6d5baf52f74637464a32209d070b28f23764abd0a07e62ee60df09');
+assert.strictEqual(getDemoParkManifestDigest(), 'e281dd96eb454be4dea42c39b2d19130c3061438743db783a54773892356e0bc');
 const changedCanonicalPayload = structuredClone(canonicalPayload);
 changedCanonicalPayload.artifacts[0].postAction = `${changedCanonicalPayload.artifacts[0].postAction}-changed`;
 const changedCanonicalJson = JSON.stringify(canonicalizeJsonValue(changedCanonicalPayload));
@@ -133,11 +133,16 @@ assert.deepStrictEqual([strategyRow[2], strategyRow[3], strategyRow[4], strategy
 ]);
 assert.strictEqual(getDemoParkArtifact('19-conversion-factors').rows[0][9], 'electricity-factor:v1');
 const benchmarkDefinitionRow = getDemoParkArtifact('20-benchmark-definitions').rows[0];
-assert.deepStrictEqual([benchmarkDefinitionRow[2], benchmarkDefinitionRow[11]], ['manual_benchmark', 'energy-benchmark:v1']);
+assert.strictEqual(benchmarkDefinitionRow.length, 14);
+assert.deepStrictEqual(
+  [benchmarkDefinitionRow[2], benchmarkDefinitionRow[9], benchmarkDefinitionRow[10], benchmarkDefinitionRow[11]],
+  ['manual_benchmark', '青岚园区能源管理目标', '2025-01-01T00:00:00Z', '2027-01-01T00:00:00Z']
+);
 const benchmarkTargetRow = getDemoParkArtifact('21-benchmark-targets').rows[0];
-assert.deepStrictEqual([benchmarkTargetRow[1], benchmarkTargetRow[14]], ['energy-benchmark:v1', 'benchmark-target:v1']);
-assert(benchmarkTargetRow.slice(5, 12).every((value) => value === ''));
-assert.deepStrictEqual([benchmarkTargetRow[12], benchmarkTargetRow[13]], [0, 0]);
+assert.strictEqual(benchmarkTargetRow.length, 14);
+assert.strictEqual(benchmarkTargetRow[1], 128);
+assert(benchmarkTargetRow.slice(4, 11).every((value) => value === ''));
+assert.deepStrictEqual([benchmarkTargetRow[11], benchmarkTargetRow[12]], [0, 0]);
 assert.strictEqual(getDemoParkArtifact('23-energy-flow-nodes').rows[1][10], 'sink');
 
 // 单工作表条目应按模板表头生成多行 XLSX/CSV，且业务编码统一使用 QL- 前缀。

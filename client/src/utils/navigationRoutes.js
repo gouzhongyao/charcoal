@@ -62,6 +62,20 @@ export function isBusinessRouteMenu(menu = {}) {
     && !RESERVED_ROUTE_PATHS.has(routePath);
 }
 
+// 将单个服务端页面菜单投影为动态路由公共合同，组件实例仍由可信 componentMap 注入。
+export function projectDynamicRouteContract(menu = {}) {
+  if (!isBusinessRouteMenu(menu)) return null;
+  return {
+    path: getMenuRoutePath(menu),
+    name: `menu-${menu.id}`,
+    componentKey: typeof menu.component === 'string' ? menu.component.trim() : '',
+    meta: {
+      title: typeof menu.menuName === 'string' ? menu.menuName : '',
+      permission: menu.permissionCode || null
+    }
+  };
+}
+
 // 查找当前账号按菜单顺序获得的第一个授权业务路径，无可用菜单时返回空字符串。
 export function findFirstAuthorizedBusinessPath(menus = []) {
   const firstMenu = flattenMenus(menus).find((menu) => isBusinessRouteMenu(menu));

@@ -11,10 +11,13 @@ process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
 process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 process.env.CHARCOAL_ALLOW_REGISTER = 'true';
+// development 环境用于验证系统手工备份原生异常不会被通用错误处理器回显。
+process.env.NODE_ENV = 'development';
 
 const { app } = require('../index');
 const { initDatabase, openDatabase, uploadsDir } = require('../db/database');
 const { login, register } = require('../services/authService');
+const backupService = require('../services/backupService');
 const { runWithMaintenance } = require('../services/maintenanceState');
 
 // 通过真实 HTTP 请求验证特殊模块的认证、权限和下载响应边界。
@@ -128,6 +131,33 @@ function createImportBatchFixture() {
 
     assert.strictEqual((await request(server, 'GET', '/api/system/backups')).status, 401);
     assert.strictEqual((await request(server, 'GET', '/api/system/backups', { token: ordinaryToken })).status, 403);
+
+    // development HTTP 故障注入用于验证手工备份原生异常不会泄漏内部路径或消息。
+    const originalCreateBackup = backupService.createBackup;
+    // 手工备份失败响应用于在恢复真实服务实现前完成稳定错误断言。
+    let backupCreateFailure;
+    // 原生错误消息用于精确确认公开响应没有回显底层文本。
+    const nativeBackupErrorMessage = `原生系统备份失败：${process.env.SQLITE_PATH}；${process.env.BACKUPS_DIR}`;
+    try {
+      backupService.createBackup = async () => {
+        throw new Error(nativeBackupErrorMessage);
+      };
+      backupCreateFailure = await request(server, 'POST', '/api/system/backups', { token: adminToken });
+    } finally {
+      backupService.createBackup = originalCreateBackup;
+    }
+    assert.strictEqual(backupCreateFailure.status, 500);
+    assert.strictEqual(backupCreateFailure.json.error.code, 'SYSTEM_BACKUP_CREATE_FAILED');
+    assert.strictEqual(backupCreateFailure.json.error.message, '系统备份创建失败，请稍后重试。');
+    assert.strictEqual(backupCreateFailure.json.error.details, null);
+    // 手工备份失败响应文本用于集中核对临时目录、SQLite 路径、备份目录和原生消息均未泄漏。
+    const backupCreateFailureText = backupCreateFailure.body.toString('utf8');
+    assert.strictEqual(backupCreateFailureText.includes(tmpDir), false);
+    assert.strictEqual(backupCreateFailureText.includes(process.env.SQLITE_PATH), false);
+    assert.strictEqual(backupCreateFailureText.includes(process.env.BACKUPS_DIR), false);
+    assert.strictEqual(backupCreateFailureText.includes(nativeBackupErrorMessage), false);
+
+    // 恢复真实备份实现后的成功请求用于证明手工备份正常路径不回归。
     const backupCreated = await request(server, 'POST', '/api/system/backups', { token: adminToken });
     assert.strictEqual(backupCreated.status, 201);
     assert(!backupCreated.body.toString('utf8').includes(tmpDir), '备份创建响应不得泄露本地目录。');

@@ -105,7 +105,10 @@ async function run() {
       'x-demo-manifest-version',
       'x-demo-manifest-digest',
       'x-demo-artifact-sha256',
-      'x-demo-context'
+      'x-demo-context',
+      'x-exported-row-count',
+      'x-exported-row-count-independent-activity',
+      'x-exported-row-count-energy-record'
     ].forEach((headerName) => assert(exposedHeaders.has(headerName), `CORS 必须暴露 ${headerName}。`));
 
     const exactOriginResponse = await requestCorsPreflight(server, 'https://demo.trycloudflare.com');
