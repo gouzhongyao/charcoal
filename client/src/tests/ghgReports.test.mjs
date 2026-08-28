@@ -62,7 +62,7 @@ function createListRow(overrides = {}) {
     id: 11,
     reportCode: 'GHG-2025-001',
     reportName: '2025 年温室气体报告',
-    reportOrganization: '青岚园区',
+    reportOrganization: '天坤集团',
     periodStart: '2025-01-01',
     periodEnd: '2025-12-31',
     templateId: 'ghg-report',
@@ -114,7 +114,7 @@ function createPreview(overrides = {}) {
 function createDetail(overrides = {}) {
   return {
     report: createListRow(),
-    organizationBoundaries: [{ id: 31, boundaryCode: 'OB-01', organizationUnit: '青岚园区', inclusionMethod: '运营控制法', boundaryDescription: '全部纳入', sourceRowNumber: 2, witness: '禁止投影' }],
+    organizationBoundaries: [{ id: 31, boundaryCode: 'OB-01', organizationUnit: '天坤集团', inclusionMethod: '运营控制法', boundaryDescription: '全部纳入', sourceRowNumber: 2, witness: '禁止投影' }],
     operationalBoundaries: [{ id: 41, emissionScope: 'scope_1', category: '固定燃烧', boundaryDescription: '锅炉天然气', sourceRowNumber: 2, fileSha256: '禁止投影' }],
     items: [
       { id: 51, itemCode: 'E-01', recordType: 'emission', emissionScope: 'scope_1', category: '固定燃烧', greenhouseGas: 'CO2', sourceOrSink: '天然气锅炉', activityValue: 100, activityUnit: 'm³', gasAmount: 2, gwp: 1, co2eValue: 2, co2eUnit: 'tCO2e', accountingMethod: '活动数据法', evidenceCode: 'EV-01', note: null, sourceRowNumber: 2, candidateRowId: 9 },

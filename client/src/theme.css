@@ -1,6 +1,8 @@
 :root { --el-color-primary: #1769e0; --el-color-primary-light-3: #5e9cf0; --el-border-radius-base: 8px; --el-font-family: Inter, "Microsoft YaHei", system-ui, sans-serif; }
 * { box-sizing: border-box; }
-html, body, #app { min-width: 100%; min-height: 100%; margin: 0; }
+html, body, #app { width: 100%; min-width: 0; max-width: 100%; min-height: 100%; margin: 0; overflow-x: hidden; }
+html.immersive-mode, body.immersive-mode, #app.immersive-mode { height: 100%; min-height: 0; overflow: hidden; }
+body.immersive-mode { background: #020b18; }
 body { color: #183153; background: #eef5ff; font-family: var(--el-font-family); }
 .page-card { padding: 20px; background: #fff; border: 1px solid #dce9fb; border-radius: 14px; box-shadow: 0 10px 28px rgba(30, 91, 180, .07); }
 .page-header { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:18px; }
@@ -14,4 +16,3 @@ body { color: #183153; background: #eef5ff; font-family: var(--el-font-family); 
 .table-actions { display:flex; flex-wrap:wrap; gap:6px; }
 .empty-state { display:grid; place-items:center; min-height:260px; color:#6d809e; text-align:center; }
 .loading-state { display:flex; justify-content:center; padding:42px; }
-.migration-note { margin-top:16px; color:#5e7394; font-size:13px; }

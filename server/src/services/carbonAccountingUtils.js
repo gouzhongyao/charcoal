@@ -9,8 +9,8 @@ const DEFAULT_PRECISION = 6;
 const EMISSION_GROUP_COLUMNS = Object.freeze({
   month: 'er.normalized_month',
   energyType: 'et.code',
-  organization: 'er.organization',
-  site: 'er.site'
+  organizationUnit: 'ou.unit_path',
+  meterDevice: 'md.meter_code'
 });
 
 const EMISSION_SORT_COLUMNS = Object.freeze({
@@ -19,8 +19,8 @@ const EMISSION_SORT_COLUMNS = Object.freeze({
   energyTypeCode: 'et.code',
   emissionValue: 'ce.emission_value',
   status: 'ce.status',
-  organization: 'er.organization',
-  site: 'er.site'
+  organizationUnit: 'ou.unit_path',
+  meterDevice: 'md.meter_code'
 });
 
 function normalizeText(value) {
@@ -218,7 +218,7 @@ function selectBestCarbonFactor(record, candidates, options = {}) {
 function normalizeEmissionGroupBy(value) {
   const groupBy = normalizeText(value) || 'month';
   if (!Object.prototype.hasOwnProperty.call(EMISSION_GROUP_COLUMNS, groupBy)) {
-    throw badRequest('groupBy 仅支持 month、energyType、organization、site。', {
+    throw badRequest('groupBy 仅支持 month、energyType、organizationUnit、meterDevice。', {
       code: 'UNSUPPORTED_EMISSION_GROUP_BY',
       groupBy,
       allowedGroupBy: Object.keys(EMISSION_GROUP_COLUMNS)

@@ -5,21 +5,15 @@ const { getCarbonManagementContract } = require('./carbonAccountingService');
 const { getPredictionManagementContract } = require('./predictionService');
 
 const importRequiredFields = [
-  { key: 'period', internalKey: 'month', label: '月份', normalizedTo: 'YYYY-MM', required: true, examples: ['2026-01', '2026/01', '2026.01', '2026-01-01 00:00:00', 'Excel 日期单元格'] },
-  { key: 'energy_type', internalKey: 'energyType', label: '能源类型/编码', required: true, examples: ['electricity', '电力', 'photovoltaic', '光伏', 'natural_gas', 'oil', '油'] },
+  { key: 'month', internalKey: 'month', label: '月份', normalizedTo: 'YYYY-MM', required: true, examples: ['2026-01', '2026/01', '2026.01', 'Excel 日期单元格'] },
+  { key: 'energyType', internalKey: 'energyType', label: '能源类型/编码', required: true, examples: ['electricity', '电力', 'photovoltaic', '光伏', 'natural_gas', 'oil', '煤', 'heat'] },
   { key: 'value', label: '能耗值', required: true, type: 'number', min: 0 },
-  { key: 'unit', label: '单位', required: true, examples: ['kWh', 'MWh', 'm³', '万m³', 'kg', 't', 'MJ', 'GJ'] }
+  { key: 'unit', label: '单位', required: true, examples: ['kWh', 'MWh', 'm³', 'kg', 't', 'MJ', 'GJ'] },
+  { key: 'organizationUnitCode', internalKey: 'organizationUnitCode', label: '用能单元编码', required: true }
 ];
 
 const importOptionalFields = [
-  { key: 'energy_name', internalKey: 'energyType', label: '能源中文名称；energy_type 为空时可作为能源类型识别来源' },
-  { key: 'organization_unit', internalKey: 'organization', label: '组织/部门/工序/用能单元' },
-  { key: 'meter_name', internalKey: 'meterCode', label: '仪表或计量点名称' },
-  { key: 'data_time', internalKey: 'dataTime', label: '数据时间；period 为空时可用于月份标准化' },
-  { key: 'site', label: '厂区/站点' },
-  { key: 'department', label: '部门' },
-  { key: 'production_line', internalKey: 'productionLine', label: '产线' },
-  { key: 'business_dimension', internalKey: 'businessDimension', label: '业务维度' },
+  { key: 'meterCode', internalKey: 'meterCode', label: '计量器具编码；填写后必须与用能单元和能源类型一致' },
   { key: 'remark', label: '备注' }
 ];
 
@@ -50,24 +44,19 @@ function getImportContract() {
     requiredFields: importRequiredFields,
     optionalFields: importOptionalFields,
     normalization: {
-      month: 'period/data_time 统一转为 YYYY-MM，并保留 original_month；支持 YYYY-MM、YYYY/MM、YYYY.MM、日期/时间和 Excel 日期单元格。',
-      energyTypes: '首期字典覆盖 electricity、photovoltaic、natural_gas、gasoline、diesel、oil、coal、heat、steam、water；光伏/photovoltaic 与通用油/oil 均可通过中文或英文识别，通用 oil 不替代 gasoline/diesel。',
-      unitAndValue: '保留 original_unit/original_value，同时写入 normalized_unit/normalized_value；首期覆盖电力/光伏 MWh→kWh、kWh，天然气 万m³→m³、m³，通用油/煤 kg→t、t，热力 GJ→MJ、MJ；汽油/柴油首期保持 L。',
-      duplicateKey: '默认由能源类型、标准月份、组织、站点、部门、产线、表计编号、业务维度等生成稳定 SHA-256；重复数据仅启用 skip 并在批次统计/错误明细中以 warning 追溯。'
+      month: '月份统一转为 YYYY-MM，并保留 original_month；支持 YYYY-MM、YYYY/MM、YYYY.MM 和 Excel 日期单元格。',
+      energyTypes: '能源类型通过规范编码或中文名称识别，并按能源字典写入 energy_type_id。',
+      unitAndValue: '保留 original_unit/original_value，同时写入 normalized_unit/normalized_value；电力和光伏统一为 kWh，油和煤统一为 t，热力统一为 MJ。',
+      ledgerBinding: '用能单元编码必须精确匹配启用台账；计量器具编码可选，填写后必须与能源类型和用能单元一致。',
+      duplicateKey: '由能源类型、标准月份、用能单元编码、计量器具编码和原始单位生成稳定 SHA-256；重复数据按 skip 策略记录 warning。'
     },
     fieldMappingExamples: {
-      period: ['period', '月份', '统计月份', '日期', '时间'],
-      energy_type: ['energy_type', '能源类型', '能源编码'],
-      energy_name: ['energy_name', '能源名称', '能源'],
+      month: ['month', '月份', '统计月份'],
+      energyType: ['energyType', '能源类型', '能源类型编码'],
       value: ['value', '用量', '消费量', '数值'],
       unit: ['unit', '单位', '计量单位'],
-      organization_unit: ['organization_unit', '用能单元', '部门', '车间', '工序'],
-      site: ['site', '地点', '厂区/站点'],
-      department: ['department', '部门', '车间'],
-      production_line: ['production_line', 'productionLine', '产线', '生产线'],
-      meter_name: ['meter_name', '仪表', '表计', '计量点'],
-      data_time: ['data_time', '数据时间', '采集时间'],
-      business_dimension: ['business_dimension', 'businessDimension', '业务维度'],
+      organizationUnitCode: ['organizationUnitCode', '用能单元编码', '组织单元编码'],
+      meterCode: ['meterCode', '计量器具编码', '仪表编码'],
       remark: ['remark', '备注']
     },
     deletion: {
@@ -122,10 +111,10 @@ function getEnergyRecordContract() {
   return {
     status: 'implemented-statistics-basic',
     table: 'energy_records',
-    filters: ['normalizedMonthStart', 'normalizedMonthEnd', 'monthStart', 'monthEnd', 'energyTypeCode', 'organization', 'site', 'department', 'organizationUnitId', 'meterDeviceId', 'sourceBatchId'],
+    filters: ['normalizedMonthStart', 'normalizedMonthEnd', 'monthStart', 'monthEnd', 'energyTypeCode', 'organizationUnitCode', 'organizationUnitId', 'meterDeviceId', 'sourceBatchId', 'keyword'],
     pagination: { page: 1, pageSize: 20, maxPageSize: 200 },
     sort: {
-      fields: ['normalizedMonth', 'energyTypeCode', 'normalizedValue', 'organization', 'site', 'department', 'sourceBatchId', 'createdAt'],
+      fields: ['normalizedMonth', 'energyTypeCode', 'normalizedValue', 'organizationUnitCode', 'organizationUnitPath', 'meterCode', 'sourceBatchId', 'createdAt'],
       orders: ['asc', 'desc'],
       default: { sortBy: 'normalizedMonth', sortOrder: 'desc' }
     },
@@ -133,7 +122,7 @@ function getEnergyRecordContract() {
       summary: 'GET /api/energy-records/statistics/summary',
       monthlyTrend: 'GET /api/energy-records/statistics/monthly-trend',
       energyTypeBreakdown: 'GET /api/energy-records/statistics/energy-type-breakdown',
-      dimensionBreakdown: 'GET /api/energy-records/statistics/dimension-breakdown?dimension=organization|site|department'
+      dimensionBreakdown: 'GET /api/energy-records/statistics/dimension-breakdown?dimension=organizationUnit|meterDevice'
     },
     dashboardRoute: 'GET /api/dashboard/summary',
     note: '当前提供能耗明细分页、基础筛选和统计聚合；工作台摘要仅基于能耗记录、导入批次和导入错误，不包含碳核算或预测结果。'
@@ -193,7 +182,7 @@ function getApiContract() {
       meterReadings: 'GET/POST/PUT/DELETE /api/meter-readings；POST /api/meter-readings/import 导入抄表；GET /api/meter-readings/export 导出当前筛选结果；抄表不自动进入 energy_records',
       generation: 'GET/POST/PUT/DELETE /api/generation/records；GET /api/generation/contract 查看发电自用导入导出契约；GET /api/generation/records/export 导出当前筛选结果；POST /api/generation/records/import/preview 预演不写库；POST /api/generation/records/import/execute 受控导入只写 generation_records',
       energyBudgets: 'GET/POST/PUT/PATCH /api/energy-budgets；GET /api/energy-budgets/execution-comparison 按 active 预算与 active energy_records.normalized_value 做月度执行对比，并返回默认 80/100 阈值预警字段与汇总；GET /api/energy-budgets/contract 查看用能预算 P2 最小预警契约',
-      energyRecords: 'GET /api/energy-records 查询已导入 active 能耗记录，兼容 organization/site/department 文本筛选并支持 organizationUnitId/meterDeviceId；GET /api/energy-records/contract 查看契约',
+      energyRecords: 'GET /api/energy-records 查询已导入 active 能耗记录，使用 organizationUnitId/meterDeviceId 规范外键并通过 JOIN 派生名称；GET /api/energy-records/contract 查看契约',
       energyStatistics: 'GET /api/energy-records/statistics/summary、monthly-trend、energy-type-breakdown、dimension-breakdown 查询基础统计聚合',
       dashboardSummary: 'GET /api/dashboard/summary 查询仅基于能耗记录、导入批次和错误数量的工作台摘要',
       carbonContract: 'GET /api/carbon/contract',

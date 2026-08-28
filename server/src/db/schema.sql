@@ -221,7 +221,7 @@ CREATE TABLE IF NOT EXISTS energy_records (
   source_batch_id INTEGER,
   source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
   energy_type_id INTEGER NOT NULL,
-  organization_unit_id INTEGER,
+  organization_unit_id INTEGER NOT NULL,
   meter_device_id INTEGER,
   original_month TEXT NOT NULL,
   normalized_month TEXT NOT NULL CHECK (
@@ -232,21 +232,15 @@ CREATE TABLE IF NOT EXISTS energy_records (
   original_value REAL NOT NULL CHECK (original_value >= 0),
   normalized_unit TEXT NOT NULL,
   normalized_value REAL NOT NULL CHECK (normalized_value >= 0),
-  organization TEXT,
-  site TEXT,
-  department TEXT,
-  production_line TEXT,
-  meter_code TEXT,
-  business_dimension TEXT,
   remark TEXT,
   duplicate_key TEXT NOT NULL,
-  record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'skipped_duplicate', 'overwritten', 'void')),
+  record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
   FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
-  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE SET NULL,
-  FOREIGN KEY (meter_device_id) REFERENCES meter_devices(id) ON DELETE SET NULL
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE RESTRICT,
+  FOREIGN KEY (meter_device_id) REFERENCES meter_devices(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS generation_records (
@@ -732,9 +726,8 @@ CREATE TABLE IF NOT EXISTS prediction_configs (
   name TEXT NOT NULL,
   note TEXT,
   energy_type_id INTEGER,
-  organization_scope TEXT,
-  site TEXT,
-  department TEXT,
+  organization_unit_id INTEGER,
+  meter_device_id INTEGER,
   source_batch_filter_id INTEGER,
   train_start_month TEXT NOT NULL,
   train_end_month TEXT NOT NULL,
@@ -747,7 +740,9 @@ CREATE TABLE IF NOT EXISTS prediction_configs (
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   archived_at TEXT,
   FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
-  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE SET NULL
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE SET NULL,
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE SET NULL,
+  FOREIGN KEY (meter_device_id) REFERENCES meter_devices(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS prediction_runs (
@@ -994,6 +989,14 @@ CREATE TABLE IF NOT EXISTS energy_conversion_factors (
 
 CREATE TABLE IF NOT EXISTS strategy_rules (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER CHECK (
+    source_batch_id IS NULL
+    OR (typeof(source_batch_id) = 'integer' AND source_batch_id >= 1)
+  ),
+  source_row_number INTEGER CHECK (
+    source_row_number IS NULL
+    OR (typeof(source_row_number) = 'integer' AND source_row_number >= 1)
+  ),
   rule_code TEXT NOT NULL,
   rule_name TEXT NOT NULL,
   rule_version TEXT NOT NULL,
@@ -1015,7 +1018,12 @@ CREATE TABLE IF NOT EXISTS strategy_rules (
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE RESTRICT,
   UNIQUE (rule_code, rule_version),
+  CHECK (
+    (source_batch_id IS NULL AND source_row_number IS NULL)
+    OR (source_batch_id IS NOT NULL AND source_row_number IS NOT NULL)
+  ),
   CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc)),
   CHECK (
     (threshold_operator = 'between' AND threshold_min IS NOT NULL AND threshold_max IS NOT NULL AND threshold_min <= threshold_max AND threshold_value IS NULL)
@@ -1516,6 +1524,8 @@ CREATE TABLE IF NOT EXISTS energy_flow_loss_evidence (
 
 CREATE TABLE IF NOT EXISTS energy_balance_boundaries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER,
   boundary_code TEXT NOT NULL,
   boundary_name TEXT NOT NULL,
   organization_unit_id INTEGER,
@@ -1529,13 +1539,25 @@ CREATE TABLE IF NOT EXISTS energy_balance_boundaries (
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
   FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE SET NULL,
   UNIQUE (boundary_code, version),
-  CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc))
+  CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc)),
+  CHECK (
+    (source_batch_id IS NULL AND source_row_number IS NULL)
+    OR (
+      source_batch_id IS NOT NULL
+      AND source_row_number IS NOT NULL
+      AND typeof(source_row_number) = 'integer'
+      AND source_row_number >= 1
+    )
+  )
 );
 
 CREATE TABLE IF NOT EXISTS energy_balance_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_batch_id INTEGER,
+  source_row_number INTEGER,
   energy_balance_boundary_id INTEGER NOT NULL,
   item_code TEXT NOT NULL,
   item_name TEXT NOT NULL,
@@ -1548,9 +1570,19 @@ CREATE TABLE IF NOT EXISTS energy_balance_items (
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
   FOREIGN KEY (energy_balance_boundary_id) REFERENCES energy_balance_boundaries(id) ON DELETE CASCADE,
   FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
   UNIQUE (energy_balance_boundary_id, item_code),
+  CHECK (
+    (source_batch_id IS NULL AND source_row_number IS NULL)
+    OR (
+      source_batch_id IS NOT NULL
+      AND source_row_number IS NOT NULL
+      AND typeof(source_row_number) = 'integer'
+      AND source_row_number >= 1
+    )
+  ),
   CHECK (
     CASE WHEN json_valid(source_mapping_json) = 1 THEN
       json_type(source_mapping_json) = 'object'
@@ -1559,6 +1591,82 @@ CREATE TABLE IF NOT EXISTS energy_balance_items (
     ELSE 0 END
   )
 );
+
+-- 删除导入批次前先同时清空来源批次和来源行，保持 provenance 成对可空与 ON DELETE SET NULL 语义一致。
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_boundaries_source_insert
+BEFORE INSERT ON energy_balance_boundaries
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance boundary import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_boundaries_source_update
+BEFORE UPDATE OF source_batch_id, source_row_number ON energy_balance_boundaries
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance boundary import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_items_source_insert
+BEFORE INSERT ON energy_balance_items
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance item import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_items_source_update
+BEFORE UPDATE OF source_batch_id, source_row_number ON energy_balance_items
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance item import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_balance_import_batch_provenance_clear
+BEFORE DELETE ON import_batches
+BEGIN
+  UPDATE energy_balance_boundaries
+  SET source_batch_id = NULL, source_row_number = NULL
+  WHERE source_batch_id = OLD.id;
+  UPDATE energy_balance_items
+  SET source_batch_id = NULL, source_row_number = NULL
+  WHERE source_batch_id = OLD.id;
+END;
 
 CREATE TABLE IF NOT EXISTS energy_balance_calculation_runs (
   calculation_run_id TEXT PRIMARY KEY,
@@ -1980,6 +2088,71 @@ CREATE INDEX IF NOT EXISTS idx_energy_flow_records_model_stage ON energy_flow_re
 CREATE INDEX IF NOT EXISTS idx_energy_flow_records_path ON energy_flow_records(energy_flow_model_id, energy_flow_path_id, record_status, start_utc, end_utc);
 CREATE INDEX IF NOT EXISTS idx_energy_flow_records_asset ON energy_flow_records(energy_flow_model_id, energy_flow_asset_id, record_status, start_utc, end_utc);
 CREATE INDEX IF NOT EXISTS idx_energy_flow_records_batch ON energy_flow_records(source_batch_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_flow_edges_source_insert
+BEFORE INSERT ON energy_flow_edges
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy flow edge import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_flow_edges_source_update
+BEFORE UPDATE OF source_batch_id, source_row_number ON energy_flow_edges
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy flow edge import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_flow_records_source_insert
+BEFORE INSERT ON energy_flow_records
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy flow record import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_flow_records_source_update
+BEFORE UPDATE OF source_batch_id, source_row_number ON energy_flow_records
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy flow record import source must contain batch and positive row together');
+END;
+
 CREATE UNIQUE INDEX IF NOT EXISTS ux_energy_flow_waste_heat_code ON energy_flow_waste_heat_facts(energy_flow_model_id, normalize_energy_flow_key(waste_heat_code));
 CREATE UNIQUE INDEX IF NOT EXISTS ux_energy_flow_waste_heat_active_record ON energy_flow_waste_heat_facts(energy_flow_record_id) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_energy_flow_waste_heat_model_role ON energy_flow_waste_heat_facts(energy_flow_model_id, waste_heat_role, status);
@@ -1994,7 +2167,9 @@ CREATE INDEX IF NOT EXISTS idx_energy_flow_loss_evidence_fact_role ON energy_flo
 CREATE INDEX IF NOT EXISTS idx_energy_flow_loss_evidence_range ON energy_flow_loss_evidence(energy_flow_model_id, evidence_start_utc, evidence_end_utc, status);
 CREATE INDEX IF NOT EXISTS idx_energy_flow_loss_evidence_batch ON energy_flow_loss_evidence(source_batch_id);
 CREATE INDEX IF NOT EXISTS idx_energy_balance_boundaries_effective ON energy_balance_boundaries(status, effective_start_utc, effective_end_utc);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_boundaries_source ON energy_balance_boundaries(source_batch_id, source_row_number);
 CREATE INDEX IF NOT EXISTS idx_energy_balance_items_boundary_role ON energy_balance_items(energy_balance_boundary_id, role, status);
+CREATE INDEX IF NOT EXISTS idx_energy_balance_items_source ON energy_balance_items(source_batch_id, source_row_number);
 CREATE INDEX IF NOT EXISTS idx_energy_balance_runs_boundary_created ON energy_balance_calculation_runs(energy_balance_boundary_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_energy_balance_runs_digest ON energy_balance_calculation_runs(source_data_digest, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_energy_balance_snapshots_run ON energy_balance_snapshots(calculation_run_id, id);
@@ -2339,6 +2514,7 @@ CREATE INDEX IF NOT EXISTS idx_demo_legacy_claim_runs_status_created
 -- 清理运行保留预演防陈旧、幂等请求、备份白名单元数据和最终结果。
 CREATE TABLE IF NOT EXISTS demo_cleanup_runs (
   cleanup_run_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
   client_request_id TEXT NOT NULL UNIQUE,
   preview_digest TEXT NOT NULL CHECK (length(preview_digest) = 64),
   preview_expires_at TEXT NOT NULL,
@@ -2357,6 +2533,7 @@ CREATE TABLE IF NOT EXISTS demo_cleanup_runs (
   started_at TEXT,
   completed_at TEXT,
   failure_reason TEXT,
+  FOREIGN KEY (run_id) REFERENCES demo_dataset_runs(run_id) ON DELETE RESTRICT,
   FOREIGN KEY (requested_by) REFERENCES sys_users(id) ON DELETE SET NULL,
   CHECK (length(trim(cleanup_run_id)) BETWEEN 1 AND 128),
   CHECK (length(trim(client_request_id)) BETWEEN 1 AND 128),
@@ -2453,4 +2630,229 @@ CREATE INDEX IF NOT EXISTS idx_demo_run_import_batches_run_artifact
 CREATE UNIQUE INDEX IF NOT EXISTS ux_demo_run_import_batches_primary_context
   ON demo_run_import_batches(context_id)
   WHERE batch_role = 'primary';
+
+-- 后置动作运行只保存服务端解析的输入、摘要、状态和审计，不接受客户端实体标识或 SQL。
+CREATE TABLE IF NOT EXISTS demo_post_action_runs (
+  action_run_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  dataset_id TEXT NOT NULL,
+  action_key TEXT NOT NULL,
+  registry_version TEXT NOT NULL,
+  resolver_version TEXT NOT NULL,
+  executor_version TEXT NOT NULL,
+  client_request_id TEXT NOT NULL,
+  manifest_version TEXT NOT NULL,
+  manifest_digest TEXT NOT NULL CHECK (
+    typeof(manifest_digest) = 'text'
+    AND length(manifest_digest) = 64
+    AND manifest_digest NOT GLOB '*[^a-f0-9]*'
+  ),
+  registry_digest TEXT NOT NULL CHECK (
+    typeof(registry_digest) = 'text'
+    AND length(registry_digest) = 64
+    AND registry_digest NOT GLOB '*[^a-f0-9]*'
+  ),
+  runtime_epoch INTEGER NOT NULL CHECK (typeof(runtime_epoch) = 'integer' AND runtime_epoch >= 1),
+  runtime_revision INTEGER NOT NULL CHECK (typeof(runtime_revision) = 'integer' AND runtime_revision >= 1),
+  input_digest TEXT NOT NULL CHECK (
+    typeof(input_digest) = 'text'
+    AND length(input_digest) = 64
+    AND input_digest NOT GLOB '*[^a-f0-9]*'
+  ),
+  preview_digest TEXT NOT NULL CHECK (
+    typeof(preview_digest) = 'text'
+    AND length(preview_digest) = 64
+    AND preview_digest NOT GLOB '*[^a-f0-9]*'
+  ),
+  output_count INTEGER NOT NULL DEFAULT 0 CHECK (
+    typeof(output_count) = 'integer' AND output_count >= 0
+  ),
+  result_digest TEXT CHECK (
+    result_digest IS NULL OR (
+      typeof(result_digest) = 'text'
+      AND length(result_digest) = 64
+      AND result_digest NOT GLOB '*[^a-f0-9]*'
+    )
+  ),
+  preview_expires_at TEXT NOT NULL CHECK (is_strict_utc_iso(preview_expires_at) = 1),
+  input_json TEXT NOT NULL CHECK (json_valid(input_json) = 1 AND json_type(input_json) = 'object'),
+  blocker_json TEXT CHECK (blocker_json IS NULL OR (json_valid(blocker_json) = 1 AND json_type(blocker_json) = 'object')),
+  result_json TEXT CHECK (result_json IS NULL OR (json_valid(result_json) = 1 AND json_type(result_json) = 'object')),
+  requested_by INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'previewed' CHECK (status IN ('previewed', 'blocked', 'executing', 'succeeded', 'failed', 'expired')),
+  retry_count INTEGER NOT NULL DEFAULT 0 CHECK (typeof(retry_count) = 'integer' AND retry_count >= 0),
+  failure_reason TEXT CHECK (
+    failure_reason IS NULL OR length(trim(failure_reason)) BETWEEN 1 AND 2000
+  ),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (is_strict_utc_iso(created_at) = 1),
+  started_at TEXT CHECK (started_at IS NULL OR is_strict_utc_iso(started_at) = 1),
+  completed_at TEXT CHECK (completed_at IS NULL OR is_strict_utc_iso(completed_at) = 1),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (is_strict_utc_iso(updated_at) = 1),
+  FOREIGN KEY (run_id) REFERENCES demo_dataset_runs(run_id) ON DELETE RESTRICT,
+  FOREIGN KEY (requested_by) REFERENCES sys_users(id) ON DELETE RESTRICT,
+  UNIQUE (run_id, action_key, client_request_id, requested_by),
+  CHECK (length(trim(action_run_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(run_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(dataset_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(action_key)) BETWEEN 1 AND 128),
+  CHECK (length(trim(registry_version)) BETWEEN 1 AND 128),
+  CHECK (length(trim(resolver_version)) BETWEEN 1 AND 128),
+  CHECK (length(trim(executor_version)) BETWEEN 1 AND 128),
+  CHECK (length(trim(client_request_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(manifest_version)) BETWEEN 1 AND 64),
+  CHECK ((result_digest IS NULL) = (result_json IS NULL)),
+  CHECK (julianday(updated_at) >= julianday(created_at)),
+  CHECK (started_at IS NULL OR julianday(started_at) >= julianday(created_at)),
+  CHECK (completed_at IS NULL OR julianday(completed_at) >= julianday(created_at)),
+  CHECK (started_at IS NULL OR completed_at IS NULL OR julianday(completed_at) >= julianday(started_at)),
+  CHECK (
+    (status = 'previewed'
+      AND blocker_json IS NULL AND result_digest IS NULL AND result_json IS NULL
+      AND failure_reason IS NULL AND started_at IS NULL AND completed_at IS NULL
+      AND output_count = 0)
+    OR (status = 'blocked'
+      AND blocker_json IS NOT NULL AND result_digest IS NULL AND result_json IS NULL
+      AND failure_reason IS NULL AND started_at IS NULL AND completed_at IS NULL
+      AND output_count = 0)
+    OR (status = 'executing'
+      AND blocker_json IS NULL AND result_digest IS NULL AND result_json IS NULL
+      AND failure_reason IS NULL AND started_at IS NOT NULL AND completed_at IS NULL)
+    OR (status = 'succeeded'
+      AND blocker_json IS NULL AND result_digest IS NOT NULL AND result_json IS NOT NULL
+      AND failure_reason IS NULL AND started_at IS NOT NULL AND completed_at IS NOT NULL)
+    OR (status = 'failed'
+      AND blocker_json IS NULL AND result_digest IS NULL AND result_json IS NULL
+      AND failure_reason IS NOT NULL AND started_at IS NOT NULL AND completed_at IS NOT NULL)
+    OR (status = 'expired'
+      AND blocker_json IS NULL AND result_digest IS NULL AND result_json IS NULL
+      AND failure_reason IS NOT NULL AND started_at IS NULL AND completed_at IS NOT NULL
+      AND output_count = 0)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_demo_post_action_runs_run_status
+  ON demo_post_action_runs(run_id, action_key, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_demo_post_action_runs_actor_created
+  ON demo_post_action_runs(requested_by, created_at DESC);
+
+-- run_id 外键之外再固定 dataset_id，禁止同一运行伪装为其他演示数据集。
+CREATE TRIGGER IF NOT EXISTS trg_demo_post_action_runs_dataset_insert
+BEFORE INSERT ON demo_post_action_runs
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1 FROM demo_dataset_runs
+  WHERE run_id = NEW.run_id AND dataset_id = NEW.dataset_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'demo post action dataset mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_demo_post_action_runs_dataset_update
+BEFORE UPDATE OF run_id, dataset_id ON demo_post_action_runs
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1 FROM demo_dataset_runs
+  WHERE run_id = NEW.run_id AND dataset_id = NEW.dataset_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'demo post action dataset mismatch');
+END;
+
+-- 新建动作运行必须给出晚于创建时间的预演过期时间；历史服务允许为过期测试回填旧时间。
+CREATE TRIGGER IF NOT EXISTS trg_demo_post_action_runs_preview_expiry_insert
+BEFORE INSERT ON demo_post_action_runs
+FOR EACH ROW
+WHEN julianday(NEW.preview_expires_at) <= julianday(NEW.created_at)
+BEGIN
+  SELECT RAISE(ABORT, 'demo post action preview expiry must be after creation');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_demo_dataset_runs_post_action_dataset_update
+BEFORE UPDATE OF dataset_id ON demo_dataset_runs
+FOR EACH ROW
+WHEN EXISTS (
+  SELECT 1 FROM demo_post_action_runs
+  WHERE run_id = OLD.run_id AND dataset_id <> NEW.dataset_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'demo dataset has post action dataset mismatch');
+END;
+
+-- 父表计数只能等于当前输出行数；输出触发器在子表写入后自动维护该值。
+CREATE TRIGGER IF NOT EXISTS trg_demo_post_action_runs_output_count_insert
+BEFORE INSERT ON demo_post_action_runs
+FOR EACH ROW
+WHEN NEW.output_count <> 0
+BEGIN
+  SELECT RAISE(ABORT, 'demo post action output count mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_demo_post_action_runs_output_count_update
+BEFORE UPDATE OF output_count ON demo_post_action_runs
+FOR EACH ROW
+WHEN NEW.output_count <> (
+  SELECT COUNT(*) FROM demo_post_action_outputs
+  WHERE action_run_id = NEW.action_run_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'demo post action output count mismatch');
+END;
+
+-- 后置动作输出只保存真实业务实体引用；只读能流分析成功时必须保持零行。
+CREATE TABLE IF NOT EXISTS demo_post_action_outputs (
+  output_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  action_run_id TEXT NOT NULL,
+  output_entity_type TEXT NOT NULL,
+  output_entity_id TEXT NOT NULL,
+  output_ref_json TEXT NOT NULL CHECK (json_valid(output_ref_json) = 1 AND json_type(output_ref_json) = 'object'),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (is_strict_utc_iso(created_at) = 1),
+  FOREIGN KEY (action_run_id) REFERENCES demo_post_action_runs(action_run_id) ON DELETE CASCADE,
+  UNIQUE (action_run_id, output_entity_type, output_entity_id),
+  CHECK (length(trim(output_entity_type)) BETWEEN 1 AND 128),
+  CHECK (length(trim(output_entity_id)) BETWEEN 1 AND 256)
+);
+CREATE INDEX IF NOT EXISTS idx_demo_post_action_outputs_run
+  ON demo_post_action_outputs(action_run_id, output_entity_type, output_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_demo_post_action_outputs_count_insert
+AFTER INSERT ON demo_post_action_outputs
+FOR EACH ROW
+BEGIN
+  UPDATE demo_post_action_runs
+  SET output_count = (
+    SELECT COUNT(*) FROM demo_post_action_outputs
+    WHERE action_run_id = NEW.action_run_id
+  )
+  WHERE action_run_id = NEW.action_run_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_demo_post_action_outputs_count_delete
+AFTER DELETE ON demo_post_action_outputs
+FOR EACH ROW
+BEGIN
+  UPDATE demo_post_action_runs
+  SET output_count = (
+    SELECT COUNT(*) FROM demo_post_action_outputs
+    WHERE action_run_id = OLD.action_run_id
+  )
+  WHERE action_run_id = OLD.action_run_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_demo_post_action_outputs_count_update
+AFTER UPDATE OF action_run_id ON demo_post_action_outputs
+FOR EACH ROW
+WHEN NEW.action_run_id <> OLD.action_run_id
+BEGIN
+  UPDATE demo_post_action_runs
+  SET output_count = (
+    SELECT COUNT(*) FROM demo_post_action_outputs
+    WHERE action_run_id = OLD.action_run_id
+  )
+  WHERE action_run_id = OLD.action_run_id;
+  UPDATE demo_post_action_runs
+  SET output_count = (
+    SELECT COUNT(*) FROM demo_post_action_outputs
+    WHERE action_run_id = NEW.action_run_id
+  )
+  WHERE action_run_id = NEW.action_run_id;
+END;
 -- DEMO_GOVERNANCE_SCHEMA_END

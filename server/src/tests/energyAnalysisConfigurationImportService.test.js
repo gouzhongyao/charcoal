@@ -18,6 +18,8 @@ process.env.ENERGY_ANALYSIS_IMPORT_HMAC_SECRET = 'energy-config-import-test-secr
 const { initDatabase, openDatabase } = require('../db/database');
 const { getImportAuditBatchDetail } = require('../services/importAuditService');
 const {
+  SHIFT_DEFINITION_IMPORT_DESCRIPTOR,
+  STRATEGY_RULE_IMPORT_DESCRIPTOR,
   executeShiftDefinitionImport,
   executeStrategyRuleImport,
   executeTouSchemeImport,
@@ -350,6 +352,13 @@ async function testStrategyRules(db, baseOptions) {
     meters: countRecords(db, 'meter_devices')
   };
   await executeStrategyRuleImport(createExecuteBody(validPreview), baseOptions);
+  assert.deepStrictEqual(db.prepare(`SELECT source_batch_id AS sourceBatchId,
+      source_row_number AS sourceRowNumber
+    FROM strategy_rules
+    WHERE rule_code = 'LOAD-RATE-HIGH' AND rule_version = 'load-rate-high:v1'`).get(), {
+    sourceBatchId: null,
+    sourceRowNumber: null
+  }, '正式非-managed 策略导入必须保持 NULL/NULL provenance。');
   assert.deepStrictEqual({
     runs: countRecords(db, 'strategy_evaluation_runs'),
     hits: countRecords(db, 'strategy_rule_hits'),
@@ -527,6 +536,18 @@ async function testTransactionRollback(db, baseOptions) {
       actorUserId: getActorUserId(db),
       actorIp: '127.0.0.1'
     };
+    assert.deepStrictEqual(SHIFT_DEFINITION_IMPORT_DESCRIPTOR.demoOwnership, {
+      artifactKey: '13-shift-definitions',
+      batchRole: 'primary',
+      entityType: 'shift_definition',
+      expectedImportType: 'shift_definition'
+    }, 'artifact 13 descriptor 必须固定绑定 artifact、batch role、实体类型和导入类型。');
+    assert.deepStrictEqual(STRATEGY_RULE_IMPORT_DESCRIPTOR.demoOwnership, {
+      artifactKey: '18-strategy-rules',
+      batchRole: 'primary',
+      entityType: 'strategy_rule',
+      expectedImportType: 'strategy_rule'
+    }, 'artifact 18 descriptor 必须固定绑定 artifact、batch role、实体类型和导入类型。');
 
     await testShiftDefinitions(db, baseOptions);
     await testTouSchemes(db, baseOptions);
@@ -534,6 +555,10 @@ async function testTransactionRollback(db, baseOptions) {
     await testExecuteAuthorization(db, baseOptions);
     await testTransactionRollback(db, baseOptions);
 
+    assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM demo_data_registry WHERE artifact_key = '13-shift-definitions'").get().total, 0,
+      '正式无 context 班次导入不得误登记 artifact 13 imported ownership。');
+    assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM demo_run_import_batches WHERE artifact_key = '13-shift-definitions'").get().total, 0,
+      '正式无 context 班次导入不得产生 managed batch link。');
     assert.deepStrictEqual(db.pragma('foreign_key_check'), [], 'PRAGMA foreign_key_check 必须为空。');
     console.log('energy analysis configuration import service tests passed');
   } finally {

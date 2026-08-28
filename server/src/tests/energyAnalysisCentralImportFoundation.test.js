@@ -64,7 +64,11 @@ const ALL_IMPORT_TYPE_LABELS = Object.freeze({
   energy_benchmark: '能效对标导入',
   energy_flow_node: '能流节点导入',
   energy_flow_edge: '能流边导入',
-  energy_flow_record: '显式边值导入'
+  energy_flow_record: '显式边值导入',
+  energy_flow_workbook: '完整能流工作簿导入',
+  carbon_activity: '独立碳活动导入',
+  carbon_emission_report: '碳排放报告导入',
+  ghg_report: '温室气体报告导入'
 });
 
 // 仅由历史通用导入链路维护、未接入统一审计服务的类型。

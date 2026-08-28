@@ -21,7 +21,7 @@ export const ENERGY_ANALYSIS_PERMISSIONS = Object.freeze({
   configurationImportExecute: 'energy:analysis:config:import:execute'
 });
 
-/** 六类受控导入定义，统一冻结上传格式、模板、青岚示例和执行后刷新目标。 */
+/** 六类受控导入定义，统一冻结上传格式、模板、天坤集团示例和执行后刷新目标。 */
 export const ENERGY_ANALYSIS_IMPORT_TYPES = Object.freeze({
   timeseries: Object.freeze({
     key: 'timeseries', label: '时序能耗', accept: '.xlsx,.csv', templateType: 'energy-timeseries',

@@ -23,6 +23,7 @@ const {
   buildImportSummary,
   createImportIssue,
   getEnergyAnalysisImportTemplate,
+  normalizeCandidateRows,
   readSafeUploadFile,
   resolveEnergyAnalysisImportHmacSecret,
   stableSerialize
@@ -34,6 +35,13 @@ const {
   setBalanceBoundaryStatus,
   setBalanceItemStatus
 } = require('./energyBalanceService');
+const {
+  createDemoOwnershipInsertWitness,
+  markDemoContextExecutedWithOwnershipTransaction,
+  registerImportedDemoOwnershipInTransaction,
+  runWithDemoOwnershipTransactionAsync,
+  updateDemoExecuteAuditInOwnershipTransaction
+} = require('./demoOwnershipService');
 const {
   parseEnergyAnalysisTemplateWorkbook
 } = require('./energyAnalysisTemplateService');
@@ -72,6 +80,10 @@ const BALANCE_SOURCE_TYPES = Object.freeze([
   'timeseries', 'monthly_energy', 'generation', 'explicit_edge_value', 'explicit_balance_value'
 ]);
 const GENERATION_VALUE_FIELDS = Object.freeze(['self_use_value_kwh', 'grid_export_value_kwh']);
+// 发电记录首期使用的 photovoltaic 能源类型编码。
+const PHOTOVOLTAIC_GENERATION_SOURCE_CODE = 'photovoltaic';
+// 自发电在能效平衡中统一计入的 electricity 消费口径编码。
+const ELECTRICITY_BALANCE_SCOPE_CODE = 'electricity';
 // 导入预演允许单个来源映射解析的最大记录数模块。
 const MAX_SOURCE_RECORD_IDS = 500;
 const LOCATOR_KEYS = Object.freeze({
@@ -263,6 +275,18 @@ function isSourceInBoundary(boundaryOrganization, sourcePath) {
     && (sourcePath === boundaryOrganization.unitPath || sourcePath.startsWith(`${boundaryOrganization.unitPath}/`));
 }
 
+/**
+ * 判断发电事实能源类型是否可计入目标平衡能源范围。
+ * @param {string} balanceEnergyTypeCode 平衡项目能源类型编码。
+ * @param {string} sourceEnergyTypeCode 发电事实能源类型编码。
+ * @returns {boolean} 是否兼容。
+ */
+function isGenerationEnergyTypeCompatible(balanceEnergyTypeCode, sourceEnergyTypeCode) {
+  return sourceEnergyTypeCode === balanceEnergyTypeCode
+    || (balanceEnergyTypeCode === ELECTRICITY_BALANCE_SCOPE_CODE
+      && sourceEnergyTypeCode === PHOTOVOLTAIC_GENERATION_SOURCE_CODE);
+}
+
 /** 判断显式边起止节点组织是否完整落在边界组织自身或后代范围。 */
 function isExplicitEdgeInBoundary(boundaryOrganization, fromOrganizationPath, toOrganizationPath) {
   return Boolean(boundaryOrganization)
@@ -326,7 +350,7 @@ function validateRequiredFields(mapped, requiredFields, rowNumber) {
     .map((fieldName) => createBalanceIssue(rowNumber, fieldName, mapped[fieldName], 'ENERGY_BALANCE_IMPORT_REQUIRED_FIELD_MISSING', `必填字段 ${fieldName} 不能为空。`));
 }
 
-/** 比较边界事实是否完全一致。 */
+/** 比较边界事实是否完全一致；严格 UTC 的秒精度与零毫秒精度视为同一事实，非零毫秒仍保持差异。 */
 function isExactBoundary(existing, record) {
   return existing.boundaryCode === record.input.boundaryCode
     && existing.boundaryName === record.input.boundaryName
@@ -334,8 +358,8 @@ function isExactBoundary(existing, record) {
     && existing.source === record.input.source
     && (existing.documentNo || null) === (record.input.documentNo || null)
     && existing.version === record.input.version
-    && existing.effectiveStartUtc === record.input.effectiveStartUtc
-    && existing.effectiveEndUtc === record.input.effectiveEndUtc
+    && normalizeOwnershipUtcMilliseconds(existing.effectiveStartUtc) === normalizeOwnershipUtcMilliseconds(record.input.effectiveStartUtc)
+    && normalizeOwnershipUtcMilliseconds(existing.effectiveEndUtc) === normalizeOwnershipUtcMilliseconds(record.input.effectiveEndUtc)
     && existing.sourceTimeZone === record.input.sourceTimeZone
     && Boolean(existing.generationBoundaryConfirmed) === Boolean(record.input.generationBoundaryConfirmed)
     && existing.status === record.status;
@@ -445,7 +469,7 @@ function buildBoundaryReferenceIndex(rows, masterData) {
     index.set(row.record.boundaryIdentity, {
       kind: 'candidate',
       candidateRowId,
-      boundary: { ...row.record.input, status: row.record.status, organization: row.record.organization }
+      boundary: { ...row.record.input, status: row.record.status }
     });
   });
   return index;
@@ -498,20 +522,26 @@ function resolveMonthlyEnergySource(db, locator, boundaryOrganization, energyTyp
 
 /** 使用稳定业务条件解析发电来源。 */
 function resolveGenerationSource(db, locator, boundaryOrganization, energyType, originalUnit, valueField, rowNumber) {
+  // electricity 平衡允许读取首期 photovoltaic 发电事实，其余范围仍要求同能源类型。
+  const compatibleSourceCode = energyType.code === ELECTRICITY_BALANCE_SCOPE_CODE
+    ? PHOTOVOLTAIC_GENERATION_SOURCE_CODE
+    : energyType.code;
   const rows = db.prepare(
     `SELECT record.id, record.normalized_month AS normalizedMonth,
             record.generation_value_kwh AS generationValueKwh,
             record.self_use_value_kwh AS selfUseValueKwh,
             record.grid_export_value_kwh AS gridExportValueKwh,
+            source_energy.code AS energyTypeCode,
             organization.unit_code AS organizationCode, organization.unit_path AS organizationPath
      FROM generation_records AS record
+     JOIN energy_types AS source_energy ON source_energy.id = record.energy_type_id
      JOIN organization_units AS organization ON organization.id = record.organization_unit_id
      WHERE record.record_status = 'active'
-       AND record.energy_type_id = ?
+       AND source_energy.code IN (?, ?)
        AND organization.unit_code = ?
        AND record.normalized_month = ?
      ORDER BY record.id ASC`
-  ).all(energyType.id, locator.organization, locator.month);
+  ).all(energyType.code, compatibleSourceCode, locator.organization, locator.month);
   if (rows.length === 0) return { recordIds: [], issues: [createBalanceIssue(rowNumber, 'sourceRecordLocator', locator, 'ENERGY_BALANCE_IMPORT_SOURCE_NOT_FOUND', '发电业务条件未找到来源记录。')] };
   if (rows.length > 1) return { recordIds: [], issues: [createBalanceIssue(rowNumber, 'sourceRecordLocator', locator, 'ENERGY_BALANCE_IMPORT_SOURCE_AMBIGUOUS', '发电业务条件匹配多条 active 记录。')] };
   const source = rows[0];
@@ -529,6 +559,7 @@ function resolveGenerationSource(db, locator, boundaryOrganization, energyType, 
     recordIds: issues.length ? [] : [Number(source.id)],
     sourceWitness: issues.length ? null : {
       recordId: Number(source.id),
+      sourceEnergyTypeCode: source.energyTypeCode,
       organizationCode: source.organizationCode,
       organizationPath: source.organizationPath,
       normalizedMonth: source.normalizedMonth,
@@ -922,11 +953,15 @@ function buildEnergyBalanceBundleImportPreview(input) {
   markItemDuplicates(input.db, itemRows);
   const boundaryPreview = buildPreviewSlice(boundaryRows, (record) => `balance-boundary:${record.input.boundaryCode}:${record.input.version}`);
   const itemPreview = buildPreviewSlice(itemRows, (record) => `balance-item:${record.boundaryIdentity.replace('\0', ':')}:${record.input.itemCode}`);
+  const candidateRows = normalizeCandidateRows([
+    ...boundaryPreview.candidateRows,
+    ...itemPreview.candidateRows
+  ]);
   return {
     fileType: 'xlsx',
     boundaryPreview: { ...boundaryPreview, fieldMapping: parsed.boundarySheet?.headerValidation?.fieldMapping || {} },
     itemPreview: { ...itemPreview, fieldMapping: parsed.itemSheet?.headerValidation?.fieldMapping || {} },
-    candidateRows: [...boundaryPreview.candidateRows, ...itemPreview.candidateRows],
+    candidateRows,
     items: [...boundaryPreview.items, ...itemPreview.items],
     summary: buildImportSummary([...boundaryPreview.items, ...itemPreview.items]),
     auditIssues: [...boundaryPreview.auditIssues, ...itemPreview.auditIssues],
@@ -1213,13 +1248,95 @@ function authorizePersistedExecute(body, boundaryBatch, itemBatch, securedPrevie
   });
 }
 
+/** 判断中央 context 零候选重算是否确实由全部重复跳过产生。 */
+function isAllSkippedDemoExecuteAllowed(authorization, domainPreview, options = {}) {
+  const previewItems = Array.isArray(domainPreview?.items) ? domainPreview.items : [];
+  const previewSummary = domainPreview?.summary || {};
+  return Boolean(
+    options.demoContext
+    && Number(authorization?.expectedWouldImport || 0) === 0
+    && Array.isArray(authorization?.errors)
+    && authorization.errors.length === 1
+    && authorization.errors[0].code === 'ENERGY_ANALYSIS_IMPORT_EMPTY_CANDIDATES_REJECTED'
+    && previewItems.length > 0
+    && previewItems.every((item) => item?.status === 'skipped')
+    && Number(previewSummary.totalRows || 0) === previewItems.length
+    && Number(previewSummary.wouldImport || 0) === 0
+    && Number(previewSummary.blocked || 0) === 0
+    && Number(previewSummary.skipped || 0) === previewItems.length
+  );
+}
+
+/** 将中央 context 的 blocked 零候选预演转换为明确业务错误。 */
+function throwBlockedPreviewFailure(domainPreview) {
+  const summary = domainPreview?.summary || {};
+  throw badRequest('平衡配置预演仍包含阻断行，修正全部阻断问题后才能执行。', {
+    code: 'ENERGY_BALANCE_IMPORT_BLOCKED_PREVIEW_REJECTED',
+    blocked: Number(summary.blocked || 0),
+    skipped: Number(summary.skipped || 0),
+    totalRows: Number(summary.totalRows || 0)
+  });
+}
+
+/** 校验平衡 execute 授权，并只允许中央 context 的真实 all-skipped 零候选例外。 */
+function requireBalanceExecuteAuthorization(authorization, domainPreview, options = {}) {
+  const allowAllSkipped = isAllSkippedDemoExecuteAllowed(authorization, domainPreview, options);
+  if (Number(authorization?.expectedWouldImport || 0) <= 0 && !allowAllSkipped) {
+    if (options.demoContext && Number(domainPreview?.summary?.blocked || 0) > 0) {
+      throwBlockedPreviewFailure(domainPreview);
+    }
+    throwAuthorizationFailure(authorization);
+  }
+  if (!authorization?.valid && !allowAllSkipped) throwAuthorizationFailure(authorization);
+}
+
 /** 将授权失败转换为稳定 BAD_REQUEST。 */
 function throwAuthorizationFailure(authorization) {
   const firstError = authorization.errors?.[0] || { code: 'ENERGY_ANALYSIS_IMPORT_EXECUTE_NOT_AUTHORIZED', message: '平衡配置导入未获授权。' };
   throw badRequest(firstError.message, { code: firstError.code, authorizationErrors: authorization.errors || [] });
 }
 
-/** 使用领域服务在同一外层事务内原子写入边界和全部项目。 */
+/** 将领域层允许的严格 UTC 规范为 ownership projection 固定的 UTC 毫秒格式。 */
+function normalizeOwnershipUtcMilliseconds(value) {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : value;
+}
+
+/** 将 preview 中明确 skipped 的行投影为 registrar 的 no-registration 输入。 */
+function buildSkippedOwnershipRecords(preview, contract) {
+  return preview.items
+    .filter((item) => item.status === 'skipped')
+    .map((item) => ({
+      entityType: contract.recordKind,
+      entityPk: item.existingId || null,
+      batchRole: contract.batchRole,
+      sourceRowNumber: item.sourceRowNumber,
+      reason: item.issues.find((issue) => issue.severity === 'warning')?.code
+        || 'DUPLICATE_ENERGY_BALANCE_RECORD_SKIPPED'
+    }));
+}
+
+/** 使用本次新插入实体的真实外键构造 contains；正式已有边界不会被伪造为 owned endpoint。 */
+function buildInsertedOwnershipRelations(insertion) {
+  const insertedBoundaryIds = new Set(
+    insertion.boundary.ownershipRecords.map((record) => String(record.entityPk))
+  );
+  return insertion.item.importedItems
+    .filter((item) => insertedBoundaryIds.has(String(item.boundaryId)))
+    .map((item) => ({
+      from: {
+        entityType: ENERGY_BALANCE_BOUNDARY_BATCH_CONTRACT.recordKind,
+        entityPk: item.boundaryId
+      },
+      to: {
+        entityType: ENERGY_BALANCE_ITEM_BATCH_CONTRACT.recordKind,
+        entityPk: item.id
+      },
+      relationType: 'contains'
+    }));
+}
+
+/** 使用既有领域服务完成正式无 context 导入，保留原审计和 inactive 状态变更行为。 */
 function insertEnergyBalanceCandidates(input) {
   const boundaryIdByCandidate = new Map();
   const boundaryImportedItems = [];
@@ -1246,8 +1363,127 @@ function insertEnergyBalanceCandidates(input) {
     if (typeof input.options.afterInsertItem === 'function') input.options.afterInsertItem({ candidate, index, importedId: created.id, boundaryId: Number(boundaryId), db: input.db });
   });
   return {
-    boundary: { imported: boundaryImportedItems.length, importedIds: boundaryImportedItems.map((item) => item.id), importedItems: boundaryImportedItems },
-    item: { imported: itemImportedItems.length, importedIds: itemImportedItems.map((item) => item.id), importedItems: itemImportedItems }
+    boundary: {
+      imported: boundaryImportedItems.length,
+      importedIds: boundaryImportedItems.map((item) => item.id),
+      importedItems: boundaryImportedItems,
+      ownershipRecords: []
+    },
+    item: {
+      imported: itemImportedItems.length,
+      importedIds: itemImportedItems.map((item) => item.id),
+      importedItems: itemImportedItems,
+      ownershipRecords: []
+    }
+  };
+}
+
+/** 在 ownership 私有事务中直接插入最终状态的边界和项目，并为两个角色生成真实行见证。 */
+function insertDemoEnergyBalanceCandidates(input) {
+  const boundaryInsertSql = `INSERT INTO energy_balance_boundaries (
+    source_batch_id, source_row_number, boundary_code, boundary_name, organization_unit_id,
+    source, document_no, version, effective_start_utc, effective_end_utc, source_timezone,
+    generation_boundary_confirmed, status
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const itemInsertSql = `INSERT INTO energy_balance_items (
+    source_batch_id, source_row_number, energy_balance_boundary_id, item_code, item_name,
+    role, energy_type_id, original_unit, source_type, source_mapping_json,
+    generation_anti_double_count_key, status
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const boundaryIdByCandidate = new Map();
+  const boundaryImportedItems = [];
+  const boundaryOwnershipRecords = [];
+  input.boundaryCandidates.forEach((candidate, index) => {
+    if (typeof input.options.beforeInsertBoundary === 'function') input.options.beforeInsertBoundary({ candidate, index, db: input.db });
+    const rowWitness = createDemoOwnershipInsertWitness({
+      transactionScope: input.transactionScope,
+      entityType: ENERGY_BALANCE_BOUNDARY_BATCH_CONTRACT.recordKind,
+      sourceBatchId: input.boundaryBatchId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      insertSql: boundaryInsertSql,
+      insertParams: [
+        input.boundaryBatchId,
+        candidate.sourceRowNumber,
+        candidate.input.boundaryCode,
+        candidate.input.boundaryName,
+        candidate.input.organizationUnitId,
+        candidate.input.source,
+        candidate.input.documentNo,
+        candidate.input.version,
+        normalizeOwnershipUtcMilliseconds(candidate.input.effectiveStartUtc),
+        normalizeOwnershipUtcMilliseconds(candidate.input.effectiveEndUtc),
+        candidate.input.sourceTimeZone,
+        candidate.input.generationBoundaryConfirmed ? 1 : 0,
+        candidate.status
+      ]
+    });
+    const entityPk = Number(rowWitness.lastInsertRowid);
+    boundaryIdByCandidate.set(candidate.candidateRowId, entityPk);
+    boundaryImportedItems.push({ id: entityPk, candidateRowId: candidate.candidateRowId, sourceRowNumber: candidate.sourceRowNumber });
+    boundaryOwnershipRecords.push({
+      entityType: ENERGY_BALANCE_BOUNDARY_BATCH_CONTRACT.recordKind,
+      entityPk,
+      batchRole: ENERGY_BALANCE_BOUNDARY_BATCH_CONTRACT.batchRole,
+      sourceRowNumber: candidate.sourceRowNumber,
+      rowWitness
+    });
+    if (typeof input.options.afterInsertBoundary === 'function') input.options.afterInsertBoundary({ candidate, index, importedId: entityPk, db: input.db });
+  });
+  const itemImportedItems = [];
+  const itemOwnershipRecords = [];
+  input.itemCandidates.forEach((candidate, index) => {
+    if (typeof input.options.beforeInsertItem === 'function') input.options.beforeInsertItem({ candidate, index, db: input.db });
+    const boundaryId = candidate.boundaryReferenceKind === 'candidate'
+      ? boundaryIdByCandidate.get(candidate.boundaryCandidateRowId)
+      : candidate.existingBoundaryId;
+    if (!Number.isSafeInteger(Number(boundaryId)) || Number(boundaryId) <= 0) {
+      throw badRequest('项目引用的平衡边界候选无法解析。', { code: 'ENERGY_BALANCE_IMPORT_BOUNDARY_REFERENCE_UNRESOLVED' });
+    }
+    const rowWitness = createDemoOwnershipInsertWitness({
+      transactionScope: input.transactionScope,
+      entityType: ENERGY_BALANCE_ITEM_BATCH_CONTRACT.recordKind,
+      sourceBatchId: input.itemBatchId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      insertSql: itemInsertSql,
+      insertParams: [
+        input.itemBatchId,
+        candidate.sourceRowNumber,
+        Number(boundaryId),
+        candidate.input.itemCode,
+        candidate.input.itemName,
+        candidate.input.role,
+        candidate.input.energyTypeId,
+        candidate.input.originalUnit,
+        candidate.input.sourceType,
+        stableSerialize(candidate.input.sourceMapping),
+        candidate.input.generationAntiDoubleCountKey,
+        candidate.status
+      ]
+    });
+    const entityPk = Number(rowWitness.lastInsertRowid);
+    itemImportedItems.push({ id: entityPk, boundaryId: Number(boundaryId), candidateRowId: candidate.candidateRowId, sourceRowNumber: candidate.sourceRowNumber });
+    itemOwnershipRecords.push({
+      entityType: ENERGY_BALANCE_ITEM_BATCH_CONTRACT.recordKind,
+      entityPk,
+      batchRole: ENERGY_BALANCE_ITEM_BATCH_CONTRACT.batchRole,
+      sourceRowNumber: candidate.sourceRowNumber,
+      rowWitness
+    });
+    if (typeof input.options.afterInsertItem === 'function') input.options.afterInsertItem({ candidate, index, importedId: entityPk, boundaryId: Number(boundaryId), db: input.db });
+  });
+  return {
+    boundary: {
+      imported: boundaryImportedItems.length,
+      importedIds: boundaryImportedItems.map((item) => item.id),
+      importedItems: boundaryImportedItems,
+      ownershipRecords: boundaryOwnershipRecords
+    },
+    item: {
+      imported: itemImportedItems.length,
+      importedIds: itemImportedItems.map((item) => item.id),
+      importedItems: itemImportedItems,
+      ownershipRecords: itemOwnershipRecords
+    }
   };
 }
 
@@ -1301,17 +1537,144 @@ async function executeEnergyBalanceBundleImport(body = {}, options = {}) {
     try {
       const boundaryBatch = getImportAuditBatchDetail(boundaryBatchId, { db, includeIssues: false });
       const itemBatch = getImportAuditBatchDetail(itemBatchId, { db, includeIssues: false });
-      trustedPair = createTrustedPairContext(boundaryBatch, itemBatch, template);
-      if (body.uploadGroupId !== trustedPair.uploadGroupId) throw badRequest('请求上传组与持久化批次不一致。', { code: 'ENERGY_BALANCE_BUNDLE_UPLOAD_GROUP_MISMATCH' });
-      const safeFile = readSafeUploadFile(options.uploadsDir || defaultUploadsDir, trustedPair.storedFilename, {
-        expectedSizeBytes: trustedPair.fileSizeBytes,
+      const persistedPair = createTrustedPairContext(boundaryBatch, itemBatch, template);
+      if (body.uploadGroupId !== persistedPair.uploadGroupId) throw badRequest('请求上传组与持久化批次不一致。', { code: 'ENERGY_BALANCE_BUNDLE_UPLOAD_GROUP_MISMATCH' });
+      const safeFile = readSafeUploadFile(options.uploadsDir || defaultUploadsDir, persistedPair.storedFilename, {
+        expectedSizeBytes: persistedPair.fileSizeBytes,
         maxSizeBytes: options.maxFileSizeBytes
       });
       const secret = resolveImportSecret(db, options);
-      const domainPreview = buildEnergyBalanceBundleImportPreview({ db, buffer: safeFile.buffer, originalFilename: trustedPair.originalFilename });
+      const domainPreview = buildEnergyBalanceBundleImportPreview({ db, buffer: safeFile.buffer, originalFilename: persistedPair.originalFilename });
       const securedPreview = securePreviewResult(domainPreview, { template, fileSha256: safeFile.fileSha256, secret });
-      const authorization = authorizePersistedExecute(body, boundaryBatch, itemBatch, securedPreview, safeFile.buffer, secret, trustedPair);
-      if (!authorization.valid) throwAuthorizationFailure(authorization);
+      const authorization = authorizePersistedExecute(body, boundaryBatch, itemBatch, securedPreview, safeFile.buffer, secret, persistedPair);
+      requireBalanceExecuteAuthorization(authorization, domainPreview, options);
+      const createBackup = typeof options.createBackup === 'function' ? options.createBackup : backupService.createBackup;
+
+      if (options.demoContext) {
+        return await runWithDemoOwnershipTransactionAsync(db, async (transactionScope, transactionDb) => {
+          const latestBoundaryBatch = getImportAuditBatchDetail(boundaryBatchId, { db: transactionDb, includeIssues: false });
+          const latestItemBatch = getImportAuditBatchDetail(itemBatchId, { db: transactionDb, includeIssues: false });
+          const latestPair = createTrustedPairContext(latestBoundaryBatch, latestItemBatch, template);
+          if (latestPair.fingerprint !== persistedPair.fingerprint) throw badRequest('锁内批次配对已变化。', { code: 'ENERGY_BALANCE_BUNDLE_PAIR_CHANGED' });
+          const latestSafeFile = readSafeUploadFile(options.uploadsDir || defaultUploadsDir, latestPair.storedFilename, {
+            expectedSizeBytes: latestPair.fileSizeBytes,
+            maxSizeBytes: options.maxFileSizeBytes
+          });
+          if (latestSafeFile.fileSha256 !== latestPair.fileSha256) {
+            throw badRequest('锁内原文件 SHA-256 与 preview 批次不一致。', {
+              code: 'ENERGY_ANALYSIS_IMPORT_CURRENT_FILE_SHA256_MISMATCH'
+            });
+          }
+          const latestDomainPreview = buildEnergyBalanceBundleImportPreview({ db: transactionDb, buffer: latestSafeFile.buffer, originalFilename: latestPair.originalFilename });
+          const latestSecuredPreview = securePreviewResult(latestDomainPreview, { template, fileSha256: latestSafeFile.fileSha256, secret });
+          const latestAuthorization = authorizePersistedExecute(body, latestBoundaryBatch, latestItemBatch, latestSecuredPreview, latestSafeFile.buffer, secret, latestPair);
+          requireBalanceExecuteAuthorization(latestAuthorization, latestDomainPreview, options);
+          trustedPair = latestPair;
+          backup = await createBackup({ reason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON, skipCheckpoint: true });
+          const insertion = insertDemoEnergyBalanceCandidates({
+            db: transactionDb,
+            transactionScope,
+            boundaryBatchId,
+            itemBatchId,
+            boundaryCandidates: latestDomainPreview.boundaryPreview.candidateRows,
+            itemCandidates: latestDomainPreview.itemPreview.candidateRows,
+            options
+          });
+          const boundarySkipped = buildSkippedOwnershipRecords(latestDomainPreview.boundaryPreview, ENERGY_BALANCE_BOUNDARY_BATCH_CONTRACT);
+          const itemSkipped = buildSkippedOwnershipRecords(latestDomainPreview.itemPreview, ENERGY_BALANCE_ITEM_BATCH_CONTRACT);
+          const insertedRecords = [...insertion.boundary.ownershipRecords, ...insertion.item.ownershipRecords];
+          const ownership = registerImportedDemoOwnershipInTransaction({
+            transactionScope,
+            demoContext: {
+              ...options.demoContext,
+              uploadFileSha256: latestSafeFile.fileSha256,
+              previewDigest: latestSecuredPreview.previewAuditDigest
+            },
+            actorUserId: options.actor.userId,
+            batchBindings: [
+              { batchId: boundaryBatchId, batchRole: 'boundary', entityType: 'energy_balance_boundary' },
+              { batchId: itemBatchId, batchRole: 'item', entityType: 'energy_balance_item' }
+            ],
+            insertedRecords,
+            skippedRecords: [...boundarySkipped, ...itemSkipped],
+            noInsertedRecords: insertedRecords.length === 0,
+            relations: buildInsertedOwnershipRelations(insertion)
+          });
+          const safeBackup = projectSafeBackupSummary(backup);
+          const buildRoleResult = (contract, preview, roleInsertion) => ({
+            executed: true,
+            writesBusinessRecords: roleInsertion.imported > 0,
+            templateType: template.templateType,
+            operation: contract.operation,
+            recordKind: contract.recordKind,
+            bundleOperation: template.operation,
+            bundleRecordKind: template.recordKind,
+            importTypes: [...template.importTypes],
+            importType: contract.importType,
+            uploadGroupId: latestPair.uploadGroupId,
+            imported: roleInsertion.imported,
+            skipped: Number(preview.summary.skipped || 0),
+            blocked: Number(preview.summary.blocked || 0),
+            warnings: Number(preview.summary.warnings || 0),
+            errors: Number(preview.summary.errors || 0),
+            candidateRowIds: preview.candidateRows.map((row) => row.candidateRowId),
+            combinedCandidateRowIds: latestSecuredPreview.candidateRowIds,
+            previewSignature: latestSecuredPreview.previewSignature,
+            previewAuditDigest: latestSecuredPreview.previewAuditDigest,
+            importedIds: roleInsertion.importedIds,
+            importedItems: roleInsertion.importedItems,
+            backup: safeBackup
+          });
+          const boundaryResult = buildRoleResult(ENERGY_BALANCE_BOUNDARY_BATCH_CONTRACT, latestDomainPreview.boundaryPreview, insertion.boundary);
+          const itemResult = buildRoleResult(ENERGY_BALANCE_ITEM_BATCH_CONTRACT, latestDomainPreview.itemPreview, insertion.item);
+          const updateRole = (batchIdForAudit, preview, roleInsertion, executeResult) => updateDemoExecuteAuditInOwnershipTransaction({
+            transactionScope,
+            batchId: batchIdForAudit,
+            status: Number(preview.summary.blocked || 0) > 0 || Number(preview.summary.skipped || 0) > 0 ? 'completed_with_errors' : 'completed',
+            statistics: {
+              totalRows: Number(preview.summary.totalRows || 0),
+              successCount: roleInsertion.imported,
+              failureCount: Number(preview.summary.blocked || 0),
+              skippedCount: Number(preview.summary.skipped || 0)
+            },
+            executeResult,
+            backup,
+            errorSummary: buildPreviewErrorSummary(preview.summary)
+          });
+          const boundaryAudit = updateRole(boundaryBatchId, latestDomainPreview.boundaryPreview, insertion.boundary, boundaryResult);
+          const itemAudit = updateRole(itemBatchId, latestDomainPreview.itemPreview, insertion.item, itemResult);
+          markDemoContextExecutedWithOwnershipTransaction({
+            transactionScope,
+            demoContext: {
+              token: options.demoContext.token,
+              userId: options.demoContext.userId,
+              artifactKey: options.demoContext.artifactKey,
+              handlerKey: options.demoContext.handlerKey
+            },
+            uploadFileSha256: latestSafeFile.fileSha256,
+            previewDigest: latestSecuredPreview.previewAuditDigest,
+            batchBindings: [
+              { batchId: boundaryBatchId, batchRole: 'boundary' },
+              { batchId: itemBatchId, batchRole: 'item' }
+            ]
+          });
+          return {
+            executed: true,
+            writesBusinessRecords: insertedRecords.length > 0,
+            uploadGroupId: latestPair.uploadGroupId,
+            boundaryBatchId,
+            itemBatchId,
+            imported: insertion.boundary.imported + insertion.item.imported,
+            boundary: { ...boundaryResult, ownership },
+            item: { ...itemResult, ownership },
+            backup: safeBackup,
+            boundaryBatch: boundaryAudit,
+            itemBatch: itemAudit
+          };
+        });
+      }
+
+      trustedPair = persistedPair;
       let transactionActive = false;
       try {
         db.exec('BEGIN IMMEDIATE');
@@ -1325,7 +1688,6 @@ async function executeEnergyBalanceBundleImport(body = {}, options = {}) {
         const latestAuthorization = authorizePersistedExecute(body, latestBoundaryBatch, latestItemBatch, latestSecuredPreview, safeFile.buffer, secret, latestPair);
         if (!latestAuthorization.valid) throwAuthorizationFailure(latestAuthorization);
         trustedPair = latestPair;
-        const createBackup = typeof options.createBackup === 'function' ? options.createBackup : backupService.createBackup;
         backup = await createBackup({ reason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON, skipCheckpoint: true });
         const insertion = insertEnergyBalanceCandidates({
           db,
@@ -1361,7 +1723,7 @@ async function executeEnergyBalanceBundleImport(body = {}, options = {}) {
         });
         const boundaryResult = buildRoleResult(ENERGY_BALANCE_BOUNDARY_BATCH_CONTRACT, latestDomainPreview.boundaryPreview, insertion.boundary);
         const itemResult = buildRoleResult(ENERGY_BALANCE_ITEM_BATCH_CONTRACT, latestDomainPreview.itemPreview, insertion.item);
-        const updateRole = (batchId, preview, roleInsertion, executeResult) => updateExecuteAuditResult(batchId, {
+        const updateRole = (batchIdForAudit, preview, roleInsertion, executeResult) => updateExecuteAuditResult(batchIdForAudit, {
           status: Number(preview.summary.blocked || 0) > 0 || Number(preview.summary.skipped || 0) > 0 ? 'completed_with_errors' : 'completed',
           statistics: {
             totalRows: Number(preview.summary.totalRows || 0),
@@ -1388,18 +1750,6 @@ async function executeEnergyBalanceBundleImport(body = {}, options = {}) {
           boundaryBatch: getImportAuditSummary(boundaryBatchId, { db }),
           itemBatch: getImportAuditSummary(itemBatchId, { db })
         };
-        if (options.demoContext) {
-          markDemoContextExecutedInTransaction({
-            db,
-            ...options.demoContext,
-            uploadFileSha256: safeFile.fileSha256,
-            previewDigest: latestSecuredPreview.previewAuditDigest,
-            batchBindings: [
-              { batchId: boundaryBatchId, batchRole: 'boundary' },
-              { batchId: itemBatchId, batchRole: 'item' }
-            ]
-          });
-        }
         db.exec('COMMIT');
         transactionActive = false;
         return result;

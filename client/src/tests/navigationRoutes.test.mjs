@@ -18,7 +18,10 @@ assert.match(sidebarSource, /permissions\.menus\.filter\(\(menu\)=>menu\.routePa
 
 // 用户下拉菜单保留个人中心路由动作和退出登录动作。
 assert.match(navbarSource, /command="profile"/);
-assert.match(navbarSource, /if\(command==='profile'\) router\.push\('\/profile'\)/);
+assert.match(
+  navbarSource,
+  /async function onCommand\s*\(\s*command\s*\)[\s\S]*?if\s*\(\s*command\s*===\s*["']profile["']\s*\)[\s\S]*?router\.push\(\s*["']\/profile["']\s*\)/
+);
 assert.match(navbarSource, /command="logout"/);
 
 console.log('navigation route contracts passed');

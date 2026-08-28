@@ -26,6 +26,26 @@ const { runWithMaintenance } = require('../services/maintenanceState');
 
 // 独立 Router 测试挂载前缀；中央 index 不在本任务内修改。
 const ROUTE_PREFIX = '/api/energy-flows';
+// 正式 API 响应禁止出现的导入追溯和原始来源映射字段。
+const PRIVATE_PROVENANCE_KEYS = Object.freeze([
+  'sourceBatchId',
+  'sourceRowNumber',
+  'source_mapping_json',
+  'sourceMappingJson',
+  '_sourceMappingJson'
+]);
+
+/**
+ * 断言 HTTP JSON 正文不包含内部追溯或原始映射字段。
+ * @param {*} value HTTP JSON 正文或业务数据。
+ * @param {string} label 断言场景。
+ */
+function assertApiJsonOmitsProvenance(value, label) {
+  const serialized = JSON.stringify(value);
+  PRIVATE_PROVENANCE_KEYS.forEach((fieldName) => {
+    assert(!serialized.includes(`"${fieldName}"`), `${label} 不得暴露 ${fieldName}。`);
+  });
+}
 
 /**
  * 创建仅挂载待测 Router 的隔离 Express 应用。
@@ -205,14 +225,27 @@ async function run() {
       sourceTimeZone: 'Asia/Shanghai',
       status: 'active',
       db: 'must-be-ignored',
-      id: 999999
+      id: 999999,
+      sourceBatchId: 999999,
+      sourceRowNumber: 9
     }, adminToken);
     assertSuccess(modelResponse, 201);
+    assertApiJsonOmitsProvenance(modelResponse.body, '模型创建响应');
     const model = modelResponse.body.data;
     assert.notStrictEqual(model.id, 999999);
     assert.strictEqual(model.effectiveStartUtc, '2026-01-01T00:00:00Z');
     assert.strictEqual(model.effectiveEndUtc, '2027-01-01T00:00:00Z');
     assert.strictEqual(modelResponse.body.meta.operation, 'energy-flow-model-create');
+    const publicModelDb = openDatabase();
+    try {
+      const publicModelProvenance = publicModelDb.prepare(
+        'SELECT source_batch_id AS sourceBatchId, source_row_number AS sourceRowNumber FROM energy_flow_models WHERE id = ?'
+      ).get(model.id);
+      assert.strictEqual(publicModelProvenance.sourceBatchId, null, '公共模型正文不得注入内部来源批次。');
+      assert.strictEqual(publicModelProvenance.sourceRowNumber, null, '公共模型正文不得注入内部来源行号。');
+    } finally {
+      publicModelDb.close();
+    }
     const invalidMillisecondModel = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models`, {
       modelCode: 'FLOW-ROUTE-INVALID-MILLISECOND',
       modelName: '非法毫秒路由模型',
@@ -256,13 +289,17 @@ async function run() {
     assert(!/INTERNAL_ERROR|SQLITE|UNIQUE|ux_energy_flow/i.test(canonicalModelDuplicate.text));
 
     const sourceResponse = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models/${model.id}/nodes`, {
-      nodeCode: 'SOURCE', nodeName: '来源节点', nodeType: 'source', x: 0, y: 0
+      nodeCode: 'SOURCE', nodeName: '来源节点', nodeType: 'source', x: 0, y: 0,
+      sourceBatchId: 999999, sourceRowNumber: 10
     }, adminToken);
     const sinkResponse = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models/${model.id}/nodes`, {
-      nodeCode: 'SINK', nodeName: '去向节点', nodeType: 'sink', x: 100, y: 0
+      nodeCode: 'SINK', nodeName: '去向节点', nodeType: 'sink', x: 100, y: 0,
+      source_batch_id: 999999, source_row_number: 11
     }, adminToken);
     assertSuccess(sourceResponse, 201);
     assertSuccess(sinkResponse, 201);
+    assertApiJsonOmitsProvenance(sourceResponse.body, '节点创建响应');
+    assertApiJsonOmitsProvenance(sinkResponse.body, '节点创建响应');
     const source = sourceResponse.body.data;
     const sink = sinkResponse.body.data;
     const canonicalNodeDuplicate = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models/${model.id}/nodes`, {
@@ -279,10 +316,18 @@ async function run() {
       energyTypeCode: 'electricity',
       unit: 'kWh',
       sourceType: 'explicit_edge_value',
-      sourceMapping: { reference: 'route:explicit-edge', password: 'must-not-persist-or-return' },
+      sourceMapping: {
+        reference: 'route:explicit-edge',
+        password: 'must-not-persist-or-return',
+        source_mapping_json: 'must-not-persist-or-return',
+        _sourceMappingJson: 'must-not-persist-or-return'
+      },
+      sourceBatchId: 999999,
+      sourceRowNumber: 12,
       status: 'active'
     }, adminToken);
     assertSuccess(edgeResponse, 201);
+    assertApiJsonOmitsProvenance(edgeResponse.body, '边创建响应');
     const edge = edgeResponse.body.data;
     assert.deepStrictEqual(edge.sourceMapping, { reference: 'route:explicit-edge' });
     assert(!edgeResponse.text.includes('must-not-persist-or-return'));
@@ -300,17 +345,50 @@ async function run() {
     assert.strictEqual(canonicalEdgeDuplicate.body.error.details.code, 'DUPLICATE_ENERGY_FLOW_EDGE_CODE');
     assert(!/INTERNAL_ERROR|SQLITE|UNIQUE|ux_energy_flow/i.test(canonicalEdgeDuplicate.text));
     insertExplicitRecord(model.id, edge.id, 25);
+    const projectionDb = openDatabase();
+    try {
+      const sourceBatchId = Number(projectionDb.prepare(
+        `INSERT INTO import_batches (
+           import_type, original_filename, file_type, status, audit_phase,
+           total_rows, success_count
+         ) VALUES ('energy_flow_workbook', 'route-projection.xlsx', 'xlsx', 'completed', 'execute', 3, 3)`
+      ).run().lastInsertRowid);
+      projectionDb.prepare(
+        'UPDATE energy_flow_nodes SET source_batch_id = ?, source_row_number = ? WHERE id IN (?, ?)'
+      ).run(sourceBatchId, 2, source.id, sink.id);
+      projectionDb.prepare(
+        'UPDATE energy_flow_edges SET source_batch_id = ?, source_row_number = ?, source_mapping_json = ? WHERE id = ?'
+      ).run(
+        sourceBatchId,
+        3,
+        JSON.stringify({
+          reference: 'route:explicit-edge',
+          source_mapping_json: 'must-not-return',
+          _sourceMappingJson: 'must-not-return',
+          sourceBatchId: 999999,
+          sourceRowNumber: 999999
+        }),
+        edge.id
+      );
+    } finally {
+      projectionDb.close();
+    }
 
     const models = await requestJson(server, 'GET', `${ROUTE_PREFIX}/models?pageSize=999&ignoredField=secret`, undefined, adminToken);
     assertSuccess(models);
     assert.strictEqual(models.body.meta.pagination.pageSize, 200);
     assert.strictEqual(models.body.data.length, 1);
+    assertApiJsonOmitsProvenance(models.body, '模型列表响应');
     const nodes = await requestJson(server, 'GET', `${ROUTE_PREFIX}/models/${model.id}/nodes?pageSize=10`, undefined, adminToken);
     assertSuccess(nodes);
     assert.strictEqual(nodes.body.data.length, 2);
+    assertApiJsonOmitsProvenance(nodes.body, '节点列表响应');
+    assert.strictEqual(nodes.body.data.find((item) => item.id === source.id).nodeCode, 'SOURCE');
     const edges = await requestJson(server, 'GET', `${ROUTE_PREFIX}/models/${model.id}/edges?pageSize=10`, undefined, adminToken);
     assertSuccess(edges);
     assert.strictEqual(edges.body.data.length, 1);
+    assertApiJsonOmitsProvenance(edges.body, '边列表响应');
+    assert.deepStrictEqual(edges.body.data[0].sourceMapping, { reference: 'route:explicit-edge' });
 
     const topology = await requestJson(server, 'GET', `${ROUTE_PREFIX}/models/${model.id}/topology`, undefined, adminToken);
     assertSuccess(topology);
@@ -318,6 +396,10 @@ async function run() {
     assert.strictEqual(topology.body.data.contract.infersOrganizationTree, false);
     assert.strictEqual(topology.body.meta.readOnly, true);
     assert.strictEqual(topology.body.meta.maintenanceAllowed, true);
+    assert.strictEqual(topology.body.data.nodes.find((item) => item.id === source.id).nodeCode, 'SOURCE');
+    assert.strictEqual(topology.body.data.edges[0].edgeCode, 'EDGE-ROUTE');
+    assert.deepStrictEqual(topology.body.data.edges[0].sourceMapping, { reference: 'route:explicit-edge' });
+    assertApiJsonOmitsProvenance(topology.body, '拓扑响应');
 
     const analysis = await requestJson(server, 'POST', `${ROUTE_PREFIX}/models/${model.id}/analysis`, {
       startMonth: '2026-01',
@@ -328,6 +410,11 @@ async function run() {
     assertSuccess(analysis);
     assert.strictEqual(analysis.body.data.edgeValues[0].value, 25);
     assert.strictEqual(analysis.body.data.contract.sourceMode, 'explicit_mapping_only');
+    assert.strictEqual(analysis.body.data.contract.formulaVersion, 'energy-flow:v1');
+    assert.strictEqual(analysis.body.data.topology.nodes.find((item) => item.id === source.id).nodeCode, 'SOURCE');
+    assert.strictEqual(analysis.body.data.topology.edges[0].edgeCode, 'EDGE-ROUTE');
+    assert.deepStrictEqual(analysis.body.data.topology.edges[0].sourceMapping, { reference: 'route:explicit-edge' });
+    assertApiJsonOmitsProvenance(analysis.body, '分析响应');
     assert.strictEqual(analysis.body.data.contract.autoOffsetsGeneration, false);
     assert.strictEqual(analysis.body.meta.readOnly, true);
     assert.strictEqual(analysis.body.meta.maintenanceAllowed, true);

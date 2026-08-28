@@ -106,7 +106,7 @@ try {
     db.close();
   }
 
-  // 模拟旧库缺少三张 N5 表并重跑初始化，验证幂等补建且不影响既有旧碳结果表。
+  // 正式 canonical 库缺失 N5 表时必须按 fingerprint fail-closed，不再自动补建历史结构。
   db = openDatabase({ databasePath });
   try {
     db.pragma('foreign_keys = OFF');
@@ -117,13 +117,14 @@ try {
   } finally {
     db.close();
   }
-  initDatabase({ databasePath });
-  initDatabase({ databasePath });
+  assert.throws(
+    () => initDatabase({ databasePath }),
+    (error) => error?.code === 'SCHEMA_FINGERPRINT_MISMATCH'
+  );
   db = openDatabase({ databasePath });
   try {
-    EXPECTED_TABLES.forEach((tableName) => assert.strictEqual(sqliteObjectExists(db, 'table', tableName), true));
+    EXPECTED_TABLES.forEach((tableName) => assert.strictEqual(sqliteObjectExists(db, 'table', tableName), false));
     assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'carbon_emissions'").get().total, 1);
-    assert.deepStrictEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
   } finally {
     db.close();
   }

@@ -93,16 +93,38 @@ function multipart(server, pathname, filename, content, token) {
     assert.strictEqual((await request(server, 'GET', '/api/templates/prediction-configs.csv', undefined, readerToken)).status, 403);
     const predictionTemplate = await request(server, 'GET', '/api/templates/prediction-configs.csv', undefined, adminToken);
     assert.strictEqual(predictionTemplate.status, 200);
-    assert(predictionTemplate.body.toString('utf8').startsWith('﻿"配置名称","备注","能源类型编码","组织范围","厂区","部门","能耗批次ID","训练开始月份","训练结束月份","预测开始月份","预测结束月份","算法","窗口大小","状态"'), '预测配置模板必须输出中文表头。');
+    assert(predictionTemplate.body.toString('utf8').startsWith('﻿"配置名称","备注","能源类型编码","用能单元编码","计量器具编码","能耗批次ID","训练开始月份","训练结束月份","预测开始月份","预测结束月份","算法","窗口大小","状态"'), '预测配置模板必须输出 canonical 中文表头。');
 
     const db = openDatabase();
     try {
       const energyTypeId = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
-      const insert = db.prepare("INSERT INTO energy_records (energy_type_id,original_month,normalized_month,original_unit,original_value,normalized_unit,normalized_value,organization,duplicate_key,record_status) VALUES (?, ?, ?, 'kWh', ?, 'kWh', ?, '预测组织', ?, 'active')");
-      [100, 120, 140].forEach((value, index) => insert.run(energyTypeId, `2026-0${index + 1}`, `2026-0${index + 1}`, value, value, `prediction-history-${index}`));
+      const organizationUnitId = db.prepare(`INSERT INTO organization_units
+        (unit_code, unit_name, unit_path, unit_type, status)
+        VALUES ('PRED-UNIT', '预测用能单元', '/PRED-UNIT', 'enterprise', 'active')`).run().lastInsertRowid;
+      const meterDeviceId = db.prepare(`INSERT INTO meter_devices
+        (meter_code, meter_name, meter_type, energy_type_id, organization_unit_id, status)
+        VALUES ('PRED-METER', '预测计量器具', 'electricity', ?, ?, 'active')`).run(
+        energyTypeId,
+        organizationUnitId
+      ).lastInsertRowid;
+      const insert = db.prepare(`INSERT INTO energy_records
+        (energy_type_id, organization_unit_id, meter_device_id, original_month,
+          normalized_month, original_unit, original_value, normalized_unit,
+          normalized_value, duplicate_key, record_status)
+        VALUES (?, ?, ?, ?, ?, 'kWh', ?, 'kWh', ?, ?, 'active')`);
+      [100, 120, 140].forEach((value, index) => insert.run(
+        energyTypeId,
+        organizationUnitId,
+        meterDeviceId,
+        `2026-0${index + 1}`,
+        `2026-0${index + 1}`,
+        value,
+        value,
+        `prediction-history-${index}`
+      ));
     } finally { db.close(); }
 
-    const payload = { name: '关键字预测草稿', note: '可编辑', energyTypeCode: 'electricity', organizationScope: '预测组织', trainStartMonth: '2026-01', trainEndMonth: '2026-03', predictStartMonth: '2026-04', predictEndMonth: '2026-05', algorithm: 'linear_trend', status: 'draft' };
+    const payload = { name: '关键字预测草稿', note: '可编辑', energyTypeCode: 'electricity', organizationUnitCode: 'PRED-UNIT', meterCode: 'PRED-METER', trainStartMonth: '2026-01', trainEndMonth: '2026-03', predictStartMonth: '2026-04', predictEndMonth: '2026-05', algorithm: 'linear_trend', status: 'draft' };
     const created = await request(server, 'POST', '/api/predictions/configs', payload, adminToken);
     assert.strictEqual(created.status, 201);
     const configId = created.body.data.id;
@@ -134,16 +156,16 @@ function multipart(server, pathname, filename, content, token) {
     assert(exported.body.toString('utf8').startsWith('﻿"预测运行ID","预测运行名称","算法","运行状态","能源类型编码","预测月份","预测值","预测单位","置信区间下限","置信区间上限","方法说明"'), '预测结果导出必须输出中文表头。');
     const configExport = await request(server, 'GET', '/api/predictions/configs/export?format=csv', undefined, adminToken);
     assert.strictEqual(configExport.status, 200);
-    assert(configExport.body.toString('utf8').startsWith('﻿"配置名称","备注","能源类型编码","组织范围"'), '预测配置导出必须输出中文表头。');
+    assert(configExport.body.toString('utf8').startsWith('﻿"配置名称","备注","能源类型编码","用能单元编码","用能单元名称","计量器具编码","计量器具名称"'), '预测配置导出必须输出 canonical 中文表头。');
     assert.strictEqual((await request(server, 'PATCH', `/api/predictions/runs/${runId}/status`, { status: 'cancelled' }, adminToken)).status, 400, '已完成运行不允许取消或改写结果。');
     assert.strictEqual((await request(server, 'PATCH', `/api/predictions/runs/${runId}/status`, { status: 'archived' }, adminToken)).status, 200);
 
-    const englishCsv = 'name,note,energyTypeCode,organizationScope,trainStartMonth,trainEndMonth,predictStartMonth,predictEndMonth,algorithm,windowSize,status\n英文表头兼容草稿,兼容性预演,electricity,预测组织,2026-01,2026-03,2026-04,2026-05,moving_average,3,draft\n';
+    const englishCsv = 'name,note,energyTypeCode,organizationUnitCode,meterCode,sourceBatchId,trainStartMonth,trainEndMonth,predictStartMonth,predictEndMonth,algorithm,windowSize,status\n英文表头兼容草稿,兼容性预演,electricity,PRED-UNIT,PRED-METER,,2026-01,2026-03,2026-04,2026-05,moving_average,3,draft\n';
     const englishPreviewResponse = await multipart(server, '/api/predictions/configs/import/preview', 'prediction-configs-english.csv', englishCsv, adminToken);
     assert.strictEqual(englishPreviewResponse.status, 200);
     assert.strictEqual(englishPreviewResponse.body.data.summary.wouldImport, 1, '预测配置导入必须继续兼容旧英文表头。');
 
-    const csv = '配置名称,备注,能源类型编码,组织范围,训练开始月份,训练结束月份,预测开始月份,预测结束月份,算法,窗口大小,状态\n导入预测草稿,不能直接产生结果,electricity,预测组织,2026-01,2026-03,2026-04,2026-05,moving_average,3,active\n导入预测草稿,同文件重复应跳过,electricity,预测组织,2026-01,2026-03,2026-04,2026-05,moving_average,3,active\n';
+    const csv = '配置名称,备注,能源类型编码,用能单元编码,计量器具编码,能耗批次ID,训练开始月份,训练结束月份,预测开始月份,预测结束月份,算法,窗口大小,状态\n导入预测草稿,不能直接产生结果,electricity,PRED-UNIT,PRED-METER,,2026-01,2026-03,2026-04,2026-05,moving_average,3,active\n导入预测草稿,同文件重复应跳过,electricity,PRED-UNIT,PRED-METER,,2026-01,2026-03,2026-04,2026-05,moving_average,3,active\n';
     const previewResponse = await multipart(server, '/api/predictions/configs/import/preview', 'prediction-configs.csv', csv, adminToken);
     assert.strictEqual(previewResponse.status, 200);
     const preview = previewResponse.body.data;

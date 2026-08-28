@@ -4,8 +4,8 @@ const get = (url, params = {}) => request({ url, params: query(params) });
 const upload = (url, file) => { const data = new FormData(); data.append('file', file); return request({ method: 'post', url, data }); };
 const exportFile = (url, params, fallbackName) => download({ url, params: query({ ...params, format: 'xlsx' }) }, fallbackName);
 const template = (name, label) => download({ url: `/templates/${name}.xlsx` }, `${label}导入模板.xlsx`);
-/** 下载指定基础台账青岚园区示例，文件内容和权限由服务端 manifest 最终约束。 */
-const demoParkExample = (artifactKey, label) => download({ url: `/templates/demo-park/${artifactKey}.xlsx` }, `青岚园区示例-${label}.xlsx`);
+/** 下载指定基础台账天坤集团示例，文件内容和权限由服务端 manifest 最终约束。 */
+const demoParkExample = (artifactKey, label) => download({ url: `/templates/demo-park/${artifactKey}.xlsx` }, `天坤集团示例-${label}.xlsx`);
 
 export const ledgerApi = {
   units: {

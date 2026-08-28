@@ -95,8 +95,9 @@ for (const contract of pageContracts) {
     `componentMap 应登记 ${contract.component}。`
   );
 }
-assert.ok(routerSource.includes('const component = componentMap[menu.component] || MigrationPlaceholder;'), '未知组件必须继续回退到 MigrationPlaceholder。');
-assert.ok(routerSource.includes('migration: component === MigrationPlaceholder'), '动态路由必须继续标识迁移占位状态。');
+assert.ok(routerSource.includes('const component = componentMap[routeContract.componentKey] || MigrationPlaceholder;'), '未知组件必须继续回退到正式不可用提示页。');
+assert.ok(routerSource.includes('unavailable: component === MigrationPlaceholder'), '未知动态组件必须标识为正式不可用状态。');
+assert.equal(routerSource.includes('migration: component === MigrationPlaceholder'), false, '动态路由不得继续暴露迁移占位状态。');
 
 // 后端菜单种子的路径、组件标识和查看权限必须与前端契约一致。
 for (const contract of pageContracts) {
@@ -185,10 +186,10 @@ for (const contract of pageContracts) {
     assert.equal(utilitySource.includes("accept: '.xlsx,.xls,.csv'"), false, '新式能源分析导入不得继续接受 XLS。');
     assert.ok(pageSource.includes(':accept="definition.accept"'), '上传控件必须按导入定义应用 accept。');
     assert.ok(pageSource.includes('downloadEnergyAnalysisImportTemplate(definition.templateType'), '页面必须提供服务端空白模板下载。');
-    assert.ok(pageSource.includes('downloadEnergyAnalysisDemoArtifact(definition.demoArtifactKey'), '页面必须提供青岚示例下载。');
+    assert.doesNotMatch(pageSource, /downloadEnergyAnalysisDemoArtifact|downloadImportDemo|天坤集团示例/, '业务页面不得继续分散提供演示下载入口。');
     assert.ok(pageSource.includes('await refreshImportedConfiguration(definition.refreshTarget)'), '配置 execute 成功后必须刷新对应配置列表。');
-    assert.ok(apiSource.includes("import { download, query, request } from '@/api/http';"), '模板与示例下载必须复用共享 download。');
-    assert.ok(apiSource.includes('/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}'), '青岚示例必须走受权限保护的模板下载路由。');
+    assert.ok(apiSource.includes("import { download, query, request } from '@/api/http';"), '模板和受控导入必须复用共享 HTTP。');
+    assert.ok(apiSource.includes('/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}'), '集中演示下载仍保留受权限保护的 API 合同。');
     assert.doesNotMatch(apiSource, /axios|Axios/, '能源分析 API 不得新建 Axios 实例。');
   }
   if (contract.wallClockDateTimeFields) {

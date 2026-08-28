@@ -519,18 +519,17 @@ function timingSafeEqualText(actual, expected) {
 }
 
 /**
- * 校验并规范化 SHA-256 摘要。
+ * 严格校验 canonical 64 位小写十六进制 SHA-256 摘要，禁止隐式归一化。
  * @param {*} value 原始摘要。
- * @returns {string} 小写摘要。
+ * @returns {string} 已验证的原始摘要。
  */
 function normalizeSha256(value) {
-  const normalized = String(value || '').trim().toLowerCase();
-  if (!SHA256_HEX_PATTERN.test(normalized)) {
-    throw badRequest('fileSha256 必须是 64 位十六进制 SHA-256。', {
+  if (typeof value !== 'string' || !SHA256_HEX_PATTERN.test(value)) {
+    throw badRequest('fileSha256 必须是 64 位小写十六进制 SHA-256。', {
       code: 'ENERGY_ANALYSIS_IMPORT_FILE_SHA256_INVALID'
     });
   }
-  return normalized;
+  return value;
 }
 
 /**

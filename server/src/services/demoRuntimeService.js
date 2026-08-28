@@ -4,13 +4,11 @@ const { badRequest } = require('../utils/errors');
 // 演示运行期设置固定使用单行主键，避免出现多套相互冲突的系统开关。
 const DEMO_RUNTIME_SETTINGS_ID = 1;
 // 历史纳管确认文本由服务端固定返回，后续执行阶段必须原样校验。
-const LEGACY_CLAIM_CONFIRMATION_TEXT = '确认纳管青岚历史演示数据 qinglan-park-v1';
+const LEGACY_CLAIM_CONFIRMATION_TEXT = '确认纳管天坤集团历史演示数据 qinglan-park-v1';
 // 全量清理确认文本由服务端固定返回，后续执行阶段必须原样校验。
-const CLEANUP_CONFIRMATION_TEXT = '确认清除青岚演示数据 qinglan-park-v1';
+const CLEANUP_CONFIRMATION_TEXT = '确认清除天坤集团演示数据 qinglan-park-v1';
 // 恢复数据库后的安全重置原因写入设置和操作审计。
 const DATABASE_RESTORE_SAFETY_REASON = 'database_restore_safety_reset';
-// 托管 artifact 下载首次惰性启用 runtime 时使用独立原因，禁止伪装为用户手工开关。
-const MANAGED_DOWNLOAD_AUTO_ENABLE_REASON = 'managed_download_auto_enable';
 
 /**
  * 将数据库行映射为稳定的运行期状态响应。
@@ -96,10 +94,17 @@ function getDemoCapabilities() {
     centralPreviewExecuteContext: true,
     retainedUploadReplayContext: false,
     ownershipRegistration: false,
+    ownershipSummary: true,
     legacyClaimPreview: false,
     legacyClaimExecute: false,
-    cleanupPreview: false,
-    cleanupExecute: false
+    cleanupPreview: true,
+    cleanupExecute: false,
+    cleanupRunStatus: true,
+    postActionRegistry: true,
+    postActionPreview: true,
+    postActionExecute: true,
+    postActionRunStatus: true,
+    postActionRetry: false
   };
 }
 
@@ -111,6 +116,51 @@ function getDemoConfirmationTexts() {
   return {
     legacyClaim: LEGACY_CLAIM_CONFIRMATION_TEXT,
     cleanup: CLEANUP_CONFIRMATION_TEXT
+  };
+}
+
+/** 在清理事务内关闭演示运行期并递增 epoch/revision，使全部旧 context 失效。 */
+function disableDemoRuntimeAfterCleanup(input = {}) {
+  const actorUserId = validateActorUserId(input.actorUserId);
+  const actorIp = input.actorIp ? String(input.actorIp) : null;
+  const db = input.db;
+  if (!db || db.inTransaction !== true) {
+    throw new Error('演示清理关闭 runtime 必须位于 IMMEDIATE 事务内。');
+  }
+  const current = assertCanonicalRuntimeRow(readRuntimeSettingRow(db));
+  const updatedAt = new Date().toISOString();
+  db.prepare(`UPDATE demo_runtime_settings
+    SET enabled = 0, runtime_epoch = runtime_epoch + 1, revision = revision + 1,
+      updated_by = ?, updated_at = ?, change_reason = 'demo_cleanup_completed'
+    WHERE id = ? AND revision = ?`).run(
+    actorUserId,
+    updatedAt,
+    DEMO_RUNTIME_SETTINGS_ID,
+    current.revision
+  );
+  const next = assertCanonicalRuntimeRow(readRuntimeSettingRow(db));
+  db.prepare(`INSERT INTO sys_operation_logs
+    (user_id, operation, target_type, target_id, detail_json, ip, created_at)
+    VALUES (?, 'system.demo.runtime.cleanup-close', 'demo_runtime_settings', ?, ?, ?, ?)`).run(
+    actorUserId,
+    String(DEMO_RUNTIME_SETTINGS_ID),
+    JSON.stringify({
+      previousEnabled: current.enabled === 1,
+      runtimeEpoch: next.runtimeEpoch,
+      revision: next.revision,
+      changeReason: 'demo_cleanup_completed'
+    }),
+    actorIp,
+    updatedAt
+  );
+  return {
+    available: true,
+    enabled: next.enabled === 1,
+    runtimeEpoch: next.runtimeEpoch,
+    revision: next.revision,
+    updatedBy: next.updatedBy,
+    updatedAt: next.updatedAt,
+    changeReason: next.changeReason
   };
 }
 
@@ -229,61 +279,6 @@ function toggleDemoRuntime(input = {}) {
 }
 
 /**
- * 为已经通过双权限和维护态检查的托管 artifact 下载幂等开启 runtime。
- * @param {object} input 下载 actor、artifact 与可选事务连接。
- * @returns {object} 当前运行期状态及本次是否自动激活。
- */
-function ensureDemoRuntimeEnabledForManagedDownload(input = {}) {
-  const actorUserId = validateActorUserId(input.actorUserId);
-  const actorIp = input.actorIp ? String(input.actorIp) : null;
-  const artifactKey = String(input.artifactKey || '').trim().toLowerCase();
-  if (!/^\d{2}-[a-z0-9-]+$/.test(artifactKey)) {
-    throw badRequest('managed 下载 artifactKey 无效。', { code: 'INVALID_MANAGED_DEMO_ARTIFACT_KEY' });
-  }
-  const ownedDb = !input.db;
-  const db = input.db || openDatabase();
-  try {
-    const activate = () => {
-      const canonicalCurrent = assertCanonicalRuntimeRow(readRuntimeSettingRow(db));
-      if (canonicalCurrent.enabled === 1) {
-        return { ...mapRuntimeStatus(canonicalCurrent), autoActivated: false };
-      }
-      const updatedAt = new Date().toISOString();
-      db.prepare(`UPDATE demo_runtime_settings
-        SET enabled = 1, runtime_epoch = runtime_epoch + 1, revision = revision + 1,
-          updated_by = ?, updated_at = ?, change_reason = ?
-        WHERE id = ? AND enabled = 0`).run(
-        actorUserId,
-        updatedAt,
-        MANAGED_DOWNLOAD_AUTO_ENABLE_REASON,
-        DEMO_RUNTIME_SETTINGS_ID
-      );
-      const canonicalNext = assertCanonicalRuntimeRow(readRuntimeSettingRow(db));
-      db.prepare(`INSERT INTO sys_operation_logs
-        (user_id, operation, target_type, target_id, detail_json, ip, created_at)
-        VALUES (?, 'system.demo.runtime.auto-enable', 'demo_runtime_settings', ?, ?, ?, ?)`).run(
-        actorUserId,
-        String(DEMO_RUNTIME_SETTINGS_ID),
-        JSON.stringify({
-          artifactKey,
-          previousEnabled: false,
-          enabled: true,
-          runtimeEpoch: canonicalNext.runtimeEpoch,
-          revision: canonicalNext.revision,
-          changeReason: MANAGED_DOWNLOAD_AUTO_ENABLE_REASON
-        }),
-        actorIp,
-        updatedAt
-      );
-      return { ...mapRuntimeStatus(canonicalNext), autoActivated: true };
-    };
-    return ownedDb ? db.transaction(activate).immediate() : activate();
-  } finally {
-    if (ownedDb) db.close();
-  }
-}
-
-/**
  * 数据库恢复后强制关闭演示开关并提升 epoch/revision，使备份内旧上下文全部失效。
  * @returns {object} 安全归一化后的运行期状态。
  */
@@ -360,9 +355,8 @@ function normalizeDemoRuntimeAfterRestore(actor = {}, options = {}) {
 module.exports = {
   CLEANUP_CONFIRMATION_TEXT,
   DATABASE_RESTORE_SAFETY_REASON,
+  disableDemoRuntimeAfterCleanup,
   LEGACY_CLAIM_CONFIRMATION_TEXT,
-  MANAGED_DOWNLOAD_AUTO_ENABLE_REASON,
-  ensureDemoRuntimeEnabledForManagedDownload,
   getDemoCapabilities,
   getDemoConfirmationTexts,
   getDemoRuntimeStatus,

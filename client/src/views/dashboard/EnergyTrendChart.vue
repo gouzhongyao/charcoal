@@ -1,5 +1,5 @@
 <template>
-  <figure class="trend-figure" :aria-labelledby="captionId">
+  <figure class="trend-figure" :class="{ 'trend-figure--compact': compact }" :aria-labelledby="captionId">
     <figcaption :id="captionId">
       <span class="legend-dot" :style="{ backgroundColor: color }" aria-hidden="true" />
       {{ seriesLabel }} · {{ series.normalizedUnit }}
@@ -32,11 +32,13 @@
 
 <script setup>
 import { computed, ref } from 'vue';
+import { formatDashboardMeasurement, resolveTrendAxisMaximum } from '@/utils/dashboardCockpit';
 
-/** 单一能源序列图输入属性。 */
+/** 单一能源或碳排序列图输入属性。 */
 const props = defineProps({
   series: { type: Object, required: true },
-  color: { type: String, required: true }
+  color: { type: String, required: true },
+  compact: { type: Boolean, default: false }
 });
 
 /** 当前悬停或键盘聚焦的数据点。 */
@@ -49,8 +51,8 @@ const seriesLabel = computed(() => props.series?.label || props.series?.energyTy
 const captionId = computed(() => `trend-caption-${String(props.series?.key || seriesLabel.value).replace(/[^a-zA-Z0-9一-龥]+/g, '-')}`);
 /** 当前能源或碳排序列的有序月份行。 */
 const rows = computed(() => Array.isArray(props.series?.rows) ? props.series.rows : []);
-/** 当前序列数值轴最大值。 */
-const maximumValue = computed(() => Math.max(...rows.value.map((row) => Number(row.totalNormalizedValue) || 0), 1));
+/** 当前序列数值轴最大值；非零极小数据保留真实最大值。 */
+const maximumValue = computed(() => resolveTrendAxisMaximum(rows.value));
 /** 趋势图单一序列折线坐标。 */
 const linePoints = computed(() => rows.value.map((row, index) => `${xFor(index)},${yFor(row.totalNormalizedValue)}`).join(' '));
 /** 趋势图纵轴刻度。 */
@@ -62,10 +64,12 @@ const axisTicks = computed(() => Array.from({ length: 5 }, (_, index) => ({
 /** 趋势图整体可访问描述。 */
 const chartAriaLabel = computed(() => `${seriesLabel.value}，单位 ${props.series.normalizedUnit}，单一数值轴，共 ${rows.value.length} 个月份数据点${isCarbonSeries.value ? '，仅展示已有真实核算结果' : ''}。`);
 
-/** 格式化趋势图数值。 */
+/** 格式化趋势图数值；碳排至少保留四位小数且非零小值不得显示成零。 */
 function formatNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(number) : '—';
+  return formatDashboardMeasurement(value, {
+    kind: isCarbonSeries.value ? 'carbon' : 'energy',
+    maximumFractionDigits: 2
+  });
 }
 
 /** 格式化趋势图记录数。 */
@@ -94,5 +98,5 @@ function pointLabel(row) {
 </script>
 
 <style scoped>
-.trend-figure{margin:0;min-width:0}.trend-figure figcaption{display:flex;align-items:center;gap:8px;margin-bottom:10px;color:var(--cockpit-text,#183153);font-size:12px}.legend-dot{width:10px;height:10px;border-radius:3px;box-shadow:0 0 0 1px var(--cockpit-mark-border,rgba(11,11,11,.1))}.trend-scroll,.table-scroll{max-width:100%;overflow-x:auto}.trend-chart{display:block;width:100%;min-width:620px;border:1px solid var(--cockpit-chart-border,#e1e0d9);border-radius:12px;background:var(--cockpit-chart-bg,#fcfcfb)}.grid-line{stroke:var(--cockpit-gridline,#e1e0d9);stroke-dasharray:3 5}.axis-text{fill:var(--cockpit-axis,#898781);font-size:11px}.trend-line{fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.point-hit{fill:transparent}.point-focus-ring{fill:none;stroke:transparent;stroke-width:2}.point-dot{stroke:var(--cockpit-chart-bg,#fcfcfb);stroke-width:3}.trend-point{cursor:default}.trend-point:focus{outline:none}.trend-point:focus .point-focus-ring,.trend-point:hover .point-focus-ring{stroke:var(--cockpit-focus,#1769e0)}.trend-point:focus .point-dot,.trend-point:hover .point-dot{r:7}.trend-tooltip{min-height:20px;margin:10px 0 0;padding:8px 10px;border:1px solid var(--cockpit-tooltip-border,#c9dcf5);border-radius:8px;background:var(--cockpit-tooltip-bg,#edf5ff);color:var(--cockpit-text,#183153);font-size:12px}.equivalent-table{margin-top:10px;color:var(--cockpit-muted,#6d809e);font-size:12px}.equivalent-table summary{cursor:pointer;color:var(--cockpit-accent,#1769e0)}.equivalent-table table{width:100%;margin-top:10px;border-collapse:collapse;white-space:nowrap}.equivalent-table th,.equivalent-table td{padding:8px 10px;border-bottom:1px solid var(--cockpit-table-border,#dce9fb);text-align:left}.equivalent-table th{color:var(--cockpit-heading,#123b79);font-weight:600}
+.trend-figure{margin:0;min-width:0}.trend-figure figcaption{display:flex;align-items:center;gap:8px;margin-bottom:10px;color:var(--cockpit-text,#183153);font-size:12px}.legend-dot{width:10px;height:10px;border-radius:3px;box-shadow:0 0 0 1px var(--cockpit-mark-border,rgba(11,11,11,.1))}.trend-scroll,.table-scroll{max-width:100%;overflow-x:auto}.trend-chart{display:block;width:100%;min-width:620px;border:1px solid var(--cockpit-chart-border,#e1e0d9);border-radius:12px;background:var(--cockpit-chart-bg,#fcfcfb)}.trend-figure--compact .trend-chart{width:100%;min-width:0;height:clamp(132px,18dvh,188px)}.trend-figure--compact figcaption{margin-bottom:6px;font-size:10px}.trend-figure--compact .trend-tooltip{min-height:0;margin-top:6px;padding:6px 8px;font-size:10px}.trend-figure--compact .equivalent-table{margin-top:6px;font-size:10px}.trend-figure--compact .equivalent-table .table-scroll{max-height:clamp(120px,28dvh,240px);overflow-x:auto;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.grid-line{stroke:var(--cockpit-gridline,#e1e0d9);stroke-dasharray:3 5}.axis-text{fill:var(--cockpit-axis,#898781);font-size:11px}.trend-line{fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.point-hit{fill:transparent}.point-focus-ring{fill:none;stroke:transparent;stroke-width:2}.point-dot{stroke:var(--cockpit-chart-bg,#fcfcfb);stroke-width:3}.trend-point{cursor:default}.trend-point:focus{outline:none}.trend-point:focus .point-focus-ring,.trend-point:hover .point-focus-ring{stroke:var(--cockpit-focus,#1769e0)}.trend-point:focus .point-dot,.trend-point:hover .point-dot{r:7}.trend-tooltip{min-height:20px;margin:10px 0 0;padding:8px 10px;border:1px solid var(--cockpit-tooltip-border,#c9dcf5);border-radius:8px;background:var(--cockpit-tooltip-bg,#edf5ff);color:var(--cockpit-text,#183153);font-size:12px}.equivalent-table{margin-top:10px;color:var(--cockpit-muted,#6d809e);font-size:12px}.equivalent-table summary{cursor:pointer;color:var(--cockpit-accent,#1769e0)}.equivalent-table table{width:100%;margin-top:10px;border-collapse:collapse;white-space:nowrap}.equivalent-table th,.equivalent-table td{padding:8px 10px;border-bottom:1px solid var(--cockpit-table-border,#dce9fb);text-align:left}.equivalent-table th{color:var(--cockpit-heading,#123b79);font-weight:600}
 </style>

@@ -115,12 +115,14 @@ export function downloadEnergyFlowImportTemplate(templateType, extension = 'xlsx
   );
 }
 
-/** 下载青岚园区能流示例文件并保存托管 context。 */
+/** 下载天坤集团能流示例文件并保存托管 context。 */
 export function downloadEnergyFlowDemoArtifact(artifactKey, extension = 'xlsx') {
   const safeExtension = extension === 'csv' ? 'csv' : 'xlsx';
-  energyFlowDemoArtifact(artifactKey);
+  const contract = energyFlowDemoArtifact(artifactKey);
   return downloadManagedDemoArtifact(
     { url: `/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}` },
-    `青岚园区能流示例.${safeExtension}`
+    `天坤集团能流示例.${safeExtension}`,
+    undefined,
+    contract
   );
 }

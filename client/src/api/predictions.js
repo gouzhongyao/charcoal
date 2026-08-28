@@ -31,9 +31,9 @@ export function downloadPredictionConfigTemplate(format = 'xlsx') {
   return download({ url: `/templates/prediction-configs.${safeFormat}` }, `预测配置草稿导入模板.${safeFormat}`);
 }
 
-/** 下载预测配置青岚园区示例；下载和导入均不会自动运行预测。 */
+/** 下载预测配置天坤集团示例；下载和导入均不会自动运行预测。 */
 export function downloadPredictionConfigDemoParkExample() {
-  return download({ url: '/templates/demo-park/12-prediction-configs.xlsx' }, '青岚园区示例-预测配置.xlsx');
+  return download({ url: '/templates/demo-park/12-prediction-configs.xlsx' }, '天坤集团示例-预测配置.xlsx');
 }
 
 /** 上传配置文件创建只读导入预演。 */

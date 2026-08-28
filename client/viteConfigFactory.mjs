@@ -35,6 +35,28 @@ export function createOpenInEditorBlockPlugin() {
   };
 }
 
+// 历史页面响应模块：保留源文件但不再由正式开发应用提供访问入口。
+function blockLegacyPageRequest(_request, response) {
+  response.statusCode = 404;
+  response.setHeader('Content-Type', 'text/plain');
+  response.end('Not Found');
+}
+
+// 历史页面端点挂载模块：在 Vite 文件服务前精确拦截固定旧地址。
+function configureLegacyPageBlocking(server) {
+  server.middlewares.use('/legacy.html', blockLegacyPageRequest);
+}
+
+// 历史页面安全插件模块：只停止正式开发应用暴露旧入口，不删除保留文件。
+export function createLegacyPageBlockPlugin() {
+  return {
+    name: 'charcoal:block-legacy-page',
+    apply: 'serve',
+    enforce: 'pre',
+    configureServer: configureLegacyPageBlocking
+  };
+}
+
 // Vite 纯配置工厂模块：仅使用调用方传入的运行环境，不读取 .env 或 process.env。
 export function createViteConfig(runtimeEnvironment) {
   // API 代理模块：保持同源 /api、动态后端端口和受控开发 Origin。
@@ -47,7 +69,7 @@ export function createViteConfig(runtimeEnvironment) {
   return {
     root: clientRoot,
     envDir: runtimeEnvironment.envDir,
-    plugins: [createOpenInEditorBlockPlugin(), vue()],
+    plugins: [createOpenInEditorBlockPlugin(), createLegacyPageBlockPlugin(), vue()],
     resolve: { alias: { '@': clientSourceRoot } },
     server: {
       host: runtimeEnvironment.frontendHost,

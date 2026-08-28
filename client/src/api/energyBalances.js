@@ -9,7 +9,7 @@ import {
 const BASE_URL = '/energy-balances';
 /** 能效平衡受控导入 API 基础路径。 */
 const IMPORT_BASE_URL = '/energy-balance-imports';
-/** 能效平衡双批次青岚 artifact 与 handler 契约。 */
+/** 能效平衡双批次天坤集团 artifact 与 handler 契约。 */
 const ENERGY_BALANCE_DEMO_IMPORT = Object.freeze({
   artifactKey: '25-energy-balance-configs',
   handlerKey: 'energy-balance-bundle-import'
@@ -60,11 +60,13 @@ export function downloadEnergyBalanceImportTemplate() {
   return download({ url: '/templates/energy-balance-configs.xlsx' }, '能效平衡配置导入模板.xlsx');
 }
 
-/** 下载青岚园区平衡边界与九角色项目 XLSX 示例并保存托管 context。 */
+/** 下载天坤集团平衡边界与九角色项目 XLSX 示例并保存托管 context。 */
 export function downloadEnergyBalanceDemoParkExample() {
   return downloadManagedDemoArtifact(
     { url: '/templates/demo-park/25-energy-balance-configs.xlsx' },
-    '青岚园区示例-平衡边界与九角色项目.xlsx'
+    '天坤集团示例-平衡边界与九角色项目.xlsx',
+    undefined,
+    ENERGY_BALANCE_DEMO_IMPORT
   );
 }
 

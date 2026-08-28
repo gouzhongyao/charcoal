@@ -51,6 +51,8 @@ const FLOW_MODEL = Object.freeze({
 const ROUTE_PREFIX = '/api/energy-flow-imports';
 // 原始备份实现，测试结束时必须恢复。
 const originalCreateBackup = backupService.createBackup;
+// 记录最近一次能流路由请求收到的 context header，验证正式流程明确不携带 demo context。
+let lastObservedDemoContextHeader = null;
 // 备份桩调用计数。
 const backupCounter = { count: 0 };
 
@@ -60,6 +62,12 @@ const backupCounter = { count: 0 };
  */
 function createIsolatedApp() {
   const app = express();
+  app.use((request, _response, next) => {
+    if (request.path.startsWith(ROUTE_PREFIX)) {
+      lastObservedDemoContextHeader = request.headers['x-demo-context'] ?? null;
+    }
+    next();
+  });
   // 能流 router 必须先于应用级 JSON parser 挂载，确保匿名畸形/超限 execute 先走认证。
   app.use(ROUTE_PREFIX, energyFlowImportRouter);
   app.use(express.json({ limit: '1mb' }));
@@ -104,17 +112,20 @@ function requestJson(server, method, requestPath, body, token = null) {
  */
 function requestRawJson(server, method, requestPath, rawBody, token = null) {
   const raw = String(rawBody || '');
+  const requestHeaders = {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(raw),
+    ...(token ? { Authorization: `Bearer ${token}` } : {})
+  };
+  assert.strictEqual(Object.keys(requestHeaders).some((headerName) => headerName.toLowerCase() === 'x-demo-context'), false,
+    '正式能流 JSON helper 不得携带 X-Demo-Context。');
   return new Promise((resolve, reject) => {
     const request = http.request({
       host: '127.0.0.1',
       port: server.address().port,
       method,
       path: requestPath,
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(raw),
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
-      }
+      headers: requestHeaders
     }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
@@ -126,7 +137,7 @@ function requestRawJson(server, method, requestPath, rawBody, token = null) {
         } catch (_error) {
           parsedBody = text;
         }
-        resolve({ status: response.statusCode, headers: response.headers, body: parsedBody, text });
+        resolve({ status: response.statusCode, headers: response.headers, body: parsedBody, text, requestHeaders });
       });
     });
     request.on('error', reject);
@@ -155,23 +166,26 @@ function requestMultipart(server, requestPath, file, token = null) {
   }
   parts.push(Buffer.from(`--${boundary}--\r\n`, 'utf8'));
   const requestBody = Buffer.concat(parts);
+  const requestHeaders = {
+    'Content-Type': `multipart/form-data; boundary=${boundary}`,
+    'Content-Length': requestBody.length,
+    ...(token ? { Authorization: `Bearer ${token}` } : {})
+  };
+  assert.strictEqual(Object.keys(requestHeaders).some((headerName) => headerName.toLowerCase() === 'x-demo-context'), false,
+    '正式能流 multipart helper 不得携带 X-Demo-Context。');
   return new Promise((resolve, reject) => {
     const request = http.request({
       host: '127.0.0.1',
       port: server.address().port,
       method: 'POST',
       path: requestPath,
-      headers: {
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': requestBody.length,
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
-      }
+      headers: requestHeaders
     }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
       response.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf8');
-        resolve({ status: response.statusCode, headers: response.headers, body: text ? JSON.parse(text) : null, text });
+        resolve({ status: response.statusCode, headers: response.headers, body: text ? JSON.parse(text) : null, text, requestHeaders });
       });
     });
     request.on('error', reject);
@@ -423,6 +437,21 @@ function countImportBatches() {
   const database = openDatabase();
   try {
     return Number(database.prepare('SELECT COUNT(*) AS count FROM import_batches').get().count);
+  } finally {
+    database.close();
+  }
+}
+
+/** 返回正式 no-context 导入不得触碰的四张 demo 治理表完整快照。 */
+function snapshotDemoGovernanceTables() {
+  const database = openDatabase();
+  try {
+    return {
+      registry: database.prepare('SELECT * FROM demo_data_registry ORDER BY registry_id').all(),
+      relations: database.prepare('SELECT * FROM demo_data_relations ORDER BY relation_id').all(),
+      batchLinks: database.prepare('SELECT * FROM demo_run_import_batches ORDER BY id').all(),
+      contexts: database.prepare('SELECT * FROM demo_import_contexts ORDER BY context_id').all()
+    };
   } finally {
     database.close();
   }
@@ -859,7 +888,8 @@ async function run() {
       .filter((filename) => !retainedUploadFilesBeforeInvalidEdge.has(filename))
       .forEach((filename) => fs.unlinkSync(path.join(uploadsDir, filename)));
 
-    // 双批次 preview/execute 使用最小 JSON；客户端伪造候选字段不得进入服务。
+    // 正式 no-context bundle 必须保留全部 demo 治理快照，且 preview/execute 请求均不能携带 X-Demo-Context。
+    const formalGovernanceBefore = snapshotDemoGovernanceTables();
     const bundlePreview = await createBundlePreview(
       server,
       adminToken,
@@ -868,6 +898,8 @@ async function run() {
       '2026-01-01T00:00:00.000Z',
       '2026-02-01T00:00:00.000Z'
     );
+    assert.strictEqual(lastObservedDemoContextHeader, null,
+      '正式 bundle preview 必须明确不携带 X-Demo-Context。');
     assert.notStrictEqual(bundlePreview.edgeBatchId, bundlePreview.recordBatchId);
     assert.strictEqual(bundlePreview.expectedWouldImport, 2);
     assert.strictEqual(bundlePreview.recordPreview.candidateRows[0].startUtc, '2026-01-01T00:00:00Z');
@@ -881,6 +913,8 @@ async function run() {
       previewSignature: 'forged'
     });
     const bundleExecute = await requestJson(server, 'POST', `${ROUTE_PREFIX}/bundle/execute`, minimalBundleBody, adminToken);
+    assert.strictEqual(lastObservedDemoContextHeader, null,
+      '正式 bundle execute 必须明确不携带 X-Demo-Context。');
     assert.strictEqual(bundleExecute.status, 200, bundleExecute.text);
     assert.strictEqual(bundleExecute.body.data.edge.imported, 1);
     assert.strictEqual(bundleExecute.body.data.record.imported, 1);
@@ -918,6 +952,8 @@ async function run() {
     } finally {
       successDatabase.close();
     }
+    assert.deepStrictEqual(snapshotDemoGovernanceTables(), formalGovernanceBefore,
+      '正式 no-context bundle preview/execute 不得创建 registry、relation、batch link 或 demo context。');
 
     // 跨组和角色串换必须保持原 preview 批次不变，随后正确路由仍可执行。
     const pairA = await createBundlePreview(server, adminToken, 'pair-a.xlsx', 'EDGE-PAIR-A-API', '2026-02-01T00:00:00Z', '2026-03-01T00:00:00Z');

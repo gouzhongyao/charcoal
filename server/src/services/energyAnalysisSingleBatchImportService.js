@@ -7,6 +7,13 @@ const {
   bindDemoContextPreviewInTransaction,
   markDemoContextExecutedInTransaction
 } = require('./demoContextService');
+const { requireDemoArtifactHandler } = require('./demoArtifactRegistry');
+const {
+  markDemoContextExecutedWithOwnershipTransaction,
+  registerImportedDemoOwnershipInTransaction,
+  runWithDemoOwnershipTransactionAsync,
+  updateDemoExecuteAuditInOwnershipTransaction
+} = require('./demoOwnershipService');
 const {
   createPreviewAuditBatch,
   getImportAuditBatchDetail,
@@ -620,6 +627,137 @@ function markEnergyAnalysisSingleBatchFailure(requestedBatchId, descriptor, erro
 }
 
 /**
+ * 从静态 artifact registry 解析单批次 ownership 绑定，禁止调用方自定义 handler、角色或实体类型。
+ * @param {object} descriptor 领域描述器。
+ * @param {object} demoContext 已由路由组装的演示 context。
+ * @returns {{artifact:object,batchRole:object,entityType:string,expectedImportType:string}} 服务端受控绑定。
+ */
+function requireSingleBatchDemoOwnershipBinding(descriptor, demoContext) {
+  const ownershipBinding = descriptor && descriptor.demoOwnership;
+  if (!ownershipBinding || typeof ownershipBinding !== 'object') {
+    throw badRequest('当前单批次导入未声明演示 ownership 绑定。', {
+      code: 'ENERGY_ANALYSIS_IMPORT_DEMO_OWNERSHIP_BINDING_REQUIRED'
+    });
+  }
+  const artifact = requireDemoArtifactHandler(demoContext.artifactKey, demoContext.handlerKey);
+  const batchRole = artifact.batchRoles.length === 1 ? artifact.batchRoles[0] : null;
+  if (artifact.artifactKey !== ownershipBinding.artifactKey
+    || artifact.templateType !== descriptor.templateType
+    || !batchRole
+    || batchRole.role !== ownershipBinding.batchRole
+    || batchRole.entityType !== ownershipBinding.entityType
+    || ownershipBinding.expectedImportType !== ownershipBinding.entityType) {
+    throw badRequest('当前演示 artifact 与单批次导入描述器不匹配。', {
+      code: 'ENERGY_ANALYSIS_IMPORT_DEMO_OWNERSHIP_BINDING_MISMATCH'
+    });
+  }
+  return {
+    artifact,
+    batchRole,
+    entityType: ownershipBinding.entityType,
+    expectedImportType: ownershipBinding.expectedImportType
+  };
+}
+
+/**
+ * 只把声明式真实 INSERT 返回的 row witness 构造成 registrar inserted 输入。
+ * @param {object} insertion 领域插入结果。
+ * @param {object} ownershipBinding 静态 ownership 绑定。
+ * @returns {object[]} 本次真实插入实体登记集合。
+ */
+function buildSingleBatchInsertedOwnershipRecords(insertion, ownershipBinding) {
+  const importedItems = Array.isArray(insertion.importedItems) ? insertion.importedItems : [];
+  return importedItems.map((item) => {
+    const entityPk = Number(item && item.id);
+    const sourceRowNumber = Number(item && item.sourceRowNumber);
+    if (!Number.isSafeInteger(entityPk) || entityPk < 1
+      || !Number.isSafeInteger(sourceRowNumber) || sourceRowNumber < 1
+      || !item.rowWitness || typeof item.rowWitness !== 'object') {
+      throw badRequest('单批次导入返回了无效的 ownership row witness。', {
+        code: 'ENERGY_ANALYSIS_IMPORT_DEMO_OWNERSHIP_ROW_WITNESS_INVALID'
+      });
+    }
+    return {
+      entityType: ownershipBinding.entityType,
+      entityPk,
+      batchRole: ownershipBinding.batchRole.role,
+      sourceRowNumber,
+      rowWitness: item.rowWitness
+    };
+  });
+}
+
+/** 从服务端锁内重算的 skipped 项构造明确不登记的 ownership 结果。 */
+function buildSingleBatchSkippedOwnershipRecords(preview, ownershipBinding) {
+  return (Array.isArray(preview.items) ? preview.items : [])
+    .filter((item) => item && item.status === 'skipped')
+    .map((item) => ({
+      entityType: ownershipBinding.entityType,
+      entityPk: null,
+      batchRole: ownershipBinding.batchRole.role,
+      sourceRowNumber: Number.isSafeInteger(item.sourceRowNumber) ? item.sourceRowNumber : null,
+      reason: String(item.issues?.[0]?.code || 'duplicate_skipped').slice(0, 256)
+    }));
+}
+
+/**
+ * 将 ownership 计数字段规范化为公开摘要使用的非负安全整数。
+ * @param {*} value 内部 ownership 计数值。
+ * @returns {number} 稳定的非负安全整数。
+ */
+function normalizeManagedOwnershipPublicCount(value) {
+  const count = Number(value);
+  return Number.isSafeInteger(count) && count >= 0 ? count : 0;
+}
+
+/**
+ * 将 ownership 内部登记结果投影为 managed execute 可公开返回的固定摘要。
+ * @param {object} ownershipSummary 完整内部 ownership 登记结果。
+ * @returns {object} 仅包含安全状态和聚合计数的公共摘要。
+ */
+function projectManagedDemoOwnershipPublicSummary(ownershipSummary) {
+  const summary = ownershipSummary && typeof ownershipSummary === 'object' ? ownershipSummary : {};
+  return {
+    applied: summary.applied === true,
+    mode: summary.mode === 'demo' ? 'demo' : 'unknown',
+    noInsertedRecords: summary.noInsertedRecords === true,
+    registrationCount: normalizeManagedOwnershipPublicCount(summary.registrationCount),
+    insertedCount: normalizeManagedOwnershipPublicCount(summary.insertedCount),
+    idempotentCount: normalizeManagedOwnershipPublicCount(summary.idempotentCount),
+    skippedCount: normalizeManagedOwnershipPublicCount(summary.skippedCount),
+    relationCount: normalizeManagedOwnershipPublicCount(summary.relationCount)
+  };
+}
+
+/**
+ * 在业务插入后、成功审计与 context CAS 前登记 imported ownership。
+ * @param {object} input 当前单批次事务上下文。
+ * @returns {object} registrar 结果。
+ */
+function registerSingleBatchDemoOwnershipInTransaction(input) {
+  const ownershipBinding = requireSingleBatchDemoOwnershipBinding(input.descriptor, input.demoContext);
+  const insertedRecords = buildSingleBatchInsertedOwnershipRecords(input.insertion, ownershipBinding);
+  const skippedRecords = buildSingleBatchSkippedOwnershipRecords(input.preview, ownershipBinding);
+  return registerImportedDemoOwnershipInTransaction({
+    transactionScope: input.transactionScope,
+    demoContext: {
+      ...input.demoContext,
+      uploadFileSha256: input.uploadFileSha256,
+      previewDigest: input.previewDigest
+    },
+    actorUserId: input.actorUserId,
+    batchBindings: [{
+      batchId: input.batchId,
+      batchRole: ownershipBinding.batchRole.role,
+      entityType: ownershipBinding.entityType
+    }],
+    insertedRecords,
+    skippedRecords,
+    noInsertedRecords: insertedRecords.length === 0
+  });
+}
+
+/**
  * 执行单批次能源分析导入：服务端重读、重算、授权、备份并在单事务内复核写入。
  * @param {object} body execute 请求体。
  * @param {object} descriptor 领域重算与写入描述器。
@@ -669,16 +807,171 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
         secret
       });
       const authorization = authorizePersistedBatchExecute(body, batch, recomputedPreview, safeFile.buffer, secret);
-      if (!authorization.valid) throwAuthorizationFailure(authorization);
-      if (Number(authorization.expectedWouldImport || 0) <= 0) throwAuthorizationFailure(authorization);
+      const initialDemoNoInsertedRecords = Boolean(
+        options.demoContext
+        && descriptor.demoOwnership
+        && Number(authorization.expectedWouldImport || 0) === 0
+        && Array.isArray(authorization.errors)
+        && authorization.errors.length === 1
+        && authorization.errors[0].code === 'ENERGY_ANALYSIS_IMPORT_EMPTY_CANDIDATES_REJECTED'
+      );
+      if (!authorization.valid && !initialDemoNoInsertedRecords) throwAuthorizationFailure(authorization);
+      if (Number(authorization.expectedWouldImport || 0) <= 0 && !initialDemoNoInsertedRecords) {
+        throwAuthorizationFailure(authorization);
+      }
 
       const createBackup = typeof options.createBackup === 'function'
         ? options.createBackup
         : backupService.createBackup;
+      const allowDemoNoInsertedRecords = (authorization) => Boolean(
+        options.demoContext
+        && descriptor.demoOwnership
+        && Number(authorization.expectedWouldImport || 0) === 0
+        && Array.isArray(authorization.errors)
+        && authorization.errors.length === 1
+        && authorization.errors[0].code === 'ENERGY_ANALYSIS_IMPORT_EMPTY_CANDIDATES_REJECTED'
+      );
+      const requireExecuteAuthorization = (authorization) => {
+        if (!authorization.valid && !allowDemoNoInsertedRecords(authorization)) {
+          throwAuthorizationFailure(authorization);
+        }
+        if (Number(authorization.expectedWouldImport || 0) <= 0 && !allowDemoNoInsertedRecords(authorization)) {
+          throwAuthorizationFailure(authorization);
+        }
+      };
+      const createExecuteResult = (latestPreview, insertion, managedOwnershipSummary = null) => {
+        const imported = Number(insertion.imported ?? latestPreview.candidateRows.length);
+        const summary = latestPreview.summary || {};
+        const publicImportedItems = (Array.isArray(insertion.importedItems) ? insertion.importedItems : []).map((item) => ({
+          id: item.id,
+          candidateRowId: item.candidateRowId,
+          sourceRowNumber: item.sourceRowNumber
+        }));
+        return {
+          executed: true,
+          writesBusinessRecords: imported > 0,
+          templateType: template.templateType,
+          operation: template.operation,
+          recordKind: template.recordKind,
+          importTypes: [...template.importTypes],
+          imported,
+          skipped: Number(summary.skipped || 0),
+          blocked: Number(summary.blocked || 0),
+          warnings: Number(summary.warnings || 0),
+          errors: Number(summary.errors || 0),
+          expectedWouldImport: latestPreview.candidateRows.length,
+          candidateRowIds: latestPreview.candidateRowIds,
+          candidateRows: latestPreview.candidateRows,
+          previewSignature: latestPreview.previewSignature,
+          previewAuditDigest: latestPreview.previewAuditDigest,
+          previewAudit: latestPreview.previewAudit,
+          importedIds: insertion.importedIds || [],
+          importedItems: publicImportedItems,
+          ...(managedOwnershipSummary
+            ? { ownership: projectManagedDemoOwnershipPublicSummary(managedOwnershipSummary) }
+            : {}),
+          backup: projectSafeBackupSummary(backup)
+        };
+      };
+
+      if (options.demoContext && descriptor.demoOwnership) {
+        failureStage = 'lock';
+        return await runWithDemoOwnershipTransactionAsync(databaseContext.db, async (transactionScope, transactionDb) => {
+          const ownershipBinding = requireSingleBatchDemoOwnershipBinding(descriptor, options.demoContext);
+          const latestBatch = getImportAuditBatchDetail(batchId, { db: transactionDb, includeIssues: false });
+          if (latestBatch.importType !== ownershipBinding.expectedImportType) {
+            throw badRequest('当前导入批次类型与演示 ownership 描述器不匹配。', {
+              code: 'ENERGY_ANALYSIS_IMPORT_DEMO_OWNERSHIP_IMPORT_TYPE_MISMATCH'
+            });
+          }
+          const latestDomainPreview = descriptor.buildPreview({
+            db: transactionDb,
+            buffer: safeFile.buffer,
+            originalFilename: latestBatch.originalFilename,
+            fileSha256: safeFile.fileSha256,
+            fileSizeBytes: safeFile.sizeBytes,
+            template,
+            options
+          });
+          const latestPreview = securePreviewResult(latestDomainPreview, {
+            template,
+            fileSha256: safeFile.fileSha256,
+            secret
+          });
+          const latestAuthorization = authorizePersistedBatchExecute(body, latestBatch, latestPreview, safeFile.buffer, secret);
+          requireExecuteAuthorization(latestAuthorization);
+
+          failureStage = 'backup';
+          // 私有 ownership 事务自锁内重算起持有 RESERVED 锁；在线备份读取锁前已提交快照。
+          if (trustedPersistedBatch) trustedFailureAuditBatchId = batchId;
+          backup = await createBackup({
+            reason: template.backupReason,
+            skipCheckpoint: true
+          });
+
+          failureStage = 'write';
+          const insertion = descriptor.insertCandidates({
+            db: transactionDb,
+            transactionScope,
+            batchId,
+            candidateRows: latestPreview.candidateRows,
+            preview: latestPreview,
+            options
+          });
+          const ownership = registerSingleBatchDemoOwnershipInTransaction({
+            transactionScope,
+            descriptor,
+            demoContext: options.demoContext,
+            actorUserId: options.demoContext.userId,
+            batchId,
+            insertion,
+            preview: latestPreview,
+            uploadFileSha256: safeFile.fileSha256,
+            previewDigest: latestPreview.previewAuditDigest
+          });
+          const executeResult = createExecuteResult(latestPreview, insertion, ownership);
+          const summary = latestPreview.summary || {};
+          const auditSummary = updateDemoExecuteAuditInOwnershipTransaction({
+            transactionScope,
+            batchId,
+            status: Number(summary.blocked || 0) > 0 || Number(summary.skipped || 0) > 0
+              ? 'completed_with_errors'
+              : 'completed',
+            statistics: {
+              totalRows: Number(summary.totalRows || 0),
+              successCount: Number(insertion.imported || 0),
+              failureCount: Number(summary.blocked || 0),
+              skippedCount: Number(summary.skipped || 0)
+            },
+            executeResult,
+            backup,
+            errorSummary: buildPreviewErrorSummary(summary, descriptor.domainName)
+          });
+          markDemoContextExecutedWithOwnershipTransaction({
+            transactionScope,
+            demoContext: {
+              token: options.demoContext.token,
+              userId: options.demoContext.userId,
+              artifactKey: options.demoContext.artifactKey,
+              handlerKey: options.demoContext.handlerKey
+            },
+            uploadFileSha256: safeFile.fileSha256,
+            previewDigest: latestPreview.previewAuditDigest,
+            batchBindings: [{ batchId, batchRole: ownershipBinding.batchRole.role }]
+          });
+          return {
+            ...executeResult,
+            persistsImportBatch: true,
+            batchId,
+            auditBatch: auditSummary
+          };
+        });
+      }
+
       let transactionActive = false;
       try {
         failureStage = 'lock';
-        // RESERVED 写锁从锁内重算前一直保持到审计和业务写入提交，阻止备份后插入前出现并发提交窗口。
+        // 正式无 context 路径保持既有事务：锁内重算、在线备份、业务写入和审计原子提交。
         databaseContext.db.exec('BEGIN IMMEDIATE');
         transactionActive = true;
 
@@ -702,9 +995,7 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
         if (Number(latestAuthorization.expectedWouldImport || 0) <= 0) throwAuthorizationFailure(latestAuthorization);
 
         failureStage = 'backup';
-        // 只有已经进入真实备份阶段的失败才写 execute failed；锁内重算和 stale 仍保留 preview 可重试。
         if (trustedPersistedBatch) trustedFailureAuditBatchId = batchId;
-        // 独立读连接在线备份锁前已提交快照；跳过会与当前 RESERVED 锁冲突的 checkpoint。
         backup = await createBackup({
           reason: template.backupReason,
           skipCheckpoint: true
@@ -718,38 +1009,15 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
           preview: latestPreview,
           options
         });
-        const imported = Number(insertion.imported ?? latestPreview.candidateRows.length);
+        const executeResult = createExecuteResult(latestPreview, insertion);
         const summary = latestPreview.summary || {};
-        const safeBackup = projectSafeBackupSummary(backup);
-        const executeResult = {
-          executed: true,
-          writesBusinessRecords: true,
-          templateType: template.templateType,
-          operation: template.operation,
-          recordKind: template.recordKind,
-          importTypes: [...template.importTypes],
-          imported,
-          skipped: Number(summary.skipped || 0),
-          blocked: Number(summary.blocked || 0),
-          warnings: Number(summary.warnings || 0),
-          errors: Number(summary.errors || 0),
-          expectedWouldImport: latestPreview.candidateRows.length,
-          candidateRowIds: latestPreview.candidateRowIds,
-          candidateRows: latestPreview.candidateRows,
-          previewSignature: latestPreview.previewSignature,
-          previewAuditDigest: latestPreview.previewAuditDigest,
-          previewAudit: latestPreview.previewAudit,
-          importedIds: insertion.importedIds || [],
-          importedItems: insertion.importedItems || [],
-          backup: safeBackup
-        };
         const auditBatch = updateExecuteAuditResult(batchId, {
           status: Number(summary.blocked || 0) > 0 || Number(summary.skipped || 0) > 0
             ? 'completed_with_errors'
             : 'completed',
           statistics: {
             totalRows: Number(summary.totalRows || 0),
-            successCount: imported,
+            successCount: Number(insertion.imported || 0),
             failureCount: Number(summary.blocked || 0),
             skippedCount: Number(summary.skipped || 0)
           },

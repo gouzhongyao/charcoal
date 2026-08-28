@@ -237,7 +237,7 @@ async function assertUnconnectedCase(server, adminToken, testCase) {
   let server;
   try {
     initDatabase();
-    const park = createOrganizationUnit({ unitCode: 'QL-PARK', unitName: '青岚智造园区', unitType: 'enterprise' });
+    const park = createOrganizationUnit({ unitCode: 'QL-PARK', unitName: '天坤集团', unitType: 'enterprise' });
     createOrganizationUnit({ unitCode: 'QL-WORKSHOP-A', unitName: '精密制造一车间', unitType: 'workshop', parentId: park.id });
     createOrganizationUnit({ unitCode: 'QL-WORKSHOP-B', unitName: '装配二车间', unitType: 'workshop', parentId: park.id });
 
@@ -251,9 +251,15 @@ async function assertUnconnectedCase(server, adminToken, testCase) {
     assert.strictEqual(loginResponse.status, 200, JSON.stringify(loginResponse.body));
     const adminToken = loginResponse.body.data.token;
 
-    // 真实 stateless 下载必须在 runtime 初始关闭时继续进入既定 direct-upload 导入链路。
+    // stateless 下载同样受独立 runtime 开关保护，先通过显式 toggle 接口开启再验证正式 direct-upload 导入链路。
+    const toggleResponse = await request(server, 'POST', '/api/system/demo-data/toggle', {
+      token: adminToken,
+      body: { enabled: true }
+    });
+    assert.strictEqual(toggleResponse.status, 200, JSON.stringify(toggleResponse.body));
+    assert.strictEqual(toggleResponse.body?.data?.runtime?.enabled, true);
     const statelessGovernanceBefore = readStatelessDownloadGovernance();
-    assert.strictEqual(statelessGovernanceBefore.runtime.enabled, 0, 'stateless 下载前 runtime 必须保持初始关闭。');
+    assert.strictEqual(statelessGovernanceBefore.runtime.enabled, 1, '显式 toggle 后 stateless 下载必须看到 runtime 已开启。');
     assert.strictEqual(statelessGovernanceBefore.runCount, 0);
     assert.strictEqual(statelessGovernanceBefore.contextCount, 0);
     assert.strictEqual(statelessGovernanceBefore.autoEnableAuditCount, 0);

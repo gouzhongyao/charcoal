@@ -15,17 +15,15 @@ process.env.CHARCOAL_ADMIN_PASSWORD = 'DemoRunRecovery123!';
 process.env.NODE_ENV = 'test';
 
 const { initDatabase, openDatabase } = require('../db/database');
-const {
-  DEMO_DATASET_ID,
-  DEMO_MANIFEST_VERSION,
-  getDemoParkManifestDigest
-} = require('../services/demoParkDatasetService');
+const { DEMO_DATASET_ID } = require('../services/demoParkDatasetService');
 const { toggleDemoRuntime } = require('../services/demoRuntimeService');
 const {
   getOrCreateActiveDemoDatasetRun,
-  MANIFEST_CONFLICT_AUTO_RETIRE_OPERATION,
-  MANIFEST_CONFLICT_AUTO_RETIRE_REASON,
-  _test: demoRunTest
+  getReadableDemoOwnershipSummary,
+  readActiveDemoDatasetRunProjection,
+  readDemoDatasetRunProjection,
+  requireDemoDatasetRun,
+  requireReadableDemoDatasetRun
 } = require('../services/demoRunService');
 
 /** 插入指定 manifest 身份的演示 run，供隔离安全边界测试使用。 */
@@ -120,48 +118,66 @@ function attachBlockingEvidence(db, run) {
         manifestDigest: 'a'.repeat(64),
         createdAt: '2026-08-20T00:00:00.000Z'
       });
-      const created = db.transaction(() => getOrCreateActiveDemoDatasetRun({ actorUserId: 1, actorIp: '127.0.0.1', db })).immediate();
-      assert.strictEqual(created.reused, false, '无关联旧 run 退役后必须创建当前 manifest 新 run。');
-      assert.notStrictEqual(created.runId, legacy.runId, '新 run 不得复用旧 run 身份。');
-      assert.strictEqual(created.datasetId, DEMO_DATASET_ID);
-      assert.strictEqual(created.manifestVersion, DEMO_MANIFEST_VERSION);
-      assert.strictEqual(created.manifestDigest, getDemoParkManifestDigest());
-      assert.strictEqual(created.status, 'active');
-
-      const retired = db.prepare(`SELECT run_id AS runId, dataset_id AS datasetId,
+      const auditCountBefore = db.prepare('SELECT COUNT(*) AS total FROM sys_operation_logs').get().total;
+      assert.throws(
+        () => db.transaction(() => getOrCreateActiveDemoDatasetRun({ actorUserId: 1, actorIp: '127.0.0.1', db })).immediate(),
+        (error) => error.code === 'DEMO_ACTIVE_RUN_MANIFEST_CONFLICT'
+          && error.statusCode === 409
+          && error.details.retirement === 'blocked_manifest_conflict'
+          && error.details.runId === legacy.runId,
+        '无论旧 run 是否存在关联，manifest/digest 冲突都必须保持 409。'
+      );
+      const unchanged = db.prepare(`SELECT run_id AS runId, dataset_id AS datasetId,
           manifest_version AS manifestVersion, manifest_digest AS manifestDigest,
           status, created_by AS createdBy, created_at AS createdAt,
           cleanup_started_at AS cleanupStartedAt, cleaned_at AS cleanedAt,
           failure_reason AS failureReason
         FROM demo_dataset_runs WHERE run_id = ?`).get(legacy.runId);
-      assert.deepStrictEqual(retired, {
+      assert.deepStrictEqual(unchanged, {
         runId: legacy.runId,
         datasetId: legacy.datasetId,
         manifestVersion: legacy.manifestVersion,
         manifestDigest: legacy.manifestDigest,
-        status: 'cleaned',
+        status: 'active',
         createdBy: legacy.createdBy,
         createdAt: legacy.createdAt,
-        cleanupStartedAt: retired.cleanupStartedAt,
-        cleanedAt: retired.cleanedAt,
-        failureReason: MANIFEST_CONFLICT_AUTO_RETIRE_REASON
-      });
-      assert(retired.cleanupStartedAt && retired.cleanedAt, '退役必须写入现有 cleaned 生命周期字段。');
-      const audit = db.prepare(`SELECT user_id AS userId, operation, target_type AS targetType,
-          target_id AS targetId, detail_json AS detailJson
-        FROM sys_operation_logs WHERE operation = ? AND target_id = ?
-        ORDER BY id DESC LIMIT 1`).get(MANIFEST_CONFLICT_AUTO_RETIRE_OPERATION, legacy.runId);
-      assert(audit, '自动退役必须写入操作审计。');
-      assert.strictEqual(audit.userId, 1);
-      assert.strictEqual(audit.targetType, 'demo_dataset_runs');
-      assert.strictEqual(audit.targetId, legacy.runId);
-      assert.strictEqual(JSON.parse(audit.detailJson).reason, MANIFEST_CONFLICT_AUTO_RETIRE_REASON);
-      assert.strictEqual(JSON.parse(audit.detailJson).previousManifestVersion, legacy.manifestVersion);
-      assert.strictEqual(JSON.parse(audit.detailJson).previousManifestDigest, legacy.manifestDigest);
+        cleanupStartedAt: null,
+        cleanedAt: null,
+        failureReason: null
+      }, 'manifest 冲突失败后旧 run 必须保持原样。');
+      assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM sys_operation_logs').get().total, auditCountBefore,
+        'manifest 冲突不得写入自动退役审计。');
       assert.deepStrictEqual(db.prepare('SELECT runtime_epoch AS runtimeEpoch FROM demo_runtime_settings WHERE id = 1').get(), runtimeBefore,
-        '自动退役不得绕过 runtime epoch 安全边界。');
+        'manifest 冲突不得修改 runtime epoch。');
+      assert.strictEqual(db.prepare(`SELECT COUNT(*) AS total FROM demo_dataset_runs
+        WHERE dataset_id = ? AND status IN ('active', 'completed', 'cleanup_pending', 'cleaning')`).get(DEMO_DATASET_ID).total, 1,
+      'manifest 冲突拒绝后不得创建第二个 active run。');
 
-      markRunCleaned(db, created.runId);
+      const activeProjection = readActiveDemoDatasetRunProjection({ db });
+      assert.strictEqual(activeProjection.activeRun.runId, legacy.runId);
+      assert.strictEqual(activeProjection.compatibility.state, 'manifest-conflict');
+      assert.strictEqual(activeProjection.compatibility.readable, true);
+      assert.strictEqual(activeProjection.compatibility.writeEligible, false);
+      const readableConflictRun = requireReadableDemoDatasetRun(db, legacy.runId);
+      assert.strictEqual(readableConflictRun.compatibility.code, 'DEMO_RUN_MANIFEST_CONFLICT_READ_ONLY');
+      assert.throws(
+        () => requireDemoDatasetRun(db, legacy.runId),
+        (error) => error.code === 'DEMO_RUN_INVALID',
+        'manifest 冲突 run 只允许只读投影，context/import/cleanup 等严格写路径必须继续拒绝。'
+      );
+      const conflictOwnership = getReadableDemoOwnershipSummary({ db, runId: legacy.runId });
+      assert.strictEqual(conflictOwnership.totalCount, 0);
+      assert.strictEqual(conflictOwnership.compatibility.state, 'manifest-conflict');
+      assert.strictEqual(conflictOwnership.cleanupWriteEligible, false);
+
+      markRunCleaned(db, legacy.runId);
+      const historicalProjection = readDemoDatasetRunProjection({ db, runId: legacy.runId });
+      assert.strictEqual(historicalProjection.compatibility.state, 'historical-manifest-conflict');
+      assert.strictEqual(historicalProjection.compatibility.readable, true);
+      assert.strictEqual(historicalProjection.compatibility.historical, true);
+      assert.strictEqual(historicalProjection.compatibility.writeEligible, false);
+      assert.strictEqual(getReadableDemoOwnershipSummary({ db, runId: legacy.runId }).cleanupWriteEligible, false);
+
       const blocked = insertRun(db, {
         runId: 'legacy-associated-run',
         manifestVersion: '1.0.0',
@@ -173,12 +189,8 @@ function attachBlockingEvidence(db, run) {
         () => db.transaction(() => getOrCreateActiveDemoDatasetRun({ actorUserId: 1, db })).immediate(),
         (error) => error.code === 'DEMO_ACTIVE_RUN_MANIFEST_CONFLICT'
           && error.statusCode === 409
-          && error.details.retirement === 'blocked_associations'
-          && error.details.associationEvidence.context === true
-          && error.details.associationEvidence.ownership === true
-          && error.details.associationEvidence.relation === true
-          && error.details.associationEvidence.businessRecord === true,
-        '存在 context、ownership、关系或业务批次关联时必须保留 409。'
+          && error.details.retirement === 'blocked_manifest_conflict',
+        '存在 context、ownership、关系或业务批次关联时同样必须保留 409。'
       );
       const blockedAfter = db.prepare(`SELECT run_id AS runId, dataset_id AS datasetId,
           manifest_version AS manifestVersion, manifest_digest AS manifestDigest,
@@ -193,19 +205,6 @@ function attachBlockingEvidence(db, run) {
         createdBy: blocked.createdBy,
         createdAt: blocked.createdAt
       }, '有关联冲突 run 的身份和状态不得被篡改。');
-      assert.strictEqual(db.prepare(`SELECT COUNT(*) AS total FROM demo_dataset_runs
-        WHERE dataset_id = ? AND status IN ('active', 'completed', 'cleanup_pending', 'cleaning')`).get(DEMO_DATASET_ID).total, 1,
-      '关联冲突拒绝后不得创建第二个 active run。');
-
-      const nonRetireable = { ...blocked, runId: 'legacy-unknown-run', status: 'unexpected' };
-      assert.throws(
-        () => db.transaction(() => demoRunTest.retireUnassociatedManifestConflictRun(db, nonRetireable, 1)).immediate(),
-        (error) => error.code === 'DEMO_ACTIVE_RUN_MANIFEST_CONFLICT'
-          && error.statusCode === 409
-          && error.details.retirement === 'blocked_status'
-          && error.details.status === 'unexpected',
-        '未知或其他非允许状态的 run 必须继续 fail-closed。'
-      );
     } finally {
       db.close();
     }

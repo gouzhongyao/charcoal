@@ -111,7 +111,7 @@ assert.deepEqual(buildCarbonActivityImportExecutePayload(activityPreview), {
 });
 assert.deepEqual(Object.keys(buildCarbonActivityImportExecutePayload(activityPreview)).sort(), ['acknowledgeSkippedRisks', 'batchId', 'confirmText', 'requireBackup']);
 assert.deepEqual(buildCarbonActivityVoidPayload('  数据撤回  ', { updatedAt: '2028-04-01T02:03:04Z', previewSignature: '禁止提交' }), { reason: '数据撤回', expectedUpdatedAt: '2028-04-01T02:03:04Z' });
-assert.equal(formatSourceWallClock('2028-04-01T09:30'), '2028-04-01T09:30', '来源墙钟必须原样展示，不能追加 Z。');
+assert.equal(formatSourceWallClock('2028-04-01T09:30'), '2028-04-01 09:30:00', '来源墙钟必须保留墙钟分量并统一补齐显示秒。');
 assert.doesNotMatch(formatSourceWallClock('2028-04-01T09:30'), /Z$/);
 
 // 统一结果默认独立来源；没有独立活动权限时必须保持未选择，旧来源只能由用户显式选择。
@@ -428,8 +428,9 @@ assert.match(legacySectionSource, /factor_missing/);
 assert.match(carbonApiSource, /\/carbon\/emissions/);
 assert.match(carbonApiSource, /\/templates\/demo-park\/11-carbon-factors\.xlsx/);
 assert.match(factorSectionSource, /hasPermi\('carbon:factor:import'\)/);
-assert.match(factorSectionSource, /不自动计算排放/);
-assert.match(factorSectionSource, /青岚园区示例下载失败/);
+assert.match(factorSectionSource, /下载模板/);
+assert.match(factorSectionSource, /导入因子/);
+assert.doesNotMatch(factorSectionSource, /factorDemoExampleLoading|downloadFactorDemoExample|天坤集团示例/);
 
 // 拆分后日期选择器合同检查对应职责组件，而非巨型页面壳。
 for (const fieldName of ['factorDraftFilters.factorYear', 'factorForm.factorYear']) {

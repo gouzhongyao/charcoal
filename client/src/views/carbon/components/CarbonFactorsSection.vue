@@ -11,7 +11,6 @@
       <el-form-item label="字符搜索"><el-input v-model.trim="factorDraftFilters.keyword" clearable placeholder="能源、地区、来源或单位" /></el-form-item>
       <template #actions>
         <el-button v-if="canFactorTemplate" :loading="factorTemplateLoading" @click="downloadFactorTemplate">下载模板</el-button>
-        <el-button v-if="canFactorImport" :loading="factorDemoExampleLoading" @click="downloadFactorDemoExample">下载青岚园区示例</el-button>
         <el-button v-if="canFactorImport" @click="openFactorImport">导入因子</el-button>
         <el-button v-if="canFactorExport" :loading="factorExportLoading" @click="exportFactors">导出当前筛选</el-button>
         <el-button v-if="canFactorCreate" type="primary" @click="openFactorCreate">新增因子</el-button>
@@ -90,7 +89,6 @@ import StatCard from '@/components/StatCard.vue';
 import StatusTag from '@/components/StatusTag.vue';
 import {
   createCarbonFactor,
-  downloadCarbonFactorDemoParkExample,
   downloadCarbonFactorTemplate,
   executeCarbonFactorImport,
   exportCarbonFactors,
@@ -132,7 +130,6 @@ const factorLoading = ref(false);
 const factorError = ref('');
 const factorExportLoading = ref(false);
 const factorTemplateLoading = ref(false);
-const factorDemoExampleLoading = ref(false);
 const factorStatusLoadingId = ref(null);
 // 新增编辑抽屉状态模块。
 const factorDrawerOpen = ref(false);
@@ -187,8 +184,6 @@ async function saveFactor() { if (factorFormBlocked.value) return; const valid =
 async function confirmFactorStatus(row) { const status = nextCarbonFactorStatus(row.status); const action = status === 'inactive' ? '停用' : '启用'; try { await ElMessageBox.confirm(`${action}“${row.energyTypeName || row.energyTypeCode} / ${row.region} / ${row.factorYear || '通用年份'}”碳因子？${status === 'inactive' ? '停用不是物理删除，已有排放历史及因子快照会保留。' : '启用后可重新参与后续服务端匹配。'}`, `确认${action}`, { type: status === 'inactive' ? 'warning' : 'info', confirmButtonText: `确认${action}`, cancelButtonText: '取消' }); } catch { return; } factorStatusLoadingId.value = row.id; const result = await safe(() => updateCarbonFactorStatus(row.id, status)); factorStatusLoadingId.value = null; if (!result.ok) { ElMessage.error(`碳因子${action}失败：${requestError(result)}`); return; } ElMessage.success(`碳因子已${action}。`); await loadFactors(); }
 /** 下载受权限保护的因子模板。 */
 async function downloadFactorTemplate() { factorTemplateLoading.value = true; const result = await safe(() => downloadCarbonFactorTemplate()); factorTemplateLoading.value = false; if (!result.ok) ElMessage.error(`碳因子模板下载失败：${requestError(result)}`); }
-/** 下载青岚园区因子示例，不自动计算排放。 */
-async function downloadFactorDemoExample() { factorDemoExampleLoading.value = true; const result = await safe(downloadCarbonFactorDemoParkExample); factorDemoExampleLoading.value = false; if (!result.ok) ElMessage.error(`青岚园区示例下载失败：${requestError(result)}`); }
 /** 导出已应用筛选。 */
 async function exportFactors() { factorExportLoading.value = true; const result = await safe(() => exportCarbonFactors(buildCarbonFactorFilters(factorAppliedFilters.value))); factorExportLoading.value = false; if (!result.ok) ElMessage.error(`碳因子导出失败：${requestError(result)}`); }
 /** 初始化导入预演抽屉。 */

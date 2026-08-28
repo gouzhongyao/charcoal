@@ -521,7 +521,11 @@ assert.match(pageSource, /未写入\$\{definition\.resultNoun\}/);
 assert.match(pageSource, /:accept="definition\.accept"/);
 assert.doesNotMatch(pageSource, /accept="\.xlsx,\.xls,\.csv"/);
 assert.match(pageSource, /downloadEnergyAnalysisImportTemplate\(definition\.templateType, 'xlsx'\)/);
-assert.match(pageSource, /downloadEnergyAnalysisDemoArtifact\(definition\.demoArtifactKey, 'xlsx'\)/);
+assert.doesNotMatch(
+  pageSource,
+  /downloadEnergyAnalysisDemoArtifact|downloadImportDemo|天坤集团示例|下载天坤集团示例|下载天坤集团示例/,
+  '业务页面不得继续提供分散演示下载入口，演示 artifact 应由集中管理页下载。'
+);
 assert.match(pageSource, /definition\.refreshTarget === 'shift-analysis'/);
 assert.match(pageSource, /definition\.refreshTarget\.endsWith\('-config'\)/);
 assert.match(pageSource, /refreshImportedConfiguration\(definition\.refreshTarget\)/);

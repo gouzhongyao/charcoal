@@ -44,7 +44,7 @@
             <el-tag :type="scope.row.status === 'active' ? 'success' : 'info'">{{ supplierStatusLabel(scope.row.status) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="updatedAt" label="更新时间" min-width="180" />
+        <el-table-column label="更新时间" min-width="180"><template #default="scope">{{ formatStrictUtcDateTimeDisplay(scope.row.updatedAt) }}</template></el-table-column>
         <el-table-column label="操作" width="250" fixed="right">
           <template #default="scope">
             <el-button link type="primary" @click="openDetail(scope.row)">详情</el-button>
@@ -117,8 +117,8 @@
         <el-descriptions-item label="备注">{{ detailSupplier.remarks || '-' }}</el-descriptions-item>
         <el-descriptions-item label="来源批次">{{ detailSupplier.sourceBatchId || '-' }}</el-descriptions-item>
         <el-descriptions-item label="来源行号">{{ detailSupplier.sourceRowNumber || '-' }}</el-descriptions-item>
-        <el-descriptions-item label="创建时间">{{ detailSupplier.createdAt }}</el-descriptions-item>
-        <el-descriptions-item label="更新时间">{{ detailSupplier.updatedAt }}</el-descriptions-item>
+        <el-descriptions-item label="创建时间">{{ formatStrictUtcDateTimeDisplay(detailSupplier.createdAt) }}</el-descriptions-item>
+        <el-descriptions-item label="更新时间">{{ formatStrictUtcDateTimeDisplay(detailSupplier.updatedAt) }}</el-descriptions-item>
       </el-descriptions>
     </el-drawer>
 
@@ -214,6 +214,7 @@ import {
   updateSupplierStatus
 } from '@/api/suppliers';
 import { hasPermi } from '@/utils/permission';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 import {
   SUPPLIER_STATUS_OPTIONS,
   buildSupplierCreatePayload,

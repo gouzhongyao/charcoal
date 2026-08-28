@@ -16,6 +16,7 @@ const {
   normalizeWorkbookKey,
   normalizeWorkbookNumber,
   normalizeWorkbookVersion,
+  normalizeWorkbookWallClockRange,
   projectEnergyFlowWorkbookPublicDto
 } = require('../services/energyFlowWorkbookContracts');
 const { parseEnergyFlowWorkbookXlsx } = require('../services/energyFlowWorkbookImportService');
@@ -74,6 +75,54 @@ assert.deepStrictEqual(normalizeWorkbookCode(issues, 2, '编码', '  FLOW-01  ')
 assert.strictEqual(normalizeWorkbookKey('  ｆｌｏｗ-０１  '), 'FLOW-01');
 assert.strictEqual(normalizeWorkbookVersion([], 2, 'v1'), 'v1');
 assert.strictEqual(normalizeWorkbookNumber([], 2, '数值', 1.25, { maxDecimals: 2 }), 1.25);
+
+// 完整能流来源墙钟兼容新旧输入，归一化后继续保存内部分钟合同并按显式 IANA 时区转换 UTC。
+const visibleWallClockIssues = [];
+assert.deepStrictEqual(normalizeWorkbookWallClockRange(
+  visibleWallClockIssues,
+  2,
+  '2026-07-01 09:05:00',
+  '2026-07-01 10:35:00',
+  'Asia/Shanghai',
+  '期间时间'
+), {
+  startWallClock: '2026-07-01T09:05',
+  endWallClock: '2026-07-01T10:35',
+  sourceTimezone: 'Asia/Shanghai',
+  startUtc: '2026-07-01T01:05:00Z',
+  endUtc: '2026-07-01T02:35:00Z'
+});
+assert.deepStrictEqual(visibleWallClockIssues, []);
+const historicalWallClockIssues = [];
+assert.deepStrictEqual(normalizeWorkbookWallClockRange(
+  historicalWallClockIssues,
+  2,
+  '2026-07-01T09:05',
+  '2026-07-01T10:35',
+  'Asia/Shanghai',
+  '期间时间'
+), {
+  startWallClock: '2026-07-01T09:05',
+  endWallClock: '2026-07-01T10:35',
+  sourceTimezone: 'Asia/Shanghai',
+  startUtc: '2026-07-01T01:05:00Z',
+  endUtc: '2026-07-01T02:35:00Z'
+});
+assert.deepStrictEqual(historicalWallClockIssues, []);
+const nonZeroSecondIssues = [];
+const nonZeroSecondRange = normalizeWorkbookWallClockRange(
+  nonZeroSecondIssues,
+  3,
+  '2026-07-01 09:05:01',
+  '2026-07-01 10:35:00',
+  'Asia/Shanghai',
+  '期间时间'
+);
+assert.strictEqual(nonZeroSecondRange.startUtc, null);
+assert.strictEqual(nonZeroSecondRange.endUtc, null);
+assert.deepStrictEqual(nonZeroSecondIssues.map((issue) => issue.code), [
+  'ENERGY_FLOW_WORKBOOK_WALL_CLOCK_SECOND_MUST_BE_ZERO'
+]);
 
 // 中央固定模板只能下载 XLSX，并且真实 SheetJS 回读仍为六表合同。
 const templateMetadata = listTemplates().find((template) => template.type === ENERGY_FLOW_WORKBOOK_TEMPLATE_TYPE);

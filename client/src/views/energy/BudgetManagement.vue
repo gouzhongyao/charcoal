@@ -15,7 +15,6 @@
         <el-form-item label="字符搜索"><el-input v-model.trim="draftFilters.keyword" clearable placeholder="组织、备注或能源类型" /></el-form-item>
         <template #actions>
           <el-button v-if="canTemplate" :loading="templateLoading" @click="downloadTemplate">下载模板</el-button>
-          <el-button v-if="canImport" :loading="demoExampleLoading" @click="downloadDemoExample">下载青岚园区示例</el-button>
           <el-button v-if="canImport" @click="openImport">导入预算</el-button>
           <el-button v-if="canExport" :loading="exportLoading" @click="exportCurrent">导出当前筛选</el-button>
           <el-button v-if="canCreate" type="primary" @click="openCreate">新增预算</el-button>
@@ -123,10 +122,11 @@ import PageState from '@/components/PageState.vue';
 import StatCard from '@/components/StatCard.vue';
 import StatusTag from '@/components/StatusTag.vue';
 import { getEnergyTypes } from '@/api/energy';
-import { createEnergyBudget, downloadEnergyBudgetDemoParkExample, downloadEnergyBudgetTemplate, executeEnergyBudgetImport, exportEnergyBudgets, getEnergyBudgetExecutionComparison, getEnergyBudgetStats, getEnergyBudgets, previewEnergyBudgetImport, updateEnergyBudget, updateEnergyBudgetStatus } from '@/api/budgets';
+import { createEnergyBudget, downloadEnergyBudgetTemplate, executeEnergyBudgetImport, exportEnergyBudgets, getEnergyBudgetExecutionComparison, getEnergyBudgetStats, getEnergyBudgets, previewEnergyBudgetImport, updateEnergyBudget, updateEnergyBudgetStatus } from '@/api/budgets';
 import { buildBudgetFilters, buildBudgetImportExecutePayload, categoryColor, nextBudgetStatus, numberValue, totalsByUnitLabel } from '@/utils/budgetManagement';
 import { budgetComparisonActualUnit, budgetComparisonBudgetUnit, budgetComparisonChartRows, budgetComparisonMetricValue, budgetComparisonStatusLabel, budgetComparisonSummaryLabel, budgetComparisonUnits, isBudgetUnitMismatch, isComparableBudgetRow } from '@/utils/energyBudgetManagement';
 import { hasPermi } from '@/utils/permission';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 
 const emptyFilters = () => ({ monthStart: '', monthEnd: '', energyTypeCode: '', organizationScope: '', status: '', keyword: '' });
 const emptyForm = () => ({ periodMonth: '', energyTypeCode: '', organizationScope: '整体', budgetValue: undefined, unit: '', remark: '', status: 'active' });
@@ -138,7 +138,7 @@ const page = ref(1); const pageSize = ref(20); const pagination = ref({ total: 0
 const comparisonSummary = ref({ totalsByUnit: [], unitMismatchCount: 0, comparableRowCount: 0, summaryUnit: null });
 const energyTypes = ref([]); const energyTypesError = ref(''); const loading = ref(false); const listError = ref(''); const statsError = ref(''); const comparisonError = ref('');
 const visualUnit = ref(''); const structureDimension = ref('energy'); const comparisonUnit = ref(''); const trendTooltip = ref(null); const structureTooltip = ref(null); const comparisonTooltip = ref(null);
-const exportLoading = ref(false); const templateLoading = ref(false); const demoExampleLoading = ref(false); const statusLoadingId = ref(null);
+const exportLoading = ref(false); const templateLoading = ref(false); const statusLoadingId = ref(null);
 const editDrawerOpen = ref(false); const editingId = ref(null); const budgetForm = ref(emptyForm()); const budgetFormRef = ref(); const saving = ref(false); const formError = ref('');
 const importDrawerOpen = ref(false); const executeDrawerOpen = ref(false); const importFile = ref(null); const importPreview = ref(null); const previewLoading = ref(false); const executeLoading = ref(false); const importError = ref(''); const executeError = ref(''); const confirmText = ref('');
 const budgetRules = { periodMonth: [{ required: true, message: '请选择预算月份。', trigger: 'change' }], energyTypeCode: [{ required: true, message: '请选择 active 能源类型。', trigger: 'change' }], organizationScope: [{ required: true, message: '请填写组织范围。', trigger: 'blur' }], budgetValue: [{ required: true, type: 'number', message: '请输入大于等于 0 的预算值。', trigger: 'change' }] };
@@ -164,7 +164,7 @@ const canExecuteImport = computed(() => Boolean(importPreview.value?.batchId && 
 function formatNumber(value, digits = 2) { return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: digits }).format(numberValue(value)); }
 function formatInteger(value) { return formatNumber(value, 0); }
 function formatPercent(value) { return value === null || value === undefined ? '—' : `${formatNumber(numberValue(value) * 100, 1)}%`; }
-function formatDateTime(value) { return value ? String(value).replace('T', ' ').replace(/\.\d+Z$/, '') : '—'; }
+function formatDateTime(value) { return formatStrictUtcDateTimeDisplay(value); }
 function xFor(index, total) { return total <= 1 ? 334 : 62 + (index * 544) / (total - 1); }
 function yFor(value) { return 196 - (numberValue(value) / trendMax.value) * 152; }
 function percentage(value, maximum) { return Math.max(2, Math.min(100, (numberValue(value) / maximum) * 100)); }
@@ -201,8 +201,6 @@ function openEdit(row) { editingId.value = row.id; budgetForm.value = { periodMo
 async function saveBudget() { if (formBlocked.value) return; const valid = await budgetFormRef.value?.validate().catch(() => false); if (!valid) return; saving.value = true; formError.value = ''; const payload = { ...budgetForm.value }; const result = await safe(() => editingId.value ? updateEnergyBudget(editingId.value, payload) : createEnergyBudget(payload)); saving.value = false; if (!result.ok) { formError.value = requestError(result); return; } editDrawerOpen.value = false; ElMessage.success(editingId.value ? '预算已更新。' : '预算已新增。'); await loadData(); }
 async function confirmStatus(row) { const status = nextBudgetStatus(row.status); const action = status === 'inactive' ? '停用' : '启用'; try { await ElMessageBox.confirm(`${action}“${row.periodMonth} ${row.energyTypeName || row.energyTypeCode} / ${row.organizationScope}”预算？${status === 'inactive' ? '停用不是物理删除，记录会保留追溯且不参与执行对比。' : '启用后该预算可重新参与执行对比。'}`, `确认${action}`, { type: status === 'inactive' ? 'warning' : 'info', confirmButtonText: `确认${action}`, cancelButtonText: '取消' }); } catch { return; } statusLoadingId.value = row.id; const result = await safe(() => updateEnergyBudgetStatus(row.id, status)); statusLoadingId.value = null; if (!result.ok) { ElMessage.error(`预算${action}失败：${requestError(result)}`); return; } ElMessage.success(`预算已${action}。`); await loadData(); }
 async function downloadTemplate() { templateLoading.value = true; const result = await safe(() => downloadEnergyBudgetTemplate()); templateLoading.value = false; if (!result.ok) ElMessage.error(`模板下载失败：${requestError(result)}`); }
-/** 下载用能预算青岚园区示例，不自动进入预演或执行。 */
-async function downloadDemoExample() { demoExampleLoading.value = true; const result = await safe(downloadEnergyBudgetDemoParkExample); demoExampleLoading.value = false; if (!result.ok) ElMessage.error(`青岚园区示例下载失败：${requestError(result)}`); }
 async function exportCurrent() { exportLoading.value = true; const result = await safe(() => exportEnergyBudgets(buildBudgetFilters(appliedFilters.value, { page: page.value, pageSize: pageSize.value }))); exportLoading.value = false; if (!result.ok) ElMessage.error(`预算导出失败：${requestError(result)}`); }
 function openImport() { importDrawerOpen.value = true; importFile.value = null; importPreview.value = null; importError.value = ''; executeError.value = ''; confirmText.value = ''; }
 function selectImportFile(file) { importFile.value = file.raw || null; importPreview.value = null; importError.value = ''; }

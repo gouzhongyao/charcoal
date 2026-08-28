@@ -31,6 +31,10 @@ const GENERATION_VALUE_FIELDS = Object.freeze([
   'self_use_value_kwh',
   'grid_export_value_kwh'
 ]);
+// 发电记录首期使用的 photovoltaic 能源类型编码。
+const PHOTOVOLTAIC_GENERATION_SOURCE_CODE = 'photovoltaic';
+// 自发电在能效平衡中统一计入的 electricity 消费口径编码。
+const ELECTRICITY_BALANCE_SCOPE_CODE = 'electricity';
 // 单次来源映射最多允许显式引用的记录数。
 const MAX_SOURCE_RECORD_IDS = 500;
 // 单次计算最多读取的来源记录数。
@@ -1377,6 +1381,18 @@ function isSourceInBoundary(boundaryOrganization, sourceOrganizationPath) {
 }
 
 /**
+ * 判断发电事实能源类型是否可计入目标平衡能源范围。
+ * @param {string} balanceEnergyTypeCode 平衡项目能源类型编码。
+ * @param {string} sourceEnergyTypeCode 发电事实能源类型编码。
+ * @returns {boolean} 是否兼容。
+ */
+function isGenerationEnergyTypeCompatible(balanceEnergyTypeCode, sourceEnergyTypeCode) {
+  return sourceEnergyTypeCode === balanceEnergyTypeCode
+    || (balanceEnergyTypeCode === ELECTRICITY_BALANCE_SCOPE_CODE
+      && sourceEnergyTypeCode === PHOTOVOLTAIC_GENERATION_SOURCE_CODE);
+}
+
+/**
  * 判断显式边起止节点组织是否完整落在边界组织自身或后代范围。
  * @param {object|null} boundaryOrganization 边界组织。
  * @param {string|null} fromOrganizationPath 起点组织路径。
@@ -1653,11 +1669,13 @@ function resolveGenerationSource(
   const valueColumn = mapping.valueField;
   const rows = db.prepare(
     `SELECT record.id, record.energy_type_id AS energyTypeId,
+            source_energy.code AS energyTypeCode,
             record.organization_unit_id AS organizationUnitId,
             organization.unit_path AS organizationUnitPath,
             record.normalized_month AS normalizedMonth,
             record.${valueColumn} AS value
      FROM generation_records AS record
+     JOIN energy_types AS source_energy ON source_energy.id = record.energy_type_id
      JOIN organization_units AS organization ON organization.id = record.organization_unit_id
      WHERE record.id IN (${idPlaceholders(mapping.recordIds)})
        AND record.record_status = 'active'
@@ -1668,7 +1686,7 @@ function resolveGenerationSource(
   let totalValue = 0;
   rows.forEach((row) => {
     if (!expectedMonths.includes(row.normalizedMonth)
-      || Number(row.energyTypeId) !== item.energyType.id
+      || !isGenerationEnergyTypeCompatible(item.energyType.code, row.energyTypeCode)
       || !isSourceInBoundary(boundaryOrganization, row.organizationUnitPath)) {
       reasonCodes.push('BALANCE_ITEM_UNMAPPED');
       return;
@@ -1684,7 +1702,11 @@ function resolveGenerationSource(
       return;
     }
     totalValue += convertedValue;
-    sourceRows.push({ id: Number(row.id), month: row.normalizedMonth, value: roundAnalysisValue(convertedValue) });
+    sourceRows.push({
+      id: Number(row.id),
+      month: row.normalizedMonth,
+      value: roundAnalysisValue(convertedValue)
+    });
   });
   const coveredMonths = new Set(sourceRows.map((row) => row.month));
   const coverageRate = expectedMonths.length === 0

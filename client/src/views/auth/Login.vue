@@ -12,7 +12,6 @@
             @keyup.enter="submit" /></el-form-item><el-button type="primary" class="login-button" :loading="loading"
           @click="submit">登录</el-button></el-form>
       <div class="auth-links"><router-link to="/register">注册账号</router-link>
-        <!-- <a href="/legacy.html" target="_blank">迁移期旧版入口</a> -->
       </div>
     </section>
   </main>

@@ -216,48 +216,23 @@ try {
     legacyDb.close();
   }
 
-  initDatabase();
-  initDatabase();
-
-  const upgradedDb = openDatabase();
+  assert.throws(
+    () => initDatabase(),
+    (error) => error?.code === 'SCHEMA_FINGERPRINT_MISMATCH'
+  );
+  const rejectedDb = openDatabase();
   try {
-    assert(importBatchesImportTypeCheckAllowsAuditTypes(getCreateSql(upgradedDb, 'import_batches')), '旧库 import_type CHECK 应升级到 production/generation 新类型。');
-    assert(importBatchesHasAuditColumns(getTableColumns(upgradedDb, 'import_batches')), '旧库升级后应包含审计字段。');
-    const legacyBatch = upgradedDb.prepare("SELECT * FROM import_batches WHERE original_filename = 'legacy-energy.xlsx'").get();
-    assert(legacyBatch, '旧 import_batches 数据应保留。');
-    assert.strictEqual(legacyBatch.import_type, 'energy_record');
-    assert.strictEqual(legacyBatch.status, 'completed_with_errors');
-    assert.strictEqual(legacyBatch.audit_phase, null, '旧批次新增 audit_phase 默认 NULL。');
-    assert.strictEqual(legacyBatch.backup_json, null, '旧批次新增 backup_json 默认 NULL。');
-    const retainedLegacyError = upgradedDb.prepare("SELECT * FROM import_errors WHERE batch_id = ? AND error_code = 'LEGACY_ERROR_RETAINED'").get(legacyBatch.id);
-    assert(retainedLegacyError, 'import_batches 重建后既有 import_errors 明细应保留。');
-    assert.strictEqual(retainedLegacyError.severity, 'warning');
-    const productionBatchId = upgradedDb.prepare("INSERT INTO import_batches (import_type, original_filename, file_type, status, audit_phase, total_rows, success_count, failure_count, skipped_count) VALUES ('production_output', 'legacy-production.csv', 'csv', 'completed', 'execute', 1, 1, 0, 0)").run().lastInsertRowid;
-    const generationBatchId = upgradedDb.prepare("INSERT INTO import_batches (import_type, original_filename, file_type, status, audit_phase, total_rows, success_count, failure_count, skipped_count) VALUES ('generation_record', 'legacy-generation.csv', 'csv', 'completed', 'execute', 1, 1, 0, 0)").run().lastInsertRowid;
-    expectedConfigurationImportTypes.forEach((importType) => {
-      upgradedDb.prepare('INSERT INTO import_batches (import_type, original_filename, file_type) VALUES (?, ?, ?)')
-        .run(importType, `legacy-${importType}.xlsx`, 'xlsx');
-    });
-    assert.strictEqual(
-      upgradedDb.prepare(`SELECT COUNT(*) AS total FROM import_batches WHERE import_type IN (${expectedConfigurationImportTypes.map(() => '?').join(', ')})`).get(...expectedConfigurationImportTypes).total,
-      expectedConfigurationImportTypes.length,
-      '旧库迁移后 CHECK 必须允许六类配置导入批次。'
-    );
-    assert.strictEqual(migrateImportBatchesImportTypeCheck(upgradedDb), false, '升级完成后再次执行 import type 迁移必须幂等。');
-    assert(getTableColumns(upgradedDb, 'production_units').includes('source_batch_id'), '旧 production_units 应补充 source_batch_id。');
-    assert(getTableColumns(upgradedDb, 'production_units').includes('source_row_number'), '旧 production_units 应补充 source_row_number。');
-    assert.strictEqual(upgradedDb.prepare("SELECT COUNT(*) AS total FROM production_units WHERE remark = '旧产能单元保留' AND source_batch_id IS NULL AND source_row_number IS NULL").get().total, 1, '旧 production_units 数据应保留且 source 默认 NULL。');
-    assert.strictEqual(upgradedDb.prepare("SELECT COUNT(*) AS total FROM production_output_records WHERE remark = '旧产量保留' AND source_batch_id IS NULL AND source_row_number IS NULL").get().total, 1, '旧 production_output_records 应保留且 source 默认 NULL。');
-    assert.strictEqual(upgradedDb.prepare("SELECT COUNT(*) AS total FROM generation_records WHERE remark = '旧发电保留' AND source_batch_id IS NULL AND source_row_number IS NULL").get().total, 1, '旧 generation_records 应保留且 source 默认 NULL。');
-    upgradedDb.prepare("INSERT INTO production_output_records (source_batch_id, source_row_number, production_unit_id, normalized_month, output_value, output_unit, data_source, record_status, created_at, updated_at) VALUES (?, 8, ?, '2026-05', 6, '件', 'upload', 'active', datetime('now'), datetime('now'))").run(productionBatchId, legacyProductionUnitId);
-    upgradedDb.prepare("INSERT INTO generation_records (source_batch_id, source_row_number, organization_unit_id, energy_type_id, normalized_month, generation_value_kwh, self_use_value_kwh, grid_export_value_kwh, data_source, record_status, created_at, updated_at) VALUES (?, 9, ?, ?, '2026-05', 70, 50, 20, 'upload', 'active', datetime('now'), datetime('now'))").run(generationBatchId, legacyOrganizationUnitId, legacyPhotovoltaicId);
-    assert(getIndexNames(upgradedDb, 'import_batches').includes('idx_import_batches_type_status_created'), '重建 import_batches 后应保留 type/status 索引。');
-    assert(getIndexNames(upgradedDb, 'production_units').includes('idx_production_units_batch'), '旧库升级后应在补列后创建 production unit source batch 索引。');
-    assert(getIndexNames(upgradedDb, 'production_output_records').includes('idx_production_output_records_batch'), '旧库升级后应创建 production source batch 索引。');
-    assert(getIndexNames(upgradedDb, 'generation_records').includes('idx_generation_records_batch'), '旧库升级后应创建 generation source batch 索引。');
-    assert.deepStrictEqual(upgradedDb.prepare('PRAGMA foreign_key_check').all(), [], '隔离库升级后 foreign_key_check 应通过。');
+    assert.strictEqual(importBatchesHasAuditColumns(getTableColumns(rejectedDb, 'import_batches')), false,
+      'fingerprint 拒绝不得自动补充旧 import_batches 审计列。');
+    assert.strictEqual(rejectedDb.prepare("SELECT COUNT(*) AS total FROM import_batches WHERE original_filename = 'legacy-energy.xlsx'").get().total, 1,
+      'fingerprint 拒绝不得删除旧导入批次。');
+    assert.strictEqual(rejectedDb.prepare("SELECT COUNT(*) AS total FROM import_errors WHERE error_code = 'LEGACY_ERROR_RETAINED'").get().total, 1,
+      'fingerprint 拒绝不得删除旧导入错误。');
+    assert.strictEqual(getTableColumns(rejectedDb, 'production_units').includes('source_batch_id'), false);
+    assert.strictEqual(getTableColumns(rejectedDb, 'production_output_records').includes('source_batch_id'), false);
+    assert.strictEqual(getTableColumns(rejectedDb, 'generation_records').includes('source_batch_id'), false);
   } finally {
-    upgradedDb.close();
+    rejectedDb.close();
   }
 
   assert(buildImportBatchesImportTypeMigrationSql().some((sql) => sql.includes("'production_output'")), '旧库迁移 SQL 应扩展 production_output。');

@@ -140,21 +140,29 @@ function createDeletionFixture(db, suffix, options = {}) {
   if (importType === 'energy_record') {
     // 电力能源类型用于满足能耗记录外键。
     const electricityId = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
+    // canonical 用能单元用于满足能耗记录必填外键。
+    const organizationUnitId = Number(db.prepare(`INSERT INTO organization_units
+      (unit_code, unit_name, unit_path, unit_type, status)
+      VALUES (?, ?, ?, 'department', 'active')`).run(
+      `ENERGY-DELETE-${suffix}`,
+      `能耗删除闭环 ${suffix}`,
+      `/ENERGY-DELETE-${suffix}`
+    ).lastInsertRowid);
     // 能耗记录插入语句用于按夹具数量生成真实批次数据。
     const insertEnergyRecord = db.prepare(
       `INSERT INTO energy_records (
          source_batch_id,
          source_row_number,
          energy_type_id,
+         organization_unit_id,
          original_month,
          normalized_month,
          original_unit,
          original_value,
          normalized_unit,
          normalized_value,
-         organization,
          duplicate_key
-       ) VALUES (?, ?, ?, '2026-08', '2026-08', 'kWh', ?, 'kWh', ?, '删除闭环测试', ?)`
+       ) VALUES (?, ?, ?, ?, '2026-08', '2026-08', 'kWh', ?, 'kWh', ?, ?)`
     );
     // 旧碳结果插入语句用于构造不依赖碳因子的 factor_missing 追溯记录。
     const insertCarbonEmission = db.prepare(
@@ -174,6 +182,7 @@ function createDeletionFixture(db, suffix, options = {}) {
         batchId,
         recordIndex + 1,
         electricityId,
+        organizationUnitId,
         energyValue,
         energyValue,
         `import-batch-delete-${suffix}-${recordIndex}`

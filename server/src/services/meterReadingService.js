@@ -1,13 +1,16 @@
 const fs = require('fs');
 const crypto = require('crypto');
+const path = require('path');
+const { spawnSync } = require('child_process');
 const XLSX = require('xlsx');
-const { openDatabase } = require('../db/database');
-const { badRequest, notFound } = require('../utils/errors');
+const { backupsDir, databasePath, openDatabase } = require('../db/database');
+const { AppError, badRequest, notFound } = require('../utils/errors');
 const { decodeUploadOriginalName } = require('../utils/filenameEncoding');
 const { createBackup } = require('./backupService');
 const { assertSupportedImportFile, parseImportFile } = require('./import/parser');
 const { normalizeMonth, normalizeUnitAndValue } = require('./import/normalization');
 const { normalizePagination } = require('./ledgerService');
+const { insertOperationLogWithDb } = require('./energyStrategyEvaluationService');
 
 const READING_STATUSES = Object.freeze(['active', 'void']);
 const READING_DATA_SOURCES = Object.freeze(['manual', 'upload', 'calculation']);
@@ -1046,27 +1049,56 @@ function mapGenerationPreviewRow(row, conflictRow) {
   return item;
 }
 
-function buildMeterReadingEnergyRecordGenerationPreviewWithDb(db, query = {}) {
-  const filters = normalizeGenerationFilters(query);
-  const detailLimit = normalizeGenerationDetailLimit(query);
+/** 校验服务端显式传入的抄表主键集合，禁止重复、非 canonical 或空范围。 */
+function normalizeExactGenerationReadingIds(readingIds) {
+  if (!Array.isArray(readingIds) || readingIds.length === 0) {
+    throw new AppError('METER_READING_GENERATION_SCOPE_EMPTY', '抄表生成范围必须是服务端解析出的非空精确主键集合。', { statusCode: 409 });
+  }
+  const normalized = readingIds.map((readingId) => {
+    if (!Number.isSafeInteger(readingId) || readingId <= 0) {
+      throw new AppError('METER_READING_GENERATION_SCOPE_INVALID', '抄表生成范围包含无效主键。', { statusCode: 409 });
+    }
+    return readingId;
+  }).sort((left, right) => left - right);
+  if (new Set(normalized).size !== normalized.length) {
+    throw new AppError('METER_READING_GENERATION_SCOPE_DUPLICATE', '抄表生成范围包含重复主键。', { statusCode: 409 });
+  }
+  return normalized;
+}
+
+/** 读取正式生成预演所需字段；筛选入口与服务端精确主键入口共用同一字段合同。 */
+function selectGenerationPreviewRows(db, options = {}) {
+  const baseSql = `SELECT mrr.id, mrr.meter_device_id AS meterDeviceId, md.meter_code AS meterCode, md.meter_name AS meterName,
+      md.status AS meterStatus, md.organization_unit_id AS meterOrganizationUnitId,
+      mrr.organization_unit_id AS organizationUnitId, ou.unit_path AS organizationUnitPath,
+      ou.status AS organizationUnitStatus, mrr.energy_type_id AS energyTypeId, et.code AS energyTypeCode,
+      et.name AS energyTypeName, et.is_active AS energyTypeActive, mrr.reading_date AS readingDate,
+      mrr.normalized_month AS normalizedMonth, mrr.usage_value AS usageValue, mrr.original_unit AS originalUnit,
+      mrr.normalized_unit AS normalizedUnit, mrr.normalized_usage_value AS normalizedUsageValue,
+      mrr.record_status AS recordStatus, mrr.generated_energy_record_id AS generatedEnergyRecordId
+    FROM meter_reading_records mrr
+    LEFT JOIN meter_devices md ON md.id = mrr.meter_device_id
+    LEFT JOIN organization_units ou ON ou.id = mrr.organization_unit_id
+    LEFT JOIN energy_types et ON et.id = mrr.energy_type_id`;
+  if (Array.isArray(options.readingIds)) {
+    const readingIds = normalizeExactGenerationReadingIds(options.readingIds);
+    const placeholders = readingIds.map(() => '?').join(', ');
+    const rows = db.prepare(`${baseSql} WHERE mrr.id IN (${placeholders})
+      ORDER BY mrr.normalized_month ASC, mrr.id ASC`).all(...readingIds);
+    const actualIds = rows.map((row) => Number(row.id)).sort((left, right) => left - right);
+    assertSameArray(actualIds, readingIds, 'METER_READING_GENERATION_SCOPE_MISMATCH', '服务端精确抄表范围与当前业务行集合不一致。');
+    return rows;
+  }
+  const filters = options.filters || {};
+  const detailLimit = options.detailLimit;
   const { whereSql, params } = buildGenerationPreviewWhere(filters);
-  const rows = db.prepare(
-    `SELECT mrr.id, mrr.meter_device_id AS meterDeviceId, md.meter_code AS meterCode, md.meter_name AS meterName,
-            md.status AS meterStatus, md.organization_unit_id AS meterOrganizationUnitId,
-            mrr.organization_unit_id AS organizationUnitId, ou.unit_path AS organizationUnitPath,
-            ou.status AS organizationUnitStatus, mrr.energy_type_id AS energyTypeId, et.code AS energyTypeCode,
-            et.name AS energyTypeName, et.is_active AS energyTypeActive, mrr.reading_date AS readingDate,
-            mrr.normalized_month AS normalizedMonth, mrr.usage_value AS usageValue, mrr.original_unit AS originalUnit,
-            mrr.normalized_unit AS normalizedUnit, mrr.normalized_usage_value AS normalizedUsageValue,
-            mrr.record_status AS recordStatus, mrr.generated_energy_record_id AS generatedEnergyRecordId
-     FROM meter_reading_records mrr
-     LEFT JOIN meter_devices md ON md.id = mrr.meter_device_id
-     LEFT JOIN organization_units ou ON ou.id = mrr.organization_unit_id
-     LEFT JOIN energy_types et ON et.id = mrr.energy_type_id
-     ${whereSql}
-     ORDER BY mrr.normalized_month ASC, mrr.id ASC
-     LIMIT @detailLimit`
-  ).all({ ...params, detailLimit });
+  return db.prepare(`${baseSql} ${whereSql}
+    ORDER BY mrr.normalized_month ASC, mrr.id ASC
+    LIMIT @detailLimit`).all({ ...params, detailLimit });
+}
+
+/** 对已精确读取的业务行复用正式冲突、重复和跳过分类算法。 */
+function buildGenerationPreviewFromRows(db, rows, options = {}) {
   const conflictStatement = db.prepare(
     `SELECT id, duplicate_key AS duplicateKey
      FROM energy_records
@@ -1090,9 +1122,7 @@ function buildMeterReadingEnergyRecordGenerationPreviewWithDb(db, query = {}) {
       item.reasonCodes = item.reasons.map((reason) => reason.code).join('|');
       item.reasonText = item.reasons.map((reason) => reason.message).join('；');
     }
-    if (item.wouldGenerate) {
-      seenGenerationKeys.add(item.duplicateKey);
-    }
+    if (item.wouldGenerate) seenGenerationKeys.add(item.duplicateKey);
     return item;
   });
   const summary = summarizeGenerationItems(items);
@@ -1104,8 +1134,8 @@ function buildMeterReadingEnergyRecordGenerationPreviewWithDb(db, query = {}) {
     carbonAccountingDeferred: true,
     confirmText: METER_READING_GENERATION_CONFIRM_TEXT,
     backupReason: METER_READING_GENERATION_BACKUP_REASON,
-    filters,
-    detailLimit,
+    filters: options.filters || {},
+    detailLimit: options.detailLimit === undefined ? items.length : options.detailLimit,
     summary,
     candidateReadingIds,
     items,
@@ -1117,6 +1147,35 @@ function buildMeterReadingEnergyRecordGenerationPreviewWithDb(db, query = {}) {
   };
   preview.previewSignature = buildGenerationPreviewSignature(preview);
   return preview;
+}
+
+/** 使用旧正式筛选合同构建生成预演，保持既有路由兼容。 */
+function buildMeterReadingEnergyRecordGenerationPreviewWithDb(db, query = {}) {
+  const filters = normalizeGenerationFilters(query);
+  const detailLimit = normalizeGenerationDetailLimit(query);
+  return buildGenerationPreviewFromRows(
+    db,
+    selectGenerationPreviewRows(db, { filters, detailLimit }),
+    { filters, detailLimit }
+  );
+}
+
+/** 使用服务端精确 readingIds 构建预演，并冻结所有分类字段作为防陈旧证据。 */
+function buildMeterReadingEnergyRecordGenerationExactPreviewWithDb(db, readingIds) {
+  const normalizedReadingIds = normalizeExactGenerationReadingIds(readingIds);
+  const preview = buildGenerationPreviewFromRows(
+    db,
+    selectGenerationPreviewRows(db, { readingIds: normalizedReadingIds }),
+    { filters: {}, detailLimit: normalizedReadingIds.length }
+  );
+  return {
+    ...preview,
+    exactScopeDigest: sha256Json({
+      version: 'meter-reading-energy-record-generation-exact-scope:v1',
+      readingIds: normalizedReadingIds,
+      items: preview.items
+    })
+  };
 }
 
 function getMeterReadingEnergyRecordGenerationPreview(query = {}) {
@@ -1218,7 +1277,8 @@ function assertSameArray(actual, expected, code, message) {
   }
 }
 
-function buildEnergyRecordInsertPayloadFromGenerationItem(item, now = getNow()) {
+function buildEnergyRecordInsertPayloadFromGenerationItem(item, now = getNow(), options = {}) {
+  const actionTrace = options.actionRunId ? `；action_run_id=${options.actionRunId}` : '';
   return {
     sourceBatchId: null,
     sourceRowNumber: null,
@@ -1231,12 +1291,466 @@ function buildEnergyRecordInsertPayloadFromGenerationItem(item, now = getNow()) 
     originalValue: item.usageValue,
     normalizedUnit: item.normalizedUnit,
     normalizedValue: item.normalizedUsageValue,
-    organization: item.organizationUnitPath,
-    meterCode: item.meterCode,
-    businessDimension: 'meter-reading-generation',
-    remark: `由抄表记录生成；meter_reading_record_id=${item.readingId}；碳核算联动后置。`,
+    remark: `由抄表记录生成；meter_reading_record_id=${item.readingId}${actionTrace}；碳核算联动后置。`,
     duplicateKey: item.duplicateKey,
     now
+  };
+}
+
+/** 规范化不同平台的物理路径比较值，避免 Windows 大小写差异影响目录边界。 */
+function normalizeMeterReadingPhysicalPath(filePath) {
+  const resolved = path.resolve(filePath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+/** 判断物理路径是否严格位于真实备份目录内，使用目录边界而不是字符串前缀。 */
+function isMeterReadingPhysicalPathInside(basePath, targetPath) {
+  const relative = path.relative(
+    normalizeMeterReadingPhysicalPath(basePath),
+    normalizeMeterReadingPhysicalPath(targetPath)
+  );
+  return relative !== ''
+    && relative !== '..'
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative);
+}
+
+/** 构造不含本机路径的备份证据路径错误。 */
+function createMeterReadingBackupEvidenceError(code, message) {
+  return new AppError(code, message, { statusCode: 409 });
+}
+
+/** 判断文件系统异常是否表示证据路径已经不存在。 */
+function isMissingMeterReadingBackupPathError(error) {
+  return error && ['ENOENT', 'ENOTDIR'].includes(error.code);
+}
+
+/** 将目录身份字段规范为可稳定比较的字符串。 */
+function normalizeMeterReadingStatIdentityValue(value) {
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return null;
+}
+
+/** 读取文件系统状态中的有效设备号；部分 Windows 文件系统会返回 0。 */
+function getMeterReadingEffectiveDevice(stat) {
+  if (!stat || stat.dev === 0 || stat.dev === 0n) return null;
+  return normalizeMeterReadingStatIdentityValue(stat.dev);
+}
+
+/** 生成不依赖路径字符串的备份目录身份快照。 */
+function buildMeterReadingBackupDirectoryIdentity(stat) {
+  return Object.freeze({
+    symbolicLink: stat.isSymbolicLink(),
+    directory: stat.isDirectory(),
+    ino: normalizeMeterReadingStatIdentityValue(stat.ino),
+    effectiveDev: getMeterReadingEffectiveDevice(stat),
+    birthtimeMs: normalizeMeterReadingStatIdentityValue(stat.birthtimeMs)
+  });
+}
+
+/** 比较两份备份目录身份，覆盖链接状态、目录类型、inode、有效设备号和创建时间。 */
+function isSameMeterReadingBackupDirectoryIdentity(leftIdentity, rightIdentity) {
+  return leftIdentity.symbolicLink === rightIdentity.symbolicLink
+    && leftIdentity.directory === rightIdentity.directory
+    && leftIdentity.ino !== null
+    && leftIdentity.ino === rightIdentity.ino
+    && leftIdentity.effectiveDev === rightIdentity.effectiveDev
+    && leftIdentity.birthtimeMs !== null
+    && leftIdentity.birthtimeMs === rightIdentity.birthtimeMs;
+}
+
+/** 构造备份目录在校验期间发生替换时的稳定 fail-closed 错误。 */
+function createMeterReadingBackupDirectoryChangedError() {
+  return createMeterReadingBackupEvidenceError(
+    'METER_READING_GENERATION_BACKUP_EVIDENCE_STALE',
+    '抄表生成备份目录身份已发生变化。'
+  );
+}
+
+/**
+ * 对配置备份目录执行 lstat → realpath → lstat 身份快照。
+ * Node/Windows 无法锁定祖先目录，本快照用于缩小并检测可观察到的替换窗口。
+ */
+function captureMeterReadingBackupDirectoryIdentity(configuredBase, options = {}) {
+  const expectedSnapshot = options.expectedSnapshot || null;
+  try {
+    const beforeStat = fs.lstatSync(configuredBase);
+    if (!beforeStat.isDirectory() || beforeStat.isSymbolicLink()) {
+      if (expectedSnapshot) throw createMeterReadingBackupDirectoryChangedError();
+      throw createMeterReadingBackupEvidenceError(
+        'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+        '抄表生成备份目录无效。'
+      );
+    }
+    const beforeIdentity = buildMeterReadingBackupDirectoryIdentity(beforeStat);
+    const realBase = fs.realpathSync(configuredBase);
+    const afterStat = fs.lstatSync(configuredBase);
+    const afterIdentity = buildMeterReadingBackupDirectoryIdentity(afterStat);
+    if (!afterStat.isDirectory() || afterStat.isSymbolicLink()
+      || !isSameMeterReadingBackupDirectoryIdentity(beforeIdentity, afterIdentity)) {
+      throw createMeterReadingBackupDirectoryChangedError();
+    }
+    const realBaseStat = fs.lstatSync(realBase);
+    const realBaseIdentity = buildMeterReadingBackupDirectoryIdentity(realBaseStat);
+    if (!realBaseStat.isDirectory() || realBaseStat.isSymbolicLink()
+      || !isSameMeterReadingBackupDirectoryIdentity(afterIdentity, realBaseIdentity)) {
+      throw createMeterReadingBackupDirectoryChangedError();
+    }
+    const snapshot = Object.freeze({
+      configuredBase,
+      realBase,
+      identity: afterIdentity
+    });
+    if (expectedSnapshot
+      && (normalizeMeterReadingPhysicalPath(snapshot.realBase)
+        !== normalizeMeterReadingPhysicalPath(expectedSnapshot.realBase)
+        || !isSameMeterReadingBackupDirectoryIdentity(snapshot.identity, expectedSnapshot.identity))) {
+      throw createMeterReadingBackupDirectoryChangedError();
+    }
+    return snapshot;
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw createMeterReadingBackupEvidenceError(
+      isMissingMeterReadingBackupPathError(error)
+        ? 'METER_READING_GENERATION_BACKUP_EVIDENCE_STALE'
+        : 'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+      isMissingMeterReadingBackupPathError(error)
+        ? '抄表生成备份已不存在或路径发生变化。'
+        : '抄表生成备份目录校验失败。'
+    );
+  }
+}
+
+/** 在关键读取节点重新执行目录身份快照并与首次身份比较。 */
+function assertMeterReadingBackupDirectoryIdentity(snapshot) {
+  return captureMeterReadingBackupDirectoryIdentity(snapshot.configuredBase, {
+    expectedSnapshot: snapshot
+  });
+}
+
+/** 校验配置备份目录和证据路径的物理边界，并拒绝所有可检测的符号链接段。 */
+function assertMeterReadingBackupPath(backupPath) {
+  if (typeof backupPath !== 'string' || backupPath.trim() === '') {
+    throw createMeterReadingBackupEvidenceError(
+      'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+      '抄表生成备份证据路径不完整。'
+    );
+  }
+  const configuredBase = path.resolve(backupsDir);
+  const target = path.resolve(backupPath);
+  const relative = path.relative(configuredBase, target);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw createMeterReadingBackupEvidenceError(
+      'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+      '抄表生成备份证据不属于当前备份目录。'
+    );
+  }
+  const directorySnapshot = captureMeterReadingBackupDirectoryIdentity(configuredBase);
+
+  let currentPath = configuredBase;
+  for (const segment of relative.split(path.sep)) {
+    currentPath = path.join(currentPath, segment);
+    let segmentStat;
+    try {
+      segmentStat = fs.lstatSync(currentPath);
+    } catch (error) {
+      throw createMeterReadingBackupEvidenceError(
+        isMissingMeterReadingBackupPathError(error)
+          ? 'METER_READING_GENERATION_BACKUP_EVIDENCE_STALE'
+          : 'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+        isMissingMeterReadingBackupPathError(error)
+          ? '抄表生成备份已不存在或路径发生变化。'
+          : '抄表生成备份路径校验失败。'
+      );
+    }
+    if (segmentStat.isSymbolicLink()) {
+      throw createMeterReadingBackupEvidenceError(
+        'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+        '抄表生成备份证据路径禁止经过符号链接。'
+      );
+    }
+  }
+
+  let targetStat;
+  let realTarget;
+  try {
+    targetStat = fs.lstatSync(target);
+    if (targetStat.isSymbolicLink()) {
+      throw createMeterReadingBackupEvidenceError(
+        'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+        '抄表生成备份证据文件禁止为符号链接。'
+      );
+    }
+    if (!targetStat.isFile()) {
+      throw createMeterReadingBackupEvidenceError(
+        'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+        '抄表生成备份证据文件必须是普通文件。'
+      );
+    }
+    realTarget = fs.realpathSync(target);
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw createMeterReadingBackupEvidenceError(
+      isMissingMeterReadingBackupPathError(error)
+        ? 'METER_READING_GENERATION_BACKUP_EVIDENCE_STALE'
+        : 'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+      isMissingMeterReadingBackupPathError(error)
+        ? '抄表生成备份已不存在或路径发生变化。'
+        : '抄表生成备份文件路径校验失败。'
+    );
+  }
+  if (!isMeterReadingPhysicalPathInside(directorySnapshot.realBase, realTarget)) {
+    throw createMeterReadingBackupEvidenceError(
+      'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+      '抄表生成备份证据不属于当前备份目录。'
+    );
+  }
+  assertMeterReadingBackupDirectoryIdentity(directorySnapshot);
+  return { target, targetStat, realTarget, directorySnapshot };
+}
+
+/** 比较路径 lstat 与已打开句柄 fstat 的稳定文件身份。 */
+function isSameMeterReadingFileIdentity(pathStat, openedStat) {
+  if (pathStat.ino !== openedStat.ino) return false;
+  if (pathStat.dev && openedStat.dev && pathStat.dev !== openedStat.dev) return false;
+  return pathStat.birthtimeMs === openedStat.birthtimeMs;
+}
+
+/** 比较同一只读句柄读取前后的身份、大小和时间状态。 */
+function isSameMeterReadingOpenedFileState(beforeStat, afterStat) {
+  return isSameMeterReadingFileIdentity(beforeStat, afterStat)
+    && beforeStat.size === afterStat.size
+    && beforeStat.mtimeMs === afterStat.mtimeMs
+    && beforeStat.ctimeMs === afterStat.ctimeMs;
+}
+
+/** 在写事务外通过正式备份服务子进程同步准备证据，保持现有同步 post-action 路由合同。 */
+function prepareMeterReadingGenerationBackupEvidence() {
+  const backupServicePath = require.resolve('./backupService');
+  const childSource = `'use strict';\nconst { createBackup } = require(${JSON.stringify(backupServicePath)});\ncreateBackup({ reason: ${JSON.stringify(METER_READING_GENERATION_BACKUP_REASON)} })\n  .then((backup) => process.stdout.write(JSON.stringify(backup)))\n  .catch((error) => { process.stderr.write(JSON.stringify({ code: error && error.code ? error.code : 'BACKUP_FAILED' })); process.exitCode = 1; });`;
+  const child = spawnSync(process.execPath, ['-e', childSource], {
+    env: { ...process.env },
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    windowsHide: true
+  });
+  if (child.error || child.status !== 0) {
+    throw new AppError('METER_READING_GENERATION_BACKUP_PREPARE_FAILED', '抄表生成写入前备份失败。', { statusCode: 409 });
+  }
+  let evidence;
+  try {
+    evidence = JSON.parse(String(child.stdout || ''));
+  } catch (_error) {
+    evidence = null;
+  }
+  return revalidateMeterReadingGenerationBackupEvidence(evidence);
+}
+
+/** 在 outer transaction 内重验事务外备份的物理路径、句柄状态、大小和 SHA。 */
+function revalidateMeterReadingGenerationBackupEvidence(evidence) {
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)
+    || evidence.reason !== METER_READING_GENERATION_BACKUP_REASON
+    || typeof evidence.backupName !== 'string'
+    || path.basename(evidence.backupName) !== evidence.backupName
+    || !evidence.backupName.includes(METER_READING_GENERATION_BACKUP_REASON)
+    || typeof evidence.path !== 'string'
+    || typeof evidence.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(evidence.sha256)
+    || !Number.isSafeInteger(evidence.sizeBytes) || evidence.sizeBytes <= 0
+    || path.resolve(String(evidence.databasePath || '')) !== path.resolve(databasePath)) {
+    throw createMeterReadingBackupEvidenceError(
+      'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+      '抄表生成备份证据不完整或与当前数据库不一致。'
+    );
+  }
+
+  const pathContext = assertMeterReadingBackupPath(evidence.path);
+  if (path.basename(pathContext.target) !== evidence.backupName) {
+    throw createMeterReadingBackupEvidenceError(
+      'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+      '抄表生成备份证据文件名校验失败。'
+    );
+  }
+
+  let fileDescriptor = null;
+  let validationError = null;
+  try {
+    const noFollowFlag = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
+    assertMeterReadingBackupDirectoryIdentity(pathContext.directorySnapshot);
+    fileDescriptor = fs.openSync(pathContext.target, fs.constants.O_RDONLY | noFollowFlag);
+    assertMeterReadingBackupDirectoryIdentity(pathContext.directorySnapshot);
+    const beforeStat = fs.fstatSync(fileDescriptor);
+    if (!beforeStat.isFile()
+      || !isSameMeterReadingFileIdentity(pathContext.targetStat, beforeStat)
+      || beforeStat.size !== evidence.sizeBytes) {
+      throw createMeterReadingBackupEvidenceError(
+        'METER_READING_GENERATION_BACKUP_EVIDENCE_STALE',
+        '抄表生成备份内容已发生变化。'
+      );
+    }
+    assertMeterReadingBackupDirectoryIdentity(pathContext.directorySnapshot);
+    const buffer = fs.readFileSync(fileDescriptor);
+    const afterStat = fs.fstatSync(fileDescriptor);
+    assertMeterReadingBackupDirectoryIdentity(pathContext.directorySnapshot);
+    if (!isSameMeterReadingOpenedFileState(beforeStat, afterStat)
+      || buffer.length !== beforeStat.size) {
+      throw createMeterReadingBackupEvidenceError(
+        'METER_READING_GENERATION_BACKUP_EVIDENCE_STALE',
+        '抄表生成备份内容已发生变化。'
+      );
+    }
+    const currentSha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+    if (currentSha256 !== evidence.sha256) {
+      throw createMeterReadingBackupEvidenceError(
+        'METER_READING_GENERATION_BACKUP_EVIDENCE_STALE',
+        '抄表生成备份内容已发生变化。'
+      );
+    }
+    assertMeterReadingBackupDirectoryIdentity(pathContext.directorySnapshot);
+  } catch (error) {
+    validationError = error instanceof AppError
+      ? error
+      : createMeterReadingBackupEvidenceError(
+        isMissingMeterReadingBackupPathError(error)
+          ? 'METER_READING_GENERATION_BACKUP_EVIDENCE_STALE'
+          : 'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+        isMissingMeterReadingBackupPathError(error)
+          ? '抄表生成备份已不存在或路径发生变化。'
+          : '抄表生成备份文件不可读取。'
+      );
+  } finally {
+    if (fileDescriptor !== null) {
+      try {
+        fs.closeSync(fileDescriptor);
+      } catch (_error) {
+        if (!validationError) {
+          validationError = createMeterReadingBackupEvidenceError(
+            'METER_READING_GENERATION_BACKUP_EVIDENCE_INVALID',
+            '抄表生成备份文件关闭失败。'
+          );
+        }
+      }
+    }
+  }
+  if (validationError) throw validationError;
+  assertMeterReadingBackupDirectoryIdentity(pathContext.directorySnapshot);
+
+  return Object.freeze({
+    backupName: evidence.backupName,
+    path: pathContext.target,
+    sizeBytes: evidence.sizeBytes,
+    sha256: evidence.sha256,
+    reason: evidence.reason,
+    method: String(evidence.method || ''),
+    databasePath: path.resolve(databasePath)
+  });
+}
+
+/** 复用正式生成写入算法；事务生命周期、备份和范围校验均由调用入口负责。 */
+function applyMeterReadingEnergyRecordGenerationWithDb(db, preview, options = {}) {
+  const insertEnergyRecord = db.prepare(
+    `INSERT INTO energy_records (
+       source_batch_id, source_row_number, energy_type_id, organization_unit_id, meter_device_id,
+       original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value,
+       remark, duplicate_key, record_status, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+  );
+  const updateReading = db.prepare(`UPDATE meter_reading_records
+    SET generated_energy_record_id = ?, updated_at = ?
+    WHERE id = ? AND record_status = 'active' AND generated_energy_record_id IS NULL`);
+  const readReadingAuditState = db.prepare(`SELECT updated_at AS updatedAt
+    FROM meter_reading_records WHERE id = ?`);
+  const generatedPairs = [];
+  const skippedItems = [];
+  preview.items.forEach((item) => {
+    if (!item.wouldGenerate) {
+      skippedItems.push({
+        readingId: item.readingId,
+        status: item.status,
+        reasonCodes: item.reasonCodes,
+        reason: item.reasonText,
+        conflictEnergyRecordId: item.conflictEnergyRecordId || null
+      });
+      return;
+    }
+    const readingBefore = readReadingAuditState.get(item.readingId);
+    if (!readingBefore || typeof readingBefore.updatedAt !== 'string') {
+      throw new AppError('METER_READING_GENERATION_SOURCE_MISSING', '抄表生成来源在写入前已不可读取。', { statusCode: 409 });
+    }
+    const payload = buildEnergyRecordInsertPayloadFromGenerationItem(item, getNow(), {
+      actionRunId: options.actionRunId
+    });
+    const insertResult = insertEnergyRecord.run(
+      payload.sourceBatchId, payload.sourceRowNumber, payload.energyTypeId,
+      payload.organizationUnitId, payload.meterDeviceId, payload.originalMonth,
+      payload.normalizedMonth, payload.originalUnit, payload.originalValue,
+      payload.normalizedUnit, payload.normalizedValue, payload.remark,
+      payload.duplicateKey, payload.now, payload.now
+    );
+    const energyRecordId = Number(insertResult.lastInsertRowid);
+    const updatedAt = getNow();
+    const updateResult = updateReading.run(energyRecordId, updatedAt, item.readingId);
+    if (updateResult.changes !== 1) {
+      throw new AppError('METER_READING_GENERATION_BACK_REFERENCE_FAILED', '抄表记录回写生成能耗记录失败。', { statusCode: 409 });
+    }
+    if (Number.isSafeInteger(options.actorUserId) && options.actorUserId > 0 && options.actionRunId) {
+      insertOperationLogWithDb(db, {
+        userId: options.actorUserId,
+        operation: 'ledger.meter-reading.generate-energy-record',
+        targetType: 'energy_record',
+        targetId: energyRecordId,
+        detail: {
+          actionRunId: options.actionRunId,
+          meterReadingRecordId: item.readingId,
+          sourceUpdatedAt: readingBefore.updatedAt,
+          updatedAt
+        },
+        ip: options.actorIp || null,
+        createdAt: updatedAt
+      });
+    }
+    generatedPairs.push({
+      readingId: item.readingId,
+      energyRecordId,
+      normalizedMonth: item.normalizedMonth,
+      normalizedUnit: item.normalizedUnit,
+      normalizedValue: item.normalizedUsageValue,
+      duplicateKey: item.duplicateKey,
+      previousUpdatedAt: readingBefore.updatedAt,
+      updatedAt
+    });
+  });
+  return { generatedPairs, skippedItems };
+}
+
+/** 在调用方 outer transaction 中按精确 reading scope 写入，并返回内部可追溯生成对。 */
+function executeMeterReadingEnergyRecordGenerationExact(options = {}) {
+  const db = options.db;
+  if (!db || db.inTransaction !== true) {
+    throw new AppError('METER_READING_GENERATION_OUTER_TRANSACTION_REQUIRED', '抄表生成必须复用调用方 outer SQLite transaction。', { statusCode: 409 });
+  }
+  if (!Number.isSafeInteger(options.actorUserId) || options.actorUserId <= 0
+    || typeof options.actionRunId !== 'string' || options.actionRunId.trim() === '') {
+    throw new AppError('METER_READING_GENERATION_AUDIT_CONTEXT_REQUIRED', '抄表生成必须绑定有效操作者和后置动作运行。', { statusCode: 409 });
+  }
+  const readingIds = normalizeExactGenerationReadingIds(options.readingIds);
+  const preview = buildMeterReadingEnergyRecordGenerationExactPreviewWithDb(db, readingIds);
+  if (typeof options.expectedExactScopeDigest !== 'string'
+    || preview.exactScopeDigest !== options.expectedExactScopeDigest) {
+    throw new AppError('METER_READING_GENERATION_INPUT_STALE', '抄表生成精确范围或领域状态已发生变化。', { statusCode: 409 });
+  }
+  if (preview.summary.wouldGenerate > 0) {
+    revalidateMeterReadingGenerationBackupEvidence(options.backupEvidence);
+  }
+  const applied = applyMeterReadingEnergyRecordGenerationWithDb(db, preview, options);
+  return {
+    generated: applied.generatedPairs.length,
+    updatedReadings: applied.generatedPairs.length,
+    skipped: applied.skippedItems.length,
+    summary: preview.summary,
+    exactScopeDigest: preview.exactScopeDigest,
+    generatedPairs: applied.generatedPairs,
+    skippedItems: applied.skippedItems
   };
 }
 
@@ -1270,60 +1784,32 @@ async function executeMeterReadingEnergyRecordGeneration(body = {}) {
         throw badRequest('expectedWouldGenerate 与执行前重新计算结果不一致，已拒绝执行。', { code: 'METER_READING_GENERATION_WOULD_GENERATE_MISMATCH', expected: preview.summary.wouldGenerate, actual: expectedWouldGenerate });
       }
       assertSameArray(preview.candidateReadingIds, candidateReadingIds, 'METER_READING_GENERATION_CANDIDATE_READING_IDS_MISMATCH', 'candidateReadingIds 与执行前重新计算结果不一致，已拒绝执行。');
-      const insertEnergyRecord = db.prepare(
-        `INSERT INTO energy_records (
-           source_batch_id, source_row_number, energy_type_id, organization_unit_id, meter_device_id,
-           original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value,
-           organization, meter_code, business_dimension, remark, duplicate_key, record_status, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
-      );
-      const updateReading = db.prepare('UPDATE meter_reading_records SET generated_energy_record_id = ?, updated_at = ? WHERE id = ? AND record_status = \'active\' AND generated_energy_record_id IS NULL');
-      const items = [];
-      let generated = 0;
-      let updatedReadings = 0;
-      preview.items.forEach((item) => {
-        if (!item.wouldGenerate) {
-          items.push({ readingId: item.readingId, status: 'skipped', previewStatus: item.status, reason: item.reasonText, conflictEnergyRecordId: item.conflictEnergyRecordId || null });
-          return;
-        }
-        const payload = buildEnergyRecordInsertPayloadFromGenerationItem(item, getNow());
-        const insertResult = insertEnergyRecord.run(
-          payload.sourceBatchId,
-          payload.sourceRowNumber,
-          payload.energyTypeId,
-          payload.organizationUnitId,
-          payload.meterDeviceId,
-          payload.originalMonth,
-          payload.normalizedMonth,
-          payload.originalUnit,
-          payload.originalValue,
-          payload.normalizedUnit,
-          payload.normalizedValue,
-          payload.organization,
-          payload.meterCode,
-          payload.businessDimension,
-          payload.remark,
-          payload.duplicateKey,
-          payload.now,
-          payload.now
-        );
-        const energyRecordId = Number(insertResult.lastInsertRowid);
-        const updateResult = updateReading.run(energyRecordId, getNow(), item.readingId);
-        if (updateResult.changes !== 1) {
-          throw badRequest('抄表记录回写 generated_energy_record_id 失败，事务已回滚。', { code: 'METER_READING_GENERATION_BACK_REFERENCE_FAILED', readingId: item.readingId, energyRecordId });
-        }
-        generated += 1;
-        updatedReadings += updateResult.changes;
-        items.push({ readingId: item.readingId, energyRecordId, status: 'generated', previewStatus: item.status, duplicateKey: item.duplicateKey, reason: '已生成 active energy_records 并回写 generated_energy_record_id。' });
-      });
+      const applied = applyMeterReadingEnergyRecordGenerationWithDb(db, preview);
+      const items = [
+        ...applied.generatedPairs.map((pair) => ({
+          readingId: pair.readingId,
+          energyRecordId: pair.energyRecordId,
+          status: 'generated',
+          previewStatus: 'wouldGenerate',
+          duplicateKey: pair.duplicateKey,
+          reason: '已生成 active energy_records 并回写 generated_energy_record_id。'
+        })),
+        ...applied.skippedItems.map((item) => ({
+          readingId: item.readingId,
+          status: 'skipped',
+          previewStatus: item.status,
+          reason: item.reason,
+          conflictEnergyRecordId: item.conflictEnergyRecordId
+        }))
+      ].sort((left, right) => left.readingId - right.readingId);
       return {
         executed: true,
         dryRun: false,
         writesEnergyRecords: true,
         carbonAccountingDeferred: true,
-        generated,
-        updatedReadings,
-        skipped: items.filter((item) => item.status === 'skipped').length,
+        generated: applied.generatedPairs.length,
+        updatedReadings: applied.generatedPairs.length,
+        skipped: applied.skippedItems.length,
         skippedConflict: preview.summary.conflict,
         skippedVoid: preview.summary.void,
         skippedAlreadyGenerated: preview.summary.alreadyGenerated,
@@ -1382,10 +1868,12 @@ module.exports = {
   buildMeterReadingExportRows,
   buildMeterReadingImportIndexes,
   buildMeterReadingPayload,
+  buildMeterReadingEnergyRecordGenerationExactPreviewWithDb,
   calculateUsageValue,
   createMeterReading,
   createMeterReadingImportBatchFromUpload,
   executeMeterReadingEnergyRecordGeneration,
+  executeMeterReadingEnergyRecordGenerationExact,
   exportMeterReadingEnergyRecordGenerationPreview,
   exportMeterReadings,
   formatGenerationExportFilters,
@@ -1395,6 +1883,8 @@ module.exports = {
   mapMeterReadingImportFields,
   normalizeReadingDate,
   normalizeReadingUnit,
+  prepareMeterReadingGenerationBackupEvidence,
+  revalidateMeterReadingGenerationBackupEvidence,
   updateMeterReading,
   validateAndNormalizeMeterReadingImportRow,
   voidMeterReading

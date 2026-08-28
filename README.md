@@ -4,7 +4,7 @@
 
 ## 完整使用说明书
 
-面向管理员和业务用户的完整安装、权限、导入、台账、核算、预测、备份恢复及故障排查说明，请从 [能碳管理平台使用说明书](docs/使用说明书/README.md) 进入。需要从空隔离库完成青岚智造园区 25 项导入、主动计算和中控验收时，直接阅读 [项目使用步骤](docs/使用说明书/项目使用步骤.md)。根 README 保留开发启动与临时演示要点，具体业务操作、风险边界和功能覆盖状态以正式使用说明书为准。
+面向管理员和业务用户的完整安装、权限、导入、台账、核算、预测、备份恢复及故障排查说明，请从 [能碳管理平台使用说明书](docs/使用说明书/README.md) 进入。需要从空隔离库按当前 29 项 manifest 完成导入、主动计算和中控验收时，直接阅读 [项目使用步骤](docs/使用说明书/项目使用步骤.md)。根 README 保留开发启动与临时演示要点，具体业务操作、风险边界和功能覆盖状态以正式使用说明书为准。
 
 ## 功能概览
 
@@ -140,7 +140,7 @@ Vite 开发服务器启用严格文件服务边界：`server.fs.strict=true`，`
 1. 执行 `npm install`，从 `.env.example` 复制根 `.env`；全新库首次创建或 inactive 管理员恢复前填写至少 8 位的 `CHARCOAL_ADMIN_PASSWORD`。
 2. 本地排障分别执行 `npm run dev:server` 和 `npm run dev:client`，打开 `http://127.0.0.1:7777/`；临时公网演示使用 `npm run dev:cloudflare`。
 3. 日常业务操作按 [正式使用说明书](docs/使用说明书/README.md) 选择对应章节。
-4. 首次演示或完整验收必须使用隔离 `DATA_DIR`，并按 [青岚智造园区项目使用步骤](docs/使用说明书/项目使用步骤.md) 执行备份、25 项领域导入、主动计算和最终验收。
+4. 首次演示或完整验收必须使用隔离 `DATA_DIR`，并按 [天坤集团项目使用步骤](docs/使用说明书/项目使用步骤.md) 执行当前 29 项领域导入、主动计算和最终验收。
 5. 不要把所有文件交给通用导入中心：每个模板必须进入对应领域页面；普通能耗支持 `.xlsx/.xls/.csv`，新式单表受控导入通常只支持 `.xlsx/.csv`，多工作表只支持 `.xlsx`。
 
 ## 使用 Cloudflare Tunnel 进行外网访问
@@ -150,6 +150,8 @@ Vite 开发服务器启用严格文件服务边界：`server.fs.strict=true`，`
 Cloudflare Tunnel 适合临时给同事或设备体验本地页面，也可以在拥有 Cloudflare 域名时配置同一个公网域名按路径转发前端和后端。
 
 当前项目已有本地登录、RBAC 权限和审计边界，但 Cloudflare Tunnel 不会额外提供生产级 HTTPS 终止治理、公网访问控制或安全防护。请只在可信、短期、脱敏的隔离环境中演示，不要把包含真实企业能耗、碳因子、备份恢复等敏感数据或管理能力的本地实例直接暴露到公网。
+
+用户指定的 `https://higher-things-strongly-decent.trycloudflare.com/?apiBase=%2Fapi` 不能由当前 Quick Tunnel 命令固定、保留或保证下一次启动仍指向本机。该地址只能在 Cloudflare 当次实际将流量路由到对应 Tunnel 时有效；启动器不会把它冒充为当前启动结果。
 
 ### 前置步骤
 
@@ -179,13 +181,13 @@ cloudflared 原始日志可能提前出现随机域名，但域名分配不代�
 [share] 公网链路已就绪
 ```
 
-正式分享只使用 `[share] 完整分享 URL`，不得复制此前 cloudflared 原始日志中的随机域名。Quick Tunnel URL 随机且重启后会变化，不落盘保存。不要启动第二条 API Tunnel，不要把公网绝对地址写入 API Base、CORS 或长期配置。停止时启动器按 Tunnel → Vite → Express 清理，只处理自己拥有的 PID；不按名称或端口杀未知进程，也不承诺 SIGKILL、断电或系统崩溃时完成清理。
+正式分享只使用 `[share] 完整分享 URL`，不得复制此前 cloudflared 原始日志中的随机域名。Quick Tunnel URL 随机且重启后会变化，不落盘保存，也不支持指定或保留某个 `trycloudflare.com` 子域名；把历史地址硬编码到启动器输出、浏览器打开逻辑或环境变量，不会让 Cloudflare 将该地址重新路由到当前进程。不要启动第二条 API Tunnel，不要把公网绝对地址写入 API Base、CORS 或长期配置。停止时启动器按 Tunnel → Vite → Express 清理，只处理自己拥有的 PID；不按名称或端口杀未知进程，也不承诺 SIGKILL、断电或系统崩溃时完成清理。
 
 `npm run dev:server` 与 `npm run dev:client` 保留为本地排障和 Tunnel 前安全预检入口。当前开发机已安装并真实运行官方 cloudflared 2026.8.2：本地 Express、Vite 和同源代理已通过，但首次公网 `/api/health` 最终超时并触发清理；本轮可靠性与 Vite 公网安全边界修复后的下一节点是用户先完成本地 403/404 安全预检，只有通过后才进行真实 Tunnel 复测。不得写成公网链路已经通过。完整配置、分阶段诊断和手工验收见[第 13 章](docs/使用说明书/13-临时外网访问.md)、[第 14 章](docs/使用说明书/14-限制风险与故障排查.md)和[Cloudflare 一键手册](docs/Cloudflare临时外网访问手册.md)。
 
 ### 命名隧道与固定域名（不属于一键 Quick Tunnel）
 
-如果你有 Cloudflare 管理的域名，也可以另行设计命名隧道，把同一个域名的 `/api/*` 转发到后端，其余路径转发到前端。该方案不由 `npm run dev:cloudflare` 创建或管理，不得把下列示例视为当前一键入口的自动配置。示例配置：
+如果你有 Cloudflare 管理的域名，也可以另行设计命名隧道，把同一个域名的 `/api/*` 转发到后端，其余路径转发到前端。固定入口必须使用该自有 Zone 下的主机名；`cloudflared --hostname` 不能为当前无账号 Quick Tunnel 保留指定的 `trycloudflare.com` 子域名。该方案不由 `npm run dev:cloudflare` 创建或管理，不得把下列示例视为当前一键入口的自动配置。示例配置：
 
 ```yaml
 tunnel: energy-carbon-demo
@@ -311,4 +313,15 @@ Quick Tunnel 场景先确认日志已依次完成“公网域名已发现”“E
 
 ### 想重置演示数据
 
-先停止前后端服务，备份或移动当前 `data/` 目录，再重新启动后端。后端启动时会初始化本地数据目录和 SQLite 数据库。请谨慎操作，避免误删真实数据。
+不要直接删除、移动或依赖后端启动自动重建当前 `data/`。默认数据库整库格式化必须使用受控 CLI。npm 入口默认、`--check` 和 `--verify` 可用；Windows 正式 execute 推荐直接使用 Node 入口，避免 npm 参数转发歧义：
+
+```bash
+npm run format:default-db
+npm run format:default-db -- --check
+npm run format:default-db -- --verify
+node scripts/format-default-database.js --execute "FORMAT data/energy-carbon.sqlite; CLEAR data/uploads; KEEP data/backups"
+```
+
+正确的正式确认文本必须作为 `--execute` 后的单个参数逐字符一致，不附加其他确认参数。`--check` 和 `--verify` 只读；`--verify` 使用严格 readonly、临时副本及 data/正式 SQLite/WAL/SHM/uploads/backups 前后完整快照保护诊断，uploads 缺失时不自动创建。主库及存在的 WAL/SHM sidecar 会在快照、checkpoint、备份和 staging 边界执行 lstat、普通文件、realpath containment 与单链接检查。`--execute` 只允许项目默认路径、精确确认文本、可确认停写、合法管理员密码、充分磁盘空间、已验证 manual backup、trusted schema profile、candidate 和回滚安全门。既有 `data/backups` 文件必须保留。
+
+截至 2026-08-28，正式 execute 已完成：新库 schema 为 `2026-08-28-formal-canonical-v3`，新库 quick/integrity/FK 通过，uploads 已清空，历史 backups 保留并新增已验证 manual backup，服务已恢复。当前应从《项目演示操作说明.md》01 开始进行页面和 01—29 全流程手工验收；不能把当前登录注销后产生的审计记录写成空，也不能把 API 复核写成浏览器、视觉或 Excel/WPS 已通过。完整操作、备份恢复和当前证据见[备份恢复与维护态](docs/使用说明书/12-备份恢复与维护态.md)。

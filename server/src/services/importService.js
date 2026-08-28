@@ -354,16 +354,10 @@ function persistImportResult(db, context) {
        original_value,
        normalized_unit,
        normalized_value,
-       organization,
-       site,
-       department,
-       production_line,
-       meter_code,
-       business_dimension,
        remark,
        duplicate_key,
        record_status
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
   );
   const updateBatch = db.prepare(
     `UPDATE import_batches
@@ -465,12 +459,6 @@ function persistImportResult(db, context) {
         record.originalValue,
         record.normalizedUnit,
         record.normalizedValue,
-        record.organization,
-        record.site,
-        record.department,
-        record.productionLine,
-        record.meterCode,
-        record.businessDimension,
         record.remark,
         record.duplicateKey
       );
@@ -1120,17 +1108,17 @@ function listEnergyRecords(query = {}) {
     where.push('et.code = @energyTypeCode');
     params.energyTypeCode = query.energyTypeCode;
   }
-  if (query.organization) {
-    where.push('er.organization = @organization');
-    params.organization = query.organization;
+  if (query.organizationUnitId) {
+    where.push('er.organization_unit_id = @organizationUnitId');
+    params.organizationUnitId = Number.parseInt(query.organizationUnitId, 10);
   }
-  if (query.site) {
-    where.push('er.site = @site');
-    params.site = query.site;
+  if (query.organizationUnitCode) {
+    where.push('ou.unit_code = @organizationUnitCode');
+    params.organizationUnitCode = String(query.organizationUnitCode).trim();
   }
-  if (query.department) {
-    where.push('er.department = @department');
-    params.department = query.department;
+  if (query.meterDeviceId) {
+    where.push('er.meter_device_id = @meterDeviceId');
+    params.meterDeviceId = Number.parseInt(query.meterDeviceId, 10);
   }
   if (query.sourceBatchId) {
     where.push('er.source_batch_id = @sourceBatchId');
@@ -1144,6 +1132,8 @@ function listEnergyRecords(query = {}) {
       `SELECT COUNT(*) AS total
        FROM energy_records er
        JOIN energy_types et ON et.id = er.energy_type_id
+       JOIN organization_units ou ON ou.id = er.organization_unit_id
+       LEFT JOIN meter_devices md ON md.id = er.meter_device_id
        ${whereSql}`
     ).get(params).total;
     const rows = db.prepare(
@@ -1159,18 +1149,21 @@ function listEnergyRecords(query = {}) {
          er.original_value AS originalValue,
          er.normalized_unit AS normalizedUnit,
          er.normalized_value AS normalizedValue,
-         er.organization,
-         er.site,
-         er.department,
-         er.production_line AS productionLine,
-         er.meter_code AS meterCode,
-         er.business_dimension AS businessDimension,
+         er.organization_unit_id AS organizationUnitId,
+         ou.unit_code AS organizationUnitCode,
+         ou.unit_name AS organizationUnitName,
+         ou.unit_path AS organizationUnitPath,
+         er.meter_device_id AS meterDeviceId,
+         md.meter_code AS meterCode,
+         md.meter_name AS meterName,
          er.remark,
          er.duplicate_key AS duplicateKey,
          er.created_at AS createdAt,
          er.updated_at AS updatedAt
        FROM energy_records er
        JOIN energy_types et ON et.id = er.energy_type_id
+       JOIN organization_units ou ON ou.id = er.organization_unit_id
+       LEFT JOIN meter_devices md ON md.id = er.meter_device_id
        ${whereSql}
        ORDER BY er.normalized_month DESC, et.display_order ASC, er.id DESC
        LIMIT @pageSize OFFSET @offset`

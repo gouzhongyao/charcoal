@@ -27,8 +27,14 @@ const {
   validateTemplateHeaders,
   validateTemplateSheetCollection
 } = require('../services/energyAnalysisTemplateService');
+const {
+  formatStrictUtcForUser,
+  formatWallClockMinuteForUser,
+  normalizeUserVisibleStrictUtcInput,
+  normalizeUserVisibleWallClockMinuteInput
+} = require('../utils/userVisibleDateTime');
 
-// 十三类模板 ID 独立硬编码，避免测试从生产对象反向生成预期。
+// 十四类模板 ID 独立硬编码，避免测试从生产对象反向生成预期。
 const EXPECTED_TEMPLATE_IDS = Object.freeze([
   'energy-timeseries',
   'shift-definitions',
@@ -39,6 +45,7 @@ const EXPECTED_TEMPLATE_IDS = Object.freeze([
   'energy-conversion-factors',
   'energy-benchmark-definitions',
   'energy-benchmark-targets',
+  'energy-flow-workbook',
   'energy-flow-models',
   'energy-balance-configs',
   'energy-flow-nodes',
@@ -262,10 +269,10 @@ function findTestZipEocd(buffer) {
   return -1;
 }
 
-// 模板列表必须精确覆盖八个已批准 ID，且顺序稳定。
+// 模板列表必须精确覆盖十四个已批准 ID，且顺序稳定。
 const listedTemplates = listEnergyAnalysisTemplates();
 assert.deepStrictEqual(listedTemplates.map((template) => template.id), EXPECTED_TEMPLATE_IDS);
-assert.strictEqual(new Set(listedTemplates.map((template) => template.id)).size, 13);
+assert.strictEqual(new Set(listedTemplates.map((template) => template.id)).size, 14);
 assert.deepStrictEqual(listTemplates().map((template) => template.id), EXPECTED_TEMPLATE_IDS, '通用列表别名必须保持兼容。');
 assert.strictEqual(getTemplateDefinition('energy-timeseries').id, 'energy-timeseries');
 assert.strictEqual(getTemplateCsv('energy-timeseries').format, 'csv');
@@ -277,6 +284,48 @@ assert.strictEqual(validateSheetCollection, validateTemplateSheetCollection);
 assert.strictEqual(normalizeTemplateHeader(' 开始_时间-（UTC）/ '), '开始时间utc');
 assert.strictEqual(normalizeTemplateHeader('Energy_Type-Code'), 'energytypecode');
 assert.strictEqual(normalizeTemplateHeader('来源\\标识'), '来源标识');
+
+// 用户可见 UTC 与来源墙钟必须使用分离纯函数，保持原分量且不经过服务器本地时区换算。
+assert.strictEqual(formatStrictUtcForUser('2026-08-24T01:05:06Z'), '2026-08-24 01:05:06');
+assert.strictEqual(formatStrictUtcForUser('2026-08-24T01:05:06.789Z'), '2026-08-24 01:05:06');
+assert.strictEqual(normalizeUserVisibleStrictUtcInput('2026-08-24 01:05:06'), '2026-08-24T01:05:06Z');
+assert.strictEqual(normalizeUserVisibleStrictUtcInput('2026-08-24T01:05:06Z'), '2026-08-24T01:05:06Z');
+assert.strictEqual(normalizeUserVisibleStrictUtcInput('2026-08-24T01:05:06.000Z'), '2026-08-24T01:05:06Z');
+assert.strictEqual(normalizeUserVisibleStrictUtcInput(''), null);
+assert.strictEqual(normalizeUserVisibleStrictUtcInput(null), null);
+assert.strictEqual(formatStrictUtcForUser(undefined), '');
+assert.throws(
+  () => normalizeUserVisibleStrictUtcInput('2026-08-24T01:05:06.001Z'),
+  (error) => error?.code === 'STRICT_UTC_INPUT_PRECISION_INVALID'
+);
+[
+  '2026-02-29 01:05:06',
+  '2026-08-24T01:05:06+08:00',
+  '2026-08-24',
+  '2026-08'
+].forEach((value) => assert.throws(
+  () => normalizeUserVisibleStrictUtcInput(value),
+  (error) => error?.code === 'STRICT_UTC_INPUT_INVALID',
+  `${value} 不得被猜测为严格 UTC。`
+));
+assert.strictEqual(formatWallClockMinuteForUser('2026-08-24T09:05'), '2026-08-24 09:05:00');
+assert.strictEqual(normalizeUserVisibleWallClockMinuteInput('2026-08-24 09:05:00'), '2026-08-24T09:05');
+assert.strictEqual(normalizeUserVisibleWallClockMinuteInput('2026-08-24T09:05'), '2026-08-24T09:05');
+assert.strictEqual(normalizeUserVisibleWallClockMinuteInput('  '), null);
+assert.strictEqual(formatWallClockMinuteForUser(null), '');
+assert.throws(
+  () => normalizeUserVisibleWallClockMinuteInput('2026-08-24 09:05:01'),
+  (error) => error?.code === 'WALL_CLOCK_INPUT_SECOND_MUST_BE_ZERO'
+);
+[
+  '2026-02-29 09:05:00',
+  '2026-08-24 09:05',
+  '2026-08-24T09:05Z'
+].forEach((value) => assert.throws(
+  () => normalizeUserVisibleWallClockMinuteInput(value),
+  (error) => error?.code === 'WALL_CLOCK_INPUT_INVALID',
+  `${value} 不得被猜测为来源墙钟。`
+));
 
 // 运营模板的组织列与排班状态说明必须精确匹配受控导入契约。
 const shiftScheduleDefinition = getEnergyAnalysisTemplateDefinition('shift-schedules');
@@ -292,8 +341,10 @@ const deviceStartUtcColumn = deviceStateDefinition.sheets[0].columns.find((colum
 const deviceEndUtcColumn = deviceStateDefinition.sheets[0].columns.find((column) => column.key === 'endUtc');
 assert.strictEqual(deviceOrganizationColumn.required, true);
 assert.strictEqual(deviceOrganizationColumn.description, '填写已维护且启用的 equipment 类型设备组织编码。');
-assert.strictEqual(deviceStartUtcColumn.description, '填写状态区间开始时间；区间在数据库 Unix 整秒边界下必须具有有效持续时间。');
-assert.strictEqual(deviceEndUtcColumn.description, '填写状态区间结束时间；区间在数据库 Unix 整秒边界下必须具有有效持续时间。');
+assert(deviceStartUtcColumn.description.startsWith('填写状态区间开始时间；区间在数据库 Unix 整秒边界下必须具有有效持续时间。'));
+assert(deviceEndUtcColumn.description.startsWith('填写状态区间结束时间；区间在数据库 Unix 整秒边界下必须具有有效持续时间。'));
+assert(deviceStartUtcColumn.description.includes('YYYY-MM-DD HH:mm:ss'));
+assert(deviceEndUtcColumn.description.includes('YYYY-MM-DDTHH:mm:ssZ'));
 
 // 规范 Buffer 解析入口必须在零数据行时仍保留原始标题数组并执行必需标题校验。
 const headerOnlyCsv = Buffer.from(`﻿${shiftScheduleDefinition.headers.map((header) => `"${header}"`).join(',')}\n`, 'utf8');
@@ -391,6 +442,82 @@ Object.entries(EXPECTED_SINGLE_SHEET_TEMPLATES).forEach(([templateId, expected])
   assert.deepStrictEqual(xlsxResult.headers, expected.headers);
 });
 assert.strictEqual(observedAsciiNames.size, 20, '十类模板的 CSV/XLSX ASCII fallback 必须全部唯一。');
+
+// 新生成的用户文件只改明确 UTC 单元格，日期/月形态普通文本保持原值，回导恢复内部 Z 秒精度合同。
+const userVisibleTimeseriesRows = [[
+  'electricity', 'OU-001', 'M-001', '2026-07-14T16:00:00Z', '2026-07-14T16:15:00Z',
+  'Asia/Shanghai', 15, 'kWh', 25.5, '2026-07', '2026-07-14'
+]];
+const userVisibleTimeseriesXlsx = generateEnergyAnalysisTemplate('energy-timeseries', 'xlsx', {
+  rows: userVisibleTimeseriesRows
+});
+const userVisibleTimeseriesWorkbook = XLSX.read(userVisibleTimeseriesXlsx.buffer, { type: 'buffer' });
+const userVisibleTimeseriesMatrix = XLSX.utils.sheet_to_json(
+  userVisibleTimeseriesWorkbook.Sheets['能耗时序'],
+  { header: 1, defval: '' }
+);
+assert.deepStrictEqual(userVisibleTimeseriesMatrix[1].slice(3, 6), [
+  '2026-07-14 16:00:00', '2026-07-14 16:15:00', 'Asia/Shanghai'
+]);
+assert.deepStrictEqual(userVisibleTimeseriesMatrix[1].slice(9, 11), ['2026-07', '2026-07-14']);
+assert.deepStrictEqual(userVisibleTimeseriesRows[0].slice(3, 5), [
+  '2026-07-14T16:00:00Z', '2026-07-14T16:15:00Z'
+], '用户文件投影不得反向修改内部演示数据数组。');
+const parsedUserVisibleTimeseriesXlsx = parseEnergyAnalysisTemplateBuffer(
+  'energy-timeseries',
+  userVisibleTimeseriesXlsx.buffer,
+  'energy-timeseries.xlsx'
+);
+assert.strictEqual(parsedUserVisibleTimeseriesXlsx.valid, true);
+assert.deepStrictEqual(parsedUserVisibleTimeseriesXlsx.sheets[0].rows[0], {
+  sourceRowNumber: 2,
+  energyTypeCode: 'electricity',
+  organizationUnitCode: 'OU-001',
+  meterCode: 'M-001',
+  startUtc: '2026-07-14T16:00:00Z',
+  endUtc: '2026-07-14T16:15:00Z',
+  sourceTimeZone: 'Asia/Shanghai',
+  granularityMinutes: 15,
+  originalUnit: 'kWh',
+  originalValue: 25.5,
+  sourceReference: '2026-07',
+  dataSource: '2026-07-14'
+});
+const userVisibleTimeseriesCsv = generateEnergyAnalysisTemplate('energy-timeseries', 'csv', {
+  rows: userVisibleTimeseriesRows
+});
+const userVisibleTimeseriesCsvText = userVisibleTimeseriesCsv.buffer.toString('utf8');
+assert(userVisibleTimeseriesCsvText.includes('"2026-07-14 16:00:00"'));
+assert(userVisibleTimeseriesCsvText.includes('"2026-07-14 16:15:00"'));
+assert(userVisibleTimeseriesCsvText.includes('"2026-07"'));
+assert(userVisibleTimeseriesCsvText.includes('"2026-07-14"'));
+const parsedUserVisibleTimeseriesCsv = parseEnergyAnalysisTemplateBuffer(
+  'energy-timeseries',
+  userVisibleTimeseriesCsv.buffer,
+  'energy-timeseries.csv'
+);
+assert.strictEqual(parsedUserVisibleTimeseriesCsv.valid, true);
+assert.strictEqual(parsedUserVisibleTimeseriesCsv.sheets[0].rows[0].startUtc, '2026-07-14T16:00:00Z');
+assert.strictEqual(parsedUserVisibleTimeseriesCsv.sheets[0].rows[0].endUtc, '2026-07-14T16:15:00Z');
+
+// 历史 ISO 继续兼容；非法日历和非零毫秒不得被模板解析器静默修复或截断。
+const historicalIsoWorkbook = createSingleSheetWorkbook('能耗时序', [
+  EXPECTED_SINGLE_SHEET_TEMPLATES['energy-timeseries'].headers,
+  userVisibleTimeseriesRows[0]
+]);
+const historicalIsoResult = parseEnergyAnalysisTemplateWorkbook('energy-timeseries', historicalIsoWorkbook);
+assert.strictEqual(historicalIsoResult.valid, true);
+assert.strictEqual(historicalIsoResult.sheets[0].rows[0].startUtc, '2026-07-14T16:00:00Z');
+const invalidUtcWorkbook = createSingleSheetWorkbook('能耗时序', [
+  EXPECTED_SINGLE_SHEET_TEMPLATES['energy-timeseries'].headers,
+  ['electricity', 'OU-001', 'M-001', '2026-02-29 16:00:00', '2026-07-14T16:15:00.001Z',
+    'Asia/Shanghai', 15, 'kWh', 25.5, 'invalid-time', 'upload']
+]);
+const invalidUtcResult = parseEnergyAnalysisTemplateWorkbook('energy-timeseries', invalidUtcWorkbook);
+assert.strictEqual(invalidUtcResult.valid, false);
+assert.strictEqual(invalidUtcResult.blockingIssues.filter(
+  (issue) => issue.code === 'INVALID_TEMPLATE_CELL_TYPE' && ['startUtc', 'endUtc'].includes(issue.key)
+).length, 2);
 
 // 三类多工作表模板只支持 XLSX，必须精确包含各自冻结的两张中文工作表。
 Object.entries(EXPECTED_MULTI_SHEET_TEMPLATES).forEach(([templateId, expected]) => {
@@ -729,8 +856,8 @@ assert.strictEqual(typedBufferResult.valid, true);
 assert.strictEqual(typedObjectResult.sheets[0].rows[0].energyTypeCode, '123');
 assert.strictEqual(typedObjectResult.sheets[0].rows[0].granularityMinutes, 15);
 assert.strictEqual(typedObjectResult.sheets[0].rows[0].originalValue, 25.5);
-assert.strictEqual(typedObjectResult.sheets[0].rows[0].startUtc, '2026-07-14T16:00:00.000Z');
-assert.strictEqual(typedObjectResult.sheets[0].rows[0].endUtc, '2026-07-14T16:15:00.000Z');
+assert.strictEqual(typedObjectResult.sheets[0].rows[0].startUtc, '2026-07-14T16:00:00Z');
+assert.strictEqual(typedObjectResult.sheets[0].rows[0].endUtc, '2026-07-14T16:15:00Z');
 assert.strictEqual(typedObjectResult.sheets[0].rows[1].startUtc.endsWith('Z'), true);
 assert.strictEqual(typedObjectResult.sheets[0].rows[1].endUtc.endsWith('Z'), true);
 assert.deepStrictEqual(typedBufferResult.sheets[0].rows, typedObjectResult.sheets[0].rows);

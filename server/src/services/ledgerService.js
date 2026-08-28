@@ -777,35 +777,48 @@ function buildLedgerIndexes(input = {}) {
 
 function findLedgerAssociationsForImportRecord(record, indexes) {
   if (!record || !indexes) {
-    return { organizationUnitId: null, meterDeviceId: null };
+    throw badRequest('能耗导入缺少规范台账索引。', { code: 'ENERGY_LEDGER_INDEX_REQUIRED' });
   }
-  const organizationText = normalizeText(record.organization);
-  const meterText = normalizeText(record.meterCode);
-  let matchedUnit = null;
-  if (organizationText) {
-    matchedUnit = indexes.orgByPath.get(organizationText) || indexes.orgByCode.get(organizationText) || indexes.orgByName.get(organizationText) || null;
+  const organizationUnitCode = normalizeText(record.organizationUnitCode);
+  const meterCode = normalizeText(record.meterCode);
+  const matchedUnit = organizationUnitCode ? indexes.orgByCode.get(organizationUnitCode) || null : null;
+  if (!matchedUnit) {
+    throw badRequest('用能单元编码不存在或未启用。', {
+      code: 'UNKNOWN_ORGANIZATION_UNIT_CODE',
+      fieldName: 'organizationUnitCode',
+      organizationUnitCode
+    });
   }
 
   let matchedMeter = null;
-  if (meterText) {
-    const byCode = indexes.metersByCode.get(meterText);
-    if (
-      byCode &&
-      Number(byCode.energyTypeId) === Number(record.energyTypeId) &&
-      (!matchedUnit || Number(byCode.organizationUnitId) === Number(matchedUnit.id))
-    ) {
-      matchedMeter = byCode;
+  if (meterCode) {
+    matchedMeter = indexes.metersByCode.get(meterCode) || null;
+    if (!matchedMeter) {
+      throw badRequest('计量器具编码不存在或未启用。', {
+        code: 'UNKNOWN_METER_CODE',
+        fieldName: 'meterCode',
+        meterCode
+      });
     }
-    if (!matchedMeter && matchedUnit) {
-      const byOrgAndName = indexes.metersByOrgAndName.get(`${matchedUnit.id} ${meterText}`);
-      if (byOrgAndName && Number(byOrgAndName.energyTypeId) === Number(record.energyTypeId)) {
-        matchedMeter = byOrgAndName;
-      }
+    if (Number(matchedMeter.energyTypeId) !== Number(record.energyTypeId)) {
+      throw badRequest('计量器具能源类型与能耗记录不一致。', {
+        code: 'METER_ENERGY_TYPE_MISMATCH',
+        fieldName: 'meterCode',
+        meterCode
+      });
+    }
+    if (Number(matchedMeter.organizationUnitId) !== Number(matchedUnit.id)) {
+      throw badRequest('计量器具不属于指定用能单元。', {
+        code: 'METER_ORGANIZATION_UNIT_MISMATCH',
+        fieldName: 'meterCode',
+        meterCode,
+        organizationUnitCode
+      });
     }
   }
 
   return {
-    organizationUnitId: matchedUnit ? matchedUnit.id : null,
+    organizationUnitId: matchedUnit.id,
     meterDeviceId: matchedMeter ? matchedMeter.id : null
   };
 }
@@ -822,256 +835,6 @@ function loadActiveLedgerIndexes(db) {
      WHERE status = 'active'`
   ).all();
   return buildLedgerIndexes({ organizationUnits, meterDevices });
-}
-
-function pushMatch(map, key, value) {
-  const text = normalizeText(key);
-  if (!text) return;
-  const matches = map.get(text) || [];
-  matches.push(value);
-  map.set(text, matches);
-}
-
-function buildLedgerBackfillPreviewIndexes(input = {}) {
-  const unitsByPath = new Map();
-  const unitsByCode = new Map();
-  const unitsByName = new Map();
-  (input.organizationUnits || []).forEach((unit) => {
-    if (!unit || unit.status !== 'active') return;
-    pushMatch(unitsByPath, unit.unitPath, unit);
-    pushMatch(unitsByCode, unit.unitCode, unit);
-    pushMatch(unitsByName, unit.unitName, unit);
-  });
-
-  const metersByCode = new Map();
-  const metersByName = new Map();
-  const metersByOrgAndName = new Map();
-  (input.meterDevices || []).forEach((meter) => {
-    if (!meter || meter.status !== 'active') return;
-    pushMatch(metersByCode, meter.meterCode, meter);
-    pushMatch(metersByName, meter.meterName, meter);
-    if (meter.organizationUnitId && meter.meterName) {
-      pushMatch(metersByOrgAndName, `${meter.organizationUnitId} ${meter.meterName}`, meter);
-    }
-  });
-
-  const metersById = new Map();
-  (input.meterDevices || []).forEach((meter) => {
-    if (meter && meter.id) metersById.set(Number(meter.id), meter);
-  });
-
-  const unitsById = new Map();
-  (input.organizationUnits || []).forEach((unit) => {
-    if (unit && unit.id) unitsById.set(Number(unit.id), unit);
-  });
-
-  return { unitsByPath, unitsByCode, unitsByName, unitsById, metersByCode, metersByName, metersByOrgAndName, metersById };
-}
-
-function loadLedgerBackfillPreviewIndexes(db) {
-  const organizationUnits = db.prepare(
-    `SELECT id, unit_code AS unitCode, unit_name AS unitName, unit_path AS unitPath, status
-     FROM organization_units`
-  ).all();
-  const meterDevices = db.prepare(
-    `SELECT
-       md.id,
-       md.meter_code AS meterCode,
-       md.meter_name AS meterName,
-       md.energy_type_id AS energyTypeId,
-       et.code AS energyTypeCode,
-       et.name AS energyTypeName,
-       md.organization_unit_id AS organizationUnitId,
-       ou.unit_code AS organizationUnitCode,
-       ou.unit_name AS organizationUnitName,
-       ou.unit_path AS organizationUnitPath,
-       md.status
-     FROM meter_devices md
-     JOIN energy_types et ON et.id = md.energy_type_id
-     LEFT JOIN organization_units ou ON ou.id = md.organization_unit_id`
-  ).all();
-  return buildLedgerBackfillPreviewIndexes({ organizationUnits, meterDevices });
-}
-
-function compactLedgerCandidate(row, type) {
-  if (!row) return null;
-  if (type === 'meter') {
-    return {
-      id: row.id,
-      meterCode: row.meterCode,
-      meterName: row.meterName,
-      energyTypeId: row.energyTypeId,
-      energyTypeCode: row.energyTypeCode,
-      organizationUnitId: row.organizationUnitId,
-      organizationUnitCode: row.organizationUnitCode,
-      organizationUnitName: row.organizationUnitName,
-      organizationUnitPath: row.organizationUnitPath
-    };
-  }
-  return {
-    id: row.id,
-    unitCode: row.unitCode,
-    unitName: row.unitName,
-    unitPath: row.unitPath
-  };
-}
-
-function chooseUniqueMatch(matches = [], context = {}) {
-  const filtered = matches.filter((match) => {
-    if (!match || match.status !== 'active') return false;
-    if (context.energyTypeId && Number(match.energyTypeId) !== Number(context.energyTypeId)) return false;
-    if (context.organizationUnitId && Number(match.organizationUnitId) !== Number(context.organizationUnitId)) return false;
-    return true;
-  });
-  if (filtered.length === 0) return { status: 'missing', matches: [] };
-  if (filtered.length > 1) return { status: 'ambiguous', matches: filtered };
-  return { status: 'matched', match: filtered[0], matches: filtered };
-}
-
-function resolveOrganizationUnitBackfillCandidate(record, indexes) {
-  const sources = [
-    { field: 'organization', value: record.organization },
-    { field: 'site', value: record.site },
-    { field: 'department', value: record.department }
-  ].filter((source) => normalizeText(source.value));
-
-  if (record.organizationUnitId) {
-    const existing = indexes.unitsById.get(Number(record.organizationUnitId));
-    return existing && existing.status === 'active'
-      ? { status: 'existing', match: existing, sources: [{ field: 'organization_unit_id', value: record.organizationUnitId }] }
-      : { status: 'blocked', reasonCode: 'EXISTING_ORGANIZATION_UNIT_NOT_ACTIVE', reason: '已有关联的用能单元不存在或未启用。', sources: [{ field: 'organization_unit_id', value: record.organizationUnitId }] };
-  }
-
-  if (sources.length === 0) {
-    return { status: 'missing', reasonCode: 'NO_ORGANIZATION_SOURCE', reason: 'energy_records 缺少可用于匹配用能单元的 organization/site/department 原始字段。', sources: [] };
-  }
-
-  const matched = [];
-  const ambiguous = [];
-  sources.forEach((source) => {
-    const text = normalizeText(source.value);
-    const pathMatch = chooseUniqueMatch(indexes.unitsByPath.get(text) || []);
-    const codeMatch = pathMatch.status === 'matched' ? pathMatch : chooseUniqueMatch(indexes.unitsByCode.get(text) || []);
-    const nameMatch = codeMatch.status === 'matched' ? codeMatch : chooseUniqueMatch(indexes.unitsByName.get(text) || []);
-    const result = nameMatch;
-    if (result.status === 'matched') matched.push({ source, match: result.match });
-    if (result.status === 'ambiguous') ambiguous.push({ source, matches: result.matches });
-  });
-
-  if (ambiguous.length > 0) {
-    return { status: 'ambiguous', reasonCode: 'AMBIGUOUS_ORGANIZATION_UNIT', reason: '用能单元名称匹配到多条 active 记录，请用唯一编码或完整路径导入后再回填。', sources, ambiguous };
-  }
-  if (matched.length === 0) {
-    return { status: 'missing', reasonCode: 'ORGANIZATION_UNIT_NOT_FOUND', reason: '未能按 organization/site/department 匹配到 active 用能单元。', sources };
-  }
-  const uniqueIds = new Set(matched.map((item) => Number(item.match.id)));
-  if (uniqueIds.size > 1) {
-    return { status: 'ambiguous', reasonCode: 'ORGANIZATION_FIELDS_CONFLICT', reason: 'organization/site/department 字段匹配到不同用能单元，不能确定唯一回填目标。', sources, matches: matched };
-  }
-  return { status: 'matched', match: matched[0].match, sources: matched.map((item) => item.source) };
-}
-
-function resolveMeterBackfillCandidate(record, indexes, organizationUnitId) {
-  const meterText = normalizeText(record.meterCode);
-
-  if (record.meterDeviceId) {
-    const existing = indexes.metersById.get(Number(record.meterDeviceId));
-    if (!existing || existing.status !== 'active') {
-      return { status: 'blocked', reasonCode: 'EXISTING_METER_NOT_ACTIVE', reason: '已有关联的计量器具不存在或未启用。' };
-    }
-    if (Number(existing.energyTypeId) !== Number(record.energyTypeId)) {
-      return { status: 'blocked', reasonCode: 'EXISTING_METER_ENERGY_TYPE_MISMATCH', reason: '已有关联的计量器具能源类型与能耗记录不一致。', match: existing };
-    }
-    return { status: 'existing', match: existing };
-  }
-
-  if (!meterText) {
-    return { status: 'missing', reasonCode: 'NO_METER_SOURCE', reason: 'energy_records 缺少可用于匹配计量器具的 meter_code 原始字段。' };
-  }
-
-  const byCode = chooseUniqueMatch(indexes.metersByCode.get(meterText) || [], { energyTypeId: record.energyTypeId });
-  if (byCode.status === 'ambiguous') {
-    return { status: 'ambiguous', reasonCode: 'AMBIGUOUS_METER_CODE', reason: 'meter_code 匹配到多条同能源类型 active 计量器具，不能确定唯一回填目标。', matches: byCode.matches };
-  }
-  if (byCode.status === 'matched') {
-    if (organizationUnitId && Number(byCode.match.organizationUnitId) !== Number(organizationUnitId)) {
-      return { status: 'blocked', reasonCode: 'METER_ORGANIZATION_CONFLICT', reason: '计量器具归属用能单元与能耗记录候选用能单元不一致。', match: byCode.match };
-    }
-    return { status: 'matched', match: byCode.match, sourceField: 'meter_code' };
-  }
-
-  const nameMatches = organizationUnitId
-    ? indexes.metersByOrgAndName.get(`${organizationUnitId} ${meterText}`) || []
-    : indexes.metersByName.get(meterText) || [];
-  const byName = chooseUniqueMatch(nameMatches, { energyTypeId: record.energyTypeId, organizationUnitId });
-  if (byName.status === 'ambiguous') {
-    return { status: 'ambiguous', reasonCode: 'AMBIGUOUS_METER_NAME', reason: 'meter_code 原始值按计量器具名称匹配到多条同能源类型 active 记录，不能确定唯一回填目标。', matches: byName.matches };
-  }
-  if (byName.status === 'matched') {
-    return { status: 'matched', match: byName.match, sourceField: organizationUnitId ? 'organization_unit_id+meter_code_as_name' : 'meter_code_as_name' };
-  }
-
-  return { status: 'missing', reasonCode: 'METER_NOT_FOUND', reason: '未能按 meter_code 编码或名称匹配到同能源类型 active 计量器具。' };
-}
-
-function buildEnergyRecordLedgerBackfillPreview(record, indexes) {
-  const organization = resolveOrganizationUnitBackfillCandidate(record, indexes);
-  const organizationUnitIdForMeter = organization.match ? organization.match.id : record.organizationUnitId;
-  const meter = resolveMeterBackfillCandidate(record, indexes, organizationUnitIdForMeter);
-  const reasons = [];
-  const candidate = { organizationUnitId: null, meterDeviceId: null };
-  let status = 'missing';
-
-  if (organization.status === 'blocked' || meter.status === 'blocked') {
-    status = 'blocked';
-  } else if (organization.status === 'ambiguous' || meter.status === 'ambiguous') {
-    status = 'ambiguous';
-  } else {
-    const matchedOrganization = organization.match || (meter.match && indexes.unitsById.get(Number(meter.match.organizationUnitId))) || null;
-    const matchedMeter = meter.match || null;
-    if (matchedMeter && matchedOrganization && Number(matchedMeter.organizationUnitId) !== Number(matchedOrganization.id)) {
-      status = 'blocked';
-      reasons.push({ code: 'METER_ORGANIZATION_CONFLICT', message: '计量器具归属用能单元与候选用能单元不一致。' });
-    } else {
-      if (!record.organizationUnitId && matchedOrganization) candidate.organizationUnitId = matchedOrganization.id;
-      if (!record.meterDeviceId && matchedMeter) candidate.meterDeviceId = matchedMeter.id;
-      if (candidate.meterDeviceId) status = 'candidate-by-meter';
-      else if (candidate.organizationUnitId) status = 'candidate-by-organization';
-      else if (record.organizationUnitId && record.meterDeviceId) status = 'already-linked';
-      else if (record.organizationUnitId || record.meterDeviceId) status = 'already-partial';
-    }
-  }
-
-  [organization, meter].forEach((result) => {
-    if (result.reasonCode) reasons.push({ code: result.reasonCode, message: result.reason });
-  });
-
-  const wouldUpdate = Boolean(candidate.organizationUnitId || candidate.meterDeviceId) && !['blocked', 'ambiguous'].includes(status);
-  return {
-    recordId: record.id,
-    status,
-    wouldUpdate,
-    candidate,
-    existing: {
-      organizationUnitId: record.organizationUnitId || null,
-      meterDeviceId: record.meterDeviceId || null
-    },
-    source: {
-      energyTypeId: record.energyTypeId,
-      energyTypeCode: record.energyTypeCode,
-      energyTypeName: record.energyTypeName || null,
-      normalizedMonth: record.normalizedMonth || null,
-      organization: record.organization || null,
-      site: record.site || null,
-      department: record.department || null,
-      meterCode: record.meterCode || null
-    },
-    matched: {
-      organizationUnit: compactLedgerCandidate(organization.match || (meter.match && indexes.unitsById.get(Number(meter.match.organizationUnitId))), 'organization'),
-      meterDevice: compactLedgerCandidate(meter.match, 'meter')
-    },
-    reasons
-  };
 }
 
 function normalizeHeaderName(value) {
@@ -1651,8 +1414,6 @@ module.exports = {
   ORGANIZATION_UNIT_IMPORT_TYPE,
   UNIT_EXPORT_FIELDS,
   UNIT_TYPES,
-  buildEnergyRecordLedgerBackfillPreview,
-  buildLedgerBackfillPreviewIndexes,
   buildLedgerImportIndexes,
   buildLedgerIndexes,
   buildMeterExportRows,
@@ -1673,7 +1434,6 @@ module.exports = {
   listMeters,
   listOrganizationUnits,
   loadActiveLedgerIndexes,
-  loadLedgerBackfillPreviewIndexes,
   mapLedgerImportFields,
   normalizeMeterPayload,
   normalizePagination,

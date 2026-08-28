@@ -20,6 +20,10 @@ export const useAppStore = defineStore('app', {
       localStorage.setItem(STORAGE_KEY, apiBase);
       return true;
     },
+    /** 显式设置侧栏折叠状态，供响应式布局复用。 */
+    setSidebarCollapsed(value) {
+      this.sidebarCollapsed = value === true;
+    },
     /** 切换侧栏折叠状态。 */
     toggleSidebar() {
       this.sidebarCollapsed = !this.sidebarCollapsed;

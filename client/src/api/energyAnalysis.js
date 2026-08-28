@@ -100,13 +100,15 @@ export function downloadEnergyAnalysisImportTemplate(templateType, extension = '
   );
 }
 
-/** 下载受领域权限保护的青岚园区能源分析示例并保存托管 context。 */
+/** 下载受领域权限保护的天坤集团能源分析示例并保存托管 context。 */
 export function downloadEnergyAnalysisDemoArtifact(artifactKey, extension = 'xlsx') {
   const safeExtension = extension === 'csv' ? 'csv' : 'xlsx';
-  analysisDemoArtifact(artifactKey);
+  const contract = analysisDemoArtifact(artifactKey);
   return downloadManagedDemoArtifact(
     { url: `/templates/demo-park/${encodeURIComponent(artifactKey)}.${safeExtension}` },
-    `青岚园区能源分析示例.${safeExtension}`
+    `天坤集团能源分析示例.${safeExtension}`,
+    undefined,
+    contract
   );
 }
 

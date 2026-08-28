@@ -1,2 +1,2 @@
-<template><section class="page-card"><h1 class="page-title">{{ title || '业务模块迁移中' }}</h1><p class="muted">该业务模块尚未迁移到 Vue3 前端壳。当前仅提供受权限控制的过渡路由，不代表业务页面已完成迁移。</p><el-alert type="info" :closable="false" title="需要回退参考旧版时，可访问 legacy.html。" show-icon /><p class="migration-note">旧版入口仅用于迁移期回退与功能参考；新功能请继续在 Vue3 壳内逐模块实现和验收。</p></section></template>
+<template><section class="page-card"><h1 class="page-title">{{ title || '当前功能不可用' }}</h1><p class="muted">当前功能暂不可用，请联系管理员检查菜单配置和访问权限。</p><el-alert type="warning" :closable="false" title="菜单配置异常或功能尚未开放。" description="请返回上一级菜单，或联系管理员确认当前账号的授权配置。" show-icon /></section></template>
 <script setup>defineProps({ title:String });</script>

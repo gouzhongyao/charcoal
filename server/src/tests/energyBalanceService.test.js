@@ -45,6 +45,10 @@ const EFFECTIVE_START_UTC = '2026-01-01T00:00:00.000Z';
 const EFFECTIVE_END_UTC = '2027-01-01T00:00:00.000Z';
 // 测试来源时区。
 const SOURCE_TIME_ZONE = 'Asia/Shanghai';
+// 能流事实表要求秒精度 UTC 开始时间。
+const FLOW_START_UTC = '2026-07-01T00:00:00Z';
+// 能流事实表要求秒精度 UTC 结束时间。
+const FLOW_END_UTC = '2026-08-01T00:00:00Z';
 // 月度来源窗口按上海自然月边界换算为 UTC。
 const MONTH_START_UTC = '2026-06-30T16:00:00.000Z';
 // 月度来源窗口结束于下一自然月首零点。
@@ -170,7 +174,14 @@ function insertExplicitEdgeFixture(db, input) {
     model_code, model_name, source, document_no, version,
     effective_start_utc, effective_end_utc, source_timezone, status
   ) VALUES (?, ?, 'test', ?, 'v1', ?, ?, ?, 'active')`)
-    .run(input.modelCode, input.modelCode, `DOC-${input.modelCode}`, EFFECTIVE_START_UTC, EFFECTIVE_END_UTC, SOURCE_TIME_ZONE)
+    .run(
+      input.modelCode,
+      input.modelCode,
+      `DOC-${input.modelCode}`,
+      EFFECTIVE_START_UTC.replace('.000Z', 'Z'),
+      EFFECTIVE_END_UTC.replace('.000Z', 'Z'),
+      SOURCE_TIME_ZONE
+    )
     .lastInsertRowid);
   const insertNode = db.prepare(`INSERT INTO energy_flow_nodes (
     energy_flow_model_id, node_code, node_name, node_type, organization_unit_id, x, y, status
@@ -187,7 +198,7 @@ function insertExplicitEdgeFixture(db, input) {
     energy_flow_model_id, energy_flow_edge_id, start_utc, end_utc, source_timezone,
     original_unit, original_value, source_type, source_mapping_json, formula_version, record_status
   ) VALUES (?, ?, ?, ?, ?, ?, ?, 'explicit_edge_value', ?, 'energy-flow:v1', 'active')`)
-    .run(modelId, edgeId, START_UTC, END_UTC, SOURCE_TIME_ZONE, input.energyType.standardUnit, input.value, JSON.stringify({ reference: input.modelCode }))
+    .run(modelId, edgeId, FLOW_START_UTC, FLOW_END_UTC, SOURCE_TIME_ZONE, input.energyType.standardUnit, input.value, JSON.stringify({ reference: input.modelCode }))
     .lastInsertRowid);
 }
 

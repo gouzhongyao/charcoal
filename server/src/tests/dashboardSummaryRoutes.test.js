@@ -61,16 +61,20 @@ function seedDashboardFixtures() {
   try {
     const electricityId = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
     const heatId = db.prepare("SELECT id FROM energy_types WHERE code = 'heat'").get().id;
+    // 中控能耗夹具统一关联 canonical 用能单元。
+    const organizationUnitId = db.prepare(`INSERT INTO organization_units
+      (unit_code, unit_name, unit_path, unit_type, status)
+      VALUES ('DASHBOARD-OU', '中控测试单元', '中控测试单元', 'enterprise', 'active')`).run().lastInsertRowid;
     const insertEnergyRecord = db.prepare(`INSERT INTO energy_records (
-      energy_type_id, original_month, normalized_month, original_unit, original_value,
+      energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value,
       normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`);
-    insertEnergyRecord.run(electricityId, '2024-12', '2024-12', 'kWh', 50, 'kWh', 50, 'dashboard-2024-electricity', 'active');
-    insertEnergyRecord.run(electricityId, '2025-01', '2025-01', 'kWh', 100, 'kWh', 100, 'dashboard-2025-electricity-kwh', 'active');
-    insertEnergyRecord.run(electricityId, '2025-06', '2025-06', 'MWh', 2, 'MWh', 2, 'dashboard-2025-electricity-mwh', 'active');
-    insertEnergyRecord.run(heatId, '2025-12', '2025-12', 'MJ', 300, 'MJ', 300, 'dashboard-2025-heat', 'active');
-    insertEnergyRecord.run(electricityId, '2025-08', '2025-08', 'kWh', 999, 'kWh', 999, 'dashboard-2025-void', 'void');
-    insertEnergyRecord.run(electricityId, '2026-01', '2026-01', 'kWh', 70, 'kWh', 70, 'dashboard-2026-electricity', 'active');
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`);
+    insertEnergyRecord.run(electricityId, organizationUnitId, '2024-12', '2024-12', 'kWh', 50, 'kWh', 50, 'dashboard-2024-electricity', 'active');
+    insertEnergyRecord.run(electricityId, organizationUnitId, '2025-01', '2025-01', 'kWh', 100, 'kWh', 100, 'dashboard-2025-electricity-kwh', 'active');
+    insertEnergyRecord.run(electricityId, organizationUnitId, '2025-06', '2025-06', 'MWh', 2, 'MWh', 2, 'dashboard-2025-electricity-mwh', 'active');
+    insertEnergyRecord.run(heatId, organizationUnitId, '2025-12', '2025-12', 'MJ', 300, 'MJ', 300, 'dashboard-2025-heat', 'active');
+    insertEnergyRecord.run(electricityId, organizationUnitId, '2025-08', '2025-08', 'kWh', 999, 'kWh', 999, 'dashboard-2025-void', 'void');
+    insertEnergyRecord.run(electricityId, organizationUnitId, '2026-01', '2026-01', 'kWh', 70, 'kWh', 70, 'dashboard-2026-electricity', 'active');
 
     const batchId = db.prepare(`INSERT INTO import_batches (
       import_type, original_filename, file_type, status, total_rows,
@@ -234,8 +238,8 @@ function findTotal(totals, energyTypeCode, normalizedUnit) {
     });
     assert.strictEqual(annual.json.data.imports.batchCount, compatible.json.data.imports.batchCount, '导入批次不按能耗年份过滤。');
     assert.strictEqual(annual.json.data.errors.importErrorCount, compatible.json.data.errors.importErrorCount, '导入错误不按能耗年份过滤。');
-    assert(annual.json.data.notices.some((notice) => notice.includes('不随该月份范围过滤')));
-    assert(annual.json.data.notices.some((notice) => notice.includes('energy.totals')));
+    assert(annual.json.data.notices.some((notice) => notice.includes('按能源类型和标准化单位分组')));
+    assert(annual.json.data.notices.some((notice) => notice.includes('不包含碳核算、预测或预算数据')));
 
     const dashboardOnlyToken = await loginAccount(server, accounts.dashboardOnly.username);
     const dashboardOnly = await request(server, 'GET', annualPath, { token: dashboardOnlyToken });

@@ -37,19 +37,15 @@ const filters = normalizeEnergyRecordFilters({
   monthStart: '2026-01',
   monthEnd: '2026-12',
   energyTypeCode: ' electricity ',
-  organization: '总部',
-  site: 'A园区',
-  department: '生产部',
+  organizationUnitCode: ' HQ ',
   sourceBatchId: '12'
 });
 assert.deepStrictEqual(filters, {
   normalizedMonthStart: '2026-01',
   normalizedMonthEnd: '2026-12',
   energyTypeCode: 'electricity',
-  organization: '总部',
+  organizationUnitCode: 'HQ',
   keyword: undefined,
-  site: 'A园区',
-  department: '生产部',
   organizationUnitId: undefined,
   meterDeviceId: undefined,
   sourceBatchId: 12
@@ -124,22 +120,10 @@ const productionServiceJs = fs.readFileSync(path.join(__dirname, '..', 'services
 const productionRouteJs = fs.readFileSync(path.join(__dirname, '..', 'routes', 'production.js'), 'utf8');
 const serverIndexJs = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
 const clientMainJs = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'client', 'src', 'legacy-main.js'), 'utf8');
-assert(statisticsServiceJs.includes('LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id'), '能耗明细应左关联用能单元，未关联记录不能因此查询失败。');
-assert(statisticsServiceJs.includes('LEFT JOIN meter_devices md ON md.id = er.meter_device_id'), '能耗明细应左关联计量器具，未关联记录不能因此查询失败。');
+assert(statisticsServiceJs.includes('JOIN organization_units ou ON ou.id = er.organization_unit_id'), 'organization_unit_id 必填，能耗明细必须关联规范用能单元。');
+assert(statisticsServiceJs.includes('LEFT JOIN meter_devices md ON md.id = er.meter_device_id'), 'meter_device_id 可选，能耗明细必须左关联计量器具。');
 assert(statisticsServiceJs.includes('ou.unit_path AS organizationUnitPath'), '能耗明细应返回用能单元路径展示字段。');
-assert(statisticsServiceJs.includes('md.meter_name AS meterDeviceName'), '能耗明细应返回计量器具名称展示字段。');
-assert(statisticsServiceJs.includes('ledgerAssociationStatus'), '能耗明细应返回台账关联状态。');
-assert(statisticsServiceJs.includes('getEnergyRecordLedgerBackfillPreview'), '应提供历史 energy_records 台账关联回填预演服务。');
-assert.strictEqual(
-  typeof require('../services/energyRecordStatisticsService').getEnergyRecordLedgerBackfillPreview,
-  'function',
-  '历史 energy_records 台账关联回填预演服务必须导出可调用函数。'
-);
-assert.strictEqual(
-  typeof require('../services/energyRecordStatisticsService').exportEnergyRecordLedgerBackfillPreview,
-  'function',
-  '历史 energy_records 台账关联回填预演审计预案导出服务必须导出可调用函数。'
-);
+assert(statisticsServiceJs.includes('md.meter_name AS meterName'), '能耗明细应返回计量器具名称展示字段。');
 assert.strictEqual(
   typeof require('../services/energyRecordStatisticsService').exportEnergyRecords,
   'function',
@@ -148,33 +132,13 @@ assert.strictEqual(
 assert(statisticsServiceJs.includes('ENERGY_RECORD_EXPORT_FIELDS'), '能耗明细导出应使用固定字段白名单。');
 assert(statisticsServiceJs.includes("fileName: `能耗明细-${date}.${format}`"), '能耗明细导出应使用中文文件名。');
 assert(statisticsServiceJs.includes('normalizeEnergyRecordExportFormat'), '能耗明细导出格式必须限制为 xlsx/csv。');
-assert(statisticsServiceJs.includes('writesEnergyRecords: false'), '历史台账关联预演必须明确不写入 energy_records。');
-assert(statisticsServiceJs.includes('previewOnly: true'), '历史台账关联预演必须明确仅为 preview。');
-assert(statisticsServiceJs.includes('历史能耗记录台账回填预演审计预案（仅预演、不写入）'), '导出文件必须包含醒目的中文只读预演说明。');
-assert(statisticsServiceJs.includes('候选用能单元ID'), '导出字段应使用中文候选用能单元 ID 标题。');
-assert(statisticsServiceJs.includes('候选计量器具ID'), '导出字段应使用中文候选计量器具 ID 标题。');
-assert(statisticsServiceJs.includes('executeEnergyRecordLedgerBackfill'), '应提供受控执行历史台账回填服务。');
-assert(statisticsServiceJs.includes('previewSignature'), 'preview 与执行审计必须包含 previewSignature。');
-assert(statisticsServiceJs.includes("confirmText !== LEDGER_BACKFILL_CONFIRM_TEXT"), '执行服务必须校验固定确认文本。');
-assert(statisticsServiceJs.includes("createBackup({ reason: 'ledger-backfill' })"), '执行服务必须在事务前自动创建 ledger-backfill 备份。');
-assert(statisticsServiceJs.includes('body.acknowledgeSkippedRisks !== true'), '执行服务必须校验 acknowledgeSkippedRisks=true。');
-assert(statisticsServiceJs.includes('body.requireBackup !== true'), '执行服务必须要求 requireBackup 显式为 true。');
-assert(statisticsServiceJs.includes("record_status = 'active'"), '执行更新必须限制 active energy_records。');
-assert(statisticsServiceJs.includes('organization_unit_id IS NULL'), '执行更新必须包含 organization_unit_id NULL 防覆盖条件。');
-assert(statisticsServiceJs.includes('meter_device_id IS NULL'), '执行更新必须包含 meter_device_id NULL 防覆盖条件。');
-assert(!/INSERT\s+INTO\s+energy_records/i.test(statisticsServiceJs), '能耗统计服务不得提供 INSERT energy_records 的回填路径。');
-assert(!/DELETE\s+FROM\s+energy_records/i.test(statisticsServiceJs), '能耗统计服务不得提供 DELETE energy_records 的回填路径。');
+assert(!/INSERT\s+INTO\s+energy_records/i.test(statisticsServiceJs), '能耗统计服务不得提供 INSERT energy_records 路径。');
+assert(!/DELETE\s+FROM\s+energy_records/i.test(statisticsServiceJs), '能耗统计服务不得提供 DELETE energy_records 路径。');
+assert(!statisticsServiceJs.includes('LedgerBackfill'), '正式能耗统计服务不得保留旧台账回填兼容流程。');
 assert(energyRecordsRouteJs.includes('router.use(authenticate)'), '能耗记录路由必须统一要求登录。');
 assert(energyRecordsRouteJs.includes("requireAnyPermission('energy:records:view', 'energy-records:view', 'energy:statistics:view')"), '只读能耗记录接口必须兼容新旧查看权限键。');
 assert(energyRecordsRouteJs.includes("router.get('/export', requireEnergyRecordView"), '应提供受保护的能耗明细导出接口。');
-assert(energyRecordsRouteJs.includes("requirePermission('energy:records:ledger-backfill:execute')"), '台账回填执行必须校验专用执行权限。');
-assert(energyRecordsRouteJs.includes("router.get('/ledger-backfill/preview/export'"), '应提供明确命名的历史台账关联预演审计预案 GET 导出接口。');
-assert(energyRecordsRouteJs.includes("router.get('/ledger-backfill/preview'"), '应提供明确命名的历史台账关联预演接口。');
-assert(energyRecordsRouteJs.includes("router.post('/ledger-backfill/execute'"), '应提供受控执行历史台账回填 POST 接口。');
-assert(energyRecordsRouteJs.includes("requireWritable('energy-records:ledger-backfill:execute')"), '执行路由必须使用维护态写保护。');
-assert(energyRecordsRouteJs.includes('X-Writes-Energy-Records'), '预演导出路由响应头必须明确不写入 energy_records。');
-assert(energyRecordsRouteJs.includes('writesEnergyRecords: false'), '预演路由响应 meta 必须明确不写入 energy_records。');
-assert(!/router\.(put|patch|delete)\('\/ledger-backfill/i.test(energyRecordsRouteJs), '不得提供 PUT/PATCH/DELETE 历史台账回填写接口。');
+assert(!energyRecordsRouteJs.includes('ledger-backfill'), '正式能耗记录路由不得暴露旧台账回填接口。');
 assert.strictEqual(
   typeof require('../services/meterReadingService').getMeterReadingEnergyRecordGenerationPreview,
   'function',
@@ -196,7 +160,7 @@ assert(meterReadingServiceJs.includes('candidateReadingIds'), '抄表生成执�
 assert(meterReadingServiceJs.includes("record_status = 'active'"), '抄表生成只应写入/回写 active 口径。');
 assert(meterReadingServiceJs.includes('generated_energy_record_id IS NULL'), '抄表生成回写必须防止已 generated 重复生成。');
 assert(meterReadingServiceJs.includes('meter-reading-month:'), '抄表生成 duplicate_key 必须支持月度唯一口径。');
-assert(meterReadingServiceJs.includes("businessDimension: 'meter-reading-generation'"), '抄表生成能耗记录必须标记业务来源。');
+assert(meterReadingServiceJs.includes('meter_reading_record_id='), '抄表生成能耗记录必须在备注中保留来源抄表记录标识。');
 assert(meterReadingServiceJs.includes('carbonAccountingDeferred: true'), '抄表生成必须声明碳核算联动后置。');
 assert(meterReadingServiceJs.includes('MONTHLY_ACTIVE_ENERGY_RECORD_EXISTS'), '同仪表同月份同能源类型已有 active 能耗记录时必须冲突跳过。');
 assert(meterReadingsRouteJs.includes("router.get('/energy-record-generation/preview'"), '应提供抄表生成只读 preview 接口。');

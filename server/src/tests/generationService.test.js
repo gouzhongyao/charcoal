@@ -103,11 +103,9 @@ try {
   assert(indexSql.includes("app.use('/api/generation', generationRoutes)"), '路由入口应挂载 /api/generation。');
 
   const legacyDb = openDatabase();
-  let migratedUnitId;
-  let migratedPhotovoltaicId;
   try {
-    migratedUnitId = legacyDb.prepare("INSERT INTO organization_units (unit_code, unit_name, unit_path, unit_type, status, created_at, updated_at) VALUES ('GEN-MIGRATE', '发电迁移验收单元', '发电迁移验收单元', 'enterprise', 'active', datetime('now'), datetime('now'))").run().lastInsertRowid;
-    migratedPhotovoltaicId = legacyDb.prepare("SELECT id FROM energy_types WHERE code = 'photovoltaic' AND is_active = 1").get().id;
+    const migratedUnitId = legacyDb.prepare("INSERT INTO organization_units (unit_code, unit_name, unit_path, unit_type, status, created_at, updated_at) VALUES ('GEN-MIGRATE', '发电迁移验收单元', '发电迁移验收单元', 'enterprise', 'active', datetime('now'), datetime('now'))").run().lastInsertRowid;
+    const migratedPhotovoltaicId = legacyDb.prepare("SELECT id FROM energy_types WHERE code = 'photovoltaic' AND is_active = 1").get().id;
     legacyDb.exec('DROP TABLE generation_records');
     legacyDb.exec(`CREATE TABLE generation_records (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,16 +133,24 @@ try {
   } finally {
     legacyDb.close();
   }
-  initDatabase();
+  assert.throws(
+    () => initDatabase(),
+    (error) => error?.code === 'SCHEMA_FINGERPRINT_MISMATCH'
+  );
   const migratedDb = openDatabase();
   try {
     const migratedCreateSql = migratedDb.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'generation_records'").get().sql;
-    assert(generationRecordsDataSourceCheckAllowsUpload(migratedCreateSql), 'initDatabase 应兼容升级旧 generation_records.data_source CHECK 以允许 upload。');
-    assert.strictEqual(migratedDb.prepare("SELECT COUNT(*) AS total FROM generation_records WHERE remark = '旧约束迁移保留记录'").get().total, 1, 'generation_records 兼容升级应保留既有记录。');
-    migratedDb.prepare("INSERT INTO generation_records (organization_unit_id, energy_type_id, normalized_month, generation_value_kwh, self_use_value_kwh, grid_export_value_kwh, data_source, record_status, remark, created_at, updated_at) VALUES (?, ?, '2026-02', 20, 15, 5, 'upload', 'active', '迁移后 upload 验证', datetime('now'), datetime('now'))").run(migratedUnitId, migratedPhotovoltaicId);
+    assert.strictEqual(generationRecordsDataSourceCheckAllowsUpload(migratedCreateSql), false,
+      '正式初始化拒绝结构漂移时不得自动扩展旧 data_source CHECK。');
+    assert.strictEqual(migratedDb.prepare("SELECT COUNT(*) AS total FROM generation_records WHERE remark = '旧约束迁移保留记录'").get().total, 1,
+      'fingerprint 拒绝不得删除旧发电记录。');
   } finally {
     migratedDb.close();
   }
+  // 恢复测试自己的隔离 canonical 基线，供后续发电服务用例使用。
+  [process.env.SQLITE_PATH, `${process.env.SQLITE_PATH}-wal`, `${process.env.SQLITE_PATH}-shm`]
+    .forEach((filePath) => fs.rmSync(filePath, { force: true }));
+  initDatabase();
 
   const db = openDatabase();
   let rootUnitId;
@@ -158,12 +164,12 @@ try {
     const otherUnitId = db.prepare("INSERT INTO organization_units (unit_code, unit_name, unit_path, unit_type, status, created_at, updated_at) VALUES ('GEN-OTHER', '其它单元', '其它单元', 'workshop', 'active', datetime('now'), datetime('now'))").run().lastInsertRowid;
     electricityId = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity' AND is_active = 1").get().id;
     heatId = db.prepare("SELECT id FROM energy_types WHERE code = 'heat' AND is_active = 1").get().id;
-    db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-06', '2026-06', 'kWh', 100, 'kWh', 100, '发电验收总厂', 'generation-reference-active-1', 'active', datetime('now'), datetime('now'))").run(electricityId, rootUnitId);
-    db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-06', '2026-06', 'kWh', 50, 'kWh', 50, '发电验收总厂', 'generation-reference-active-2', 'active', datetime('now'), datetime('now'))").run(electricityId, rootUnitId);
-    db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-06', '2026-06', 'kWh', 999, 'kWh', 999, '发电验收总厂', 'generation-reference-void', 'void', datetime('now'), datetime('now'))").run(electricityId, rootUnitId);
-    db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-06', '2026-06', 'MJ', 888, 'MJ', 888, '发电验收总厂', 'generation-reference-heat', 'active', datetime('now'), datetime('now'))").run(heatId, rootUnitId);
-    db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-06', '2026-06', 'kWh', 777, 'kWh', 777, '其它单元', 'generation-reference-other-org', 'active', datetime('now'), datetime('now'))").run(electricityId, otherUnitId);
-    carbonSeedEnergyRecordId = db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-07', '2026-07', 'kWh', 1, 'kWh', 1, '发电验收总厂', 'generation-carbon-seed-record', 'active', datetime('now'), datetime('now'))").run(electricityId, rootUnitId).lastInsertRowid;
+    db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-06', '2026-06', 'kWh', 100, 'kWh', 100, 'generation-reference-active-1', 'active', datetime('now'), datetime('now'))").run(electricityId, rootUnitId);
+    db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-06', '2026-06', 'kWh', 50, 'kWh', 50, 'generation-reference-active-2', 'active', datetime('now'), datetime('now'))").run(electricityId, rootUnitId);
+    db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-06', '2026-06', 'kWh', 999, 'kWh', 999, 'generation-reference-void', 'void', datetime('now'), datetime('now'))").run(electricityId, rootUnitId);
+    db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-06', '2026-06', 'MJ', 888, 'MJ', 888, 'generation-reference-heat', 'active', datetime('now'), datetime('now'))").run(heatId, rootUnitId);
+    db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-06', '2026-06', 'kWh', 777, 'kWh', 777, 'generation-reference-other-org', 'active', datetime('now'), datetime('now'))").run(electricityId, otherUnitId);
+    carbonSeedEnergyRecordId = db.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-07', '2026-07', 'kWh', 1, 'kWh', 1, 'generation-carbon-seed-record', 'active', datetime('now'), datetime('now'))").run(electricityId, rootUnitId).lastInsertRowid;
     db.prepare("INSERT INTO carbon_emissions (energy_record_id, calculation_method, calculation_basis, activity_value, activity_unit, emission_unit, status, calculated_at, note) VALUES (?, 'test-seed', 'test-seed', 1, 'kWh', 'kgCO2e', 'factor_missing', datetime('now'), '发电测试种子')").run(carbonSeedEnergyRecordId);
   } finally {
     db.close();

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
 // 待执行生产模块源码路径。
@@ -48,28 +49,34 @@ class MemoryStorage {
   }
 }
 
-// 写入两个演示 context 和一个无关的 sessionStorage 值。
+// 写入两个 v2 演示 context、旧版 fail-closed 键和一个无关 sessionStorage 值。
 function seedDemoContexts(storage) {
-  storage.setItem('charcoal.demoContext.v1:artifact-a:handler-a', '{"token":"a"}');
-  storage.setItem('charcoal.demoContext.v1:artifact-b:handler-b', '{"token":"b"}');
+  storage.setItem('charcoal.demoContext.v2:artifact-a:handler-a', '{"token":"a"}');
+  storage.setItem('charcoal.demoContext.v2:artifact-b:handler-b', '{"token":"b"}');
+  storage.setItem('charcoal.demoContext.v1:artifact-a:handler-a', 'legacy-simple-preserve');
+  storage.setItem('charcoal.demoContext.v1:a::b', 'legacy-collision-preserve');
   storage.setItem('unrelated.session.key', 'preserve');
 }
 
-// 断言所有演示 context 已清理且无关 sessionStorage 保留。
+// 断言所有 v2 演示 context 已清理，旧版和无关 sessionStorage 均保持 fail-closed。
 function assertDemoContextsCleared(storage, messagePrefix) {
   assert.strictEqual(
-    [...storage.values.keys()].some((key) => key.startsWith('charcoal.demoContext.v1:')),
+    [...storage.values.keys()].some((key) => key.startsWith('charcoal.demoContext.v2:')),
     false,
-    `${messagePrefix}必须清理全部演示 context。`
+    `${messagePrefix}必须清理全部 v2 演示 context。`
   );
+  assert.strictEqual(storage.getItem('charcoal.demoContext.v1:artifact-a:handler-a'), 'legacy-simple-preserve', `${messagePrefix}不得清理旧版普通 key。`);
+  assert.strictEqual(storage.getItem('charcoal.demoContext.v1:a::b'), 'legacy-collision-preserve', `${messagePrefix}不得误删旧版碰撞 key。`);
   assert.strictEqual(storage.getItem('unrelated.session.key'), 'preserve', `${messagePrefix}不得清理无关 sessionStorage。`);
 }
 
-// 断言登录态和全部演示 context 均保持不变。
+// 断言登录态、v2 context、旧版 fail-closed 键和无关值均保持不变。
 function assertSessionPreserved(localStorage, sessionStorage, messagePrefix) {
   assert.strictEqual(localStorage.getItem('charcoal.token'), 'login-token', `${messagePrefix}不得清理登录 token。`);
-  assert.strictEqual(sessionStorage.getItem('charcoal.demoContext.v1:artifact-a:handler-a'), '{"token":"a"}', `${messagePrefix}不得清理第一个演示 context。`);
-  assert.strictEqual(sessionStorage.getItem('charcoal.demoContext.v1:artifact-b:handler-b'), '{"token":"b"}', `${messagePrefix}不得清理第二个演示 context。`);
+  assert.strictEqual(sessionStorage.getItem('charcoal.demoContext.v2:artifact-a:handler-a'), '{"token":"a"}', `${messagePrefix}不得清理第一个演示 context。`);
+  assert.strictEqual(sessionStorage.getItem('charcoal.demoContext.v2:artifact-b:handler-b'), '{"token":"b"}', `${messagePrefix}不得清理第二个演示 context。`);
+  assert.strictEqual(sessionStorage.getItem('charcoal.demoContext.v1:artifact-a:handler-a'), 'legacy-simple-preserve', `${messagePrefix}不得清理旧版普通 key。`);
+  assert.strictEqual(sessionStorage.getItem('charcoal.demoContext.v1:a::b'), 'legacy-collision-preserve', `${messagePrefix}不得清理旧版碰撞 key。`);
   assert.strictEqual(sessionStorage.getItem('unrelated.session.key'), 'preserve', `${messagePrefix}不得清理无关 sessionStorage。`);
 }
 
@@ -298,7 +305,7 @@ const resolveApiBase = () => '/api';`;
     return {
       data: testBlob,
       headers: {
-        'content-disposition': "attachment; filename*=UTF-8''%E9%9D%92%E5%B2%9A%E7%A4%BA%E4%BE%8B.xlsx",
+        'content-disposition': "attachment; filename*=UTF-8''%E5%A4%A9%E5%9D%A4%E9%9B%86%E5%9B%A2%E7%A4%BA%E4%BE%8B.xlsx",
         'x-demo-context': 'c'.repeat(43),
         'x-demo-dataset-id': 'qinglan-park-v1',
         'x-demo-artifact-key': 'demo-artifact'
@@ -306,10 +313,10 @@ const resolveApiBase = () => '/api';`;
     };
   };
   const downloadResult = await httpModule.download({ url: '/test-download', method: 'get' }, 'fallback.xlsx');
-  assert.strictEqual(downloadResult.fileName, '青岚示例.xlsx', 'download 必须使用响应头文件名。');
+  assert.strictEqual(downloadResult.fileName, '天坤集团示例.xlsx', 'download 必须使用响应头文件名。');
   assert.strictEqual(downloadResult.demo.contextToken, 'c'.repeat(43), 'download 必须返回响应头中的演示 context。');
   assert.strictEqual(testLink.href, 'blob:pure-logic-stub');
-  assert.strictEqual(testLink.download, '青岚示例.xlsx');
+  assert.strictEqual(testLink.download, '天坤集团示例.xlsx');
   assert.deepStrictEqual(
     downloadEffects.map(([effect]) => effect),
     ['createObjectURL', 'createElement', 'appendChild', 'click', 'remove', 'revokeObjectURL'],
@@ -357,7 +364,70 @@ const requestWithHeaders = (...args) => globalThis.__CHARCOAL_DEMO_DATA_TEST_ADA
     artifactSha256: 'b'.repeat(64),
     contextToken: 'c'.repeat(43)
   };
+
+  // artifactKey='a:'、handlerKey='b' 与反向冒号组合必须使用不同且可定向清理的 key。
+  const collisionStorage = new MemoryStorage();
+  const firstCollisionMetadata = { ...safeFallbackMetadata, artifactKey: 'a:', handlerKey: 'b', contextToken: 'd'.repeat(43) };
+  const secondCollisionMetadata = { ...safeFallbackMetadata, artifactKey: 'a', handlerKey: ':b', contextToken: 'e'.repeat(43) };
+  demoDataModule.storeDemoContext(firstCollisionMetadata, collisionStorage);
+  demoDataModule.storeDemoContext(secondCollisionMetadata, collisionStorage);
+  assert.equal(demoDataModule.readDemoContext('a:', 'b', collisionStorage)?.token, firstCollisionMetadata.contextToken);
+  assert.equal(demoDataModule.readDemoContext('a', ':b', collisionStorage)?.token, secondCollisionMetadata.contextToken);
+  demoDataModule.clearDemoContexts('a:', 'b', collisionStorage);
+  assert.equal(demoDataModule.readDemoContext('a:', 'b', collisionStorage), null, '定向清理不得保留第一组 context。');
+  assert.equal(demoDataModule.readDemoContext('a', ':b', collisionStorage)?.token, secondCollisionMetadata.contextToken, '定向清理不得误删第二组 context。');
+  const legacyCollisionKey = 'charcoal.demoContext.v1:a::b';
+  collisionStorage.setItem(legacyCollisionKey, JSON.stringify({ artifactKey: 'a:', handlerKey: 'b', token: 'f'.repeat(43) }));
+  assert.equal(demoDataModule.readDemoContext('a:', 'b', collisionStorage), null, '第一组不得读取旧版碰撞 key。');
+  assert.equal(demoDataModule.readDemoContext('a', ':b', collisionStorage)?.token, secondCollisionMetadata.contextToken, '第二组仍应只读取自己的新版 key。');
+  assert.equal(collisionStorage.getItem(legacyCollisionKey)?.length > 0, true, '读取旧版碰撞 key 不得误删它。');
+  demoDataModule.clearDemoContexts(null, null, collisionStorage);
+  assert.equal(collisionStorage.getItem(legacyCollisionKey)?.length > 0, true, '全量清理 v2 context 时不得误删旧版碰撞 key。');
+  assert.equal(demoDataModule.readDemoContext('a', ':b', collisionStorage), null, '全量清理必须删除当前 v2 context。');
+
+  // 导航失败只清理当前仍为本次签发 B 的 token；旧 A 不恢复，后来替换的 C 不受影响。
+  const navigationFailureStorage = new MemoryStorage();
+  const oldMetadata = { ...safeFallbackMetadata, contextToken: 'a'.repeat(43) };
+  const issuedMetadata = { ...safeFallbackMetadata, contextToken: 'b'.repeat(43) };
+  const replacedMetadata = { ...safeFallbackMetadata, contextToken: 'd'.repeat(43) };
+  demoDataModule.storeDemoContext(oldMetadata, navigationFailureStorage);
+  demoDataModule.storeDemoContext(issuedMetadata, navigationFailureStorage);
+  assert.strictEqual(demoDataModule.clearDemoContextIfTokenMatches(
+    issuedMetadata.artifactKey,
+    issuedMetadata.handlerKey,
+    issuedMetadata.contextToken,
+    navigationFailureStorage
+  ), true);
+  assert.strictEqual(
+    demoDataModule.readDemoContext(issuedMetadata.artifactKey, issuedMetadata.handlerKey, navigationFailureStorage),
+    null,
+    '本次 B 清理后不得恢复旧 A。'
+  );
+  demoDataModule.storeDemoContext(issuedMetadata, navigationFailureStorage);
+  demoDataModule.storeDemoContext(replacedMetadata, navigationFailureStorage);
+  assert.strictEqual(demoDataModule.clearDemoContextIfTokenMatches(
+    issuedMetadata.artifactKey,
+    issuedMetadata.handlerKey,
+    issuedMetadata.contextToken,
+    navigationFailureStorage
+  ), false);
+  assert.strictEqual(
+    demoDataModule.readDemoContext(replacedMetadata.artifactKey, replacedMetadata.handlerKey, navigationFailureStorage)?.token,
+    replacedMetadata.contextToken,
+    '当前 token 已变化时不得清理后来签发的 context。'
+  );
+
   demoDataAdapter.downloadResult = { fileName: 'demo.xlsx', headers: {}, demo: safeFallbackMetadata };
+  const missingIdentityStorage = new MemoryStorage();
+  await assert.rejects(
+    demoDataModule.downloadManagedDemoArtifact(
+      { method: 'get', url: '/missing-identity-download' },
+      'demo.xlsx',
+      missingIdentityStorage
+    ),
+    /缺少预期的 artifactKey 或 handlerKey/
+  );
+  assert.equal(missingIdentityStorage.length, 0, '缺少预期身份时不得下载或写入任何 context。');
   const sessionStorageDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
   const sessionStorageSecurityError = new Error('浏览器策略禁止访问 sessionStorage。');
   sessionStorageSecurityError.name = 'SecurityError';
@@ -370,7 +440,9 @@ const requestWithHeaders = (...args) => globalThis.__CHARCOAL_DEMO_DATA_TEST_ADA
   try {
     const safeDownloadResult = await demoDataModule.downloadManagedDemoArtifact(
       { method: 'get', url: '/safe-download' },
-      'demo.xlsx'
+      'demo.xlsx',
+      undefined,
+      { artifactKey: safeFallbackMetadata.artifactKey, handlerKey: safeFallbackMetadata.handlerKey }
     );
     assert.strictEqual(safeDownloadResult.demoContextStored, false, 'sessionStorage getter 抛错时下载仍必须完成且不得虚报 context 已保存。');
 
@@ -395,6 +467,35 @@ const requestWithHeaders = (...args) => globalThis.__CHARCOAL_DEMO_DATA_TEST_ADA
     if (sessionStorageDescriptor) Object.defineProperty(globalThis, 'sessionStorage', sessionStorageDescriptor);
     else delete globalThis.sessionStorage;
   }
+
+  // 托管下载跨 await 时，后来签发的 C 必须保留，不能被本次响应的 D 覆盖。
+  const downloadInterleaveStorage = new MemoryStorage();
+  const downloadBeforeMetadata = { ...safeFallbackMetadata, contextToken: 'k'.repeat(43) };
+  const downloadLaterMetadata = { ...safeFallbackMetadata, contextToken: 'l'.repeat(43) };
+  const downloadResponseMetadata = { ...safeFallbackMetadata, contextToken: 'm'.repeat(43) };
+  demoDataModule.storeDemoContext(downloadBeforeMetadata, downloadInterleaveStorage);
+  let settleManagedDownload;
+  let notifyManagedDownload;
+  const managedDownloadStarted = new Promise((resolve) => { notifyManagedDownload = resolve; });
+  const originalDemoDownload = demoDataAdapter.download;
+  demoDataAdapter.download = async (config, fallbackName) => {
+    const pending = new Promise((resolve) => { settleManagedDownload = resolve; });
+    notifyManagedDownload({ config, fallbackName });
+    return pending;
+  };
+  const managedDownloadPromise = demoDataModule.downloadManagedDemoArtifact(
+    { method: 'get', url: '/interleave-download' },
+    'demo.xlsx',
+    downloadInterleaveStorage,
+    { artifactKey: downloadBeforeMetadata.artifactKey, handlerKey: downloadBeforeMetadata.handlerKey }
+  );
+  await managedDownloadStarted;
+  demoDataModule.storeDemoContext(downloadLaterMetadata, downloadInterleaveStorage);
+  settleManagedDownload({ fileName: 'demo.xlsx', headers: {}, demo: downloadResponseMetadata });
+  const managedDownloadInterleaveResult = await managedDownloadPromise;
+  assert.equal(managedDownloadInterleaveResult.demoContextStored, false, '下载 CAS 丢失时不得虚报 context 已保存。');
+  assert.equal(demoDataModule.readDemoContext(downloadLaterMetadata.artifactKey, downloadLaterMetadata.handlerKey, downloadInterleaveStorage)?.token, downloadLaterMetadata.contextToken);
+  demoDataAdapter.download = originalDemoDownload;
 
   // file.arrayBuffer() 拒绝时必须安全降级，不能在摘要计算阶段中断正式 preview。
   const arrayBufferFailureStorage = new MemoryStorage();
@@ -456,6 +557,191 @@ const requestWithHeaders = (...args) => globalThis.__CHARCOAL_DEMO_DATA_TEST_ADA
     if (cryptoDescriptor) Object.defineProperty(globalThis, 'crypto', cryptoDescriptor);
     else delete globalThis.crypto;
   }
+
+  // execute 成功跨 await 时，后来签发的 C 必须保留，不能被旧 B 的清理误删。
+  const asyncBaseMetadata = { ...safeFallbackMetadata, contextToken: 'g'.repeat(43) };
+  const asyncLaterMetadata = { ...safeFallbackMetadata, contextToken: 'h'.repeat(43) };
+  const executeInterleaveStorage = new MemoryStorage();
+  demoDataModule.storeDemoContext(asyncBaseMetadata, executeInterleaveStorage);
+  let settleExecuteRequest;
+  let notifyExecuteRequest;
+  const executeRequestStarted = new Promise((resolve) => { notifyExecuteRequest = resolve; });
+  demoDataAdapter.request = (config) => {
+    demoDataAdapter.requests.push(config);
+    const pending = new Promise((resolve) => { settleExecuteRequest = resolve; });
+    notifyExecuteRequest(config);
+    return pending;
+  };
+  const executeInterleavePromise = demoDataModule.executeManagedDemoImport(
+    { method: 'post', url: '/interleave-execute', data: {} },
+    asyncBaseMetadata.artifactKey,
+    asyncBaseMetadata.handlerKey,
+    executeInterleaveStorage
+  );
+  const executeRequestConfig = await executeRequestStarted;
+  assert.equal(executeRequestConfig.demoContext.token, asyncBaseMetadata.contextToken);
+  demoDataModule.storeDemoContext(asyncLaterMetadata, executeInterleaveStorage);
+  settleExecuteRequest({ success: true, data: { accepted: true } });
+  await executeInterleavePromise;
+  assert.equal(demoDataModule.readDemoContext(asyncLaterMetadata.artifactKey, asyncLaterMetadata.handlerKey, executeInterleaveStorage)?.token, asyncLaterMetadata.contextToken);
+
+  // preview 摘要不匹配跨 await 时，后来签发的 C 必须保留，不能被 stale B 清理。
+  const previewInterleaveStorage = new MemoryStorage();
+  demoDataModule.storeDemoContext(asyncBaseMetadata, previewInterleaveStorage);
+  let settlePreviewRequest;
+  let notifyPreviewRequest;
+  const previewRequestStarted = new Promise((resolve) => { notifyPreviewRequest = resolve; });
+  demoDataAdapter.request = (config) => {
+    demoDataAdapter.requests.push(config);
+    const pending = new Promise((resolve) => { settlePreviewRequest = resolve; });
+    notifyPreviewRequest(config);
+    return pending;
+  };
+  const previewInterleavePromise = demoDataModule.previewManagedDemoImport(
+    { method: 'post', url: '/interleave-preview', data: {} },
+    asyncBaseMetadata.artifactKey,
+    asyncBaseMetadata.handlerKey,
+    new Blob(['not-the-downloaded-file']),
+    previewInterleaveStorage
+  );
+  const previewRequestConfig = await previewRequestStarted;
+  assert.equal(previewRequestConfig.demoContext, undefined);
+  demoDataModule.storeDemoContext(asyncLaterMetadata, previewInterleaveStorage);
+  settlePreviewRequest({ success: true, data: { accepted: true } });
+  await previewInterleavePromise;
+  assert.equal(demoDataModule.readDemoContext(asyncLaterMetadata.artifactKey, asyncLaterMetadata.handlerKey, previewInterleaveStorage)?.token, asyncLaterMetadata.contextToken);
+
+  // preview 摘要匹配跨 await 时，后来签发的 C 也不得让旧 B 进入请求。
+  const matchingPreviewBytes = Buffer.from('matching-preview-file', 'utf8');
+  const matchingPreviewMetadata = {
+    ...safeFallbackMetadata,
+    artifactSha256: createHash('sha256').update(matchingPreviewBytes).digest('hex'),
+    contextToken: 'j'.repeat(43)
+  };
+  const matchingPreviewLaterMetadata = { ...matchingPreviewMetadata, contextToken: 'k'.repeat(43) };
+  const matchingPreviewStorage = new MemoryStorage();
+  demoDataModule.storeDemoContext(matchingPreviewMetadata, matchingPreviewStorage);
+  let releasePreviewDigest;
+  let notifyPreviewDigest;
+  const previewDigestStarted = new Promise((resolve) => { notifyPreviewDigest = resolve; });
+  const matchingPreviewFile = new Blob([matchingPreviewBytes]);
+  Object.defineProperty(matchingPreviewFile, 'arrayBuffer', {
+    configurable: true,
+    value() {
+      notifyPreviewDigest();
+      return new Promise((resolve) => {
+        releasePreviewDigest = () => resolve(new Uint8Array(matchingPreviewBytes).buffer);
+      });
+    }
+  });
+  demoDataAdapter.request = async (config) => {
+    demoDataAdapter.requests.push(config);
+    return { success: true, data: { accepted: true } };
+  };
+  const matchingPreviewPromise = demoDataModule.previewManagedDemoImport(
+    { method: 'post', url: '/matching-interleave-preview', data: {} },
+    matchingPreviewMetadata.artifactKey,
+    matchingPreviewMetadata.handlerKey,
+    matchingPreviewFile,
+    matchingPreviewStorage
+  );
+  await previewDigestStarted;
+  demoDataModule.storeDemoContext(matchingPreviewLaterMetadata, matchingPreviewStorage);
+  releasePreviewDigest();
+  await matchingPreviewPromise;
+  assert.equal(demoDataAdapter.requests.at(-1).demoContext, undefined, '摘要 await 期间 token 变化时不得携带旧 B。');
+  assert.equal(demoDataModule.readDemoContext(matchingPreviewLaterMetadata.artifactKey, matchingPreviewLaterMetadata.handlerKey, matchingPreviewStorage)?.token, matchingPreviewLaterMetadata.contextToken, '摘要 await 期间后来签发的 C 必须保留。');
+
+  // reassociate 请求失败跨 await 时，后来签发的 C 必须保留，不能被旧 B 的失败清理误删。
+  const reassociateFailureStorage = new MemoryStorage();
+  demoDataModule.storeDemoContext(asyncBaseMetadata, reassociateFailureStorage);
+  let rejectReassociateRequest;
+  let notifyReassociateFailure;
+  const reassociateFailureStarted = new Promise((resolve) => { notifyReassociateFailure = resolve; });
+  demoDataAdapter.requestWithHeaders = (config) => {
+    const pending = new Promise((resolve, reject) => { rejectReassociateRequest = reject; });
+    notifyReassociateFailure(config);
+    return pending;
+  };
+  const reassociateFailure = new Error('reassociate failed');
+  const reassociateFailurePromise = demoDataModule.reassociateDemoContext(
+    asyncBaseMetadata.artifactKey,
+    asyncBaseMetadata.handlerKey,
+    new Blob(['reassociate-file']),
+    reassociateFailureStorage
+  );
+  await reassociateFailureStarted;
+  demoDataModule.storeDemoContext(asyncLaterMetadata, reassociateFailureStorage);
+  rejectReassociateRequest(reassociateFailure);
+  await assert.rejects(reassociateFailurePromise, (error) => error === reassociateFailure);
+  assert.equal(demoDataModule.readDemoContext(asyncLaterMetadata.artifactKey, asyncLaterMetadata.handlerKey, reassociateFailureStorage)?.token, asyncLaterMetadata.contextToken);
+
+  // reassociate 成功跨 await 时，后来签发的 C 必须保留，不能被成功替换覆盖。
+  const reassociateSuccessStorage = new MemoryStorage();
+  demoDataModule.storeDemoContext(asyncBaseMetadata, reassociateSuccessStorage);
+  let settleReassociateRequest;
+  let notifyReassociateSuccess;
+  const reassociateSuccessStarted = new Promise((resolve) => { notifyReassociateSuccess = resolve; });
+  demoDataAdapter.requestWithHeaders = (config) => {
+    const pending = new Promise((resolve) => { settleReassociateRequest = resolve; });
+    notifyReassociateSuccess(config);
+    return pending;
+  };
+  const reassociateSuccessPromise = demoDataModule.reassociateDemoContext(
+    asyncBaseMetadata.artifactKey,
+    asyncBaseMetadata.handlerKey,
+    new Blob(['reassociate-file']),
+    reassociateSuccessStorage
+  );
+  await reassociateSuccessStarted;
+  demoDataModule.storeDemoContext(asyncLaterMetadata, reassociateSuccessStorage);
+  settleReassociateRequest({
+    headers: { 'x-demo-context': 'i'.repeat(43) },
+    data: { data: { artifactFileSha256: 'a'.repeat(64) } }
+  });
+  await reassociateSuccessPromise;
+  assert.equal(demoDataModule.readDemoContext(asyncLaterMetadata.artifactKey, asyncLaterMetadata.handlerKey, reassociateSuccessStorage)?.token, asyncLaterMetadata.contextToken);
+
+  // reassociate 普通失败必须清理仍为请求 token 的 B。
+  const reassociateOrdinaryFailureStorage = new MemoryStorage();
+  demoDataModule.storeDemoContext(asyncBaseMetadata, reassociateOrdinaryFailureStorage);
+  demoDataAdapter.requestWithHeaders = async () => { throw reassociateFailure; };
+  await assert.rejects(
+    demoDataModule.reassociateDemoContext(
+      asyncBaseMetadata.artifactKey,
+      asyncBaseMetadata.handlerKey,
+      new Blob(['reassociate-failure-file']),
+      reassociateOrdinaryFailureStorage
+    ),
+    (error) => error === reassociateFailure
+  );
+  assert.equal(demoDataModule.readDemoContext(asyncBaseMetadata.artifactKey, asyncBaseMetadata.handlerKey, reassociateOrdinaryFailureStorage), null);
+
+  // reassociate 普通成功必须把仍为 B 的 context 条件替换为服务端新 token。
+  const reassociateOrdinarySuccessStorage = new MemoryStorage();
+  demoDataModule.storeDemoContext(asyncBaseMetadata, reassociateOrdinarySuccessStorage);
+  const reassociateReplacementToken = 'i'.repeat(43);
+  demoDataAdapter.requestWithHeaders = async () => ({
+    headers: { 'x-demo-context': reassociateReplacementToken },
+    data: { data: { artifactFileSha256: 'a'.repeat(64) } }
+  });
+  await demoDataModule.reassociateDemoContext(
+    asyncBaseMetadata.artifactKey,
+    asyncBaseMetadata.handlerKey,
+    new Blob(['reassociate-success-file']),
+    reassociateOrdinarySuccessStorage
+  );
+  assert.equal(
+    demoDataModule.readDemoContext(asyncBaseMetadata.artifactKey, asyncBaseMetadata.handlerKey, reassociateOrdinarySuccessStorage)?.token,
+    reassociateReplacementToken
+  );
+
+  // 恢复 demo adapter 的即时行为，后续 user store 测试只关注退出清理。
+  demoDataAdapter.request = async (config) => {
+    demoDataAdapter.requests.push(config);
+    return { success: true, data: { accepted: true } };
+  };
+  demoDataAdapter.requestWithHeaders = async () => null;
 
   // Pinia 和请求 adapter 只负责构造 store/控制远程结果，logout action 本身来自生产 user.js。
   const userPiniaStub = `

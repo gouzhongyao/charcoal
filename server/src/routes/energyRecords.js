@@ -1,15 +1,11 @@
 const express = require('express');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticate } = require('../middleware/auth');
-const { requireAnyPermission, requirePermission } = require('../middleware/permission');
-const { requireWritable } = require('../middleware/maintenance');
+const { requireAnyPermission } = require('../middleware/permission');
 const { getEnergyRecordContract } = require('../services/contractService');
 const {
-  executeEnergyRecordLedgerBackfill,
   exportEnergyRecords,
-  exportEnergyRecordLedgerBackfillPreview,
   getDimensionBreakdown,
-  getEnergyRecordLedgerBackfillPreview,
   getEnergyRecordSummary,
   getEnergyTypeBreakdown,
   getMonthlyTrend,
@@ -46,28 +42,6 @@ router.get('/statistics/energy-type-breakdown', requireEnergyRecordView, asyncHa
 router.get('/statistics/dimension-breakdown', requireEnergyRecordView, asyncHandler(async (req, res) => {
   const result = getDimensionBreakdown(req.query);
   sendSuccess(res, result.rows, { meta: { dimension: result.dimension } });
-}));
-
-router.get('/ledger-backfill/preview/export', requireEnergyRecordView, asyncHandler(async (req, res) => {
-  const result = exportEnergyRecordLedgerBackfillPreview(req.query);
-  res.setHeader('Content-Type', result.contentType);
-  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, `lishi-nenghao-huitian-preview.${result.format}`));
-  res.setHeader('Content-Length', String(result.body.length));
-  res.setHeader('X-Export-Row-Count', String(result.rowCount));
-  res.setHeader('X-Dry-Run', 'true');
-  res.setHeader('X-Preview-Only', 'true');
-  res.setHeader('X-Writes-Energy-Records', 'false');
-  res.status(200).send(result.body);
-}));
-
-router.get('/ledger-backfill/preview', requireEnergyRecordView, asyncHandler(async (req, res) => {
-  const result = getEnergyRecordLedgerBackfillPreview(req.query);
-  sendSuccess(res, result, { meta: { dryRun: true, previewOnly: true, writesEnergyRecords: false } });
-}));
-
-router.post('/ledger-backfill/execute', requirePermission('energy:records:ledger-backfill:execute'), requireWritable('energy-records:ledger-backfill:execute'), asyncHandler(async (req, res) => {
-  const result = await executeEnergyRecordLedgerBackfill(req.body || {});
-  sendSuccess(res, result, { meta: { dryRun: false, previewOnly: false, writesEnergyRecords: true } });
 }));
 
 router.get('/export', requireEnergyRecordView, asyncHandler(async (req, res) => {

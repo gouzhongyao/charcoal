@@ -53,7 +53,7 @@
           <el-table-column label="因子值" min-width="145"><template #default="{ row }">{{ row.factorValue === null ? '—（factor_missing）' : formatNumber(row.factorValue, 6) }}</template></el-table-column>
           <el-table-column label="排放量" min-width="165"><template #default="{ row }">{{ row.emissionValue === null ? '—（factor_missing）' : `${formatNumber(row.emissionValue, 4)} ${row.emissionUnit}` }}</template></el-table-column>
           <el-table-column label="状态" width="120"><template #default="{ row }"><el-tag size="small" effect="light" :type="emissionStatusType(row.status)">{{ emissionStatusLabel(row.status) }}</el-tag></template></el-table-column>
-          <el-table-column prop="calculatedAt" label="计算时间（UTC）" min-width="190" />
+          <el-table-column label="计算时间（UTC）" min-width="190"><template #default="scope">{{ formatStrictUtcDateTimeDisplay(scope.row.calculatedAt) }}</template></el-table-column>
         </el-table>
         <div class="pagination"><el-pagination v-model:current-page="emissionPage" v-model:page-size="emissionPageSize" layout="total, sizes, prev, pager, next" :page-sizes="[20,50,100]" :total="emissionPagination.total || 0" @current-change="loadEmissions" @size-change="changeEmissionPageSize" /></div>
       </template>
@@ -90,6 +90,7 @@ import {
   totalsByEmissionUnitLabel
 } from '@/utils/carbonManagement';
 import { hasPermi } from '@/utils/permission';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 
 // 组件属性模块：能源字典由页面壳统一加载。
 const props = defineProps({ energyTypes: { type: Array, default: () => [] } });

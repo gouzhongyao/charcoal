@@ -54,8 +54,12 @@ const EXPECTED_TEMPLATES = [
   ['energy-flow-models', 'energy-flow-model-import', 'energy_flow_model', ['energy_flow_model'], '确认导入能流模型', false],
   ['energy-flow-nodes', 'energy-flow-node-import', 'energy_flow_node', ['energy_flow_node'], '确认导入能流节点', false],
   ['energy-flow-edges', 'energy-flow-edge-bundle-import', 'energy_flow_edge_record_bundle', ['energy_flow_edge', 'energy_flow_record'], '确认导入能流边及显式边值', true],
+  ['energy-flow-workbook', 'energy-flow-workbook-import', 'energy_flow_workbook', ['energy_flow_workbook'], '确认导入完整能流工作簿', true],
   ['energy-balance-configs', 'energy-balance-config-bundle-import', 'energy_balance_config_bundle', ['energy_balance_boundary', 'energy_balance_item'], '确认导入平衡边界及九角色项目', true],
-  ['suppliers', 'supplier-import', 'supplier', ['supplier'], '确认导入供应商台账', true]
+  ['suppliers', 'supplier-import', 'supplier', ['supplier'], '确认导入供应商台账', true],
+  ['carbon-activities', 'carbon-activity-import', 'carbon_activity', ['carbon_activity'], '确认导入独立碳活动', true],
+  ['carbon-emission-report', 'carbon-emission-report-import', 'carbon_emission_report', ['carbon_emission_report'], '确认导入碳排放报告', true],
+  ['ghg-report', 'ghg-report-import', 'ghg_report', ['ghg_report'], '确认导入温室气体报告', true]
 ];
 
 /**
@@ -179,11 +183,18 @@ function testTemplateContracts() {
     ]),
     EXPECTED_TEMPLATES
   );
+  const backupReasonByTemplateId = {
+    'energy-flow-workbook': 'energy-flow-workbook-import',
+    suppliers: 'supplier-import',
+    'carbon-activities': 'carbon-activity-import',
+    'carbon-emission-report': 'carbon-emission-report-import',
+    'ghg-report': 'ghg-report-import'
+  };
   ENERGY_ANALYSIS_IMPORT_TEMPLATES.forEach((template) => {
     assert.strictEqual(template.id, template.templateType);
     assert.strictEqual(
       template.backupReason,
-      template.id === 'suppliers' ? 'supplier-import' : 'energy-analysis-import'
+      backupReasonByTemplateId[template.id] || 'energy-analysis-import'
     );
     assert.strictEqual(Object.isFrozen(template), true);
     assert.strictEqual(Object.isFrozen(template.importTypes), true);
@@ -271,6 +282,40 @@ function testSigningAndDomainSeparation() {
   } finally {
     crypto.timingSafeEqual = originalTimingSafeEqual;
   }
+}
+
+/**
+ * 运行中央导入 SHA-256 canonical 边界测试。
+ */
+function testCanonicalSha256Boundary() {
+  // 非 canonical SHA 输入固定覆盖大写、前后空白和非字符串。
+  const invalidSha256Values = [
+    'A'.repeat(64),
+    ` ${TEST_FILE_SHA256}`,
+    `${TEST_FILE_SHA256} `,
+    123
+  ];
+  invalidSha256Values.forEach((invalidSha256Value) => {
+    // 当前循环值必须由签名和 execute 入口按原值拒绝，不能被静默修正。
+    assertThrowsCode(
+      () => buildEnergyAnalysisImportSignaturePayload(createSignatureInput({ fileSha256: invalidSha256Value })),
+      'ENERGY_ANALYSIS_IMPORT_FILE_SHA256_INVALID'
+    );
+    // 当前非法摘要对应的 execute 安全上下文。
+    const executeFixture = createExecuteFixture(
+      [{ candidateRowId: 'row-1', rowNumber: 2, value: 1 }],
+      { fileSha256: invalidSha256Value }
+    );
+    // execute 授权结果必须稳定包含摘要格式错误。
+    const authorization = authorizeEnergyAnalysisImportExecute(executeFixture.input, executeFixture.serverContext);
+    assert.strictEqual(authorization.valid, false);
+    assert(authorization.errors.some((error) => error.code === 'ENERGY_ANALYSIS_IMPORT_FILE_SHA256_INVALID'));
+  });
+  assert.strictEqual(
+    buildEnergyAnalysisImportSignaturePayload(createSignatureInput()).fileSha256,
+    TEST_FILE_SHA256,
+    'canonical 小写 SHA 必须原样进入签名载荷'
+  );
 }
 
 /**
@@ -724,6 +769,7 @@ function run() {
   testTemplateContracts();
   testStableSerialization();
   testSigningAndDomainSeparation();
+  testCanonicalSha256Boundary();
   testSecretResolutionAndNonDisclosure();
   testSafeUploadPathAndSha();
   testCandidateWitness();

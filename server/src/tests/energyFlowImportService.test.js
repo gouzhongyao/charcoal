@@ -26,6 +26,9 @@ process.env.ENERGY_ANALYSIS_IMPORT_HMAC_SECRET = 'energy-flow-import-test-secret
 
 const { initDatabase, openDatabase } = require('../db/database');
 const { createBackup, validateBackupFile } = require('../services/backupService');
+const { createDemoContext, sha256Buffer } = require('../services/demoContextService');
+const { getOrCreateActiveDemoDatasetRun } = require('../services/demoRunService');
+const { toggleDemoRuntime } = require('../services/demoRuntimeService');
 const {
   ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
   ENERGY_ANALYSIS_IMPORT_DUPLICATE_STRATEGY
@@ -35,6 +38,8 @@ const {
 } = require('../services/energyAnalysisTemplateService');
 const {
   ENERGY_FLOW_EDGE_BATCH_CONTRACT,
+  ENERGY_FLOW_MODEL_IMPORT_DESCRIPTOR,
+  ENERGY_FLOW_NODE_IMPORT_DESCRIPTOR,
   ENERGY_FLOW_RECORD_BATCH_CONTRACT,
   buildEnergyFlowBundleImportPreview,
   executeEnergyFlowBundleImport,
@@ -216,6 +221,23 @@ function buildSingleBatchExecuteBody(preview) {
     confirmText: preview.confirmText,
     requireBackup: true,
     acknowledgeSkippedRisks: true
+  };
+}
+
+/** 为隔离上传文件创建同一 active run 下的托管演示 context。 */
+function createManagedDemoContext(input) {
+  const context = createDemoContext({
+    userId: input.actorUserId,
+    runId: input.runId,
+    artifactKey: input.artifactKey,
+    handlerKey: input.handlerKey,
+    artifactFileSha256: sha256Buffer(fs.readFileSync(input.file.path))
+  });
+  return {
+    token: context.token,
+    userId: input.actorUserId,
+    artifactKey: input.artifactKey,
+    handlerKey: input.handlerKey
   };
 }
 
@@ -403,6 +425,18 @@ function testHardCodedFlowContracts() {
   assert.deepStrictEqual(definition.sheets[1].columns.map((column) => column.name), [...HARD_CODED_RECORD_HEADERS]);
   assert.deepStrictEqual(ENERGY_FLOW_EDGE_BATCH_CONTRACT, HARD_CODED_BATCH_CONTRACTS.edge);
   assert.deepStrictEqual(ENERGY_FLOW_RECORD_BATCH_CONTRACT, HARD_CODED_BATCH_CONTRACTS.record);
+  assert.deepStrictEqual(ENERGY_FLOW_MODEL_IMPORT_DESCRIPTOR.demoOwnership, {
+    artifactKey: '22-energy-flow-models',
+    entityType: 'energy_flow_model',
+    batchRole: 'primary',
+    expectedImportType: 'energy_flow_model'
+  });
+  assert.deepStrictEqual(ENERGY_FLOW_NODE_IMPORT_DESCRIPTOR.demoOwnership, {
+    artifactKey: '23-energy-flow-nodes',
+    entityType: 'energy_flow_node',
+    batchRole: 'primary',
+    expectedImportType: 'energy_flow_node'
+  });
 }
 
 /**
@@ -623,6 +657,24 @@ async function run() {
   assert.strictEqual(modelExecute.imported, 1);
   assert.strictEqual(modelBackupCounter.count, 1);
   assert.strictEqual(countRows('energy_flow_models'), initialModelCount + 1);
+  const importedModelProvenanceDb = openDatabase();
+  try {
+    const importedModelProvenance = importedModelProvenanceDb.prepare(
+      `SELECT source_batch_id AS sourceBatchId, source_row_number AS sourceRowNumber
+       FROM energy_flow_models WHERE id = ?`
+    ).get(modelExecute.importedIds[0]);
+    assert.strictEqual(importedModelProvenance.sourceBatchId, modelPreview.batchId,
+      '正式 22 execute 必须把服务端当前批次写入 source_batch_id。');
+    assert.strictEqual(importedModelProvenance.sourceRowNumber, modelPreview.candidateRows[0].sourceRowNumber,
+      '正式 22 execute 必须把候选物理来源行写入 source_row_number。');
+    assert.strictEqual(importedModelProvenanceDb.prepare(
+      `SELECT COUNT(*) AS total FROM demo_data_registry
+       WHERE entity_type = 'energy_flow_model' AND entity_pk = ?`
+    ).get(String(modelExecute.importedIds[0])).total, 0,
+    '无 demoContext 的正式 22 execute 不得写入 demo registry。');
+  } finally {
+    importedModelProvenanceDb.close();
+  }
 
   // 备份前原文件摘要失败不得污染 preview 批次；恢复原文件后同一批次必须可重试成功。
   const retryModelFile = createWorkbookUpload('energy-flow-models-retry.xlsx', [{
@@ -762,8 +814,453 @@ async function run() {
     assert.strictEqual(importedNode.organizationUnitId, master.organizationId);
     assert.strictEqual(importedNode.x, 80);
     assert.strictEqual(importedNode.y, 120);
+    assert.strictEqual(nodeDb.prepare(
+      `SELECT COUNT(*) AS total FROM demo_data_registry
+       WHERE entity_type = 'energy_flow_node' AND entity_pk = ?`
+    ).get(String(nodeExecute.importedIds[0])).total, 0,
+    '无 demoContext 的正式 23 execute 不得写入 demo registry。');
   } finally {
     nodeDb.close();
+  }
+
+  // 22/23/24 演示链路必须在同一 run 原子登记 ownership，并由服务端生成完整 contains 关系。
+  toggleDemoRuntime({ enabled: true, actorUserId, actorIp: '127.0.0.1' });
+  const demoRun = getOrCreateActiveDemoDatasetRun({ actorUserId, actorIp: '127.0.0.1' });
+  const demoModelRow = createModelRow({
+    modelCode: 'FLOW-DEMO-OWNERSHIP',
+    modelName: '演示 ownership 能流模型',
+    source: '演示 ownership 隔离测试',
+    documentNo: 'FLOW-DEMO-OWNERSHIP-2026',
+    version: 'energy-flow:v1'
+  });
+  const demoModelFile = createWorkbookUpload('energy-flow-demo-model.xlsx', [{
+    templateType: 'energy-flow-models',
+    sheetName: '能流模型',
+    rows: [demoModelRow]
+  }]);
+  const demoModelContext = createManagedDemoContext({
+    actorUserId,
+    runId: demoRun.runId,
+    artifactKey: '22-energy-flow-models',
+    handlerKey: 'energy-flow-models-import',
+    file: demoModelFile
+  });
+  const demoModelPreview = previewEnergyFlowModelImport(demoModelFile, {
+    uploadsDir: temporaryUploadsDir,
+    demoContext: demoModelContext
+  });
+  const demoModelExecute = await executeEnergyFlowModelImport(
+    buildSingleBatchExecuteBody(demoModelPreview),
+    {
+      uploadsDir: temporaryUploadsDir,
+      actorUserId,
+      actorIp: '127.0.0.1',
+      demoContext: demoModelContext,
+      createBackup: createBackupStub({ count: 0 })
+    }
+  );
+  assert.strictEqual(demoModelExecute.ownership.registrationCount, 1);
+  const demoModelId = demoModelExecute.importedIds[0];
+
+  const demoNodeRows = [
+    createNodeRow({
+      modelCode: demoModelRow.modelCode,
+      modelName: demoModelRow.modelName,
+      modelSource: demoModelRow.source,
+      modelDocumentNo: demoModelRow.documentNo,
+      modelVersion: demoModelRow.version,
+      modelEffectiveStartUtc: demoModelRow.effectiveStartUtc,
+      modelEffectiveEndUtc: demoModelRow.effectiveEndUtc,
+      sourceTimeZone: demoModelRow.sourceTimeZone,
+      nodeCode: 'DEMO-SOURCE',
+      nodeName: '演示源节点',
+      nodeType: 'source',
+      organizationUnitCode: '',
+      x: 10,
+      y: 20
+    }),
+    createNodeRow({
+      modelCode: demoModelRow.modelCode,
+      modelName: demoModelRow.modelName,
+      modelSource: demoModelRow.source,
+      modelDocumentNo: demoModelRow.documentNo,
+      modelVersion: demoModelRow.version,
+      modelEffectiveStartUtc: demoModelRow.effectiveStartUtc,
+      modelEffectiveEndUtc: demoModelRow.effectiveEndUtc,
+      sourceTimeZone: demoModelRow.sourceTimeZone,
+      nodeCode: 'DEMO-SINK',
+      nodeName: '演示汇节点',
+      nodeType: 'sink',
+      organizationUnitCode: '',
+      x: 30,
+      y: 40
+    })
+  ];
+  const demoNodeFile = createWorkbookUpload('energy-flow-demo-nodes.xlsx', [{
+    templateType: 'energy-flow-nodes',
+    sheetName: '能流节点',
+    rows: demoNodeRows
+  }]);
+  const demoNodeContext = createManagedDemoContext({
+    actorUserId,
+    runId: demoRun.runId,
+    artifactKey: '23-energy-flow-nodes',
+    handlerKey: 'energy-flow-nodes-import',
+    file: demoNodeFile
+  });
+  const demoNodePreview = previewEnergyFlowNodeImport(demoNodeFile, {
+    uploadsDir: temporaryUploadsDir,
+    demoContext: demoNodeContext
+  });
+  const demoNodeExecute = await executeEnergyFlowNodeImport(
+    buildSingleBatchExecuteBody(demoNodePreview),
+    {
+      uploadsDir: temporaryUploadsDir,
+      demoContext: demoNodeContext,
+      createBackup: createBackupStub({ count: 0 })
+    }
+  );
+  assert.strictEqual(demoNodeExecute.ownership.registrationCount, 2);
+
+  const demoBundleFile = createHardCodedBundleUpload(
+    'energy-flow-demo-bundle.xlsx',
+    [createEdgeRow({
+      modelCode: demoModelRow.modelCode,
+      modelVersion: demoModelRow.version,
+      edgeCode: 'DEMO-EDGE',
+      fromNodeCode: 'DEMO-SOURCE',
+      toNodeCode: 'DEMO-SINK',
+      sourceReference: 'demo:edge:DEMO-EDGE'
+    })],
+    [createRecordRow({
+      modelCode: demoModelRow.modelCode,
+      modelVersion: demoModelRow.version,
+      edgeCode: 'DEMO-EDGE',
+      sourceReference: 'demo:record:DEMO-EDGE'
+    })]
+  );
+  const demoBundleContext = createManagedDemoContext({
+    actorUserId,
+    runId: demoRun.runId,
+    artifactKey: '24-energy-flow-edges',
+    handlerKey: 'energy-flow-bundle-import',
+    file: demoBundleFile
+  });
+  const demoBundlePreview = previewEnergyFlowBundleImport(demoBundleFile, {
+    uploadsDir: temporaryUploadsDir,
+    demoContext: demoBundleContext,
+    createUploadGroupId: () => 'flow-demo-ownership-group'
+  });
+  const demoBundleBody = buildExecuteBody(demoBundlePreview, {
+    edgeBatchId: demoBundlePreview.edgeBatchId,
+    recordBatchId: demoBundlePreview.recordBatchId
+  });
+  await assertRejectsWithCode(
+    () => executeEnergyFlowBundleImport(
+      { ...demoBundleBody, relations: [] },
+      {
+        uploadsDir: temporaryUploadsDir,
+        demoContext: demoBundleContext,
+        createBackup: createBackupStub({ count: 0 })
+      }
+    ),
+    'ENERGY_FLOW_BUNDLE_CLIENT_RELATIONS_FORBIDDEN'
+  );
+  const demoBundleExecute = await executeEnergyFlowBundleImport(
+    demoBundleBody,
+    {
+      uploadsDir: temporaryUploadsDir,
+      demoContext: demoBundleContext,
+      createBackup: createBackupStub({ count: 0 })
+    }
+  );
+  assert.strictEqual(demoBundleExecute.edge.ownership.registrationCount, 2);
+  assert.strictEqual(demoBundleExecute.edge.ownership.relationCount, 5);
+  const demoOwnedEdgeId = demoBundleExecute.edge.importedIds[0];
+  const demoOwnedRecordId = demoBundleExecute.record.importedIds[0];
+  const demoOwnershipDb = openDatabase();
+  try {
+    const modelRegistry = demoOwnershipDb.prepare(`SELECT entity_pk AS entityPk, source_batch_id AS sourceBatchId,
+        source_row_number AS sourceRowNumber FROM demo_data_registry
+      WHERE run_id = ? AND artifact_key = '22-energy-flow-models' AND entity_type = 'energy_flow_model'`).get(demoRun.runId);
+    assert(modelRegistry, 'artifact 22 必须登记真实 energy_flow_model ownership。');
+    assert.strictEqual(Number(modelRegistry.entityPk), demoModelId);
+    assert.strictEqual(Number(modelRegistry.sourceBatchId), demoModelPreview.batchId);
+    assert.strictEqual(Number(modelRegistry.sourceRowNumber), demoModelPreview.candidateRows[0].sourceRowNumber);
+    const modelBusinessRow = demoOwnershipDb.prepare(`SELECT source_batch_id AS sourceBatchId,
+        source_row_number AS sourceRowNumber FROM energy_flow_models WHERE id = ?`).get(demoModelId);
+    assert.strictEqual(modelBusinessRow.sourceBatchId, demoModelPreview.batchId);
+    assert.strictEqual(modelBusinessRow.sourceRowNumber, demoModelPreview.candidateRows[0].sourceRowNumber);
+
+    const nodeRegistry = demoOwnershipDb.prepare(`SELECT entity_pk AS entityPk, source_batch_id AS sourceBatchId,
+        source_row_number AS sourceRowNumber FROM demo_data_registry
+      WHERE run_id = ? AND artifact_key = '23-energy-flow-nodes' AND entity_type = 'energy_flow_node'
+      ORDER BY registry_id`).all(demoRun.runId);
+    assert.strictEqual(nodeRegistry.length, 2);
+    assert(nodeRegistry.every((row) => Number(row.sourceBatchId) === demoNodePreview.batchId));
+    assert.deepStrictEqual(nodeRegistry.map((row) => Number(row.sourceRowNumber)), [2, 3]);
+
+    const relations = demoOwnershipDb.prepare(`SELECT parent.entity_type AS fromEntityType,
+        parent.entity_pk AS fromEntityPk, child.entity_type AS toEntityType,
+        child.entity_pk AS toEntityPk, relation.relation_type AS relationType
+      FROM demo_data_relations relation
+      JOIN demo_data_registry parent ON parent.registry_id = relation.from_registry_id
+      JOIN demo_data_registry child ON child.registry_id = relation.to_registry_id
+      WHERE relation.run_id = ? ORDER BY parent.entity_type, parent.entity_pk, child.entity_type, child.entity_pk`
+    ).all(demoRun.runId);
+    assert.deepStrictEqual(relations, [
+      { fromEntityType: 'energy_flow_edge', fromEntityPk: String(demoOwnedEdgeId), toEntityType: 'energy_flow_record', toEntityPk: String(demoOwnedRecordId), relationType: 'contains' },
+      { fromEntityType: 'energy_flow_model', fromEntityPk: String(demoModelId), toEntityType: 'energy_flow_edge', toEntityPk: String(demoOwnedEdgeId), relationType: 'contains' },
+      { fromEntityType: 'energy_flow_model', fromEntityPk: String(demoModelId), toEntityType: 'energy_flow_node', toEntityPk: String(nodeRegistry[0].entityPk), relationType: 'contains' },
+      { fromEntityType: 'energy_flow_model', fromEntityPk: String(demoModelId), toEntityType: 'energy_flow_node', toEntityPk: String(nodeRegistry[1].entityPk), relationType: 'contains' },
+      { fromEntityType: 'energy_flow_model', fromEntityPk: String(demoModelId), toEntityType: 'energy_flow_record', toEntityPk: String(demoOwnedRecordId), relationType: 'contains' }
+    ]);
+  } finally {
+    demoOwnershipDb.close();
+  }
+
+  // managed record-only 必须为同 run 已 owned existing edge 生成 edge→record；model→record 也必须同事务登记。
+  const demoRecordOnlyFile = createHardCodedBundleUpload(
+    'energy-flow-demo-record-only-owned.xlsx',
+    [],
+    [createRecordRow({
+      modelCode: demoModelRow.modelCode,
+      modelVersion: demoModelRow.version,
+      edgeCode: 'DEMO-EDGE',
+      startUtc: '2027-01-01T00:00:00Z',
+      endUtc: '2027-02-01T00:00:00Z',
+      originalValue: 1300,
+      sourceReference: 'demo:record:DEMO-EDGE:record-only-owned'
+    })]
+  );
+  const demoRecordOnlyContext = createManagedDemoContext({
+    actorUserId,
+    runId: demoRun.runId,
+    artifactKey: '24-energy-flow-edges',
+    handlerKey: 'energy-flow-bundle-import',
+    file: demoRecordOnlyFile
+  });
+  const demoRecordOnlyPreview = previewEnergyFlowBundleImport(demoRecordOnlyFile, {
+    uploadsDir: temporaryUploadsDir,
+    demoContext: demoRecordOnlyContext,
+    createUploadGroupId: () => 'flow-demo-record-only-owned'
+  });
+  assert.strictEqual(demoRecordOnlyPreview.edgePreview.candidateRows.length, 0);
+  assert.strictEqual(demoRecordOnlyPreview.recordPreview.candidateRows.length, 1);
+  assert.strictEqual(demoRecordOnlyPreview.recordPreview.candidateRows[0].edgeReferenceKind, 'existing');
+  assert.strictEqual(demoRecordOnlyPreview.recordPreview.candidateRows[0].existingEdgeId, demoOwnedEdgeId);
+  const demoRecordOnlyExecute = await executeEnergyFlowBundleImport(
+    buildExecuteBody(demoRecordOnlyPreview, {
+      edgeBatchId: demoRecordOnlyPreview.edgeBatchId,
+      recordBatchId: demoRecordOnlyPreview.recordBatchId
+    }),
+    {
+      uploadsDir: temporaryUploadsDir,
+      demoContext: demoRecordOnlyContext,
+      createBackup: createBackupStub({ count: 0 })
+    }
+  );
+  assert.strictEqual(demoRecordOnlyExecute.edge.imported, 0);
+  assert.strictEqual(demoRecordOnlyExecute.record.imported, 1);
+  assert.strictEqual(demoRecordOnlyExecute.record.ownership.registrationCount, 1);
+  assert.strictEqual(demoRecordOnlyExecute.record.ownership.relationCount, 4,
+    'record-only 关系输入应包含已有 model→nodes、model→record 和 existing edge→record。');
+  const demoRecordOnlyId = demoRecordOnlyExecute.record.importedIds[0];
+  const ownedRecordRelationDb = openDatabase();
+  try {
+    assert.strictEqual(ownedRecordRelationDb.prepare(`SELECT COUNT(*) AS total FROM demo_data_relations relation
+      JOIN demo_data_registry parent ON parent.registry_id = relation.from_registry_id
+      JOIN demo_data_registry child ON child.registry_id = relation.to_registry_id
+      WHERE relation.run_id = ? AND relation.relation_type = 'contains'
+        AND parent.entity_type = 'energy_flow_edge' AND parent.entity_pk = ?
+        AND child.entity_type = 'energy_flow_record' AND child.entity_pk = ?`).get(
+      demoRun.runId, String(demoOwnedEdgeId), String(demoRecordOnlyId)
+    ).total, 1, '同 run existing edge 必须生成 edge→record contains。');
+    assert.strictEqual(ownedRecordRelationDb.prepare(`SELECT COUNT(*) AS total FROM demo_data_relations relation
+      JOIN demo_data_registry parent ON parent.registry_id = relation.from_registry_id
+      JOIN demo_data_registry child ON child.registry_id = relation.to_registry_id
+      WHERE relation.run_id = ? AND relation.relation_type = 'contains'
+        AND parent.entity_type = 'energy_flow_model' AND parent.entity_pk = ?
+        AND child.entity_type = 'energy_flow_record' AND child.entity_pk = ?`).get(
+      demoRun.runId, String(demoModelId), String(demoRecordOnlyId)
+    ).total, 1, '同 run record-only 必须生成 model→record contains。');
+    assert.strictEqual(ownedRecordRelationDb.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+      WHERE run_id = ? AND entity_type = 'energy_flow_record' AND entity_pk = ?`).get(
+      demoRun.runId, String(demoRecordOnlyId)
+    ).total, 1);
+  } finally {
+    ownedRecordRelationDb.close();
+  }
+
+  // 未纳管正式 edge 不得被接管；record、registry、relation 必须随 ownership 端点失败整体回滚。
+  const unownedEdgeDb = openDatabase();
+  let unownedEdgeId;
+  try {
+    const sourceNodeId = Number(unownedEdgeDb.prepare(`SELECT id FROM energy_flow_nodes
+      WHERE energy_flow_model_id = ? AND node_code = 'DEMO-SOURCE'`).get(demoModelId).id);
+    const sinkNodeId = Number(unownedEdgeDb.prepare(`SELECT id FROM energy_flow_nodes
+      WHERE energy_flow_model_id = ? AND node_code = 'DEMO-SINK'`).get(demoModelId).id);
+    const energyTypeId = Number(unownedEdgeDb.prepare(
+      `SELECT id FROM energy_types WHERE code = 'electricity' ORDER BY id LIMIT 1`
+    ).get().id);
+    unownedEdgeId = Number(unownedEdgeDb.prepare(`INSERT INTO energy_flow_edges (
+      energy_flow_model_id, edge_code, from_node_id, to_node_id, energy_type_id, unit,
+      source_type, source_mapping_json, status
+    ) VALUES (?, 'DEMO-UNOWNED-EDGE', ?, ?, ?, 'kWh', 'explicit_edge_value', ?, 'active')`).run(
+      demoModelId,
+      sourceNodeId,
+      sinkNodeId,
+      energyTypeId,
+      JSON.stringify({ reference: 'formal:DEMO-UNOWNED-EDGE' })
+    ).lastInsertRowid);
+  } finally {
+    unownedEdgeDb.close();
+  }
+  const unownedRecordFile = createHardCodedBundleUpload(
+    'energy-flow-demo-record-only-unowned.xlsx',
+    [],
+    [createRecordRow({
+      modelCode: demoModelRow.modelCode,
+      modelVersion: demoModelRow.version,
+      edgeCode: 'DEMO-UNOWNED-EDGE',
+      startUtc: '2028-01-01T00:00:00Z',
+      endUtc: '2028-02-01T00:00:00Z',
+      originalValue: 1400,
+      sourceReference: 'demo:record:DEMO-UNOWNED-EDGE'
+    })]
+  );
+  const unownedRecordContext = createManagedDemoContext({
+    actorUserId,
+    runId: demoRun.runId,
+    artifactKey: '24-energy-flow-edges',
+    handlerKey: 'energy-flow-bundle-import',
+    file: unownedRecordFile
+  });
+  const unownedRecordPreview = previewEnergyFlowBundleImport(unownedRecordFile, {
+    uploadsDir: temporaryUploadsDir,
+    demoContext: unownedRecordContext,
+    createUploadGroupId: () => 'flow-demo-record-only-unowned'
+  });
+  assert.strictEqual(unownedRecordPreview.edgePreview.candidateRows.length, 0);
+  assert.strictEqual(unownedRecordPreview.recordPreview.candidateRows.length, 1);
+  const unownedRecordCountBefore = countRows('energy_flow_records');
+  await assertRejectsWithCode(
+    () => executeEnergyFlowBundleImport(
+      buildExecuteBody(unownedRecordPreview, {
+        edgeBatchId: unownedRecordPreview.edgeBatchId,
+        recordBatchId: unownedRecordPreview.recordBatchId
+      }),
+      {
+        uploadsDir: temporaryUploadsDir,
+        demoContext: unownedRecordContext,
+        createBackup: createBackupStub({ count: 0 })
+      }
+    ),
+    'ENERGY_FLOW_OWNERSHIP_RELATION_ENDPOINT_NOT_OWNED'
+  );
+  assert.strictEqual(countRows('energy_flow_records'), unownedRecordCountBefore);
+  const unownedRollbackDb = openDatabase();
+  try {
+    assert.strictEqual(unownedRollbackDb.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+      WHERE run_id = ? AND entity_type = 'energy_flow_edge' AND entity_pk = ?`).get(
+      demoRun.runId, String(unownedEdgeId)
+    ).total, 0, '未纳管正式 edge 不得被接管。');
+    assert.strictEqual(unownedRollbackDb.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+      WHERE run_id = ? AND entity_type = 'energy_flow_record'
+        AND source_batch_id = ?`).get(demoRun.runId, unownedRecordPreview.recordBatchId).total, 0,
+    'ownership 端点失败后 record registry 必须回滚。');
+    assert.strictEqual(unownedRollbackDb.prepare(`SELECT COUNT(*) AS total FROM demo_data_relations
+      WHERE run_id = ? AND relation_type = 'contains'
+        AND to_registry_id IN (SELECT registry_id FROM demo_data_registry WHERE source_batch_id = ?)`).get(
+      demoRun.runId, unownedRecordPreview.recordBatchId
+    ).total, 0, 'ownership 端点失败后 relation 必须回滚。');
+  } finally {
+    unownedRollbackDb.close();
+  }
+
+  // 其它 run 已拥有的 edge 只能返回跨 run 稳定错误码，不能被当前 run 接管或留下孤立 record。
+  const crossRunId = 'demo-run-rf-p1-007-cross-run';
+  const crossRunDb = openDatabase();
+  try {
+    const currentRun = crossRunDb.prepare(`SELECT dataset_id AS datasetId, manifest_version AS manifestVersion,
+      manifest_digest AS manifestDigest, created_by AS createdBy, created_at AS createdAt
+      FROM demo_dataset_runs WHERE run_id = ?`).get(demoRun.runId);
+    crossRunDb.prepare(`INSERT INTO demo_dataset_runs
+      (run_id, dataset_id, manifest_version, manifest_digest, status, created_by, created_at)
+      VALUES (?, ?, ?, ?, 'failed', ?, ?)`).run(
+      crossRunId,
+      currentRun.datasetId,
+      currentRun.manifestVersion,
+      currentRun.manifestDigest,
+      currentRun.createdBy,
+      currentRun.createdAt
+    );
+    crossRunDb.prepare(`INSERT INTO demo_data_registry
+      (run_id, artifact_key, entity_type, entity_pk, ownership_kind, identity_digest, snapshot_digest, registered_by)
+      VALUES (?, '24-energy-flow-edges', 'energy_flow_edge', ?, 'imported', ?, ?, ?)`).run(
+      crossRunId,
+      String(unownedEdgeId),
+      '1'.repeat(64),
+      '2'.repeat(64),
+      actorUserId
+    );
+  } finally {
+    crossRunDb.close();
+  }
+  const crossRunRecordFile = createHardCodedBundleUpload(
+    'energy-flow-demo-record-only-cross-run.xlsx',
+    [],
+    [createRecordRow({
+      modelCode: demoModelRow.modelCode,
+      modelVersion: demoModelRow.version,
+      edgeCode: 'DEMO-UNOWNED-EDGE',
+      startUtc: '2029-01-01T00:00:00Z',
+      endUtc: '2029-02-01T00:00:00Z',
+      originalValue: 1500,
+      sourceReference: 'demo:record:DEMO-UNOWNED-EDGE:cross-run'
+    })]
+  );
+  const crossRunRecordContext = createManagedDemoContext({
+    actorUserId,
+    runId: demoRun.runId,
+    artifactKey: '24-energy-flow-edges',
+    handlerKey: 'energy-flow-bundle-import',
+    file: crossRunRecordFile
+  });
+  const crossRunRecordPreview = previewEnergyFlowBundleImport(crossRunRecordFile, {
+    uploadsDir: temporaryUploadsDir,
+    demoContext: crossRunRecordContext,
+    createUploadGroupId: () => 'flow-demo-record-only-cross-run'
+  });
+  const crossRunRecordCountBefore = countRows('energy_flow_records');
+  await assertRejectsWithCode(
+    () => executeEnergyFlowBundleImport(
+      buildExecuteBody(crossRunRecordPreview, {
+        edgeBatchId: crossRunRecordPreview.edgeBatchId,
+        recordBatchId: crossRunRecordPreview.recordBatchId
+      }),
+      {
+        uploadsDir: temporaryUploadsDir,
+        demoContext: crossRunRecordContext,
+        createBackup: createBackupStub({ count: 0 })
+      }
+    ),
+    'ENERGY_FLOW_OWNERSHIP_RELATION_CROSS_RUN'
+  );
+  assert.strictEqual(countRows('energy_flow_records'), crossRunRecordCountBefore);
+  const crossRunRollbackDb = openDatabase();
+  try {
+    assert.strictEqual(crossRunRollbackDb.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+      WHERE run_id = ? AND entity_type = 'energy_flow_record'
+        AND source_batch_id = ?`).get(demoRun.runId, crossRunRecordPreview.recordBatchId).total, 0);
+    assert.strictEqual(crossRunRollbackDb.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+      WHERE run_id = ? AND entity_type = 'energy_flow_edge' AND entity_pk = ?`).get(
+      demoRun.runId, String(unownedEdgeId)
+    ).total, 0, '跨 run edge ownership 不得被当前 run 接管。');
+    assert.strictEqual(crossRunRollbackDb.prepare(`SELECT run_id AS runId FROM demo_data_registry
+      WHERE entity_type = 'energy_flow_edge' AND entity_pk = ?`).get(String(unownedEdgeId)).runId, crossRunId);
+  } finally {
+    crossRunRollbackDb.close();
   }
 
   // 数据库完全相同节点按 skip，冲突定义、非法模型/枚举/组织/坐标必须阻断。

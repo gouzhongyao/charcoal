@@ -40,6 +40,10 @@ const {
   GHG_REPORT_TEMPLATE_TYPE,
   GHG_REPORT_TEMPLATE_VERSION
 } = require('./ghgReportContracts');
+const {
+  formatWallClockMinuteForUser,
+  normalizeUserVisibleWallClockMinuteInput
+} = require('../utils/userVisibleDateTime');
 
 const UTF8_BOM = '﻿';
 
@@ -125,13 +129,13 @@ const TEMPLATE_DEFINITIONS = {
     recommendedFormat: 'xlsx',
     appliesTo: ['数据导入', '能耗统计', '预测管理历史数据'],
     contractRoute: 'POST /api/imports/batches',
-    description: '用于上传能耗记录；预测管理的历史数据沿用此能耗记录导入结构，导入后按训练月份读取历史能耗。',
-    headers: ['月份', '能源类型编码', '能源类型名称', '用量', '单位', '用能单元', '厂区', '部门', '产线', '仪表编码', '数据时间', '业务维度', '备注'],
+    description: '用于上传能耗记录；用能单元编码必须精确匹配启用台账，计量器具编码可选且必须与能源类型和用能单元一致。预测历史复用本结构。',
+    headers: ['月份', '能源类型编码', '用量', '单位', '用能单元编码', '计量器具编码', '备注'],
     rows: [
-      ['2026-01', 'electricity', '电力', '1000', 'kWh', '烟测集团/生产部', '烟测园区', '生产部', '一线', 'E-001', '2026-01-01 00:00:00', 'monthly-energy', '能耗导入与预测历史样例'],
-      ['2026/02', 'natural_gas', '天然气', '50', 'm3', '烟测集团/动力部', '烟测园区', '动力部', '', 'G-001', '2026-02-01 00:00:00', 'monthly-energy', '碳核算缺失因子样例'],
-      ['2026-03', 'photovoltaic', '光伏', '1.5', 'MWh', '烟测集团/能源站', '屋顶光伏区', '能源站', '', 'PV-001', '2026-03-01 00:00:00', 'self-generation', '光伏 MWh 自动标准化为 kWh'],
-      ['2026-04', 'oil', '油', '800', 'kg', '烟测集团/锅炉房', '烟测园区', '锅炉房', '', 'OIL-001', '2026-04-01 00:00:00', 'monthly-energy', '通用油 kg 自动标准化为 t']
+      ['2026-01', 'electricity', '1000', 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '能耗导入与预测历史样例'],
+      ['2026/02', 'natural_gas', '50', 'm3', 'QL-UTILITY', 'QL-M-GAS-UTILITY', '天然气能耗样例'],
+      ['2026-03', 'photovoltaic', '1.5', 'MWh', 'QL-PARK', '', '光伏 MWh 自动标准化为 kWh'],
+      ['2026-04', 'oil', '800', 'kg', 'QL-UTILITY', '', '通用油 kg 自动标准化为 t']
     ]
   },
   'meter-readings': {
@@ -181,8 +185,8 @@ const TEMPLATE_DEFINITIONS = {
     description: '固定 Excel v1 供应商模板；联系电话 E2:E5001 按文本保存，最多 5000 条数据。合作状态必填，支持合作中、已踢出及冻结映射别名，空白或未知值阻断；编码按 trim、NFKC 和大写规范键判重，同文件重复阻断，库内已有编码 skip warning，不覆盖既有供应商。',
     headers: ['供应商编码', '供应商名称', '地址', '联系人', '联系电话', '备注', '合作状态'],
     rows: [
-      ['SUP-001', '青岚设备服务商', '青岚园区产业路 1 号', '张工', '010-01234567', '电话列固定为文本', '合作中'],
-      ['SUP-002', '示例原料供应商', '青岚园区仓储路 2 号', '李经理', '+86 138-0000-0000 转 801', '已停止合作的示例', '已踢出']
+      ['SUP-001', '天坤集团设备服务商', '天坤集团产业路 1 号', '张工', '010-01234567', '电话列固定为文本', '合作中'],
+      ['SUP-002', '示例原料供应商', '天坤集团仓储路 2 号', '李经理', '+86 138-0000-0000 转 801', '已停止合作的示例', '已踢出']
     ],
     textColumnIndexes: [4],
     textColumnDataRowLimit: SUPPLIER_IMPORT_RESOURCE_LIMITS.maxDataRows
@@ -283,12 +287,13 @@ const TEMPLATE_DEFINITIONS = {
     recommendedFormat: 'xlsx',
     appliesTo: ['碳核算', '独立碳活动'],
     contractRoute: 'POST /api/carbon/activities/imports/preview -> POST /api/carbon/activities/imports/execute',
-    description: '固定 Excel v1 独立碳活动模板；仅接受一张可见的“独立碳活动”工作表和 15 列精确中文表头。来源墙钟按 IANA 时区唯一转换为 UTC，DST gap/fold 拒绝；导入只写活动事实，不匹配碳因子、不创建计算运行、不写核算结果或旧碳排放结果。',
+    description: '固定 Excel v1 独立碳活动模板；仅接受一张可见的“独立碳活动”工作表和 15 列精确中文表头。来源墙钟在用户文件中使用 YYYY-MM-DD HH:mm:00，历史 YYYY-MM-DDTHH:mm 继续兼容；按 IANA 时区唯一转换为 UTC，DST gap/fold 拒绝；导入只写活动事实，不匹配碳因子、不创建计算运行、不写核算结果或旧碳排放结果。',
     headers: [...CARBON_ACTIVITY_IMPORT_HEADERS],
     rows: [
-      ['CA-2026-0001', '', '范围二', '购入电力', 'OU-001', 'electricity', '2026-01-01T00:00', '2026-02-01T00:00', 'Asia/Shanghai', '12000', 'kWh', 'default', 'electric-meter-summary-2026-01', 'evidence://electricity/2026-01', '来源墙钟必须精确到分钟'],
+      ['CA-2026-0001', '', '范围二', '购入电力', 'OU-001', 'electricity', '2026-01-01T00:00', '2026-02-01T00:00', 'Asia/Shanghai', '12000', 'kWh', 'default', 'electric-meter-summary-2026-01', 'evidence://electricity/2026-01', '用户文件墙钟使用 YYYY-MM-DD HH:mm:00，内部仍精确到分钟'],
       ['CA-2026-0002', '', 'scope_1', '天然气燃烧', 'OU-002', 'natural_gas', '2026-01-01T00:00', '2026-02-01T00:00', 'Asia/Shanghai', '500', 'm3', 'default', 'gas-meter-summary-2026-01', '', '仅写独立活动事实']
     ],
+    userVisibleWallClockColumnIndexes: [6, 7],
     textColumnIndexes: [0, 1, 6, 7, 8, 12, 13, 14],
     textColumnDataRowLimit: CARBON_ACTIVITY_IMPORT_RESOURCE_LIMITS.maxDataRows
   },
@@ -310,14 +315,14 @@ const TEMPLATE_DEFINITIONS = {
       {
         name: '报告信息',
         headers: [...CARBON_EMISSION_REPORT_SHEETS[0].headers],
-        rows: [['CER-2026-0001', '青岚园区 2026 年度碳排放报告', '青岚智造园区', '2026-01-01', '2026-12-31', CARBON_EMISSION_REPORT_TEMPLATE_TYPE, CARBON_EMISSION_REPORT_TEMPLATE_VERSION, '示例报告，只写报告事实']],
+        rows: [['CER-2026-0001', '天坤集团 2026 年度碳排放报告', '天坤集团', '2026-01-01', '2026-12-31', CARBON_EMISSION_REPORT_TEMPLATE_TYPE, CARBON_EMISSION_REPORT_TEMPLATE_VERSION, '示例报告，只写报告事实']],
         textColumnIndexes: [0, 3, 4, 5, 6, 7],
         textColumnDataRowLimit: 1
       },
       {
         name: '组织与核算边界',
         headers: [...CARBON_EMISSION_REPORT_SHEETS[1].headers],
-        rows: [['组织边界', '青岚智造园区全部受控生产与辅助设施', '按运营控制法确定组织边界'], ['核算边界', '范围一、范围二及已识别范围三排放', '报告期间内纳入核算的排放源']],
+        rows: [['组织边界', '天坤集团全部受控生产与辅助设施', '按运营控制法确定组织边界'], ['核算边界', '范围一、范围二及已识别范围三排放', '报告期间内纳入核算的排放源']],
         textColumnIndexes: [0, 1, 2],
         textColumnDataRowLimit: 2
       },
@@ -363,14 +368,14 @@ const TEMPLATE_DEFINITIONS = {
       {
         name: '报告信息',
         headers: [...GHG_REPORT_SHEETS[0].headers],
-        rows: [['GHG-2026-0001', '青岚园区 2026 年度温室气体报告', '青岚智造园区', '2026-01-01', '2026-12-31', GHG_REPORT_TEMPLATE_TYPE, GHG_REPORT_TEMPLATE_VERSION, '示例报告，只写 N7 报告事实']],
+        rows: [['GHG-2026-0001', '天坤集团 2026 年度温室气体报告', '天坤集团', '2026-01-01', '2026-12-31', GHG_REPORT_TEMPLATE_TYPE, GHG_REPORT_TEMPLATE_VERSION, '示例报告，只写 N7 报告事实']],
         textColumnIndexes: [0, 3, 4, 5, 6, 7],
         textColumnDataRowLimit: 1
       },
       {
         name: '组织边界',
         headers: [...GHG_REPORT_SHEETS[1].headers],
-        rows: [['ORG-001', '青岚智造园区全部受控生产与辅助设施', '运营控制法', '报告期间内由报告组织运营控制的设施']],
+        rows: [['ORG-001', '天坤集团全部受控生产与辅助设施', '运营控制法', '报告期间内由报告组织运营控制的设施']],
         textColumnIndexes: [0, 1, 2, 3],
         textColumnDataRowLimit: GHG_REPORT_SHEETS[1].maxDataRows
       },
@@ -425,7 +430,7 @@ const TEMPLATE_DEFINITIONS = {
     description: '仅用于导入可编辑的草稿预测配置；不会运行预测，不会写预测结果、能耗记录或碳排放结果。预测结果必须由后端基于已入库能耗数据生成。',
     headers: [...PREDICTION_CONFIG_IMPORT_HEADERS],
     rows: [
-      ['电力趋势预测草稿', '导入后可编辑，运行时由服务端读取已入库能耗', 'electricity', '生产部', 'A园区', '生产部', '', '2026-01', '2026-03', '2026-04', '2026-06', 'moving_average', '3', 'draft']
+      ['电力趋势预测草稿', '导入后可编辑，运行时由服务端读取已入库能耗', 'electricity', 'QL-PARK', 'QL-M-ELEC-PARK', '', '2026-01', '2026-03', '2026-04', '2026-06', 'moving_average', '3', 'draft']
     ]
   },
   'prediction-history': {
@@ -439,12 +444,12 @@ const TEMPLATE_DEFINITIONS = {
     appliesTo: ['预测管理', '数据导入'],
     contractRoute: 'POST /api/imports/batches',
     reusableTemplateType: 'energy-records',
-    description: '预测历史数据复用能耗记录导入结构；请先下载/填写并导入本模板或能耗数据导入模板，再在预测管理中选择训练月份。',
-    headers: ['月份', '能源类型编码', '能源类型名称', '用量', '单位', '用能单元', '厂区', '部门', '产线', '仪表编码', '数据时间', '业务维度', '备注'],
+    description: '预测历史数据复用能耗记录导入结构；用能单元编码必填，计量器具编码可选且必须匹配台账。导入后在预测管理中选择训练月份。',
+    headers: ['月份', '能源类型编码', '用量', '单位', '用能单元编码', '计量器具编码', '备注'],
     rows: [
-      ['2026-01', 'electricity', '电力', '1000', 'kWh', '烟测集团/生产部', '烟测园区', '生产部', '一线', 'E-001', '2026-01-01 00:00:00', 'prediction-history', '预测训练历史第 1 月'],
-      ['2026-02', 'electricity', '电力', '1100', 'kWh', '烟测集团/生产部', '烟测园区', '生产部', '一线', 'E-001', '2026-02-01 00:00:00', 'prediction-history', '预测训练历史第 2 月'],
-      ['2026-03', 'electricity', '电力', '1200', 'kWh', '烟测集团/生产部', '烟测园区', '生产部', '一线', 'E-001', '2026-03-01 00:00:00', 'prediction-history', '移动平均至少需要 3 个历史月份']
+      ['2026-01', 'electricity', '1000', 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '预测训练历史第 1 月'],
+      ['2026-02', 'electricity', '1100', 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '预测训练历史第 2 月'],
+      ['2026-03', 'electricity', '1200', 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '移动平均至少需要 3 个历史月份']
     ]
   }
 };
@@ -453,8 +458,9 @@ function escapeCsvCell(value) {
   return `"${String(value ?? '').replace(/"/g, '""')}"`;
 }
 
-function renderCsv(headers, rows) {
-  const lines = [headers, ...rows].map((row) => row.map(escapeCsvCell).join(','));
+function renderCsv(headers, rows, options = {}) {
+  const visibleRows = formatHistoricalTemplateRowsForUser(options, rows);
+  const lines = [headers, ...visibleRows].map((row) => row.map(escapeCsvCell).join(','));
   return `${UTF8_BOM}${lines.join('\n')}\n`;
 }
 
@@ -466,6 +472,18 @@ function buildColumnWidths(headers, rows) {
   });
 }
 
+/** 按模板显式列语义格式化用户可见来源墙钟单元格。 */
+function formatHistoricalTemplateRowsForUser(sheetDefinition, rows) {
+  // 未声明墙钟列的历史模板保持原矩阵，避免日期、月份和普通文本被误转。
+  const wallClockColumnIndexes = new Set(sheetDefinition.userVisibleWallClockColumnIndexes || []);
+  return rows.map((row) => row.map((value, columnIndex) => {
+    if (!wallClockColumnIndexes.has(columnIndex) || value === null || value === undefined || value === '') {
+      return value;
+    }
+    return formatWallClockMinuteForUser(normalizeUserVisibleWallClockMinuteInput(value));
+  }));
+}
+
 function renderXlsxBuffer(template) {
   const workbook = XLSX.utils.book_new();
   const sheetDefinitions = Array.isArray(template.sheets) && template.sheets.length > 0
@@ -474,13 +492,15 @@ function renderXlsxBuffer(template) {
         name: template.sheetName,
         headers: template.headers,
         rows: template.rows,
+        userVisibleWallClockColumnIndexes: template.userVisibleWallClockColumnIndexes,
         textColumnIndexes: template.textColumnIndexes,
         textColumnDataRowLimit: template.textColumnDataRowLimit
       }];
   sheetDefinitions.forEach((sheetDefinition) => {
     const headers = sheetDefinition.headers || [];
     const rows = sheetDefinition.rows || [];
-    const worksheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    const visibleRows = formatHistoricalTemplateRowsForUser(sheetDefinition, rows);
+    const worksheet = XLSX.utils.aoa_to_sheet([headers, ...visibleRows]);
     // 指定文本列从第 2 行预格式到领域最大数据行，避免 Excel/WPS 将编码或长文本数值化。
     (sheetDefinition.textColumnIndexes || []).forEach((columnIndex) => {
       const dataRowLimit = Number.isSafeInteger(sheetDefinition.textColumnDataRowLimit)
@@ -488,7 +508,7 @@ function renderXlsxBuffer(template) {
         : rows.length;
       for (let dataRowIndex = 0; dataRowIndex < dataRowLimit; dataRowIndex += 1) {
         const address = XLSX.utils.encode_cell({ r: dataRowIndex + 1, c: columnIndex });
-        const value = String(rows[dataRowIndex]?.[columnIndex] ?? '');
+        const value = String(visibleRows[dataRowIndex]?.[columnIndex] ?? '');
         worksheet[address] = {
           ...(worksheet[address] || {}),
           t: 's',
@@ -502,7 +522,7 @@ function renderXlsxBuffer(template) {
       worksheetRange.e.c = Math.max(worksheetRange.e.c, columnIndex);
       worksheet['!ref'] = XLSX.utils.encode_range(worksheetRange);
     });
-    worksheet['!cols'] = buildColumnWidths(headers, rows);
+    worksheet['!cols'] = buildColumnWidths(headers, visibleRows);
     XLSX.utils.book_append_sheet(workbook, worksheet, String(sheetDefinition.name || ''));
   });
   return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx', compression: true });
@@ -680,7 +700,7 @@ function getTemplateCsv(templateType) {
   return {
     template,
     fileName: getFileName(template, 'csv'),
-    csv: renderCsv(template.headers, template.rows)
+    csv: renderCsv(template.headers, template.rows, template)
   };
 }
 

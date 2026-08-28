@@ -81,7 +81,7 @@ export const getEnergyBenchmarkQualificationRate = (payload) => request({ method
 /** 获取结构化导出行；该接口返回 JSON，禁止作为 Blob 下载。 */
 export const getEnergyBenchmarkExportRows = (payload) => request({ method: 'post', url: `${ENERGY_BENCHMARK_BASE_URL}/export-rows`, data: payload });
 
-/** 三类能效对标导入的空白模板与青岚园区示例映射。 */
+/** 三类能效对标导入的空白模板与天坤集团示例映射。 */
 const ENERGY_BENCHMARK_IMPORT_DOWNLOADS = Object.freeze({
   'conversion-factors': Object.freeze({ templateType: 'energy-conversion-factors', artifactKey: '19-conversion-factors', handlerKey: 'energy-conversion-factors-import', label: '能源折标系数' }),
   definitions: Object.freeze({ templateType: 'energy-benchmark-definitions', artifactKey: '20-benchmark-definitions', handlerKey: 'energy-benchmark-definitions-import', label: '对标定义' }),
@@ -101,12 +101,14 @@ export function downloadEnergyBenchmarkImportTemplate(importType) {
   return download({ url: `/templates/${config.templateType}.xlsx` }, `${config.label}导入模板.xlsx`);
 }
 
-/** 下载当前能效对标导入类型的青岚园区 XLSX 示例并保存托管 context。 */
+/** 下载当前能效对标导入类型的天坤集团 XLSX 示例并保存托管 context。 */
 export function downloadEnergyBenchmarkDemoParkExample(importType) {
   const config = energyBenchmarkImportDownload(importType);
   return downloadManagedDemoArtifact(
     { url: `/templates/demo-park/${config.artifactKey}.xlsx` },
-    `青岚园区示例-${config.label}.xlsx`
+    `天坤集团示例-${config.label}.xlsx`,
+    undefined,
+    config
   );
 }
 

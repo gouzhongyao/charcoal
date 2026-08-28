@@ -428,14 +428,11 @@ function setEnergyBudgetStatus(budgetId, statusInput) {
   }
 }
 
-// 实际能耗组织范围匹配模块：沿用预算既有的组织文本精确匹配口径。
+// 实际能耗组织范围匹配模块：只使用 canonical 用能单元 JOIN 派生字段。
 function buildActualOrganizationMatch(where, params, organizationScope) {
   if (organizationScope && organizationScope !== WHOLE_ORGANIZATION_SCOPE) {
     where.push(`(
-      er.organization = @organizationScope
-      OR er.site = @organizationScope
-      OR er.department = @organizationScope
-      OR ou.unit_code = @organizationScope
+      ou.unit_code = @organizationScope
       OR ou.unit_name = @organizationScope
       OR ou.unit_path = @organizationScope
     )`);
@@ -460,7 +457,7 @@ function getActualUsageGroups(db, periodMonth, energyTypeId, organizationScope) 
        COUNT(er.id) AS recordCount,
        er.normalized_unit AS normalizedUnit
      FROM energy_records er
-     LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id
+     JOIN organization_units ou ON ou.id = er.organization_unit_id
      ${whereSql}
      GROUP BY er.normalized_unit
      ORDER BY er.normalized_unit ASC`
@@ -516,7 +513,7 @@ function buildActualRangeWhere(filters) {
   return { whereSql: `WHERE ${where.join(' AND ')}`, params };
 }
 
-// 实际能耗组合读取模块：保留组织字段用于判断是否已有对应 active 预算覆盖。
+// 实际能耗组合读取模块：只保留 canonical 用能单元派生字段。
 function listActualUsageGroups(db, filters) {
   const { whereSql, params } = buildActualRangeWhere(filters);
   return db.prepare(
@@ -526,9 +523,7 @@ function listActualUsageGroups(db, filters) {
        et.code AS energyTypeCode,
        et.name AS energyTypeName,
        er.normalized_unit AS normalizedUnit,
-       er.organization,
-       er.site,
-       er.department,
+       ou.id AS organizationUnitId,
        ou.unit_code AS organizationUnitCode,
        ou.unit_name AS organizationUnitName,
        ou.unit_path AS organizationUnitPath,
@@ -536,10 +531,10 @@ function listActualUsageGroups(db, filters) {
        COUNT(er.id) AS recordCount
      FROM energy_records er
      JOIN energy_types et ON et.id = er.energy_type_id
-     LEFT JOIN organization_units ou ON ou.id = er.organization_unit_id
+     JOIN organization_units ou ON ou.id = er.organization_unit_id
      ${whereSql}
      GROUP BY er.normalized_month, er.energy_type_id, et.code, et.name, er.normalized_unit,
-              er.organization, er.site, er.department, ou.unit_code, ou.unit_name, ou.unit_path
+              ou.id, ou.unit_code, ou.unit_name, ou.unit_path
      ORDER BY er.normalized_month ASC, et.display_order ASC, er.normalized_unit ASC`
   ).all(params).map((row) => ({
     ...row,
@@ -554,9 +549,6 @@ function budgetMatchesActualGroup(budget, actual) {
   if (budget.periodMonth !== actual.periodMonth || budget.energyTypeId !== actual.energyTypeId) return false;
   if (budget.organizationScope === WHOLE_ORGANIZATION_SCOPE) return true;
   const organizationKeys = [
-    actual.organization,
-    actual.site,
-    actual.department,
     actual.organizationUnitCode,
     actual.organizationUnitName,
     actual.organizationUnitPath
@@ -564,11 +556,11 @@ function budgetMatchesActualGroup(budget, actual) {
   return organizationKeys.includes(budget.organizationScope);
 }
 
-// 无预算实际组合组织键模块：优先使用用能单元名称，再回退到现有组织文本字段。
+// 无预算实际组合组织键模块：仅从 canonical 用能单元派生字段选择。
 function getActualOrganizationScope(actual, requestedOrganizationScope) {
-  return requestedOrganizationScope || normalizeText(actual.organizationUnitName) || normalizeText(actual.department)
-    || normalizeText(actual.site) || normalizeText(actual.organization) || normalizeText(actual.organizationUnitCode)
-    || normalizeText(actual.organizationUnitPath) || WHOLE_ORGANIZATION_SCOPE;
+  return requestedOrganizationScope || normalizeText(actual.organizationUnitName)
+    || normalizeText(actual.organizationUnitCode) || normalizeText(actual.organizationUnitPath)
+    || WHOLE_ORGANIZATION_SCOPE;
 }
 
 // 无预算实际组合合并模块：仅合并月份、能源、单位和组织范围完全一致的数据。

@@ -7,8 +7,10 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
 const MANUAL_ROOT = path.join(PROJECT_ROOT, 'docs', '使用说明书');
 // 正式使用说明书总入口用于校验章节目录。
 const MANUAL_INDEX_PATH = path.join(MANUAL_ROOT, 'README.md');
-// 青岚完整演示主步骤用于校验首次演示入口和 25 项清单完整性。
+// 天坤集团完整演示主步骤用于校验首次演示入口和 29 项清单完整性。
 const PROJECT_STEPS_PATH = path.join(MANUAL_ROOT, '项目使用步骤.md');
+// 通用操作正文用于独立校验用户可见日期时间与内部技术格式分层合同。
+const COMMON_OPERATIONS_MANUAL_PATH = path.join(MANUAL_ROOT, '03-导航权限与通用操作.md');
 // 功能覆盖矩阵用于校验动态页面和特殊页面覆盖情况。
 const COVERAGE_MATRIX_PATH = path.join(MANUAL_ROOT, '维护附录', '功能覆盖矩阵.md');
 // 路由文件用于动态读取当前 componentMap 标识，避免脚本维护静态页面清单。
@@ -51,7 +53,7 @@ const requiredManualFiles = [
   '维护附录/功能覆盖矩阵.md',
   '维护附录/变更记录.md'
 ];
-// 青岚演示 artifact 标识用于约束主步骤与服务端 manifest 的固定 25 项覆盖。
+// 天坤集团演示 artifact 标识用于约束主步骤与服务端 manifest 的固定 29 项覆盖。
 const demoParkArtifactKeys = [
   '01-organization-root',
   '02-organization-departments',
@@ -330,6 +332,45 @@ const n7ManualDocumentContracts = [
     path: CHANGELOG_PATH,
     groups: [
       { label: 'N7-B 文档闭环与后续入口', allOf: ['2026-08-25：温室气体报告前端与正式说明书', 'N7-01 至 N7-08', 'N7-B 实施节点完成', 'N7 整体仍待最终独立审查与 findings 闭环', '不开始 N8/N9', '不归档'] }
+    ]
+  }
+];
+// 模板与展示日期时间统一的三份正式文档最低合同；每份文件独立校验，禁止依靠跨文件合并文本通过。
+const userVisibleDateTimeDocumentContracts = [
+  {
+    label: '03-导航权限与通用操作.md',
+    path: COMMON_OPERATIONS_MANUAL_PATH,
+    groups: [
+      { label: '用户可见完整 UTC 格式', allOf: ['`YYYY-MM-DD HH:mm:ss`', '严格 UTC'] },
+      { label: '内部严格 UTC 格式', allOf: ['`YYYY-MM-DDTHH:mm:ssZ`', 'API、SQLite、model'] },
+      { label: '来源墙钟格式与时区', allOf: ['`YYYY-MM-DD HH:mm:00`', '`YYYY-MM-DDTHH:mm`', 'IANA', '不能直接追加 `Z`'] },
+      { label: 'token 与其他字段', allOf: ['`MM` 表示月份', '`mm` 表示分钟', '`YYYY-MM`', '`YYYY-MM-DD`', '`HH:mm`'] },
+      { label: '新旧模板和文件边界', allOf: ['新模板、新 CSV/XLSX', '历史 ISO/T/Z', '非零毫秒', '上传原文件', 'SQLite 备份'] },
+      { label: '内部安全与精度边界', allOf: ['乐观锁', '签名载荷', '内部审计', '非零秒'] }
+    ]
+  },
+  {
+    label: '功能覆盖矩阵.md',
+    path: COVERAGE_MATRIX_PATH,
+    groups: [
+      { label: '用户可见完整 UTC 格式', allOf: ['用户可见严格 UTC `YYYY-MM-DD HH:mm:ss`'] },
+      { label: '内部严格 UTC 格式', allOf: ['内部/API/SQLite/model/乐观锁/签名/计算', '`YYYY-MM-DDTHH:mm:ssZ`'] },
+      { label: '来源墙钟格式与时区', allOf: ['用户可见来源墙钟 `YYYY-MM-DD HH:mm:00`', '`YYYY-MM-DDTHH:mm`', 'IANA', '不直接追加 Z'] },
+      { label: 'token 与其他字段', allOf: ['`MM` 表示月份', '`mm` 表示分钟', '`YYYY-MM`', '`YYYY-MM-DD`', '`HH:mm`'] },
+      { label: '新旧模板和文件边界', allOf: ['新模板、新 CSV/XLSX', '历史 ISO/T/Z', '`.000Z`', '非零毫秒', '上传原文件', 'SQLite 备份'] },
+      { label: '内部安全与精度边界', allOf: ['乐观锁', '签名', '审计安全链', '非零秒'] }
+    ]
+  },
+  {
+    label: '变更记录.md',
+    path: CHANGELOG_PATH,
+    groups: [
+      { label: '用户可见完整 UTC 格式', allOf: ['`YYYY-MM-DD HH:mm:ss`', '严格 UTC'] },
+      { label: '内部严格 UTC 格式', allOf: ['`YYYY-MM-DDTHH:mm:ssZ`', 'API、SQLite、model'] },
+      { label: '来源墙钟格式与时区', allOf: ['`YYYY-MM-DD HH:mm:00`', '`YYYY-MM-DDTHH:mm`', 'IANA `sourceTimeZone`', '不追加 `Z`'] },
+      { label: 'token 与其他字段', allOf: ['`MM`', '`mm`', '`YYYY-MM`', '`YYYY-MM-DD`', '`HH:mm`'] },
+      { label: '新旧模板和文件边界', allOf: ['新模板、新 CSV/XLSX', '旧 ISO/T/Z', '`.000Z`', '非零毫秒', '上传原文件', 'SQLite 备份'] },
+      { label: '内部安全与精度边界', allOf: ['乐观锁', '签名载荷', '审计安全链', '非零秒'] }
     ]
   }
 ];
@@ -677,7 +718,7 @@ function verifyProjectSteps() {
   const projectStepsMarkerGroups = [
     ['安全前提和完成判定'],
     ['安装、登录、权限和演示前备份'],
-    ['25 个 artifact 的唯一导入顺序'],
+    ['29 个 artifact 的唯一导入顺序'],
     ['preview / execute', 'preview/execute'],
     ['全部导入完成后的主动操作'],
     ['最终页面验收'],
@@ -920,6 +961,22 @@ function verifyN7ManualDocumentContracts() {
 }
 
 /**
+ * 校验三份正式文档分别保留用户可见日期时间、历史兼容和内部安全边界。
+ */
+function verifyUserVisibleDateTimeDocumentContracts() {
+  for (const documentContract of userVisibleDateTimeDocumentContracts) {
+    // 当前文档文本单独读取，避免其他说明书中的标识掩盖本文件缺项。
+    const documentContent = readText(documentContract.path);
+    if (!documentContent) continue;
+    for (const markerGroup of documentContract.groups) {
+      if (!satisfiesMarkerGroup(documentContent, markerGroup)) {
+        addFailure(`${documentContract.label} 缺少用户可见日期时间最低合同：${markerGroup.label}`);
+      }
+    }
+  }
+}
+
+/**
  * 校验说明书整体包含首次启动、数据安全和高风险操作关键主题。
  */
 function verifyCriticalTopics() {
@@ -992,6 +1049,7 @@ function main() {
   verifyN6ManualDocumentContracts();
   verifyN7CarbonManualContract();
   verifyN7ManualDocumentContracts();
+  verifyUserVisibleDateTimeDocumentContracts();
   verifyCriticalTopics();
   verifyClaudeIndex();
   verifyRuleReferences();

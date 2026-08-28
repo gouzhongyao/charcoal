@@ -1,4 +1,5 @@
 const assert = require('assert');
+const XLSX = require('xlsx');
 const fs = require('fs');
 const http = require('http');
 const os = require('os');
@@ -9,7 +10,7 @@ process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads'); process.env.BACKUPS_DIR 
 const { initDatabase, openDatabase } = require('../db/database');
 initDatabase();
 const fixtureDb = openDatabase();
-const fixtureNow = new Date().toISOString();
+const fixtureNow = '2026-08-24T01:05:06Z';
 const energyTypeId = fixtureDb.prepare(`INSERT INTO energy_types (code, name, category, default_unit, standard_unit, is_active, display_order, created_at, updated_at)
   VALUES ('test-electricity', '测试电力', 'energy', 'kWh', 'kWh', 1, 1, ?, ?)`).run(fixtureNow, fixtureNow).lastInsertRowid;
 const organizationUnitId = fixtureDb.prepare(`INSERT INTO organization_units (unit_code, unit_name, unit_path, unit_type, status, created_at, updated_at)
@@ -18,12 +19,12 @@ const meterDeviceId = fixtureDb.prepare(`INSERT INTO meter_devices (meter_code, 
   VALUES ('TEST-METER-01', 'Alpha 测试仪表', 'electricity', ?, ?, '甲地点配电室', 'active', ?, ?)`).run(energyTypeId, organizationUnitId, fixtureNow, fixtureNow).lastInsertRowid;
 fixtureDb.prepare(`INSERT INTO energy_records (
   energy_type_id, organization_unit_id, meter_device_id, original_month, normalized_month,
-  original_unit, original_value, normalized_unit, normalized_value, organization, site,
-  department, production_line, meter_code, business_dimension, remark, duplicate_key,
+  original_unit, original_value, normalized_unit, normalized_value, remark, duplicate_key,
   record_status, created_at, updated_at
-) VALUES (?, ?, ?, '2026-08', '2026-08', 'kWh', 12, 'kWh', 12, '华北组织', '甲地点',
-  '生产部', '一线', 'IMPORT-E-01', 'monthly-energy', 'Alpha 导出检索备注', 'auth-route-energy-record',
-  'active', ?, ?)`).run(energyTypeId, organizationUnitId, meterDeviceId, fixtureNow, fixtureNow);
+) VALUES (?, ?, ?, '2026-08', '2026-08', 'kWh', 12, 'kWh', 12,
+  'Alpha 导出检索备注', 'auth-route-energy-record', 'active', ?, ?)`).run(
+  energyTypeId, organizationUnitId, meterDeviceId, fixtureNow, fixtureNow
+);
 fixtureDb.close();
 const { app } = require('../index');
 function request(server, method, pathname, body, token) {
@@ -43,6 +44,8 @@ function request(server, method, pathname, body, token) {
     const instance = app.listen(0, '127.0.0.1', () => resolve(instance));
   });
   try {
+    const internalCreatedAt = fixtureNow;
+    const userVisibleCreatedAt = internalCreatedAt.replace('T', ' ').replace(/(?:\.\d{3})?Z$/, '');
     const denied = await request(server, 'GET', '/api/users');
     assert.strictEqual(denied.status, 401); assert.strictEqual(denied.body.error.code, 'UNAUTHENTICATED');
     const energyDenied = await request(server, 'GET', '/api/energy-records?keyword=Alpha');
@@ -52,25 +55,36 @@ function request(server, method, pathname, body, token) {
     const signedIn = await request(server, 'POST', '/api/login', { username: 'admin', password: 'AdminPassword123!' });
     assert.strictEqual(signedIn.status, 200); assert(signedIn.body.data.token);
     const token = signedIn.body.data.token;
-    const keywordList = await request(server, 'GET', `/api/energy-records?organization=${encodeURIComponent('华北组织')}&keyword=Alpha`, null, token);
+    const keywordList = await request(server, 'GET', `/api/energy-records?organizationUnitCode=TEST-OU&keyword=Alpha`, null, token);
     assert.strictEqual(keywordList.status, 200);
     assert.strictEqual(keywordList.body.data.length, 1);
-    assert.strictEqual(keywordList.body.data[0].meterDeviceName, 'Alpha 测试仪表');
+    assert.strictEqual(keywordList.body.data[0].meterName, 'Alpha 测试仪表');
+    assert.strictEqual(keywordList.body.data[0].createdAt, internalCreatedAt, '能耗列表 API 必须继续返回严格 UTC 技术值。');
+    assert.strictEqual(keywordList.body.data[0].normalizedMonth, '2026-08', '月份字段必须继续保持 YYYY-MM。');
     const injectionList = await request(server, 'GET', `/api/energy-records?keyword=${encodeURIComponent("Alpha' OR 1=1 --")}`, null, token);
     assert.strictEqual(injectionList.status, 200);
     assert.strictEqual(injectionList.body.data.length, 0, 'keyword 必须作为参数绑定，不能扩大查询范围。');
-    const exportCsv = await request(server, 'GET', `/api/energy-records/export?format=csv&organization=${encodeURIComponent('华北组织')}&keyword=Alpha`, null, token);
+    const exportCsv = await request(server, 'GET', `/api/energy-records/export?format=csv&organizationUnitCode=TEST-OU&keyword=Alpha`, null, token);
     assert.strictEqual(exportCsv.status, 200);
     assert.strictEqual(exportCsv.headers['content-type'], 'text/csv; charset=utf-8');
     assert.strictEqual(exportCsv.headers['x-export-row-count'], '1');
     assert(String(exportCsv.headers['content-disposition']).includes("filename*=UTF-8''"));
-    assert(exportCsv.body.toString('utf8').includes('能耗记录ID'));
-    assert(exportCsv.body.toString('utf8').includes('Alpha 测试仪表'));
-    assert(!exportCsv.body.toString('utf8').includes(tmpDir), '导出字段不得泄露服务器临时路径。');
+    const exportCsvText = exportCsv.body.toString('utf8');
+    assert(exportCsvText.includes('能耗记录ID'));
+    assert(exportCsvText.includes('Alpha 测试仪表'));
+    assert(exportCsvText.includes(userVisibleCreatedAt), '能耗 CSV 创建时间必须使用用户可见空格秒格式。');
+    assert(!exportCsvText.includes(internalCreatedAt), '能耗 CSV 不得泄漏内部 T/Z 日期时间。');
+    assert(exportCsvText.includes('2026-08'), '能耗 CSV 月份必须继续保持 YYYY-MM。');
+    assert(!exportCsvText.includes(tmpDir), '导出字段不得泄露服务器临时路径。');
     const exportXlsx = await request(server, 'GET', '/api/energy-records/export?format=xlsx&keyword=Alpha', null, token);
     assert.strictEqual(exportXlsx.status, 200);
     assert.strictEqual(exportXlsx.headers['content-type'], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     assert(exportXlsx.body.length > 100);
+    const energyWorkbook = XLSX.read(exportXlsx.body, { type: 'buffer' });
+    const energyRows = XLSX.utils.sheet_to_json(energyWorkbook.Sheets['能耗明细'], { header: 1, raw: false });
+    const energyHeaders = energyRows[0];
+    assert.strictEqual(energyRows[1][energyHeaders.indexOf('创建时间')], userVisibleCreatedAt);
+    assert.strictEqual(energyRows[1][energyHeaders.indexOf('月份')], '2026-08');
     const info = await request(server, 'GET', '/api/getInfo', null, token);
     assert.strictEqual(info.status, 200); assert.strictEqual(info.body.data.username, 'admin');
     const users = await request(server, 'GET', '/api/users', null, token);

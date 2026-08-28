@@ -14,6 +14,10 @@ process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
 process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
+// current canonical 初始化身份为 v2；历史能流 predecessor fixture 继续保留业务模型 v1。
+const CURRENT_CANONICAL_SCHEMA_VERSION = '2026-08-28-formal-canonical-v3';
+const HISTORICAL_ENERGY_FLOW_PREDECESSOR_MODEL_VERSION = 'legacy:v1';
+
 // 能源分析底座与 N8 canonical v2 必须创建的二十七张业务表。
 const EXPECTED_TABLES = [
   'energy_timeseries_records',
@@ -107,6 +111,15 @@ function loadDatabaseModule(databaseFilePath) {
 }
 
 /**
+ * 为 SQLite 标识符添加双引号转义。
+ * @param {string} identifier 标识符。
+ * @returns {string} 可安全拼接到测试 SQL 的标识符。
+ */
+function quoteSqlIdentifier(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
+/**
  * 读取表的建表 SQL。
  * @param {object} db SQLite 连接。
  * @param {string} tableName 表名。
@@ -135,6 +148,14 @@ function getIndexNames(db) {
  * @param {string} weakManifestDigest 不可信旧摘要。
  */
 function weakenDemoDatasetRunsSha256Contract(db, runId, weakManifestDigest) {
+  // 表替换前拆除所有引用父表的 post-action 触发器，替换后按原 SQL 恢复，保持测试夹具与生产迁移相同的生命周期。
+  const dependentTriggers = db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'trigger'
+      AND (tbl_name = 'demo_dataset_runs'
+        OR instr(lower(COALESCE(sql, '')), 'demo_dataset_runs') > 0)
+    ORDER BY name`).all();
+  dependentTriggers.forEach((trigger) => db.exec(`DROP TRIGGER ${quoteSqlIdentifier(trigger.name)}`));
+
   db.pragma('foreign_keys = OFF');
   db.exec(`DROP INDEX IF EXISTS ux_demo_dataset_runs_active_dataset;
     DROP INDEX IF EXISTS idx_demo_dataset_runs_status_created;
@@ -172,6 +193,7 @@ function weakenDemoDatasetRunsSha256Contract(db, runId, weakManifestDigest) {
       WHERE status IN ('active', 'completed', 'cleanup_pending', 'cleaning');
     CREATE INDEX idx_demo_dataset_runs_status_created
       ON demo_dataset_runs(status, created_at DESC);`);
+  dependentTriggers.forEach((trigger) => db.exec(trigger.sql));
   db.pragma('foreign_keys = ON');
 }
 
@@ -246,9 +268,71 @@ function seedDemoSha256MigrationContext(db, input) {
 function assertConstraintFailure(action, message) {
   assert.throws(
     action,
-    /(CHECK constraint failed|FOREIGN KEY constraint failed|benchmark target import source must contain batch and positive row together)/,
+    /(CHECK constraint failed|FOREIGN KEY constraint failed|benchmark target import source must contain batch and positive row together|energy flow (?:edge|record) import source must contain batch and positive row together)/,
     message
   );
+}
+
+/**
+ * 断言正式初始化按稳定错误码拒绝现有 SQLite。
+ * @param {Function} action 初始化动作。
+ * @param {string} expectedCode 预期错误码。
+ * @param {string} message 断言说明。
+ */
+function assertInitializationRejected(action, expectedCode, message) {
+  assert.throws(
+    action,
+    (error) => error?.code === expectedCode,
+    message
+  );
+}
+
+/**
+ * 断言带未知持久 schema 对象的未登记库在首次初始化时即被拒绝且不写 metadata。
+ * @param {string} databaseFilePath 隔离 SQLite 路径。
+ * @param {string} setupSql 未知 schema 对象建表语句。
+ * @param {string[]} expectedObjectNames 应完整保留的对象名称。
+ */
+function assertUnknownSchemaObjectsRejected(databaseFilePath, setupSql, expectedObjectNames) {
+  const seedDb = new Database(databaseFilePath);
+  try {
+    seedDb.exec(setupSql);
+  } finally {
+    seedDb.close();
+  }
+  const beforeDb = new Database(databaseFilePath, { readonly: true });
+  const beforeObjects = beforeDb.prepare(`SELECT type, name, tbl_name AS tableName, sql
+    FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name, tbl_name`).all();
+  beforeDb.close();
+  assert.deepStrictEqual(
+    beforeObjects.map((schemaObject) => schemaObject.name).sort(),
+    [...expectedObjectNames].sort(),
+    '未知 schema 对象测试夹具必须精确建立预期对象。'
+  );
+
+  const databaseModule = loadDatabaseModule(databaseFilePath);
+  assertInitializationRejected(
+    () => databaseModule.initDatabase(),
+    'UNKNOWN_EXISTING_SCHEMA',
+    '任一未知持久 schema 对象都必须在首次初始化时 fail-closed。'
+  );
+
+  const afterDb = new Database(databaseFilePath, { readonly: true });
+  try {
+    assert.deepStrictEqual(
+      afterDb.prepare(`SELECT type, name, tbl_name AS tableName, sql
+        FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name, tbl_name`).all(),
+      beforeObjects,
+      '未知 schema 对象被拒绝后不得改写原始结构。'
+    );
+    assert.strictEqual(
+      afterDb.prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'app_meta'").get().total,
+      0,
+      '未知 schema 对象被拒绝后不得污染 app_meta metadata。'
+    );
+  } finally {
+    afterDb.close();
+  }
 }
 
 /**
@@ -329,6 +413,208 @@ function assertBenchmarkTargetImportSourceConstraints(db, benchmarkDefinitionId,
     '被对标目标引用的导入批次不得通用物理删除。'
   );
   assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM benchmark_targets WHERE id = ?').get(validTargetId).total, 1);
+}
+
+/**
+ * 向 strategy_rules 写入一条可重复构造的测试规则。
+ * @param {object} db SQLite 连接。
+ * @param {number|string|null} sourceBatchId 来源批次值。
+ * @param {number|string|null} sourceRowNumber 来源行号值。
+ * @param {string} suffix 规则编码和版本后缀。
+ * @returns {object} 插入结果。
+ */
+function insertStrategyRule(db, sourceBatchId, sourceRowNumber, suffix) {
+  return db.prepare(`INSERT INTO strategy_rules
+    (source_batch_id, source_row_number, rule_code, rule_name, rule_version, formula_version,
+     metric_code, threshold_operator, threshold_value, threshold_unit, reduction_rate, priority,
+     evidence_requirements_json, recommendation_text, source, effective_start_utc, effective_end_utc,
+     source_timezone)
+    VALUES (?, ?, ?, '策略规则', ?, 'strategy:v1', 'energy_intensity', 'gt', 1, 'kgce/t',
+      0.1, 'medium', '{}', '测试建议', '测试来源', '2026-01-01T00:00:00Z',
+      '2027-01-01T00:00:00Z', 'Asia/Shanghai')`)
+    .run(sourceBatchId, sourceRowNumber, `TEST-RULE-${suffix}`, `test:${suffix}`);
+}
+
+/**
+ * 创建只含历史导入审计表的旧库样例。
+ * @param {string} databaseFilePath 隔离数据库路径。
+ */
+/**
+ * 将隔离 canonical 库替换为精确已知、edge/record 尚无 provenance 的 populated 能流 v1。
+ * @param {object} db 已注册项目 SQLite 函数的隔离连接。
+ * @returns {{sourceBatchId:number,before:object}} 历史来源批次和四表业务快照。
+ */
+function installPopulatedEnergyFlowV1WithoutEdgeRecordProvenance(db) {
+  const sourceBatchId = Number(db.prepare(`INSERT INTO import_batches
+    (import_type, original_filename, file_type)
+    VALUES ('energy_flow_node', 'legacy-flow-nodes.xlsx', 'xlsx')`).run().lastInsertRowid);
+  const wasForeignKeysEnabled = db.pragma('foreign_keys', { simple: true }) === 1;
+  db.pragma('foreign_keys = OFF');
+  try {
+    db.exec(`DROP TABLE IF EXISTS energy_flow_loss_evidence;
+      DROP TABLE IF EXISTS energy_flow_loss_facts;
+      DROP TABLE IF EXISTS energy_flow_waste_heat_facts;
+      DROP TABLE IF EXISTS energy_flow_records;
+      DROP TABLE IF EXISTS energy_flow_edges;
+      DROP TABLE IF EXISTS energy_flow_nodes;
+      DROP TABLE IF EXISTS energy_flow_paths;
+      DROP TABLE IF EXISTS energy_flow_assets;
+      DROP TABLE IF EXISTS energy_flow_models;
+
+      CREATE TABLE energy_flow_models (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_code TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        source TEXT NOT NULL,
+        document_no TEXT,
+        version TEXT NOT NULL,
+        effective_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_start_utc) = 1),
+        effective_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_end_utc) = 1),
+        source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        UNIQUE (model_code, version),
+        CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc))
+      );
+      CREATE TABLE energy_flow_nodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_batch_id INTEGER,
+        source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),
+        energy_flow_model_id INTEGER NOT NULL,
+        node_code TEXT NOT NULL,
+        node_name TEXT NOT NULL,
+        node_type TEXT NOT NULL CHECK (node_type IN ('source', 'process', 'storage', 'sink', 'loss', 'boundary')),
+        organization_unit_id INTEGER,
+        x REAL NOT NULL,
+        y REAL NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
+        FOREIGN KEY (energy_flow_model_id) REFERENCES energy_flow_models(id) ON DELETE CASCADE,
+        FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE SET NULL,
+        UNIQUE (energy_flow_model_id, node_code),
+        UNIQUE (energy_flow_model_id, id)
+      );
+      CREATE TABLE energy_flow_edges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        energy_flow_model_id INTEGER NOT NULL,
+        edge_code TEXT NOT NULL,
+        from_node_id INTEGER NOT NULL,
+        to_node_id INTEGER NOT NULL,
+        energy_type_id INTEGER NOT NULL,
+        unit TEXT NOT NULL,
+        source_type TEXT NOT NULL CHECK (source_type IN ('timeseries', 'monthly_energy', 'generation', 'explicit_edge_value')),
+        source_mapping_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        FOREIGN KEY (energy_flow_model_id) REFERENCES energy_flow_models(id) ON DELETE CASCADE,
+        FOREIGN KEY (energy_flow_model_id, from_node_id) REFERENCES energy_flow_nodes(energy_flow_model_id, id) ON DELETE RESTRICT,
+        FOREIGN KEY (energy_flow_model_id, to_node_id) REFERENCES energy_flow_nodes(energy_flow_model_id, id) ON DELETE RESTRICT,
+        FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE RESTRICT,
+        UNIQUE (energy_flow_model_id, edge_code),
+        UNIQUE (energy_flow_model_id, id),
+        CHECK (from_node_id <> to_node_id),
+        CHECK (
+          CASE WHEN json_valid(source_mapping_json) = 1 THEN
+            json_type(source_mapping_json) = 'object'
+            AND typeof(json_extract(source_mapping_json, '$.reference')) = 'text'
+            AND trim(json_extract(source_mapping_json, '$.reference')) <> ''
+          ELSE 0 END
+        )
+      );
+      CREATE TABLE energy_flow_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        energy_flow_model_id INTEGER NOT NULL,
+        energy_flow_edge_id INTEGER NOT NULL,
+        start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(start_utc) = 1),
+        end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(end_utc) = 1),
+        source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+        original_unit TEXT NOT NULL,
+        original_value REAL NOT NULL CHECK (original_value >= 0),
+        source_type TEXT NOT NULL CHECK (source_type IN ('timeseries', 'monthly_energy', 'generation', 'explicit_edge_value')),
+        source_mapping_json TEXT NOT NULL,
+        formula_version TEXT NOT NULL,
+        record_status TEXT NOT NULL DEFAULT 'active' CHECK (record_status IN ('active', 'void')),
+        void_reason TEXT,
+        voided_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        FOREIGN KEY (energy_flow_model_id) REFERENCES energy_flow_models(id) ON DELETE RESTRICT,
+        FOREIGN KEY (energy_flow_model_id, energy_flow_edge_id) REFERENCES energy_flow_edges(energy_flow_model_id, id) ON DELETE RESTRICT,
+        CHECK (unixepoch(start_utc) < unixepoch(end_utc)),
+        CHECK (
+          CASE WHEN json_valid(source_mapping_json) = 1 THEN
+            json_type(source_mapping_json) = 'object'
+            AND typeof(json_extract(source_mapping_json, '$.reference')) = 'text'
+            AND trim(json_extract(source_mapping_json, '$.reference')) <> ''
+          ELSE 0 END
+        ),
+        CHECK (
+          (record_status = 'active' AND void_reason IS NULL AND voided_at IS NULL)
+          OR (
+            record_status = 'void'
+            AND trim(COALESCE(void_reason, '')) <> ''
+            AND is_strict_utc_iso(voided_at) = 1
+          )
+        )
+      );
+      CREATE INDEX idx_energy_flow_models_effective ON energy_flow_models(status, effective_start_utc, effective_end_utc);
+      CREATE INDEX idx_energy_flow_nodes_model_type ON energy_flow_nodes(energy_flow_model_id, node_type, status);
+      CREATE INDEX idx_energy_flow_nodes_batch ON energy_flow_nodes(source_batch_id);
+      CREATE INDEX idx_energy_flow_edges_model_type ON energy_flow_edges(energy_flow_model_id, source_type, status);
+      CREATE INDEX idx_energy_flow_records_edge_range ON energy_flow_records(energy_flow_edge_id, record_status, start_utc, end_utc);`);
+
+    const energyTypeId = Number(db.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id);
+    db.prepare(`INSERT INTO energy_flow_models
+      (id, model_code, model_name, source, document_no, version, effective_start_utc,
+       effective_end_utc, source_timezone, status, created_at, updated_at)
+      VALUES (101, 'LEGACY-FLOW', '历史能流模型', '历史人工配置', 'LEGACY-FLOW-DOC', 'legacy:v1',
+       '2025-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai', 'active',
+       '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z')`).run();
+    const insertNode = db.prepare(`INSERT INTO energy_flow_nodes
+      (id, source_batch_id, source_row_number, energy_flow_model_id, node_code, node_name,
+       node_type, organization_unit_id, x, y, status, created_at, updated_at)
+      VALUES (?, ?, ?, 101, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`);
+    insertNode.run(201, sourceBatchId, 2, 'LEGACY-SOURCE', '历史源节点', 'source', 12.5, 20.25,
+      'active', '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z');
+    insertNode.run(202, sourceBatchId, 3, 'LEGACY-SINK', '历史汇节点', 'sink', 312.5, 20.25,
+      'inactive', '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z');
+    db.prepare(`INSERT INTO energy_flow_edges
+      (id, energy_flow_model_id, edge_code, from_node_id, to_node_id, energy_type_id,
+       unit, source_type, source_mapping_json, status, created_at, updated_at)
+      VALUES (301, 101, 'LEGACY-EDGE', 201, 202, ?, 'kWh', 'explicit_edge_value',
+       '{"reference":"legacy-edge:LEGACY-EDGE"}', 'active',
+       '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z')`).run(energyTypeId);
+    db.prepare(`INSERT INTO energy_flow_records
+      (id, energy_flow_model_id, energy_flow_edge_id, start_utc, end_utc, source_timezone,
+       original_unit, original_value, source_type, source_mapping_json, formula_version,
+       record_status, void_reason, voided_at, created_at, updated_at)
+      VALUES (401, 101, 301, '2026-06-01T00:00:00Z', '2026-07-01T00:00:00Z',
+       'Asia/Shanghai', 'kWh', 1234.5, 'explicit_edge_value',
+       '{"reference":"legacy-record:LEGACY-EDGE:202606"}', 'legacy-formula:v1',
+       'active', NULL, NULL, '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z')`).run();
+  } finally {
+    if (wasForeignKeysEnabled) db.pragma('foreign_keys = ON');
+  }
+  const before = {
+    models: db.prepare(`SELECT id, model_code, model_name, source, document_no, version,
+      effective_start_utc, effective_end_utc, source_timezone, status, created_at, updated_at
+      FROM energy_flow_models ORDER BY id`).all(),
+    nodes: db.prepare(`SELECT id, source_batch_id, source_row_number, energy_flow_model_id, node_code,
+      node_name, node_type, organization_unit_id, x, y, status, created_at, updated_at
+      FROM energy_flow_nodes ORDER BY id`).all(),
+    edges: db.prepare(`SELECT id, energy_flow_model_id, edge_code, from_node_id, to_node_id,
+      energy_type_id, unit, source_type, source_mapping_json, status, created_at, updated_at
+      FROM energy_flow_edges ORDER BY id`).all(),
+    records: db.prepare(`SELECT id, energy_flow_model_id, energy_flow_edge_id, start_utc, end_utc,
+      source_timezone, original_unit, original_value, source_type, source_mapping_json,
+      formula_version, record_status, void_reason, voided_at, created_at, updated_at
+      FROM energy_flow_records ORDER BY id`).all()
+  };
+  return { sourceBatchId, before };
 }
 
 /**
@@ -561,8 +847,22 @@ try {
     const indexNames = new Set(getIndexNames(newDb));
     EXPECTED_INDEXES.forEach((indexName) => assert(indexNames.has(indexName), `新库缺少 ${indexName}。`));
 
-    assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_stage'").get().value, 'demo-context-foundation');
-    assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value, '2026-08-13-demo-context-v4');
+    assert.strictEqual(newDatabaseModule.CANONICAL_SCHEMA_VERSION, CURRENT_CANONICAL_SCHEMA_VERSION,
+      '数据库模块导出的 current canonical 版本必须保持 v2。');
+    assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_stage'").get().value, 'formal-canonical');
+    assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value,
+      CURRENT_CANONICAL_SCHEMA_VERSION, 'current 初始化必须写入 formal-canonical v3。');
+    const freshSchemaFingerprint = newDatabaseModule.calculateSchemaFingerprint(newDb);
+    const freshTrustedProfile = newDatabaseModule.matchTrustedCanonicalSchemaProfile(
+      newDb,
+      CURRENT_CANONICAL_SCHEMA_VERSION
+    );
+    assert.strictEqual(freshTrustedProfile.profileName, 'canonical',
+      'fresh schema 必须命中代码控制的 current canonical profile。');
+    assert.strictEqual(freshTrustedProfile.fingerprint, freshSchemaFingerprint,
+      'fresh schema 实际 fingerprint 必须等于 trusted canonical fingerprint。');
+    assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_fingerprint'").get().value,
+      freshSchemaFingerprint, 'fresh metadata 必须记录经过 trusted profile 验证的实际 fingerprint。');
 
     const importBatchSql = getCreateSql(newDb, 'import_batches');
     EXPECTED_IMPORT_TYPES.forEach((importType) => {
@@ -770,6 +1070,20 @@ try {
     const flowEdgeId = newDb.prepare(`INSERT INTO energy_flow_edges
       (energy_flow_model_id, edge_code, from_node_id, to_node_id, energy_type_id, unit, source_type, source_mapping_json)
       VALUES (?, 'source-sink', ?, ?, ?, 'kWh', 'explicit_edge_value', '{"reference":"test:edge"}')`).run(flowModelId, sourceNodeId, sinkNodeId, energyTypeId).lastInsertRowid;
+    const flowEdgeBatchId = newDb.prepare("SELECT id FROM import_batches WHERE import_type = 'energy_flow_edge' ORDER BY id LIMIT 1").get().id;
+    const flowRecordBatchId = newDb.prepare("SELECT id FROM import_batches WHERE import_type = 'energy_flow_record' ORDER BY id LIMIT 1").get().id;
+    assertConstraintFailure(
+      () => newDb.prepare(`INSERT INTO energy_flow_edges
+        (source_batch_id, energy_flow_model_id, edge_code, from_node_id, to_node_id,
+         energy_type_id, unit, source_type, source_mapping_json)
+        VALUES (?, ?, 'bad-edge-source-pair', ?, ?, ?, 'kWh', 'explicit_edge_value', '{"reference":"test:bad-edge-source"}')`)
+        .run(flowEdgeBatchId, flowModelId, sourceNodeId, sinkNodeId, energyTypeId),
+      '能流边 imported provenance 必须同时提供批次和正整数来源行。'
+    );
+    assertConstraintFailure(
+      () => newDb.prepare('UPDATE energy_flow_edges SET source_row_number = 1 WHERE id = ?').run(flowEdgeId),
+      '能流边 UPDATE 不得把正式 NULL/NULL provenance 改成单边来源。'
+    );
     assertConstraintFailure(
       () => newDb.prepare(`INSERT INTO energy_flow_records
         (energy_flow_model_id, energy_flow_edge_id, start_utc, end_utc, source_timezone, original_unit, original_value,
@@ -801,6 +1115,15 @@ try {
        'energy-flow:v1', ?, ?, ?)`);
     insertFlowRecord.run(flowModelId, flowEdgeId, '2026-07-01T00:00:00Z', '2026-08-01T00:00:00Z',
       'void', '来源更正', '2026-08-02T00:00:00Z');
+    assertConstraintFailure(
+      () => newDb.prepare(`INSERT INTO energy_flow_records
+        (source_batch_id, energy_flow_model_id, energy_flow_edge_id, start_utc, end_utc,
+         source_timezone, original_unit, original_value, source_type, source_mapping_json, formula_version)
+        VALUES (?, ?, ?, '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z',
+         'Asia/Shanghai', 'kWh', 1, 'explicit_edge_value', '{"reference":"test:bad-record-source"}', 'energy-flow:v1')`)
+        .run(flowRecordBatchId, flowModelId, flowEdgeId),
+      '显式边值 imported provenance 必须同时提供批次和正整数来源行。'
+    );
     assertConstraintFailure(
       () => insertFlowRecord.run(flowModelId, flowEdgeId, '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z',
         'active', '不应存在', null),
@@ -1047,9 +1370,399 @@ try {
       const createSql = getCreateSql(newDb, tableName);
       tokens.forEach((token) => assert(createSql.includes(token), `${tableName} CHECK 缺少 ${token}。`));
     });
+    assert.strictEqual(newDb.prepare(`SELECT COUNT(*) AS total FROM sqlite_master
+      WHERE type = 'trigger' AND name IN (
+        'trg_energy_flow_edges_source_insert', 'trg_energy_flow_edges_source_update',
+        'trg_energy_flow_records_source_insert', 'trg_energy_flow_records_source_update'
+      )`).get().total, 4, '新库必须安装四个 canonical 能流 provenance 触发器。');
     assert.deepStrictEqual(newDb.prepare('PRAGMA foreign_key_check').all(), [], '新库外键检查必须通过。');
   } finally {
     newDb.close();
+  }
+
+  // strategy_rules 来源批次必须与来源行号一样，只允许可空或正安全整数，并保留受限外键。
+  const strategyProvenancePath = path.join(dataDir, 'energy-analysis-strategy-provenance.sqlite');
+  const strategyProvenanceModule = loadDatabaseModule(strategyProvenancePath);
+  strategyProvenanceModule.initDatabase();
+  const strategyProvenanceDb = strategyProvenanceModule.openDatabase();
+  try {
+    const strategyRulesSql = getCreateSql(strategyProvenanceDb, 'strategy_rules');
+    assert(strategyRulesSql.includes("typeof(source_batch_id) = 'integer'"),
+      'strategy_rules.source_batch_id 必须声明整数类型约束。');
+    assert(strategyRulesSql.includes('source_batch_id >= 1'),
+      'strategy_rules.source_batch_id 必须声明正整数约束。');
+    assert(strategyRulesSql.includes('source_batch_id IS NULL AND source_row_number IS NULL'),
+      'strategy_rules 必须保留来源字段成对可空约束。');
+    const strategySourceForeignKey = strategyProvenanceDb.prepare('PRAGMA foreign_key_list(strategy_rules)').all()
+      .find((foreignKey) => foreignKey.from === 'source_batch_id');
+    assert(strategySourceForeignKey, 'strategy_rules.source_batch_id 必须声明导入批次外键。');
+    assert.strictEqual(strategySourceForeignKey.table, 'import_batches');
+    assert.strictEqual(strategySourceForeignKey.to, 'id');
+    assert.strictEqual(String(strategySourceForeignKey.on_delete).toUpperCase(), 'RESTRICT');
+
+    strategyProvenanceDb.exec(`INSERT INTO import_batches
+      (id, import_type, original_filename, file_type)
+      VALUES (-1, 'strategy_rule', 'strategy-negative.csv', 'csv'),
+        (0, 'strategy_rule', 'strategy-zero.csv', 'csv'),
+        (2, 'strategy_rule', 'strategy-valid.csv', 'csv')`);
+    assert(insertStrategyRule(strategyProvenanceDb, null, null, 'null-null').lastInsertRowid,
+      'strategy_rules 必须允许 NULL/NULL provenance。');
+    const integerSourceRuleId = insertStrategyRule(strategyProvenanceDb, 2, 1, 'integer').lastInsertRowid;
+    assert(integerSourceRuleId, 'strategy_rules 必须允许正整数来源批次和行号。');
+    const textSourceRuleId = insertStrategyRule(strategyProvenanceDb, '2', 2, 'text-number').lastInsertRowid;
+    assert.strictEqual(
+      strategyProvenanceDb.prepare('SELECT source_batch_id, typeof(source_batch_id) AS sourceType FROM strategy_rules WHERE id = ?')
+        .get(textSourceRuleId).sourceType,
+      'integer',
+      'SQLite INTEGER affinity 应将可规范化的文本数字来源批次保存为 integer。'
+    );
+    const decimalTextSourceRuleId = insertStrategyRule(strategyProvenanceDb, '2.0', 3, 'text-decimal-number').lastInsertRowid;
+    assert.strictEqual(
+      strategyProvenanceDb.prepare('SELECT source_batch_id, typeof(source_batch_id) AS sourceType FROM strategy_rules WHERE id = ?')
+        .get(decimalTextSourceRuleId).sourceType,
+      'integer',
+      'SQLite INTEGER affinity 应将可规范化的文本 2.0 来源批次保存为 integer。'
+    );
+    const realSourceRuleId = insertStrategyRule(strategyProvenanceDb, 2.0, 4, 'real-number').lastInsertRowid;
+    assert.strictEqual(
+      strategyProvenanceDb.prepare('SELECT source_batch_id, typeof(source_batch_id) AS sourceType FROM strategy_rules WHERE id = ?')
+        .get(realSourceRuleId).sourceType,
+      'integer',
+      'SQLite INTEGER affinity 应将可规范化的 2.0 来源批次保存为 integer。'
+    );
+    assertConstraintFailure(
+      () => insertStrategyRule(strategyProvenanceDb, 2, null, 'row-null'),
+      'strategy_rules 只填写来源批次时必须被成对约束拒绝。'
+    );
+    assertConstraintFailure(
+      () => insertStrategyRule(strategyProvenanceDb, null, 5, 'batch-null'),
+      'strategy_rules 只填写来源行号时必须被成对约束拒绝。'
+    );
+    assertConstraintFailure(
+      () => insertStrategyRule(strategyProvenanceDb, 0, 6, 'zero-batch'),
+      '显式合法的 import_batches id=0 也必须被 strategy_rules 正整数约束拒绝。'
+    );
+    assertConstraintFailure(
+      () => insertStrategyRule(strategyProvenanceDb, -1, 7, 'negative-batch'),
+      '显式合法的 import_batches id=-1 也必须被 strategy_rules 正整数约束拒绝。'
+    );
+    [0, -1, 1.5].forEach((invalidRowNumber) => {
+      assertConstraintFailure(
+        () => insertStrategyRule(strategyProvenanceDb, 2, invalidRowNumber, `invalid-row-${String(invalidRowNumber).replace('.', '-')}`),
+        'strategy_rules 来源行号必须拒绝零、负数和小数。'
+      );
+    });
+    assertConstraintFailure(
+      () => strategyProvenanceDb.prepare('DELETE FROM import_batches WHERE id = 2').run(),
+      '被 strategy_rules 引用的导入批次必须继续受 ON DELETE RESTRICT 保护。'
+    );
+    assert.deepStrictEqual(strategyProvenanceDb.prepare('PRAGMA foreign_key_check').all(), []);
+  } finally {
+    strategyProvenanceDb.close();
+  }
+
+  // strategy_rules v2 predecessor 必须继续由 canonical profile 派生并原子迁移到 v3。
+  const strategyMigrationPath = path.join(dataDir, 'energy-analysis-strategy-migration.sqlite');
+  const strategyMigrationModule = loadDatabaseModule(strategyMigrationPath);
+  const legacyStrategyRuleId = 42;
+  const legacyStrategySequenceHighWater = 200;
+  const legacyStrategyBusinessColumns = [
+    'id', 'rule_code', 'rule_name', 'rule_version', 'formula_version', 'metric_code',
+    'threshold_operator', 'threshold_value', 'threshold_min', 'threshold_max',
+    'threshold_unit', 'reduction_rate', 'priority', 'evidence_requirements_json',
+    'recommendation_text', 'source', 'effective_start_utc', 'effective_end_utc',
+    'source_timezone', 'status', 'created_at', 'updated_at'
+  ];
+  let legacyStrategyRuleSnapshot;
+  let legacyStrategyHitSnapshot;
+  let migratedStrategyFingerprint;
+  let postMigrationAutoRuleId;
+  strategyMigrationModule.initDatabase();
+  const strategyMigrationSeedDb = strategyMigrationModule.openDatabase();
+  try {
+    strategyMigrationSeedDb.pragma('foreign_keys = OFF');
+    strategyMigrationSeedDb.exec('DROP TABLE strategy_rules');
+    strategyMigrationSeedDb.exec(`CREATE TABLE strategy_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rule_code TEXT NOT NULL,
+      rule_name TEXT NOT NULL,
+      rule_version TEXT NOT NULL,
+      formula_version TEXT NOT NULL,
+      metric_code TEXT NOT NULL,
+      threshold_operator TEXT NOT NULL CHECK (threshold_operator IN ('gt', 'gte', 'lt', 'lte', 'between')),
+      threshold_value REAL,
+      threshold_min REAL,
+      threshold_max REAL,
+      threshold_unit TEXT NOT NULL,
+      reduction_rate REAL CHECK (reduction_rate IS NULL OR (reduction_rate > 0 AND reduction_rate <= 1)),
+      priority TEXT NOT NULL CHECK (priority IN ('low', 'medium', 'high')),
+      evidence_requirements_json TEXT NOT NULL,
+      recommendation_text TEXT NOT NULL,
+      source TEXT NOT NULL,
+      effective_start_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_start_utc) = 1),
+      effective_end_utc TEXT NOT NULL CHECK (is_strict_utc_iso(effective_end_utc) = 1),
+      source_timezone TEXT NOT NULL CHECK (is_valid_iana_timezone(source_timezone) = 1),
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      UNIQUE (rule_code, rule_version),
+      CHECK (unixepoch(effective_start_utc) < unixepoch(effective_end_utc)),
+      CHECK (
+        (threshold_operator = 'between' AND threshold_min IS NOT NULL AND threshold_max IS NOT NULL
+          AND threshold_min <= threshold_max AND threshold_value IS NULL)
+        OR (threshold_operator <> 'between' AND threshold_value IS NOT NULL
+          AND threshold_min IS NULL AND threshold_max IS NULL)
+      )
+    );
+    CREATE INDEX idx_strategy_rules_status_metric ON strategy_rules(status, metric_code, rule_code)`);
+    strategyMigrationSeedDb.prepare(`INSERT INTO strategy_rules
+      (id, rule_code, rule_name, rule_version, formula_version, metric_code, threshold_operator,
+       threshold_value, threshold_unit, reduction_rate, priority, evidence_requirements_json,
+       recommendation_text, source, effective_start_utc, effective_end_utc, source_timezone,
+       status, created_at, updated_at)
+      VALUES (?, 'MIGRATION-RULE', '迁移规则', 'legacy:v2', 'strategy:v1', 'energy_intensity', 'gt',
+       1, 'kgce/t', 0.1, 'medium', '{}', '迁移建议', '迁移测试',
+       '2026-01-01T00:00:00Z', '2027-01-01T00:00:00Z', 'Asia/Shanghai', 'active',
+       '2026-02-01T00:00:00.000Z', '2026-02-02T00:00:00.000Z')`).run(legacyStrategyRuleId);
+    assert.strictEqual(
+      strategyMigrationSeedDb.prepare("UPDATE sqlite_sequence SET seq = ? WHERE name = 'strategy_rules'")
+        .run(legacyStrategySequenceHighWater).changes,
+      1,
+      'v2 predecessor 夹具必须显式建立高于历史 ID 的 sqlite_sequence 高水位。'
+    );
+    strategyMigrationSeedDb.pragma('foreign_keys = ON');
+    const legacyEvaluationRunId = Number(strategyMigrationSeedDb.prepare(`INSERT INTO strategy_evaluation_runs
+      (run_code, scope_type, scope_reference, start_utc, end_utc, source_timezone,
+       formula_version, status, reason_codes_json)
+      VALUES ('MIGRATION-RUN', 'organization', 'migration:organization',
+       '2026-03-01T00:00:00Z', '2026-04-01T00:00:00Z', 'Asia/Shanghai',
+       'strategy:v1', 'completed', '["migration"]')`).run().lastInsertRowid);
+    strategyMigrationSeedDb.prepare(`INSERT INTO strategy_rule_hits
+      (evaluation_run_id, strategy_rule_id, match_status, manual_status, actual_value,
+       threshold_snapshot_json, evidence_json, reason_codes_json, coverage_rate, priority,
+       estimated_saving, estimated_saving_unit, data_start_utc, data_end_utc, source_timezone,
+       reviewed_at, review_note)
+      VALUES (?, ?, 'matched', 'accepted', 1.5, '{"operator":"gt","value":1}',
+       '["migration-evidence"]', '["migration"]', 0.95, 'medium', 12, 'kgce',
+       '2026-03-01T00:00:00Z', '2026-04-01T00:00:00Z', 'Asia/Shanghai',
+       '2026-04-02T00:00:00Z', '迁移后必须保留入向外键行')`)
+      .run(legacyEvaluationRunId, legacyStrategyRuleId);
+    legacyStrategyRuleSnapshot = strategyMigrationSeedDb.prepare(
+      `SELECT ${legacyStrategyBusinessColumns.join(', ')} FROM strategy_rules WHERE id = ?`
+    ).get(legacyStrategyRuleId);
+    legacyStrategyHitSnapshot = strategyMigrationSeedDb.prepare(
+      'SELECT * FROM strategy_rule_hits WHERE strategy_rule_id = ?'
+    ).get(legacyStrategyRuleId);
+    assert(legacyStrategyHitSnapshot, 'v2 predecessor 必须建立引用显式规则 ID 的 strategy_rule_hits 夹具。');
+    assert.deepStrictEqual(strategyMigrationSeedDb.prepare('PRAGMA foreign_key_check').all(), []);
+    const predecessorFingerprint = strategyMigrationModule.calculateSchemaFingerprint(strategyMigrationSeedDb);
+    strategyMigrationSeedDb.prepare("UPDATE app_meta SET value = ? WHERE key = 'schema_version'")
+      .run('2026-08-27-formal-canonical-v2');
+    strategyMigrationSeedDb.prepare("UPDATE app_meta SET value = ? WHERE key = 'schema_fingerprint'")
+      .run(predecessorFingerprint);
+  } finally {
+    strategyMigrationSeedDb.close();
+  }
+  strategyMigrationModule.initDatabase();
+  const strategyMigrationDb = strategyMigrationModule.openDatabase();
+  try {
+    assert.strictEqual(strategyMigrationDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value,
+      CURRENT_CANONICAL_SCHEMA_VERSION, 'strategy_rules predecessor 迁移后必须写入 current canonical v3。');
+    const migratedStrategyColumns = new Set(strategyMigrationDb.prepare('PRAGMA table_info(strategy_rules)').all()
+      .map((column) => column.name));
+    assert(migratedStrategyColumns.has('source_batch_id'));
+    assert(migratedStrategyColumns.has('source_row_number'));
+    assert.deepStrictEqual(
+      strategyMigrationDb.prepare(
+        `SELECT ${legacyStrategyBusinessColumns.join(', ')} FROM strategy_rules WHERE id = ?`
+      ).get(legacyStrategyRuleId),
+      legacyStrategyRuleSnapshot,
+      'strategy_rules predecessor 迁移必须逐值保留显式非默认主键与全部历史业务字段。'
+    );
+    assert.deepStrictEqual(
+      strategyMigrationDb.prepare(`SELECT source_batch_id AS sourceBatchId,
+        source_row_number AS sourceRowNumber FROM strategy_rules WHERE id = ?`).get(legacyStrategyRuleId),
+      { sourceBatchId: null, sourceRowNumber: null },
+      'strategy_rules predecessor 迁移必须将历史规则 provenance 补为 NULL/NULL。'
+    );
+    assert.deepStrictEqual(
+      strategyMigrationDb.prepare('SELECT * FROM strategy_rule_hits WHERE strategy_rule_id = ?')
+        .get(legacyStrategyRuleId),
+      legacyStrategyHitSnapshot,
+      'strategy_rules 重建后必须逐值保留 strategy_rule_hits 入向外键业务行。'
+    );
+    const migratedHitForeignKey = strategyMigrationDb.prepare('PRAGMA foreign_key_list(strategy_rule_hits)').all()
+      .find((foreignKey) => foreignKey.from === 'strategy_rule_id');
+    assert(migratedHitForeignKey, 'strategy_rule_hits 必须继续引用 strategy_rules.id。');
+    assert.strictEqual(migratedHitForeignKey.table, 'strategy_rules');
+    assert.strictEqual(migratedHitForeignKey.to, 'id');
+    assert.strictEqual(String(migratedHitForeignKey.on_delete).toUpperCase(), 'RESTRICT');
+    const migratedStrategyForeignKey = strategyMigrationDb.prepare('PRAGMA foreign_key_list(strategy_rules)').all()
+      .find((foreignKey) => foreignKey.from === 'source_batch_id');
+    assert(migratedStrategyForeignKey);
+    assert.strictEqual(migratedStrategyForeignKey.table, 'import_batches');
+    assert.strictEqual(String(migratedStrategyForeignKey.on_delete).toUpperCase(), 'RESTRICT');
+    const migratedStrategySql = getCreateSql(strategyMigrationDb, 'strategy_rules');
+    assert(migratedStrategySql.includes('UNIQUE (rule_code, rule_version)'),
+      'strategy_rules 迁移后必须保留直接 UNIQUE(rule_code, rule_version) 表级约束。');
+    assert(strategyMigrationDb.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_strategy_rules_status_metric'").get(),
+      'strategy_rules 迁移后必须保留显式候选查询索引。');
+    assert(
+      strategyMigrationDb.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'strategy_rules'").get().seq
+        >= legacyStrategySequenceHighWater,
+      'strategy_rules 迁移后不得降低 sqlite_sequence 历史高水位。'
+    );
+    postMigrationAutoRuleId = Number(
+      insertStrategyRule(strategyMigrationDb, null, null, 'post-migration-auto').lastInsertRowid
+    );
+    assert(postMigrationAutoRuleId >= legacyStrategySequenceHighWater + 1,
+      'strategy_rules 迁移后的下一自增 ID 必须从历史高水位之后继续。');
+    assert.throws(
+      () => insertStrategyRule(strategyMigrationDb, null, null, 'post-migration-auto'),
+      (error) => error.code === 'SQLITE_CONSTRAINT_UNIQUE'
+        && /strategy_rules\.rule_code, strategy_rules\.rule_version/i.test(String(error.message || '')),
+      'strategy_rules 迁移后必须由直接 UNIQUE(rule_code, rule_version) 约束拒绝重复身份。'
+    );
+    assert.deepStrictEqual(strategyMigrationDb.prepare('PRAGMA foreign_key_check').all(), []);
+    migratedStrategyFingerprint = strategyMigrationModule.calculateSchemaFingerprint(strategyMigrationDb);
+  } finally {
+    strategyMigrationDb.close();
+  }
+  // populated v2→v3 完成后再次初始化必须幂等，不得丢失规则、hit、索引或序列。
+  strategyMigrationModule.initDatabase();
+  const reinitializedStrategyMigrationDb = strategyMigrationModule.openDatabase();
+  try {
+    assert.strictEqual(
+      strategyMigrationModule.calculateSchemaFingerprint(reinitializedStrategyMigrationDb),
+      migratedStrategyFingerprint,
+      'strategy_rules populated 迁移后二次初始化必须保持 schema fingerprint 稳定。'
+    );
+    assert.deepStrictEqual(
+      reinitializedStrategyMigrationDb.prepare(
+        `SELECT ${legacyStrategyBusinessColumns.join(', ')} FROM strategy_rules WHERE id = ?`
+      ).get(legacyStrategyRuleId),
+      legacyStrategyRuleSnapshot,
+      '二次初始化后必须继续保留显式历史规则 ID 与业务字段。'
+    );
+    assert.deepStrictEqual(
+      reinitializedStrategyMigrationDb.prepare('SELECT * FROM strategy_rule_hits WHERE strategy_rule_id = ?')
+        .get(legacyStrategyRuleId),
+      legacyStrategyHitSnapshot,
+      '二次初始化后必须继续保留 strategy_rule_hits 入向外键行。'
+    );
+    assert.strictEqual(
+      reinitializedStrategyMigrationDb.prepare('SELECT COUNT(*) AS total FROM strategy_rules WHERE id = ?')
+        .get(postMigrationAutoRuleId).total,
+      1,
+      '二次初始化后必须保留迁移后生成的自增规则。'
+    );
+    assert(
+      reinitializedStrategyMigrationDb.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'strategy_rules'").get().seq
+        >= postMigrationAutoRuleId,
+      '二次初始化不得回退 strategy_rules sqlite_sequence。'
+    );
+    assert(reinitializedStrategyMigrationDb.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_strategy_rules_status_metric'"
+    ).get());
+    assert.deepStrictEqual(reinitializedStrategyMigrationDb.prepare('PRAGMA foreign_key_check').all(), []);
+  } finally {
+    reinitializedStrategyMigrationDb.close();
+  }
+
+  // 触发器名称包含双引号、分号和 SQL 元字符时，拆装必须只作用于目标触发器。
+  const specialTriggerPath = path.join(dataDir, 'energy-analysis-trigger-identifier.sqlite');
+  const specialTriggerModule = loadDatabaseModule(specialTriggerPath);
+  specialTriggerModule.initDatabase();
+  const specialTriggerDb = specialTriggerModule.openDatabase();
+  try {
+    const specialTriggerName = 'rf-p1-032"; DROP TABLE trigger_identifier_probe; --';
+    const quoteBreakoutCompanionTriggerName = 'rf-p1-032\\';
+    specialTriggerDb.exec(`CREATE TABLE trigger_identifier_probe (
+      id INTEGER PRIMARY KEY,
+      marker TEXT NOT NULL
+    );
+    INSERT INTO trigger_identifier_probe (id, marker) VALUES (1, 'preserved');
+    CREATE TRIGGER trg_rf_p1_032_unrelated
+    AFTER UPDATE ON trigger_identifier_probe
+    FOR EACH ROW
+    BEGIN
+      SELECT 1;
+    END;
+    CREATE TRIGGER ${quoteSqlIdentifier(quoteBreakoutCompanionTriggerName)}
+    AFTER UPDATE ON demo_dataset_runs
+    FOR EACH ROW
+    BEGIN
+      SELECT 1;
+    END;
+    CREATE TRIGGER ${quoteSqlIdentifier(specialTriggerName)}
+    AFTER UPDATE ON demo_dataset_runs
+    FOR EACH ROW
+    BEGIN
+      SELECT 1;
+    END;`);
+    const canonicalTriggerNames = [
+      'trg_demo_post_action_runs_dataset_insert',
+      'trg_demo_post_action_runs_dataset_update',
+      'trg_demo_dataset_runs_post_action_dataset_update'
+    ];
+    const beforeCanonicalTriggers = specialTriggerDb.prepare(`SELECT name, sql FROM sqlite_master
+      WHERE type = 'trigger' AND name IN (${canonicalTriggerNames.map(() => '?').join(', ')})
+      ORDER BY name`).all(...canonicalTriggerNames);
+    assert.deepStrictEqual(
+      beforeCanonicalTriggers.map((trigger) => trigger.name),
+      [...canonicalTriggerNames].sort(),
+      '特殊名称回归场景必须保留 canonical 三个演示触发器作为拆装基线。'
+    );
+    const beforeSpecialTrigger = specialTriggerDb.prepare(
+      'SELECT name, sql FROM sqlite_master WHERE type = \'trigger\' AND name = ?'
+    ).get(specialTriggerName);
+    const beforeQuoteBreakoutCompanionTrigger = specialTriggerDb.prepare(
+      'SELECT name, sql FROM sqlite_master WHERE type = \'trigger\' AND name = ?'
+    ).get(quoteBreakoutCompanionTriggerName);
+    const beforeUnrelatedTrigger = specialTriggerDb.prepare(
+      'SELECT name, sql FROM sqlite_master WHERE type = \'trigger\' AND name = ?'
+    ).get('trg_rf_p1_032_unrelated');
+    assert(beforeSpecialTrigger, '特殊名称触发器必须创建成功。');
+    assert(beforeQuoteBreakoutCompanionTrigger, '引号突破配套触发器必须创建成功。');
+    assert(beforeUnrelatedTrigger, '无关触发器必须创建成功。');
+
+    weakenDemoDatasetRunsSha256Contract(specialTriggerDb, 'trigger-identifier-run', 'a'.repeat(64));
+
+    assert.deepStrictEqual(
+      specialTriggerDb.prepare('SELECT id, marker FROM trigger_identifier_probe ORDER BY id').all(),
+      [{ id: 1, marker: 'preserved' }],
+      '特殊触发器名称不得注入删除无关表或改写无关数据的附加 SQL。'
+    );
+    assert.deepStrictEqual(
+      specialTriggerDb.prepare(
+        'SELECT name, sql FROM sqlite_master WHERE type = \'trigger\' AND name = ?'
+      ).get(specialTriggerName),
+      beforeSpecialTrigger,
+      '特殊名称触发器拆装后必须按原名称和 SQL 恢复。'
+    );
+    assert.deepStrictEqual(
+      specialTriggerDb.prepare(
+        'SELECT name, sql FROM sqlite_master WHERE type = \'trigger\' AND name = ?'
+      ).get(quoteBreakoutCompanionTriggerName),
+      beforeQuoteBreakoutCompanionTrigger,
+      '引号突破配套触发器不得被附加 SQL 提前删除，且必须按原 SQL 恢复。'
+    );
+    assert.deepStrictEqual(
+      specialTriggerDb.prepare(
+        'SELECT name, sql FROM sqlite_master WHERE type = \'trigger\' AND name = ?'
+      ).get('trg_rf_p1_032_unrelated'),
+      beforeUnrelatedTrigger,
+      '与 demo_dataset_runs 无关的触发器不得被拆装或改写。'
+    );
+    assert.deepStrictEqual(
+      specialTriggerDb.prepare(`SELECT name, sql FROM sqlite_master
+        WHERE type = 'trigger' AND name IN (${canonicalTriggerNames.map(() => '?').join(', ')})
+        ORDER BY name`).all(...canonicalTriggerNames),
+      beforeCanonicalTriggers,
+      'canonical 三个演示触发器拆装后必须按原 SQL 恢复。'
+    );
+  } finally {
+    specialTriggerDb.close();
   }
 
   // 新库二次初始化必须幂等，不新增正式配置或重复结构。
@@ -1060,9 +1773,191 @@ try {
     assert.strictEqual(reinitializedDb.prepare('SELECT COUNT(*) AS total FROM energy_flow_models').get().total, 2, '二次初始化不得复制人工插入的两个模型。');
     assert.strictEqual(reinitializedDb.prepare("SELECT COUNT(*) AS total FROM benchmark_targets WHERE version = 'new-source:valid'").get().total, 1, '二次初始化不得丢失或复制来源对标目标。');
     assert.strictEqual(reinitializedDb.prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'trigger' AND name IN ('trg_benchmark_targets_source_insert', 'trg_benchmark_targets_source_update')").get().total, 2, '二次初始化必须幂等保留两个来源约束触发器。');
+    assert.strictEqual(reinitializedDb.prepare(`SELECT COUNT(*) AS total FROM sqlite_master
+      WHERE type = 'trigger' AND name IN (
+        'trg_energy_flow_edges_source_insert', 'trg_energy_flow_edges_source_update',
+        'trg_energy_flow_records_source_insert', 'trg_energy_flow_records_source_update'
+      )`).get().total, 4, '二次初始化必须幂等保留四个能流 provenance 触发器。');
     assert.deepStrictEqual(reinitializedDb.prepare('PRAGMA foreign_key_check').all(), [], '二次初始化后外键检查必须通过。');
   } finally {
     reinitializedDb.close();
+  }
+
+  // 精确已知 populated 能流 v1 即使 edge/record 完全没有 provenance，也必须机械迁移到 canonical v2。
+  const noProvenanceV1Path = path.join(dataDir, 'energy-flow-v1-no-provenance.sqlite');
+  const noProvenanceV1Module = loadDatabaseModule(noProvenanceV1Path);
+  noProvenanceV1Module.initDatabase();
+  const noProvenanceV1Db = noProvenanceV1Module.openDatabase();
+  let noProvenanceScenario;
+  let migratedFlowSnapshot;
+  try {
+    noProvenanceScenario = installPopulatedEnergyFlowV1WithoutEdgeRecordProvenance(noProvenanceV1Db);
+    assert.strictEqual(noProvenanceScenario.before.models[0].version,
+      HISTORICAL_ENERGY_FLOW_PREDECESSOR_MODEL_VERSION,
+      '历史 predecessor fixture 必须继续保留能流模型 v1，不能被 current schema 版本机械替换。');
+    ['energy_flow_edges', 'energy_flow_records'].forEach((tableName) => {
+      const legacyColumns = noProvenanceV1Db.prepare(`PRAGMA table_info(${tableName})`).all()
+        .map((column) => column.name);
+      assert(!legacyColumns.includes('source_batch_id'), `${tableName} 场景迁移前不得存在 source_batch_id。`);
+      assert(!legacyColumns.includes('source_row_number'), `${tableName} 场景迁移前不得存在 source_row_number。`);
+    });
+    assert.strictEqual(noProvenanceV1Db.prepare(`SELECT COUNT(*) AS total FROM sqlite_master
+      WHERE type = 'index' AND name IN ('idx_energy_flow_edges_batch', 'idx_energy_flow_records_batch')`).get().total, 0);
+    assert.strictEqual(noProvenanceV1Db.prepare(`SELECT COUNT(*) AS total FROM sqlite_master
+      WHERE type = 'trigger' AND tbl_name IN ('energy_flow_edges', 'energy_flow_records')`).get().total, 0);
+
+    assert.strictEqual(noProvenanceV1Module.ensureEnergyAnalysisTables(noProvenanceV1Db), false,
+      '已有能源分析底座上的精确 v1 迁移不应误报首次建表。');
+    const migratedBusiness = {
+      models: noProvenanceV1Db.prepare(`SELECT id, model_code, model_name, source, document_no, version,
+        effective_start_utc, effective_end_utc, source_timezone, status, created_at, updated_at
+        FROM energy_flow_models ORDER BY id`).all(),
+      nodes: noProvenanceV1Db.prepare(`SELECT id, source_batch_id, source_row_number, energy_flow_model_id, node_code,
+        node_name, node_type, organization_unit_id, x, y, status, created_at, updated_at
+        FROM energy_flow_nodes ORDER BY id`).all(),
+      edges: noProvenanceV1Db.prepare(`SELECT id, energy_flow_model_id, edge_code, from_node_id, to_node_id,
+        energy_type_id, unit, source_type, source_mapping_json, status, created_at, updated_at
+        FROM energy_flow_edges ORDER BY id`).all(),
+      records: noProvenanceV1Db.prepare(`SELECT id, energy_flow_model_id, energy_flow_edge_id, start_utc, end_utc,
+        source_timezone, original_unit, original_value, source_type, source_mapping_json,
+        formula_version, record_status, void_reason, voided_at, created_at, updated_at
+        FROM energy_flow_records ORDER BY id`).all()
+    };
+    assert.deepStrictEqual(migratedBusiness, noProvenanceScenario.before,
+      '精确 v1 迁移必须逐值保留全部历史业务字段和历史行。');
+    ['energy_flow_edges', 'energy_flow_records'].forEach((tableName) => {
+      const columns = noProvenanceV1Db.prepare(`PRAGMA table_info(${tableName})`).all()
+        .map((column) => column.name);
+      assert(columns.includes('source_batch_id'), `${tableName} 迁移后必须安装 source_batch_id。`);
+      assert(columns.includes('source_row_number'), `${tableName} 迁移后必须安装 source_row_number。`);
+      const sourceForeignKey = noProvenanceV1Db.prepare(`PRAGMA foreign_key_list(${tableName})`).all()
+        .find((foreignKey) => foreignKey.from === 'source_batch_id');
+      assert(sourceForeignKey, `${tableName} 迁移后必须安装来源批次外键。`);
+      assert.strictEqual(sourceForeignKey.table, 'import_batches');
+      assert.strictEqual(sourceForeignKey.to, 'id');
+      assert.strictEqual(String(sourceForeignKey.on_delete).toUpperCase(), 'RESTRICT');
+      const sourceRows = noProvenanceV1Db.prepare(`SELECT source_batch_id AS sourceBatchId,
+        source_row_number AS sourceRowNumber FROM ${tableName} ORDER BY id`).all();
+      assert(sourceRows.every((row) => row.sourceBatchId === null && row.sourceRowNumber === null),
+        `${tableName} 历史行必须补为 NULL/NULL provenance。`);
+    });
+    ['idx_energy_flow_edges_batch', 'idx_energy_flow_records_batch'].forEach((indexName) => {
+      assert(noProvenanceV1Db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(indexName),
+        `精确 v1 迁移后缺少 ${indexName}。`);
+    });
+    const expectedFlowSourceTriggers = [
+      'trg_energy_flow_edges_source_insert',
+      'trg_energy_flow_edges_source_update',
+      'trg_energy_flow_records_source_insert',
+      'trg_energy_flow_records_source_update'
+    ];
+    assert.deepStrictEqual(noProvenanceV1Db.prepare(`SELECT name FROM sqlite_master
+      WHERE type = 'trigger' AND name IN (${expectedFlowSourceTriggers.map(() => '?').join(', ')})
+      ORDER BY name`).all(...expectedFlowSourceTriggers).map((row) => row.name), [...expectedFlowSourceTriggers].sort());
+    assert.deepStrictEqual(noProvenanceV1Db.prepare('PRAGMA foreign_key_check').all(), []);
+
+    assertConstraintFailure(
+      () => noProvenanceV1Db.prepare('UPDATE energy_flow_edges SET source_row_number = 7 WHERE id = 301').run(),
+      '迁移后 edge UPDATE 不得接受单边 provenance。'
+    );
+    assertConstraintFailure(
+      () => noProvenanceV1Db.prepare('UPDATE energy_flow_records SET source_row_number = 8 WHERE id = 401').run(),
+      '迁移后 record UPDATE 不得接受单边 provenance。'
+    );
+    const energyTypeId = noProvenanceV1Db.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
+    assertConstraintFailure(
+      () => noProvenanceV1Db.prepare(`INSERT INTO energy_flow_edges
+        (source_row_number, energy_flow_model_id, edge_code, from_node_id, to_node_id,
+         energy_type_id, unit, source_type, source_mapping_json)
+        VALUES (9, 101, 'LEGACY-EDGE-INVALID', 201, 202, ?, 'kWh', 'explicit_edge_value',
+         '{"reference":"legacy-edge:invalid"}')`).run(energyTypeId),
+      '迁移后 edge INSERT 不得接受单边 provenance。'
+    );
+    assertConstraintFailure(
+      () => noProvenanceV1Db.prepare(`INSERT INTO energy_flow_records
+        (source_batch_id, energy_flow_model_id, energy_flow_edge_id, start_utc, end_utc,
+         source_timezone, original_unit, original_value, source_type, source_mapping_json, formula_version)
+        VALUES (?, 101, 301, '2026-07-01T00:00:00Z', '2026-08-01T00:00:00Z',
+         'Asia/Shanghai', 'kWh', 1, 'explicit_edge_value',
+         '{"reference":"legacy-record:invalid"}', 'legacy-formula:v1')`)
+        .run(noProvenanceScenario.sourceBatchId),
+      '迁移后 record INSERT 不得接受单边 provenance。'
+    );
+
+    migratedFlowSnapshot = {
+      schema: noProvenanceV1Db.prepare(`SELECT type, name, tbl_name AS tableName, sql FROM sqlite_master
+        WHERE name LIKE 'energy_flow_%' OR name LIKE 'trg_energy_flow_%'
+        ORDER BY type, name`).all(),
+      business: migratedBusiness
+    };
+    assert.strictEqual(noProvenanceV1Module.ensureEnergyAnalysisTables(noProvenanceV1Db), false);
+    assert.deepStrictEqual({
+      schema: noProvenanceV1Db.prepare(`SELECT type, name, tbl_name AS tableName, sql FROM sqlite_master
+        WHERE name LIKE 'energy_flow_%' OR name LIKE 'trg_energy_flow_%'
+        ORDER BY type, name`).all(),
+      business: {
+        models: noProvenanceV1Db.prepare(`SELECT id, model_code, model_name, source, document_no, version,
+          effective_start_utc, effective_end_utc, source_timezone, status, created_at, updated_at
+          FROM energy_flow_models ORDER BY id`).all(),
+        nodes: noProvenanceV1Db.prepare(`SELECT id, source_batch_id, source_row_number, energy_flow_model_id, node_code,
+          node_name, node_type, organization_unit_id, x, y, status, created_at, updated_at
+          FROM energy_flow_nodes ORDER BY id`).all(),
+        edges: noProvenanceV1Db.prepare(`SELECT id, energy_flow_model_id, edge_code, from_node_id, to_node_id,
+          energy_type_id, unit, source_type, source_mapping_json, status, created_at, updated_at
+          FROM energy_flow_edges ORDER BY id`).all(),
+        records: noProvenanceV1Db.prepare(`SELECT id, energy_flow_model_id, energy_flow_edge_id, start_utc, end_utc,
+          source_timezone, original_unit, original_value, source_type, source_mapping_json,
+          formula_version, record_status, void_reason, voided_at, created_at, updated_at
+          FROM energy_flow_records ORDER BY id`).all()
+      }
+    }, migratedFlowSnapshot, '精确 v1 迁移重复执行必须幂等。');
+  } finally {
+    noProvenanceV1Db.close();
+  }
+  noProvenanceV1Module.initDatabase();
+  const reinitializedNoProvenanceV1Db = noProvenanceV1Module.openDatabase();
+  try {
+    assert.strictEqual(reinitializedNoProvenanceV1Db.prepare("SELECT value FROM app_meta WHERE key = 'schema_stage'").get().value,
+      'formal-canonical', '精确 v1 迁移后正式初始化身份必须继续保持 formal-canonical。');
+    assert.deepStrictEqual(reinitializedNoProvenanceV1Db.prepare('PRAGMA foreign_key_check').all(), []);
+    assert.strictEqual(reinitializedNoProvenanceV1Db.prepare('SELECT COUNT(*) AS total FROM energy_flow_edges').get().total, 1);
+    assert.strictEqual(reinitializedNoProvenanceV1Db.prepare('SELECT COUNT(*) AS total FROM energy_flow_records').get().total, 1);
+  } finally {
+    reinitializedNoProvenanceV1Db.close();
+  }
+
+  // 单边补列并携带未知索引的 populated 漂移结构不得命中精确 profile，也不得被通用补列修复。
+  const driftedNoProvenanceV1Path = path.join(dataDir, 'energy-flow-v1-no-provenance-drift.sqlite');
+  const driftedNoProvenanceV1Module = loadDatabaseModule(driftedNoProvenanceV1Path);
+  driftedNoProvenanceV1Module.initDatabase();
+  const driftedNoProvenanceV1Db = driftedNoProvenanceV1Module.openDatabase();
+  try {
+    installPopulatedEnergyFlowV1WithoutEdgeRecordProvenance(driftedNoProvenanceV1Db);
+    driftedNoProvenanceV1Db.exec(`ALTER TABLE energy_flow_edges ADD COLUMN source_batch_id INTEGER;
+      CREATE INDEX idx_energy_flow_edges_batch ON energy_flow_edges(source_batch_id);
+      CREATE TRIGGER test_energy_flow_unknown_trigger BEFORE UPDATE ON energy_flow_records
+      FOR EACH ROW WHEN 0 BEGIN SELECT RAISE(ABORT, 'unknown trigger'); END;`);
+    const beforeDriftReject = {
+      schema: driftedNoProvenanceV1Db.prepare(`SELECT type, name, tbl_name AS tableName, sql FROM sqlite_master
+        WHERE name LIKE 'energy_flow_%' OR name LIKE 'idx_energy_flow_%' OR name LIKE 'test_energy_flow_%'
+        ORDER BY type, name`).all(),
+      edges: driftedNoProvenanceV1Db.prepare('SELECT * FROM energy_flow_edges ORDER BY id').all(),
+      records: driftedNoProvenanceV1Db.prepare('SELECT * FROM energy_flow_records ORDER BY id').all()
+    };
+    assertInitializationRejected(
+      () => driftedNoProvenanceV1Module.ensureEnergyAnalysisTables(driftedNoProvenanceV1Db),
+      'N8_ENERGY_FLOW_NON_CANONICAL_DATA',
+      '单边 provenance、未知索引或未知触发器漂移必须 fail-closed。'
+    );
+    assert.deepStrictEqual({
+      schema: driftedNoProvenanceV1Db.prepare(`SELECT type, name, tbl_name AS tableName, sql FROM sqlite_master
+        WHERE name LIKE 'energy_flow_%' OR name LIKE 'idx_energy_flow_%' OR name LIKE 'test_energy_flow_%'
+        ORDER BY type, name`).all(),
+      edges: driftedNoProvenanceV1Db.prepare('SELECT * FROM energy_flow_edges ORDER BY id').all(),
+      records: driftedNoProvenanceV1Db.prepare('SELECT * FROM energy_flow_records ORDER BY id').all()
+    }, beforeDriftReject, '漂移结构被拒绝后不得改写 schema 或历史业务行。');
+  } finally {
+    driftedNoProvenanceV1Db.close();
   }
 
   // 字段完整但 SHA CHECK 较弱的旧治理表必须替换不可信摘要、撤销 context、清绑定并保持幂等。
@@ -1091,10 +1986,16 @@ try {
   } finally {
     weakShaDb.close();
   }
-  weakShaDatabaseModule.initDatabase();
-  let migratedWeakShaSnapshot;
+  assertInitializationRejected(
+    () => weakShaDatabaseModule.initDatabase(),
+    'SCHEMA_FINGERPRINT_MISMATCH',
+    '已登记 canonical 库的 SHA 约束漂移必须在任何自动修补前被拒绝。'
+  );
   const migratedWeakShaDb = weakShaDatabaseModule.openDatabase();
   try {
+    migratedWeakShaDb.pragma('foreign_keys = OFF');
+    weakShaDatabaseModule.prepareDemoGovernanceTablesForMigration(migratedWeakShaDb);
+    migratedWeakShaDb.pragma('foreign_keys = ON');
     const migratedRun = migratedWeakShaDb.prepare(`SELECT manifest_digest AS manifestDigest
       FROM demo_dataset_runs WHERE run_id = 'sha-weak-run'`).get();
     const migratedContext = migratedWeakShaDb.prepare(`SELECT token_hash AS tokenHash,
@@ -1104,15 +2005,15 @@ try {
       FROM demo_import_contexts WHERE context_id = 'sha-weak-context'`).get();
     assert.match(migratedRun.manifestDigest, /^[a-f0-9]{64}$/);
     assert.notStrictEqual(migratedRun.manifestDigest, weakRunManifestDigest,
-      '不可信 run manifest 不得作为有效绑定继续保留。');
+      '专用迁移 helper 不得继续保留不可信 run manifest。');
     assert.match(migratedContext.tokenHash, /^[a-f0-9]{64}$/);
     assert.notStrictEqual(migratedContext.tokenHash, weakTokenHash,
-      '不可信旧 token hash 必须替换为不可逆 canonical 安全摘要。');
+      '专用迁移 helper 必须替换不可信旧 token hash。');
     assert.strictEqual(migratedWeakShaDb.prepare('SELECT COUNT(*) AS total FROM demo_import_contexts WHERE token_hash = ?')
       .get(weakTokenHash).total, 0, '原不可信 token hash 不得继续命中 context。');
     assert.match(migratedContext.artifactFileSha256, /^[a-f0-9]{64}$/);
     assert.notStrictEqual(migratedContext.artifactFileSha256, weakArtifactSha,
-      '不可信 artifact 摘要必须替换为 canonical 安全摘要。');
+      '专用迁移 helper 必须替换不可信 artifact 摘要。');
     assert.strictEqual(migratedContext.manifestDigest, migratedRun.manifestDigest,
       'context 必须改绑到迁移后的 canonical run manifest。');
     assert.strictEqual(migratedContext.status, 'revoked');
@@ -1123,30 +2024,26 @@ try {
     assert.strictEqual(migratedContext.revokeReason, 'invalid_sha256_migration');
     assert.match(getCreateSql(migratedWeakShaDb, 'demo_dataset_runs'), /NOT GLOB '\*\[\^a-f0-9\]\*'/i);
     assert.match(getCreateSql(migratedWeakShaDb, 'demo_import_contexts'), /NOT GLOB '\*\[\^a-f0-9\]\*'/i);
-    migratedWeakShaSnapshot = { run: migratedRun, context: migratedContext };
-  } finally {
-    migratedWeakShaDb.close();
-  }
-  weakShaDatabaseModule.initDatabase();
-  const idempotentWeakShaDb = weakShaDatabaseModule.openDatabase();
-  try {
+    const migratedWeakShaSnapshot = { run: migratedRun, context: migratedContext };
+    weakShaDatabaseModule.prepareDemoGovernanceTablesForMigration(migratedWeakShaDb);
     assert.deepStrictEqual(
-      idempotentWeakShaDb.prepare(`SELECT manifest_digest AS manifestDigest
+      migratedWeakShaDb.prepare(`SELECT manifest_digest AS manifestDigest
         FROM demo_dataset_runs WHERE run_id = 'sha-weak-run'`).get(),
       migratedWeakShaSnapshot.run,
-      '重复初始化不得再次替换已 canonical 的 run 摘要。'
+      '专用迁移 helper 重复运行不得再次替换已 canonical 的 run 摘要。'
     );
     assert.deepStrictEqual(
-      idempotentWeakShaDb.prepare(`SELECT token_hash AS tokenHash,
+      migratedWeakShaDb.prepare(`SELECT token_hash AS tokenHash,
           manifest_digest AS manifestDigest, artifact_file_sha256 AS artifactFileSha256,
           status, upload_file_sha256 AS uploadFileSha256, preview_digest AS previewDigest,
           previewed_at AS previewedAt, revoked_at AS revokedAt, revoke_reason AS revokeReason
         FROM demo_import_contexts WHERE context_id = 'sha-weak-context'`).get(),
       migratedWeakShaSnapshot.context,
-      '重复初始化不得再次改写已撤销 context 或迁移时间。'
+      '专用迁移 helper 重复运行不得再次改写已撤销 context 或迁移时间。'
     );
+    assert.deepStrictEqual(migratedWeakShaDb.prepare('PRAGMA foreign_key_check').all(), []);
   } finally {
-    idempotentWeakShaDb.close();
+    migratedWeakShaDb.close();
   }
 
   // run 摘要弱化时，即使 context 表自身已 canonical，也必须强制撤销关联 context 并清绑定。
@@ -1174,9 +2071,16 @@ try {
   } finally {
     canonicalContextUnsafeRunDb.close();
   }
-  canonicalContextUnsafeRunModule.initDatabase();
+  assertInitializationRejected(
+    () => canonicalContextUnsafeRunModule.initDatabase(),
+    'SCHEMA_FINGERPRINT_MISMATCH',
+    '仅 run 摘要约束漂移也必须阻断正式初始化。'
+  );
   const migratedCanonicalContextDb = canonicalContextUnsafeRunModule.openDatabase();
   try {
+    migratedCanonicalContextDb.pragma('foreign_keys = OFF');
+    canonicalContextUnsafeRunModule.prepareDemoGovernanceTablesForMigration(migratedCanonicalContextDb);
+    migratedCanonicalContextDb.pragma('foreign_keys = ON');
     const run = migratedCanonicalContextDb.prepare(`SELECT manifest_digest AS manifestDigest
       FROM demo_dataset_runs WHERE run_id = 'sha-canonical-context-run'`).get();
     const context = migratedCanonicalContextDb.prepare(`SELECT manifest_digest AS manifestDigest,
@@ -1190,151 +2094,37 @@ try {
     assert.strictEqual(context.previewDigest, null);
     assert.strictEqual(context.previewedAt, null);
     assert.strictEqual(context.revokeReason, 'invalid_sha256_migration');
+    assert.deepStrictEqual(migratedCanonicalContextDb.prepare('PRAGMA foreign_key_check').all(), []);
   } finally {
     migratedCanonicalContextDb.close();
   }
 
-  // 旧库升级必须安全重建 import_batches，保留历史批次和 import_errors 外键。
+  // 未登记旧库必须 fail-closed，专用导入审计迁移 helper 仍在隔离库中单独验证。
   const legacyDatabasePath = path.join(dataDir, 'energy-analysis-legacy.sqlite');
   createLegacyDatabase(legacyDatabasePath);
   const legacyDatabaseModule = loadDatabaseModule(legacyDatabasePath);
-  legacyDatabaseModule.initDatabase();
-  legacyDatabaseModule.initDatabase();
-  const upgradedDb = legacyDatabaseModule.openDatabase();
+  const legacyBeforeDb = new Database(legacyDatabasePath, { readonly: true });
+  const legacyBeforeSchema = legacyBeforeDb.prepare(`SELECT type, name, tbl_name AS tableName, sql
+    FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`).all();
+  const legacyBeforeBatch = legacyBeforeDb.prepare('SELECT * FROM import_batches ORDER BY id').all();
+  const legacyBeforeErrors = legacyBeforeDb.prepare('SELECT * FROM import_errors ORDER BY id').all();
+  legacyBeforeDb.close();
+  assertInitializationRejected(
+    () => legacyDatabaseModule.initDatabase(),
+    'UNKNOWN_EXISTING_SCHEMA',
+    '没有 app_meta schema 身份的旧库必须拒绝自动升级。'
+  );
+  const rejectedLegacyDb = new Database(legacyDatabasePath, { readonly: true });
   try {
-    EXPECTED_TABLES.forEach((tableName) => assert(getCreateSql(upgradedDb, tableName), `旧库升级后缺少 ${tableName}。`));
-    EXPECTED_IMPORT_TYPES.forEach((importType) => assert(getCreateSql(upgradedDb, 'import_batches').includes(`'${importType}'`), `旧库 import_type 缺少 ${importType}。`));
-    const legacyBatch = upgradedDb.prepare("SELECT * FROM import_batches WHERE original_filename = 'legacy-energy.csv'").get();
-    assert(legacyBatch, '旧 import_batches 批次必须保留。');
-    assert.strictEqual(legacyBatch.error_summary, '旧批次必须保留');
-    assert.strictEqual(legacyBatch.audit_phase, null, '旧批次新增审计列默认 NULL。');
-    const legacyError = upgradedDb.prepare("SELECT * FROM import_errors WHERE batch_id = ? AND error_code = 'LEGACY_WARNING'").get(legacyBatch.id);
-    assert(legacyError, 'import_batches 重建后 import_errors 必须保留。');
-    assert.strictEqual(legacyError.severity, 'warning');
-    const legacyTargets = upgradedDb.prepare(`SELECT * FROM benchmark_targets
-      WHERE version IN ('benchmark-target-internal-revision:v3', 'benchmark-target-internal-revision:v4') ORDER BY id`).all();
-    assert.strictEqual(legacyTargets.length, 2, '阶段 2 旧库升级后既有 benchmark_targets 行数必须保留。');
-    assert.deepStrictEqual(legacyTargets.map((target) => target.target_value), [15, 14]);
-    assert(legacyTargets.every((target) => target.source_batch_id === null && target.source_row_number === null));
-    assert.deepStrictEqual(legacyTargets.map((target) => target.internal_revision), [1, 2],
-      '旧目标必须按稳定顺序回填单调正整数内部修订。');
-    const legacyDefinitions = upgradedDb.prepare(`SELECT * FROM benchmark_definitions
-      WHERE benchmark_code = 'LEGACY-BENCHMARK' ORDER BY id`).all();
-    assert.strictEqual(legacyDefinitions.length, 2, '历史定义行数和主键必须完整保留。');
-    assert.deepStrictEqual(legacyDefinitions.map((definition) => definition.version), [
-      'benchmark-definition-internal-revision:v3',
-      'benchmark-definition-internal-revision:v4'
-    ], '历史定义版本必须原样保留，即使其恰好占用未来服务端默认兼容版本。');
-    assert.deepStrictEqual(legacyDefinitions.map((definition) => definition.document_no), ['LEGACY-DOC-001', 'LEGACY-DOC-002'],
-      '历史定义文号必须原样保留。');
-    assert.deepStrictEqual(legacyDefinitions.map((definition) => definition.internal_revision), [1, 2],
-      '旧定义必须按稳定顺序回填单调正整数内部修订。');
-    const revisionSnapshot = {
-      definitions: legacyDefinitions.map((definition) => [definition.id, definition.internal_revision]),
-      targets: legacyTargets.map((target) => [target.id, target.internal_revision])
-    };
-    assert.strictEqual(legacyDatabaseModule.migrateEnergyBenchmarkInternalRevisions(upgradedDb), false,
-      '内部修订迁移重复运行不得再次改写历史数据。');
-    assert.deepStrictEqual({
-      definitions: upgradedDb.prepare(`SELECT id, internal_revision AS internalRevision FROM benchmark_definitions
-        WHERE benchmark_code = 'LEGACY-BENCHMARK' ORDER BY id`).all().map((row) => [row.id, row.internalRevision]),
-      targets: upgradedDb.prepare(`SELECT id, internal_revision AS internalRevision FROM benchmark_targets
-        WHERE version IN ('benchmark-target-internal-revision:v3', 'benchmark-target-internal-revision:v4') ORDER BY id`).all().map((row) => [row.id, row.internalRevision])
-    }, revisionSnapshot, '重复迁移后定义和目标内部修订必须保持稳定。');
-
-    upgradedDb.prepare(`INSERT INTO organization_units
-      (unit_code, unit_name, unit_path, unit_type, status)
-      VALUES ('LEGACY-ORG', '旧库对标组织', '/LEGACY-ORG', 'workshop', 'active')`).run();
-    const serviceModulePath = require.resolve('../services/energyBenchmarkService');
-    delete require.cache[serviceModulePath];
-    const {
-      createBenchmarkDefinition,
-      createBenchmarkTarget,
-      getBenchmarkDefinition,
-      getBenchmarkTarget,
-      updateBenchmarkDefinition,
-      updateBenchmarkTarget
-    } = require('../services/energyBenchmarkService');
-    const adminUser = upgradedDb.prepare('SELECT id, username FROM sys_users ORDER BY id LIMIT 1').get();
-    const serviceOptions = {
-      db: upgradedDb,
-      actor: { userId: Number(adminUser.id), username: adminUser.username, ip: '127.0.0.1' }
-    };
-    const legacySuccessorInput = {
-      benchmarkCode: 'LEGACY-BENCHMARK',
-      benchmarkName: '旧库兼容版本后继',
-      benchmarkType: 'manual_benchmark',
-      metricCode: 'energy_intensity',
-      unit: 'kgce/t',
-      periodType: 'month',
-      scopeType: 'organization',
-      scopeReference: 'LEGACY-ORG',
-      direction: 'lower_better',
-      source: '旧库迁移服务回归',
-      effectiveStartUtc: '2028-01-01T00:00:00Z',
-      effectiveEndUtc: '2029-01-01T00:00:00Z',
-      sourceTimeZone: 'Asia/Shanghai',
-      status: 'active'
-    };
-    const createdLegacySuccessor = createBenchmarkDefinition(legacySuccessorInput, serviceOptions);
-    assert.strictEqual(createdLegacySuccessor.internalRevision, 3);
-    assert.strictEqual(createdLegacySuccessor.version, 'benchmark-definition-internal-revision:v3:server-1',
-      '旧库历史 version 占用默认 v3 时，新定义必须选择确定性备用后缀。');
-    const inactiveLegacySuccessor = updateBenchmarkDefinition(createdLegacySuccessor.id, {
-      ...legacySuccessorInput,
-      benchmarkName: '旧库未生效定义后继',
-      status: 'inactive'
-    }, serviceOptions);
-    assert.strictEqual(inactiveLegacySuccessor.internalRevision, 4);
-    assert.strictEqual(inactiveLegacySuccessor.version, 'benchmark-definition-internal-revision:v4:server-1');
-    assert.strictEqual(getBenchmarkDefinition(createdLegacySuccessor.id, { db: upgradedDb }).status, 'active',
-      '旧库 active 定义创建 inactive 后继时必须继续生效。');
-
-    const legacyBenchmarkDefinition = legacyDefinitions[0];
-    const createdLegacyTarget = createBenchmarkTarget({
-      benchmarkDefinitionId: legacyBenchmarkDefinition.id,
-      targetValue: 13,
-      lowerBound: null,
-      upperBound: null,
-      status: 'active'
-    }, serviceOptions);
-    assert.strictEqual(createdLegacyTarget.internalRevision, 3);
-    assert.strictEqual(createdLegacyTarget.version, 'benchmark-target-internal-revision:v3:server-1',
-      '旧库历史 version 占用默认目标 v3 时，新目标必须选择确定性备用后缀。');
-    const inactiveLegacyTarget = updateBenchmarkTarget(createdLegacyTarget.id, {
-      targetValue: 12,
-      lowerBound: null,
-      upperBound: null,
-      status: 'inactive'
-    }, serviceOptions);
-    assert.strictEqual(inactiveLegacyTarget.internalRevision, 4);
-    assert.strictEqual(inactiveLegacyTarget.version, 'benchmark-target-internal-revision:v4:server-1');
-    assert.strictEqual(getBenchmarkTarget(createdLegacyTarget.id, { db: upgradedDb }).status, 'active',
-      '旧库 active 目标创建 inactive 后继时必须继续生效。');
-    assert.deepStrictEqual(upgradedDb.prepare(`SELECT version FROM benchmark_definitions
-      WHERE id IN (?, ?) ORDER BY id`).all(legacyDefinitions[0].id, legacyDefinitions[1].id).map((row) => row.version), [
-      'benchmark-definition-internal-revision:v3',
-      'benchmark-definition-internal-revision:v4'
-    ], '服务写入不得改写旧库历史定义 version。');
-    assert.deepStrictEqual(upgradedDb.prepare(`SELECT version FROM benchmark_targets
-      WHERE id IN (?, ?) ORDER BY id`).all(legacyTargets[0].id, legacyTargets[1].id).map((row) => row.version), [
-      'benchmark-target-internal-revision:v3',
-      'benchmark-target-internal-revision:v4'
-    ], '服务写入不得改写旧库历史目标 version。');
-
-    const legacyBenchmarkBatchId = upgradedDb.prepare(
-      "INSERT INTO import_batches (import_type, original_filename, file_type) VALUES ('energy_benchmark', 'benchmark.csv', 'csv')"
-    ).run().lastInsertRowid;
-    assertBenchmarkTargetImportSourceConstraints(
-      upgradedDb,
-      legacyBenchmarkDefinition.id,
-      legacyBenchmarkBatchId,
-      'legacy-source'
-    );
-    upgradedDb.prepare("INSERT INTO import_batches (import_type, original_filename, file_type) VALUES ('energy_flow_record', 'flow.csv', 'csv')").run();
-    assert.deepStrictEqual(upgradedDb.prepare('PRAGMA foreign_key_check').all(), [], '旧库升级和二次初始化后外键检查必须通过。');
+    assert.deepStrictEqual(rejectedLegacyDb.prepare(`SELECT type, name, tbl_name AS tableName, sql
+      FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`).all(), legacyBeforeSchema,
+    '未知旧库被拒绝后不得改写结构。');
+    assert.deepStrictEqual(rejectedLegacyDb.prepare('SELECT * FROM import_batches ORDER BY id').all(), legacyBeforeBatch,
+      '未知旧库被拒绝后不得改写导入批次。');
+    assert.deepStrictEqual(rejectedLegacyDb.prepare('SELECT * FROM import_errors ORDER BY id').all(), legacyBeforeErrors,
+      '未知旧库被拒绝后不得改写导入错误。');
   } finally {
-    upgradedDb.close();
+    rejectedLegacyDb.close();
   }
 
   // 旧平衡库相同摘要的历史快照必须逐条回填独立运行 ID，子记录按所属快照绑定且迁移幂等。
@@ -1940,7 +2730,7 @@ try {
     schemaRollbackDb.close();
   }
 
-  // SHA 治理迁移完成后若 RBAC 后段失败，弱表、旧摘要和有效绑定必须随初始化事务整体回滚。
+  // 已登记 canonical 库出现 SHA 治理结构漂移时，正式初始化必须先拒绝且不得改写任何结构或绑定。
   const shaRollbackPath = path.join(dataDir, 'demo-sha256-init-rollback.sqlite');
   const shaRollbackModule = loadDatabaseModule(shaRollbackPath);
   shaRollbackModule.initDatabase();
@@ -1981,17 +2771,11 @@ try {
       WHERE context_id = 'sha-rollback-context'`).get()
   };
   shaRollbackBeforeDb.close();
-  const configuredShaRollbackAdminPassword = process.env.CHARCOAL_ADMIN_PASSWORD;
-  delete process.env.CHARCOAL_ADMIN_PASSWORD;
-  try {
-    assert.throws(
-      () => shaRollbackModule.initDatabase(),
-      /缺少 CHARCOAL_ADMIN_PASSWORD/,
-      'SHA 治理迁移后的 RBAC 失败必须向调用方抛出错误。'
-    );
-  } finally {
-    process.env.CHARCOAL_ADMIN_PASSWORD = configuredShaRollbackAdminPassword;
-  }
+  assertInitializationRejected(
+    () => shaRollbackModule.initDatabase(),
+    'SCHEMA_FINGERPRINT_MISMATCH',
+    'SHA 治理结构漂移必须在管理员恢复或任何迁移动作前被拒绝。'
+  );
   const shaRollbackAfterDb = new Database(shaRollbackPath, { readonly: true });
   try {
     assert.strictEqual(getCreateSql(shaRollbackAfterDb, 'demo_dataset_runs'), shaRollbackBefore.runSql,
@@ -2043,7 +2827,7 @@ try {
     noAdminDb.close();
   }
 
-  // 既有库初始化后段失败时，原有结构与数据也必须逐字节语义不变。
+  // 无 schema 身份的既有库必须优先按 UNKNOWN_EXISTING_SCHEMA 拒绝，并保持结构与数据不变。
   const existingNoAdminDatabasePath = path.join(dataDir, 'energy-analysis-existing-no-admin.sqlite');
   const existingNoAdminDb = new Database(existingNoAdminDatabasePath);
   try {
@@ -2064,7 +2848,11 @@ try {
   delete process.env.CHARCOAL_ADMIN_PASSWORD;
   const existingNoAdminModule = loadDatabaseModule(existingNoAdminDatabasePath);
   try {
-    assert.throws(() => existingNoAdminModule.initDatabase(), /缺少 CHARCOAL_ADMIN_PASSWORD/);
+    assertInitializationRejected(
+      () => existingNoAdminModule.initDatabase(),
+      'UNKNOWN_EXISTING_SCHEMA',
+      '没有 app_meta 身份的既有库必须拒绝初始化，不得因管理员密码分支进入自动迁移。'
+    );
   } finally {
     process.env.CHARCOAL_ADMIN_PASSWORD = configuredAdminPassword;
   }
@@ -2072,12 +2860,39 @@ try {
   try {
     assert.deepStrictEqual(afterFailedInitDb.prepare(`SELECT type, name, tbl_name AS tableName, sql
       FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`).all(), beforeFailedInitSnapshot,
-    'RBAC 后段失败时既有库结构必须整体不变。');
+    '未知既有库被拒绝后结构必须整体不变。');
     assert.deepStrictEqual(afterFailedInitDb.prepare('SELECT id, value FROM preserved_probe ORDER BY id').all(), beforeFailedInitData,
-      'RBAC 后段失败时既有数据必须整体不变。');
+      '未知既有库被拒绝后数据必须整体不变。');
   } finally {
     afterFailedInitDb.close();
   }
+
+  // 全新数据库仅含未知 view 时也不得被误判为 fresh，且第一次初始化不得写入 metadata。
+  assertUnknownSchemaObjectsRejected(
+    path.join(dataDir, 'energy-analysis-unknown-view.sqlite'),
+    `CREATE VIEW unknown_fresh_view AS SELECT 1 AS marker`,
+    ['unknown_fresh_view']
+  );
+
+  // 全新数据库仅含未知 trigger 及其承载表时必须拒绝，不能只检查业务 table 白名单。
+  assertUnknownSchemaObjectsRejected(
+    path.join(dataDir, 'energy-analysis-unknown-trigger.sqlite'),
+    `CREATE TABLE unknown_trigger_base (id INTEGER PRIMARY KEY);
+     CREATE TRIGGER unknown_fresh_trigger
+     AFTER INSERT ON unknown_trigger_base
+     FOR EACH ROW BEGIN
+       SELECT 1;
+     END`,
+    ['unknown_trigger_base', 'unknown_fresh_trigger']
+  );
+
+  // 显式未知 index 同样属于持久 schema 对象，必须在首次初始化前被拒绝。
+  assertUnknownSchemaObjectsRejected(
+    path.join(dataDir, 'energy-analysis-unknown-index.sqlite'),
+    `CREATE TABLE unknown_index_base (id INTEGER PRIMARY KEY, marker TEXT);
+     CREATE INDEX unknown_fresh_index ON unknown_index_base(marker)`,
+    ['unknown_index_base', 'unknown_fresh_index']
+  );
 
   console.log('energy analysis schema migration tests passed');
 } finally {

@@ -209,6 +209,37 @@ function parsePositiveInteger(value, fieldName, options = {}) {
 }
 
 /**
+ * 规范仅允许服务端受信调用提供的模型导入追溯，不从公共业务载荷读取。
+ * @param {object} options 服务端依赖与追溯选项。
+ * @returns {{sourceBatchId:number|null,sourceRowNumber:number|null}} 成对追溯字段。
+ */
+function normalizeTrustedModelProvenance(options = {}) {
+  const sourceBatchId = options.sourceBatchId;
+  const sourceRowNumber = options.sourceRowNumber;
+  const batchIsNull = sourceBatchId === null || sourceBatchId === undefined;
+  const rowIsNull = sourceRowNumber === null || sourceRowNumber === undefined;
+  if (batchIsNull && rowIsNull) return { sourceBatchId: null, sourceRowNumber: null };
+  if (batchIsNull || rowIsNull) {
+    throw badRequest('模型导入来源批次和来源行号必须同时为空或同时提供。', {
+      code: 'ENERGY_FLOW_MODEL_PROVENANCE_PAIR_INVALID'
+    });
+  }
+  if (!Number.isSafeInteger(sourceBatchId) || sourceBatchId <= 0) {
+    throw badRequest('模型导入来源批次必须是正安全整数。', {
+      code: 'ENERGY_FLOW_MODEL_PROVENANCE_INVALID',
+      fieldName: 'sourceBatchId'
+    });
+  }
+  if (!Number.isSafeInteger(sourceRowNumber) || sourceRowNumber <= 0) {
+    throw badRequest('模型导入来源行号必须是正安全整数。', {
+      code: 'ENERGY_FLOW_MODEL_PROVENANCE_INVALID',
+      fieldName: 'sourceRowNumber'
+    });
+  }
+  return { sourceBatchId, sourceRowNumber };
+}
+
+/**
  * 解析有限数值。
  * @param {*} value 原始值。
  * @param {string} fieldName 字段名。
@@ -608,8 +639,6 @@ function mapNodeRow(row) {
     x: Number(row.x),
     y: Number(row.y),
     status: row.status,
-    sourceBatchId: row.sourceBatchId === null || row.sourceBatchId === undefined ? null : Number(row.sourceBatchId),
-    sourceRowNumber: row.sourceRowNumber === null || row.sourceRowNumber === undefined ? null : Number(row.sourceRowNumber),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt
   };
@@ -640,8 +669,6 @@ function mapEdgeRow(row) {
     sourceType: row.sourceType,
     sourceMapping: sanitizeSourceMapping(row.sourceMappingJson),
     status: row.status,
-    sourceBatchId: row.sourceBatchId === null || row.sourceBatchId === undefined ? null : Number(row.sourceBatchId),
-    sourceRowNumber: row.sourceRowNumber === null || row.sourceRowNumber === undefined ? null : Number(row.sourceRowNumber),
     recordCount: row.recordCount === undefined ? undefined : Number(row.recordCount),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt
@@ -669,8 +696,7 @@ const NODE_SELECT_SQL = `
          node.node_code AS nodeCode, node.node_name AS nodeName, node.node_type AS nodeType,
          node.organization_unit_id AS organizationUnitId,
          organization.unit_code AS organizationUnitCode, organization.unit_name AS organizationUnitName,
-         node.x, node.y, node.status, node.source_batch_id AS sourceBatchId,
-         node.source_row_number AS sourceRowNumber, node.created_at AS createdAt, node.updated_at AS updatedAt
+         node.x, node.y, node.status, node.created_at AS createdAt, node.updated_at AS updatedAt
   FROM energy_flow_nodes node
   LEFT JOIN organization_units organization ON organization.id = node.organization_unit_id`;
 
@@ -682,8 +708,7 @@ const EDGE_SELECT_SQL = `
          edge.energy_type_id AS energyTypeId, energy_type.code AS energyTypeCode,
          energy_type.name AS energyTypeName, energy_type.standard_unit AS standardUnit,
          edge.unit, edge.source_type AS sourceType, edge.source_mapping_json AS sourceMappingJson,
-         edge.status, edge.source_batch_id AS sourceBatchId, edge.source_row_number AS sourceRowNumber,
-         edge.created_at AS createdAt, edge.updated_at AS updatedAt,
+         edge.status, edge.created_at AS createdAt, edge.updated_at AS updatedAt,
          (SELECT COUNT(*) FROM energy_flow_records record WHERE record.energy_flow_edge_id = edge.id) AS recordCount
   FROM energy_flow_edges edge
   JOIN energy_flow_nodes from_node ON from_node.id = edge.from_node_id
@@ -876,6 +901,7 @@ function normalizeModelPayload(input = {}, existing = null) {
  */
 function createEnergyFlowModel(input = {}, options = {}) {
   const payload = normalizeModelPayload(input);
+  const provenance = normalizeTrustedModelProvenance(options);
   const databaseContext = openServiceDatabase(options);
   try {
     return executeBusinessWrite(databaseContext.db, options, () => {
@@ -896,10 +922,11 @@ function createEnergyFlowModel(input = {}, options = {}) {
       }
       const result = databaseContext.db.prepare(
         `INSERT INTO energy_flow_models (
-           model_code, model_name, source, document_no, version,
+           source_batch_id, source_row_number, model_code, model_name, source, document_no, version,
            effective_start_utc, effective_end_utc, source_timezone, status
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
+        provenance.sourceBatchId, provenance.sourceRowNumber,
         payload.modelCode, payload.modelName, payload.source, payload.documentNo, payload.version,
         payload.effectiveStartUtc, payload.effectiveEndUtc, payload.sourceTimeZone, payload.status
       );

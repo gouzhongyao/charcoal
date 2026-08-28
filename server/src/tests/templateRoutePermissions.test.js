@@ -17,9 +17,13 @@ process.env.CHARCOAL_ALLOW_REGISTER = 'true';
 const { initDatabase, openDatabase } = require('../db/database');
 const { register } = require('../services/authService');
 const { listDemoParkArtifacts } = require('../services/demoParkDatasetService');
+const {
+  DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES,
+  listDemoArtifactRegistrations
+} = require('../services/demoArtifactRegistry');
 const { parseImportFile } = require('../services/import/parser');
 const { mapRowFields } = require('../services/import/normalization');
-const { exportEnergyRecords, exportEnergyRecordLedgerBackfillPreview } = require('../services/energyRecordStatisticsService');
+const { exportEnergyRecords } = require('../services/energyRecordStatisticsService');
 const { exportEnergyBudgets } = require('../services/energyBudgetService');
 const { createOrganizationUnit, exportMeters, exportOrganizationUnits } = require('../services/ledgerService');
 const { exportMeterReadingEnergyRecordGenerationPreview, exportMeterReadings } = require('../services/meterReadingService');
@@ -31,7 +35,7 @@ const { exportPredictionConfigs, exportPredictionResults } = require('../service
 // 各模板用户可见首行的完整顺序契约。
 const EXPECTED_TEMPLATE_HEADERS = Object.freeze({
   'energy-budgets': ['预算月份', '能源类型编码', '组织范围', '预算值', '单位', '备注', '状态'],
-  'energy-records': ['月份', '能源类型编码', '能源类型名称', '用量', '单位', '用能单元', '厂区', '部门', '产线', '仪表编码', '数据时间', '业务维度', '备注'],
+  'energy-records': ['月份', '能源类型编码', '用量', '单位', '用能单元编码', '计量器具编码', '备注'],
   'meter-readings': ['抄表日期', '计量器具编码', '计量器具名称', '上期表码', '本期表码', '倍率', '用量', '单位', '用能单元', '备注'],
   'production-units': ['产能单元编码', '产能单元名称', '所属用能单元编码', '产品名称', '产量单位', '备注', '状态'],
   'production-outputs': ['产能单元编码', '产能单元名称', '月份', '产量值', '产量单位', '数据来源', '备注'],
@@ -40,8 +44,8 @@ const EXPECTED_TEMPLATE_HEADERS = Object.freeze({
   meters: ['计量器具编码', '计量器具名称', '计量器具类型', '能源类型编码', '用能单元编码', '用能单元', '在线状态', '网关ID', '倍率', '允许手工抄表', '流向', '安装位置', '状态', '备注'],
   'carbon-factors': ['能源类型编码', '地区', '因子年份', '活动数据单位', '因子值', '排放单位', '因子来源', '来源链接', '有效开始日期', '有效结束日期', '状态'],
   'carbon-activities': ['活动记录编码', '替代活动记录编码', '排放范围', '活动类别', '用能单元编码', '能源类型编码', '活动开始时间', '活动结束时间', '来源时区', '活动数据值', '活动数据单位', '因子地区', '来源标识', '证据引用', '备注'],
-  'prediction-configs': ['配置名称', '备注', '能源类型编码', '组织范围', '厂区', '部门', '能耗批次ID', '训练开始月份', '训练结束月份', '预测开始月份', '预测结束月份', '算法', '窗口大小', '状态'],
-  'prediction-history': ['月份', '能源类型编码', '能源类型名称', '用量', '单位', '用能单元', '厂区', '部门', '产线', '仪表编码', '数据时间', '业务维度', '备注']
+  'prediction-configs': ['配置名称', '备注', '能源类型编码', '用能单元编码', '计量器具编码', '能耗批次ID', '训练开始月份', '训练结束月份', '预测开始月份', '预测结束月份', '算法', '窗口大小', '状态'],
+  'prediction-history': ['月份', '能源类型编码', '用量', '单位', '用能单元编码', '计量器具编码', '备注']
 });
 
 // 各 Excel 模板的用户可见工作表名称契约。
@@ -92,6 +96,15 @@ const EXPECTED_TEMPLATE_FILE_NAMES = Object.freeze({
   'prediction-history': '预测历史数据模板'
 });
 
+// N6 固定 Excel v1 五表名称和表头必须在中央模板权限回归中独立冻结。
+const EXPECTED_CARBON_EMISSION_REPORT_SHEETS = Object.freeze([
+  Object.freeze({ name: '报告信息', headers: Object.freeze(['报告编码', '报告名称', '报告组织', '报告开始日期', '报告结束日期', '模板标识', '模板版本', '备注']) }),
+  Object.freeze({ name: '组织与核算边界', headers: Object.freeze(['边界类型', '边界名称', '边界说明']) }),
+  Object.freeze({ name: '报告项目', headers: Object.freeze(['项目编码', '排放范围', '类别', '排放源或能源类型', '活动量', '活动量单位', '排放因子', '因子单位', '排放量', 'CO2e单位', '证据编号', '备注']) }),
+  Object.freeze({ name: '汇总', headers: Object.freeze(['汇总编码', '汇总维度', '汇总值', '排放量', 'CO2e单位', '备注']) }),
+  Object.freeze({ name: '证据说明', headers: Object.freeze(['证据编号', '证据名称', '证据类型', '证据说明', '备注']) })
+]);
+
 // N7 固定 Excel v1 六表名称和表头必须在中央模板权限回归中独立冻结。
 const EXPECTED_GHG_REPORT_SHEETS = Object.freeze([
   Object.freeze({ name: '报告信息', headers: Object.freeze(['报告编码', '报告名称', '报告组织', '报告开始日期', '报告结束日期', '模板标识', '模板版本', '备注']) }),
@@ -103,6 +116,38 @@ const EXPECTED_GHG_REPORT_SHEETS = Object.freeze([
 ]);
 
 // 组织管理页三个分层示例的真实下载文件名和完整业务编码契约。
+// 26—29 只走正式无状态导入，精确冻结下载、预演、执行、权限、处理器和 fail-closed 合同。
+const EXPECTED_STATELESS_FORMAL_IMPORT_CONTRACTS = Object.freeze([
+  Object.freeze({
+    artifactKey: '26-suppliers', handlerKey: 'supplier-import',
+    download: '/api/templates/demo-park/26-suppliers.xlsx',
+    preview: '/api/suppliers/imports/preview', execute: '/api/suppliers/imports/execute',
+    downloadPermission: 'ledger:suppliers:import:preview',
+    previewPermission: 'ledger:suppliers:import:preview', executePermission: 'ledger:suppliers:import:execute'
+  }),
+  Object.freeze({
+    artifactKey: '27-carbon-activities', handlerKey: 'carbon-activity-import',
+    download: '/api/templates/demo-park/27-carbon-activities.xlsx',
+    preview: '/api/carbon/activities/imports/preview', execute: '/api/carbon/activities/imports/execute',
+    downloadPermission: 'carbon:activities:import:preview',
+    previewPermission: 'carbon:activities:import:preview', executePermission: 'carbon:activities:import:execute'
+  }),
+  Object.freeze({
+    artifactKey: '28-carbon-emission-report', handlerKey: 'carbon-emission-report-import',
+    download: '/api/templates/demo-park/28-carbon-emission-report.xlsx',
+    preview: '/api/carbon/emission-reports/imports/preview', execute: '/api/carbon/emission-reports/imports/execute',
+    downloadPermission: 'carbon:emission-reports:import:preview',
+    previewPermission: 'carbon:emission-reports:import:preview', executePermission: 'carbon:emission-reports:import:execute'
+  }),
+  Object.freeze({
+    artifactKey: '29-ghg-report', handlerKey: 'ghg-report-import',
+    download: '/api/templates/demo-park/29-ghg-report.xlsx',
+    preview: '/api/carbon/ghg-reports/imports/preview', execute: '/api/carbon/ghg-reports/imports/execute',
+    downloadPermission: 'carbon:ghg-reports:import:preview',
+    previewPermission: 'carbon:ghg-reports:import:preview', executePermission: 'carbon:ghg-reports:import:execute'
+  })
+]);
+
 const EXPECTED_ORGANIZATION_EXAMPLE_CONTRACTS = Object.freeze([
   {
     artifactKey: '01-organization-root',
@@ -126,7 +171,7 @@ const ORGANIZATION_EXAMPLE_BY_KEY = new Map(
 
 // 十二类常规数据导出的独立中文标题和工作表契约。
 const EXPECTED_EXPORT_CONTRACTS = Object.freeze([
-  { name: '能耗明细', sheetName: '能耗明细', run: exportEnergyRecords, headers: ['能耗记录ID', '来源批次ID', '来源行号', '月份', '能源类型编码', '能源类型名称', '原始值', '原始单位', '标准化值', '标准化单位', '组织', '地点', '部门', '产线', '原始仪表编码', '关联仪表编码', '关联仪表名称', '关联用能单元编码', '关联用能单元名称', '关联用能单元路径', '业务维度', '备注', '创建时间'] },
+  { name: '能耗明细', sheetName: '能耗明细', run: exportEnergyRecords, headers: ['能耗记录ID', '来源批次ID', '来源行号', '月份', '能源类型编码', '能源类型名称', '原始值', '原始单位', '标准化值', '标准化单位', '用能单元编码', '用能单元名称', '用能单元路径', '计量器具编码', '计量器具名称', '备注', '创建时间'] },
   { name: '用能预算', sheetName: '用能预算', run: exportEnergyBudgets, headers: ['预算月份', '能源类型编码', '组织范围', '预算值', '单位', '备注', '状态'] },
   { name: '用能单元', sheetName: '用能单元', run: exportOrganizationUnits, headers: ['用能单元编码', '用能单元名称', '用能单元路径', '父级编码', '父级名称', '类型', '面积', '排序', '状态', '备注'] },
   { name: '计量器具', sheetName: '计量器具', run: exportMeters, headers: ['计量器具编码', '计量器具名称', '类型', '能源类型编码', '能源类型', '用能单元编码', '用能单元', '在线状态', '网关ID', '倍率', '允许手工抄表', '流向', '安装位置', '状态', '备注'] },
@@ -135,12 +180,12 @@ const EXPECTED_EXPORT_CONTRACTS = Object.freeze([
   { name: '产能单元', sheetName: '产能单元', run: exportProductionUnits, headers: ['产能单元编码', '产能单元名称', '所属用能单元编码', '产品名称', '产量单位', '备注', '状态'] },
   { name: '月度产量', sheetName: '月度产量', run: exportProductionOutputs, headers: ['产能单元编码', '产能单元名称', '所属用能单元', '产品名称', '月份', '产量值', '产量单位', '数据来源', '状态', '备注'] },
   { name: '碳因子', sheetName: '碳因子', run: exportCarbonFactors, headers: ['能源类型编码', '地区', '因子年份', '活动数据单位', '因子值', '排放单位', '因子来源', '来源链接', '有效开始日期', '有效结束日期', '状态'] },
-  { name: '碳排放结果', sheetName: '碳排放结果', run: exportCarbonEmissions, headers: ['碳排放记录ID', '月份', '能源类型编码', '能源类型名称', '组织', '厂区', '部门', '核算方法', '活动数据值', '活动数据单位', '因子值', '排放量', '排放单位', '状态', '因子地区', '因子年份', '因子来源', '核算时间'] },
-  { name: '预测配置', sheetName: '预测配置草稿', run: exportPredictionConfigs, headers: ['配置名称', '备注', '能源类型编码', '组织范围', '厂区', '部门', '能耗批次ID', '训练开始月份', '训练结束月份', '预测开始月份', '预测结束月份', '算法', '窗口大小', '状态'] },
+  { name: '碳排放结果', sheetName: '碳排放结果', run: exportCarbonEmissions, headers: ['碳排放记录ID', '月份', '能源类型编码', '能源类型名称', '用能单元ID', '用能单元编码', '用能单元名称', '用能单元路径', '计量器具ID', '计量器具编码', '计量器具名称', '核算方法', '活动数据值', '活动数据单位', '因子值', '排放量', '排放单位', '状态', '因子地区', '因子年份', '因子来源', '核算时间'] },
+  { name: '预测配置', sheetName: '预测配置草稿', run: exportPredictionConfigs, headers: ['配置名称', '备注', '能源类型编码', '用能单元编码', '用能单元名称', '计量器具编码', '计量器具名称', '能耗批次ID', '训练开始月份', '训练结束月份', '预测开始月份', '预测结束月份', '算法', '窗口大小', '状态'] },
   { name: '预测结果', sheetName: '预测结果', run: exportPredictionResults, headers: ['预测运行ID', '预测运行名称', '算法', '运行状态', '能源类型编码', '预测月份', '预测值', '预测单位', '置信区间下限', '置信区间上限', '方法说明'] }
 ]);
 
-// 十二类常规导出与两类预演审计的真实 HTTP 下载契约。
+// 十二类常规导出与抄表生成能耗记录预演审计的真实 HTTP 下载契约。
 const EXPECTED_HTTP_EXPORT_CONTRACTS = Object.freeze([
   { name: '能耗明细', path: '/api/energy-records/export', asciiBase: 'nenghao-mingxi', chinesePrefix: '能耗明细-' },
   { name: '用能预算', path: '/api/energy-budgets/export', asciiBase: 'yongneng-yusuan', chinesePrefix: '用能预算导出-' },
@@ -154,7 +199,6 @@ const EXPECTED_HTTP_EXPORT_CONTRACTS = Object.freeze([
   { name: '碳排放结果', path: '/api/carbon/emissions/export', asciiBase: 'tan-paifang-jieguo', chinesePrefix: '碳排放结果导出-' },
   { name: '预测配置', path: '/api/predictions/configs/export', asciiBase: 'yuce-peizhi', chinesePrefix: '预测配置草稿导出-' },
   { name: '预测结果', path: '/api/predictions/results/export', asciiBase: 'yuce-jieguo', chinesePrefix: '预测结果导出-' },
-  { name: '历史能耗台账回填预演审计', path: '/api/energy-records/ledger-backfill/preview/export', asciiBase: 'lishi-nenghao-huitian-preview', chinesePrefix: '能耗记录-台账回填预演审计预案-' },
   { name: '抄表生成能耗记录预演审计', path: '/api/meter-readings/energy-record-generation/preview/export', asciiBase: 'chaobiao-nenghao-preview', chinesePrefix: '抄表生成能耗记录预演审计预案-' }
 ]);
 
@@ -233,12 +277,6 @@ function assertExportContract(contract) {
 function assertPreviewExportContracts() {
   const previews = [
     {
-      name: '历史能耗台账回填预演审计',
-      run: exportEnergyRecordLedgerBackfillPreview,
-      title: '历史能耗记录台账回填预演审计预案（仅预演、不写入）',
-      headers: ['能耗记录ID', '月份', '能源类型编码', '能源类型名称', '原始组织', '原始地点', '原始部门', '原始仪表字段', '预演状态', '是否可作为回填候选', '原因编码', '原因说明', '原用能单元ID', '原计量器具ID', '候选用能单元ID', '候选用能单元编码', '候选用能单元名称', '候选用能单元路径', '候选计量器具ID', '候选计量器具编码', '候选计量器具名称', '候选计量器具能源类型', '候选计量器具所属用能单元ID', '候选计量器具所属用能单元编码', '候选计量器具所属用能单元名称', '候选计量器具所属用能单元路径', '只读审计说明']
-    },
-    {
       name: '抄表生成能耗记录预演审计',
       run: exportMeterReadingEnergyRecordGenerationPreview,
       title: '抄表生成能耗记录预演审计预案',
@@ -287,6 +325,37 @@ function request(server, pathname, token) {
   });
 }
 
+/** 发送演示治理 JSON 请求，用于验证显式 toggle 权限与副作用边界。 */
+function requestJson(server, method, pathname, token, body) {
+  return new Promise((resolve, reject) => {
+    const rawBody = Buffer.from(JSON.stringify(body), 'utf8');
+    const req = http.request({
+      host: '127.0.0.1',
+      port: server.address().port,
+      method,
+      path: pathname,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Content-Length': String(rawBody.length)
+      }
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      res.on('end', () => {
+        const responseBody = Buffer.concat(chunks);
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          body: responseBody.length ? JSON.parse(responseBody.toString('utf8')) : null
+        });
+      });
+    });
+    req.on('error', reject);
+    req.end(rawBody);
+  });
+}
+
 /** 快照除演示治理表和认证会话心跳外的全部数据库表，证明下载不会写领域、权限或导入审计数据。 */
 function snapshotNonGovernanceTables(db) {
   const excludedTables = new Set([
@@ -306,7 +375,7 @@ function snapshotNonGovernanceTables(db) {
   }));
 }
 
-/** 快照 runtime、run、context、自动激活审计与全部非治理表。 */
+/** 快照 runtime、run、context、操作审计与全部非治理表。 */
 function snapshotDemoDownloadState() {
   const db = openDatabase();
   try {
@@ -319,6 +388,9 @@ function snapshotDemoDownloadState() {
       runtimeAutoEnableAudits: db.prepare(`SELECT user_id AS userId, operation, target_type AS targetType,
           target_id AS targetId, detail_json AS detailJson, ip, created_at AS createdAt
         FROM sys_operation_logs WHERE operation = 'system.demo.runtime.auto-enable' ORDER BY id`).all(),
+      operationLogs: db.prepare(`SELECT user_id AS userId, operation, target_type AS targetType,
+          target_id AS targetId, detail_json AS detailJson, ip, created_at AS createdAt
+        FROM sys_operation_logs ORDER BY id`).all(),
       nonGovernanceTables: snapshotNonGovernanceTables(db)
     };
   } finally {
@@ -360,21 +432,55 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
     initDatabase();
     createOrganizationUnit({
       unitCode: 'QL-PARK',
-      unitName: '数据库中已存在的青岚园区',
+      unitName: '数据库中已存在的天坤集团',
       unitType: 'enterprise',
       remark: '证明下载不受同编码组织影响'
     });
     EXPECTED_EXPORT_CONTRACTS.forEach(assertExportContract);
     assertPreviewExportContracts();
+    // 全量 artifact 清单同时驱动 01—29 精确领域权限授权与下载矩阵。
+    const demoArtifacts = listDemoParkArtifacts();
+    assert.strictEqual(demoArtifacts.length, 29, '全量下载矩阵必须覆盖 registry 01—29。');
+    const registrations = listDemoArtifactRegistrations();
+    assert.strictEqual(registrations.length, 29);
+    EXPECTED_STATELESS_FORMAL_IMPORT_CONTRACTS.forEach((expected) => {
+      const artifact = demoArtifacts.find((item) => item.artifactKey === expected.artifactKey);
+      const registration = registrations.find((item) => item.artifactKey === expected.artifactKey);
+      assert(artifact, `${expected.artifactKey} 必须出现在 dataset。`);
+      assert(registration, `${expected.artifactKey} 必须出现在 registry。`);
+      assert.strictEqual(registration.handlerKey, expected.handlerKey);
+      assert.strictEqual(registration.downloadLifecycle, DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.STATELESS_FORMAL_IMPORT);
+      assert.deepStrictEqual(registration.routes.download, [expected.download]);
+      assert.deepStrictEqual(registration.routes.preview, [expected.preview]);
+      assert.deepStrictEqual(registration.routes.execute, [expected.execute]);
+      assert.deepStrictEqual(registration.permissions, {
+        download: expected.downloadPermission,
+        preview: expected.previewPermission,
+        execute: expected.executePermission
+      });
+      assert.deepStrictEqual(registration.guards, ['demo-context-fail-closed']);
+      assert.strictEqual(registration.blocker.previewExecuteContext, 'direct-upload-context-not-connected');
+      assert.strictEqual(artifact.formats.length, 1);
+      assert.deepStrictEqual(artifact.formats, ['xlsx']);
+    });
     register({ username: 'template-reader', password: 'Password123!' });
     register({ username: 'carbon-activity-template-reader', password: 'Password123!' });
+    register({ username: 'carbon-emission-report-template-reader', password: 'Password123!' });
     register({ username: 'ghg-report-template-reader', password: 'Password123!' });
     register({ username: 'demo-system-only', password: 'Password123!' });
     register({ username: 'demo-meter-domain-only', password: 'Password123!' });
+    register({ username: 'demo-download-authorized', password: 'Password123!' });
+    register({ username: 'demo-toggle-operator', password: 'Password123!' });
     grantUserPermissions('carbon-activity-template-reader', 'carbon-activity-template-reader-role', ['carbon:activities:import:preview']);
+    grantUserPermissions('carbon-emission-report-template-reader', 'carbon-emission-report-template-reader-role', ['carbon:emission-reports:import:preview']);
     grantUserPermissions('ghg-report-template-reader', 'ghg-report-template-reader-role', ['carbon:ghg-reports:import:preview']);
     grantUserPermissions('demo-system-only', 'demo-system-only-role', ['system:demo:download']);
     grantUserPermissions('demo-meter-domain-only', 'demo-meter-domain-only-role', ['ledger:meters:import']);
+    grantUserPermissions('demo-download-authorized', 'demo-download-authorized-role', [
+      'system:demo:download',
+      ...new Set(demoArtifacts.map((artifact) => artifact.permissions.download))
+    ]);
+    grantUserPermissions('demo-toggle-operator', 'demo-toggle-operator-role', ['system:demo:toggle']);
     const { app } = require('../index');
     server = await new Promise((resolve) => {
       const instance = app.listen(0, '127.0.0.1', () => resolve(instance));
@@ -398,9 +504,12 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
     const adminToken = (await login('admin', 'AdminPassword123!')).data.token;
     const ordinaryToken = (await login('template-reader', 'Password123!')).data.token;
     const carbonActivityTemplateToken = (await login('carbon-activity-template-reader', 'Password123!')).data.token;
+    const carbonEmissionReportTemplateToken = (await login('carbon-emission-report-template-reader', 'Password123!')).data.token;
     const ghgReportTemplateToken = (await login('ghg-report-template-reader', 'Password123!')).data.token;
     const systemOnlyToken = (await login('demo-system-only', 'Password123!')).data.token;
     const meterDomainOnlyToken = (await login('demo-meter-domain-only', 'Password123!')).data.token;
+    const downloadAuthorizedToken = (await login('demo-download-authorized', 'Password123!')).data.token;
+    const toggleOperatorToken = (await login('demo-toggle-operator', 'Password123!')).data.token;
     const observedAsciiNames = new Set();
 
     const demoDownloadStateBefore = snapshotDemoDownloadState();
@@ -410,26 +519,55 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
       1,
       '专项场景必须预置同编码 QL-PARK 组织。'
     );
-    const demoArtifacts = listDemoParkArtifacts();
-    assert.strictEqual(demoArtifacts.length, 25, '全量下载矩阵必须覆盖 registry 01—25。');
+    // runtime 关闭时，具备系统下载与全部领域权限但没有 toggle 权限的普通用户不得触发任何下载副作用。
+    for (const artifact of demoArtifacts) {
+      for (const format of artifact.formats) {
+        const pathname = `/api/templates/demo-park/${artifact.artifactKey}.${format}`;
+        const anonymous = await request(server, pathname);
+        assert.strictEqual(anonymous.status, 401, `${artifact.artifactKey}.${format} 必须拒绝匿名下载。`);
+        assert.strictEqual(anonymous.body.error.code, 'UNAUTHENTICATED');
+
+        const forbidden = await request(server, pathname, ordinaryToken);
+        assert.strictEqual(forbidden.status, 403, `${artifact.artifactKey}.${format} 必须拒绝缺少系统与领域权限的用户。`);
+        assert.strictEqual(forbidden.body.error.code, 'FORBIDDEN');
+
+        const blocked = await request(server, pathname, downloadAuthorizedToken);
+        assert.strictEqual(blocked.status, 409, `${artifact.artifactKey}.${format} runtime 关闭时必须拒绝普通用户下载。`);
+        assert.strictEqual(blocked.body.error.code, 'DEMO_RUNTIME_DISABLED');
+
+        const superAdminBlocked = await request(server, pathname, adminToken);
+        assert.strictEqual(superAdminBlocked.status, 409, `${artifact.artifactKey}.${format} runtime 关闭时超级管理员也不得绕过业务开关。`);
+        assert.strictEqual(superAdminBlocked.body.error.code, 'DEMO_RUNTIME_DISABLED');
+      }
+    }
+    assert.strictEqual((await request(server, '/api/templates/demo-park/04-meters.xlsx', systemOnlyToken)).status, 403, '只有 system:demo:download 不得下载计量器具示例。');
+    assert.strictEqual((await request(server, '/api/templates/demo-park/04-meters.xlsx', meterDomainOnlyToken)).status, 403, '只有 ledger:meters:import 不得下载计量器具示例。');
+    assert.deepStrictEqual(snapshotDemoDownloadState(), demoDownloadStateBefore, 'runtime 关闭时 01—29 下载不得改写 runtime、run、context、审计或业务表。');
+
+    const deniedToggle = await requestJson(server, 'POST', '/api/system/demo-data/toggle', downloadAuthorizedToken, { enabled: true });
+    assert.strictEqual(deniedToggle.status, 403, '具备全部下载权限但没有 system:demo:toggle 的普通用户不得开启 runtime。');
+    assert.strictEqual(deniedToggle.body.error.code, 'FORBIDDEN');
+    assert.deepStrictEqual(snapshotDemoDownloadState(), demoDownloadStateBefore, '无 toggle 权限的开启请求不得产生运行期或审计副作用。');
+
+    // 只有显式 toggle 接口才能开启 runtime，下载请求本身不得改变 epoch 或 revision。
+    const toggleResponse = await requestJson(server, 'POST', '/api/system/demo-data/toggle', toggleOperatorToken, { enabled: true });
+    assert.strictEqual(toggleResponse.status, 200, `具备 toggle 权限的账号必须能显式开启 runtime：${JSON.stringify(toggleResponse.body)}`);
+    assert.strictEqual(toggleResponse.body.data.runtime.enabled, true);
+    const demoDownloadStateAfterToggle = snapshotDemoDownloadState();
+    assert.strictEqual(demoDownloadStateAfterToggle.runtime.enabled, 1);
+    assert.strictEqual(demoDownloadStateAfterToggle.runtime.runtimeEpoch, demoDownloadStateBefore.runtime.runtimeEpoch + 1);
+    assert.strictEqual(demoDownloadStateAfterToggle.runtime.revision, demoDownloadStateBefore.runtime.revision + 1);
+    assert.strictEqual(demoDownloadStateAfterToggle.runtime.changeReason, 'runtime_toggle_enabled');
+    assert.strictEqual(demoDownloadStateAfterToggle.runs.length, 0, '显式 toggle 不得预建 active run。');
+    assert.strictEqual(demoDownloadStateAfterToggle.contexts.length, 0, '显式 toggle 不得预签发 context。');
+
     let firstManagedContextToken = null;
+    let statelessFormalState = null;
     for (const artifact of demoArtifacts) {
       const pathname = `/api/templates/demo-park/${artifact.artifactKey}.xlsx`;
-      const anonymous = await request(server, pathname);
-      assert.strictEqual(anonymous.status, 401, `${artifact.artifactKey} 必须拒绝匿名下载。`);
-      assert.strictEqual(anonymous.body.error.code, 'UNAUTHENTICATED');
-
-      const forbidden = await request(server, pathname, ordinaryToken);
-      assert.strictEqual(forbidden.status, 403, `${artifact.artifactKey} 必须拒绝缺少系统与领域权限的用户。`);
-      assert.strictEqual(forbidden.body.error.code, 'FORBIDDEN');
-
-      if (artifact.artifactKey === '04-meters') {
-        assert.strictEqual((await request(server, pathname, systemOnlyToken)).status, 403, '只有 system:demo:download 不得下载计量器具示例。');
-        assert.strictEqual((await request(server, pathname, meterDomainOnlyToken)).status, 403, '只有 ledger:meters:import 不得下载计量器具示例。');
-      }
-
-      const allowed = await request(server, pathname, adminToken);
-      assert.strictEqual(allowed.status, 200, `${artifact.artifactKey} 在 runtime 初始关闭时必须允许授权下载。`);
+      if (artifact.order === 26) statelessFormalState = snapshotDemoDownloadState();
+      const allowed = await request(server, pathname, downloadAuthorizedToken);
+      assert.strictEqual(allowed.status, 200, `${artifact.artifactKey} 在显式开启 runtime 后必须允许授权下载。`);
       assert.strictEqual(allowed.headers['content-type'], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       assert.strictEqual(allowed.body.subarray(0, 2).toString('ascii'), 'PK', `${artifact.artifactKey} 必须返回有效 XLSX。`);
       const names = parseContentDisposition(allowed.headers['content-disposition']);
@@ -439,10 +577,10 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
       if (artifact.downloadLifecycle === 'stateless-formal-import') {
         assert.strictEqual(allowed.headers['x-demo-context'], undefined, `${artifact.artifactKey} 无状态下载不得签发 context。`);
         assert.strictEqual(allowed.headers['x-demo-run-id'], undefined, `${artifact.artifactKey} 无状态下载不得创建或暴露 run。`);
-        const current = snapshotDemoDownloadState();
-        assert.strictEqual(current.runtime.enabled, 0, `${artifact.artifactKey} 无状态下载不得自动开启 runtime。`);
-        assert.strictEqual(current.runs.length, 0, `${artifact.artifactKey} 无状态下载不得创建 run。`);
-        assert.strictEqual(current.contexts.length, 0, `${artifact.artifactKey} 无状态下载不得创建 context。`);
+        if (artifact.order >= 26) {
+          assert.deepStrictEqual(snapshotDemoDownloadState(), statelessFormalState,
+            `${artifact.artifactKey} 正式无状态下载不得把 runtime、run、context、ownership、cleanup 或领域表当作可写能力。`);
+        }
       } else {
         assert.strictEqual(artifact.downloadLifecycle, 'managed-context-auto-runtime');
         assert(/^[A-Za-z0-9_-]{43}$/.test(allowed.headers['x-demo-context'] || ''), `${artifact.artifactKey} 必须签发 context。`);
@@ -462,15 +600,16 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
     }
 
     const demoDownloadStateAfter = snapshotDemoDownloadState();
-    assert.strictEqual(demoDownloadStateAfter.runtime.enabled, 1, '首个 managed 下载必须惰性开启 runtime。');
-    assert.strictEqual(demoDownloadStateAfter.runtime.runtimeEpoch, demoDownloadStateBefore.runtime.runtimeEpoch + 1, 'managed 自动激活只提升一次 runtime epoch。');
-    assert.strictEqual(demoDownloadStateAfter.runtime.revision, demoDownloadStateBefore.runtime.revision + 1, 'managed 自动激活只提升一次 revision。');
-    assert.strictEqual(demoDownloadStateAfter.runtime.changeReason, 'managed_download_auto_enable');
+    assert.strictEqual(demoDownloadStateAfter.runtime.enabled, 1, '显式 toggle 后 runtime 必须保持开启。');
+    assert.strictEqual(demoDownloadStateAfter.runtime.runtimeEpoch, demoDownloadStateAfterToggle.runtime.runtimeEpoch, '下载不得提升 runtime epoch。');
+    assert.strictEqual(demoDownloadStateAfter.runtime.revision, demoDownloadStateAfterToggle.runtime.revision, '下载不得提升 runtime revision。');
+    assert.strictEqual(demoDownloadStateAfter.runtime.changeReason, 'runtime_toggle_enabled');
     assert.strictEqual(demoDownloadStateAfter.runs.length, 1, '13 个 managed 下载必须复用唯一 active run。');
     assert.strictEqual(demoDownloadStateAfter.contexts.length, 13, '13—25 每项下载必须签发一个独立 context。');
     assert.strictEqual(new Set(demoDownloadStateAfter.contexts.map((row) => row.token_hash)).size, 13, 'managed context token hash 必须互不相同。');
-    assert.strictEqual(demoDownloadStateAfter.runtimeAutoEnableAudits.length, 1, '并列 managed 下载只允许一条 runtime 自动激活审计。');
-    assert.deepStrictEqual(demoDownloadStateAfter.nonGovernanceTables, demoDownloadStateBefore.nonGovernanceTables, '01—25 下载不得改写任何领域、权限或导入审计表。');
+    assert.strictEqual(demoDownloadStateAfter.runtimeAutoEnableAudits.length, 0, '下载不得产生 runtime 自动激活审计。');
+    assert.deepStrictEqual(demoDownloadStateAfter.operationLogs, demoDownloadStateAfterToggle.operationLogs, '下载不得追加 runtime 或其他操作审计。');
+    assert.deepStrictEqual(demoDownloadStateAfter.nonGovernanceTables, demoDownloadStateBefore.nonGovernanceTables, '01—29 下载不得改写任何领域、权限或导入审计表。');
 
     const statelessRepeatBefore = snapshotDemoDownloadState();
     assert.strictEqual((await request(server, '/api/templates/demo-park/04-meters.xlsx', adminToken)).status, 200);
@@ -485,7 +624,8 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
     assert.strictEqual(managedRepeatAfter.runtime.revision, managedRepeatBefore.runtime.revision, '重复 managed 下载不得再次提升 revision。');
     assert.strictEqual(managedRepeatAfter.runs.length, managedRepeatBefore.runs.length, '重复 managed 下载必须复用 active run。');
     assert.strictEqual(managedRepeatAfter.contexts.length, managedRepeatBefore.contexts.length + 1, '重复 managed 下载只新增一个 context。');
-    assert.strictEqual(managedRepeatAfter.runtimeAutoEnableAudits.length, managedRepeatBefore.runtimeAutoEnableAudits.length, '重复 managed 下载不得重复写自动激活审计。');
+    assert.strictEqual(managedRepeatAfter.runtimeAutoEnableAudits.length, managedRepeatBefore.runtimeAutoEnableAudits.length, '重复 managed 下载不得产生自动激活审计。');
+    assert.deepStrictEqual(managedRepeatAfter.operationLogs, managedRepeatBefore.operationLogs, '重复 managed 下载不得追加操作审计。');
     assert.deepStrictEqual(managedRepeatAfter.nonGovernanceTables, managedRepeatBefore.nonGovernanceTables, '重复 managed 下载不得写业务表。');
 
     const ledgerTemplates = [
@@ -565,6 +705,30 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
       supportedFormats: ['xlsx']
     });
 
+    // N6 碳排放报告模板使用独立 preview 权限、固定五表和 XLSX-only 合同。
+    const carbonEmissionReportTemplatePath = '/api/templates/carbon-emission-report.xlsx';
+    assert.strictEqual((await request(server, carbonEmissionReportTemplatePath)).status, 401);
+    assert.strictEqual((await request(server, carbonEmissionReportTemplatePath, ordinaryToken)).status, 403);
+    assert.strictEqual((await request(server, carbonEmissionReportTemplatePath, carbonActivityTemplateToken)).status, 403,
+      '独立碳活动 preview 权限不得下载 N6 模板。');
+    const carbonEmissionReportTemplate = await request(server, carbonEmissionReportTemplatePath, carbonEmissionReportTemplateToken);
+    assert.strictEqual(carbonEmissionReportTemplate.status, 200);
+    const carbonEmissionReportWorkbook = XLSX.read(carbonEmissionReportTemplate.body, { type: 'buffer' });
+    assert.deepStrictEqual(carbonEmissionReportWorkbook.SheetNames, EXPECTED_CARBON_EMISSION_REPORT_SHEETS.map((sheet) => sheet.name));
+    EXPECTED_CARBON_EMISSION_REPORT_SHEETS.forEach((sheet) => {
+      const rows = XLSX.utils.sheet_to_json(carbonEmissionReportWorkbook.Sheets[sheet.name], { header: 1, blankrows: false });
+      assert.deepStrictEqual(rows[0], sheet.headers, `${sheet.name} 必须保持 N6 固定中文表头。`);
+    });
+    assertHttpDownloadResponse(carbonEmissionReportTemplate, {
+      name: '碳排放报告模板', asciiBase: 'carbon-emission-report', chinesePrefix: '碳排放报告导入模板.'
+    }, 'xlsx', observedAsciiNames);
+    const carbonEmissionReportCsv = await request(server, '/api/templates/carbon-emission-report.csv', carbonEmissionReportTemplateToken);
+    assert.strictEqual(carbonEmissionReportCsv.status, 400);
+    assert.strictEqual(carbonEmissionReportCsv.body.error.code, 'TEMPLATE_FORMAT_UNSUPPORTED');
+    assert.deepStrictEqual(carbonEmissionReportCsv.body.error.details, {
+      templateId: 'carbon-emission-report', format: 'csv', supportedFormats: ['xlsx']
+    });
+
     // N7 温室气体报告模板使用独立 preview 权限、固定六表和 XLSX-only 合同。
     const ghgReportTemplatePath = '/api/templates/ghg-report.xlsx';
     assert.strictEqual((await request(server, ghgReportTemplatePath)).status, 401);
@@ -614,7 +778,7 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
         assertHttpDownloadResponse(response, contract, format, observedAsciiNames);
       }
     }
-    assert.strictEqual(observedAsciiNames.size, 52, '13 类模板、12 类常规导出和 2 类预演的 ASCII fallback 必须全部唯一。');
+    assert.strictEqual(observedAsciiNames.size, 51, '14 类模板、12 类常规导出和 1 类预演的 ASCII fallback 必须全部唯一。');
 
     // 将实际下载的中文能耗模板回导解析，验证首行可被现有导入映射识别。
     const energyTemplateResponse = await request(server, '/api/templates/energy-records.csv');
@@ -627,10 +791,10 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
     assert.strictEqual(mappedChineseRow.month, '2026-01');
     assert.strictEqual(mappedChineseRow.energyType, 'electricity');
     assert.strictEqual(mappedChineseRow.value, '1000');
-    assert.strictEqual(mappedChineseRow.meterCode, 'E-001');
+    assert.strictEqual(mappedChineseRow.meterCode, 'QL-M-ELEC-PARK');
 
     // 旧英文表头继续映射到同一内部字段，作为历史文件兼容回归。
-    const mappedEnglishRow = mapRowFields({ period: '2026-01', energy_type: 'electricity', value: '1000', unit: 'kWh', meter_name: 'E-001' }).mapped;
+    const mappedEnglishRow = mapRowFields({ period: '2026-01', energy_type: 'electricity', value: '1000', unit: 'kWh', meter_code: 'E-001' }).mapped;
     assert.deepStrictEqual(mappedEnglishRow, { month: '2026-01', energyType: 'electricity', value: '1000', unit: 'kWh', meterCode: 'E-001' });
 
     console.log('template route permission tests passed');

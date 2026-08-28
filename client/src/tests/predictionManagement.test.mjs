@@ -52,11 +52,11 @@ assert.deepEqual(PREDICTION_CATEGORY_COLORS, ['#2a78d6', '#eb6834', '#1baf7a', '
 const predictionPageSource = readFileSync(new URL('../views/predictions/PredictionManagement.vue', import.meta.url), 'utf8');
 const predictionApiSource = readFileSync(new URL('../api/predictions.js', import.meta.url), 'utf8');
 assert.match(predictionApiSource, /\/templates\/demo-park\/12-prediction-configs\.xlsx/);
-assert.match(predictionPageSource, /v-if="canConfigImport" :loading="demoExampleLoading" @click="downloadDemoExample">下载青岚园区示例/);
 assert.match(predictionPageSource, /hasPermi\('prediction:config:import'\)/);
-assert.match(predictionPageSource, /历史能耗复用数据导入页文件/);
-assert.match(predictionPageSource, /不会自动运行预测/);
-assert.match(predictionPageSource, /青岚园区示例下载失败/);
+assert.match(predictionPageSource, /下载模板/);
+assert.match(predictionPageSource, /导入草稿/);
+assert.match(predictionPageSource, /不会运行预测/);
+assert.doesNotMatch(predictionPageSource, /demoExampleLoading|downloadDemoExample|天坤集团示例/);
 for (const fieldName of [
   'runDraftFilters.targetMonth',
   'resultDraftFilters.targetMonthStart',

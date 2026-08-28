@@ -191,13 +191,17 @@ try {
     assert.strictEqual(db.prepare(`SELECT COUNT(*) AS total FROM carbon_accounting_results
       WHERE calculation_run_id = ?`).get(cascadeRunId).total, 0);
 
-    // 旧 carbon_emissions 写入哨兵后重跑初始化，必须保持原行完整不变。
+    // carbon_emissions 写入哨兵后重跑初始化，必须保持原行完整不变。
     const energyTypeId = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
+    const organizationUnitId = db.prepare(`INSERT INTO organization_units
+      (unit_code, unit_name, unit_path, unit_type, status)
+      VALUES ('CARBON-RUN-MIGRATION-OU', '核算运行迁移测试单元', '核算运行迁移测试单元', 'enterprise', 'active')`)
+      .run().lastInsertRowid;
     const energyRecordId = db.prepare(`INSERT INTO energy_records
-      (energy_type_id, original_month, normalized_month, original_unit, original_value,
+      (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value,
        normalized_unit, normalized_value, duplicate_key, record_status)
-      VALUES (?, '2026-01', '2026-01', 'kWh', 10, 'kWh', 10, 'migration-energy', 'active')`)
-      .run(energyTypeId).lastInsertRowid;
+      VALUES (?, ?, '2026-01', '2026-01', 'kWh', 10, 'kWh', 10, 'migration-energy', 'active')`)
+      .run(energyTypeId, organizationUnitId).lastInsertRowid;
     db.prepare(`INSERT INTO carbon_emissions
       (energy_record_id, calculation_method, calculation_basis, activity_value, activity_unit,
        emission_value, emission_unit, status, note)
@@ -224,15 +228,16 @@ try {
     db.close();
   }
 
-  // 空的非 canonical N5-A 骨架必须可重建为 canonical，且重复初始化仍幂等。
+  // 正式 canonical 库出现空的非 canonical N5-A 骨架时必须按 fingerprint fail-closed。
   replaceWithLegacySkeleton(databasePath, false);
-  initDatabase({ databasePath });
-  initDatabase({ databasePath });
+  assert.throws(
+    () => initDatabase({ databasePath }),
+    (error) => error?.code === 'SCHEMA_FINGERPRINT_MISMATCH'
+  );
   db = openDatabase({ databasePath });
   try {
-    assert.strictEqual(carbonAccountingTableIsCanonical(db, 'carbon_calculation_runs'), true);
-    assert.strictEqual(carbonAccountingTableIsCanonical(db, 'carbon_accounting_results'), true);
-    assert.deepStrictEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
+    assert.strictEqual(carbonAccountingTableIsCanonical(db, 'carbon_calculation_runs'), false);
+    assert.strictEqual(carbonAccountingTableIsCanonical(db, 'carbon_accounting_results'), false);
   } finally {
     db.close();
   }
@@ -313,14 +318,17 @@ try {
     }
   }
 
-  // 空弱表允许重建，字段和索引恢复 canonical。
+  // 空弱表同样属于 fingerprint 漂移，正式初始化不得自动重建。
   const emptyWeakPath = path.join(temporaryRoot, 'weak-empty-rebuild.sqlite');
   initDatabase({ databasePath: emptyWeakPath });
   weakenAccountingTable(emptyWeakPath, 'carbon_calculation_runs', weakenedContracts[0].transform);
-  initDatabase({ databasePath: emptyWeakPath });
+  assert.throws(
+    () => initDatabase({ databasePath: emptyWeakPath }),
+    (error) => error?.code === 'SCHEMA_FINGERPRINT_MISMATCH'
+  );
   db = openDatabase({ databasePath: emptyWeakPath });
   try {
-    assert.strictEqual(carbonAccountingTableIsCanonical(db, 'carbon_calculation_runs'), true);
+    assert.strictEqual(carbonAccountingTableIsCanonical(db, 'carbon_calculation_runs'), false);
     assert.strictEqual(carbonAccountingTableIsCanonical(db, 'carbon_accounting_results'), true);
   } finally {
     db.close();
@@ -344,7 +352,7 @@ try {
   }
   assert.throws(
     () => initDatabase({ databasePath: populatedWeakPath }),
-    (error) => error?.code === 'CARBON_ACCOUNTING_NON_CANONICAL_DATA'
+    (error) => error?.code === 'SCHEMA_FINGERPRINT_MISMATCH'
   );
   db = openDatabase({ databasePath: populatedWeakPath });
   try {
@@ -360,7 +368,7 @@ try {
   replaceWithLegacySkeleton(blockedPath, true);
   assert.throws(
     () => initDatabase({ databasePath: blockedPath }),
-    (error) => error?.code === 'CARBON_ACCOUNTING_NON_CANONICAL_DATA'
+    (error) => error?.code === 'SCHEMA_FINGERPRINT_MISMATCH'
   );
   db = openDatabase({ databasePath: blockedPath });
   try {

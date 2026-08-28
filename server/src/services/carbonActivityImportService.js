@@ -23,6 +23,9 @@ const {
   normalizeCarbonActivityText,
   normalizeCarbonActivityValue
 } = require('./carbonActivityContracts');
+const {
+  normalizeUserVisibleWallClockMinuteInput
+} = require('../utils/userVisibleDateTime');
 const { convertSourceWallClockRangeToUtc, isValidIanaTimezone } = require('./sourceWallClockService');
 
 // ZIP 中央目录和本地文件头签名用于 SheetJS 解压前的资源预检。
@@ -507,10 +510,26 @@ function normalizeCarbonActivityImportRow(row, context) {
   if (sourceTimezone && !isValidIanaTimezone(sourceTimezone)) {
     pushIssue(issues, row.rowNumber, '来源时区', sourceTimezone, 'CARBON_ACTIVITY_TIMEZONE_INVALID', '来源时区必须是项目允许的 IANA 时区。');
   }
-  let utcRange = null;
-  if (startWallClock && endWallClock && sourceTimezone && isValidIanaTimezone(sourceTimezone)) {
+  let normalizedStartWallClock = startWallClock || null;
+  let normalizedEndWallClock = endWallClock || null;
+  let wallClockInputValid = Boolean(startWallClock && endWallClock);
+  if (wallClockInputValid) {
     try {
-      utcRange = convertSourceWallClockRangeToUtc(startWallClock, endWallClock, sourceTimezone);
+      normalizedStartWallClock = normalizeUserVisibleWallClockMinuteInput(startWallClock);
+      normalizedEndWallClock = normalizeUserVisibleWallClockMinuteInput(endWallClock);
+    } catch (error) {
+      wallClockInputValid = false;
+      pushIssue(issues, row.rowNumber, '活动开始时间,活动结束时间', `${startWallClock}|${endWallClock}`,
+        error?.code === 'WALL_CLOCK_INPUT_SECOND_MUST_BE_ZERO'
+          ? 'CARBON_ACTIVITY_WALL_CLOCK_SECOND_MUST_BE_ZERO'
+          : 'CARBON_ACTIVITY_WALL_CLOCK_INVALID',
+        error.message);
+    }
+  }
+  let utcRange = null;
+  if (wallClockInputValid && sourceTimezone && isValidIanaTimezone(sourceTimezone)) {
+    try {
+      utcRange = convertSourceWallClockRangeToUtc(normalizedStartWallClock, normalizedEndWallClock, sourceTimezone);
     } catch (error) {
       pushIssue(issues, row.rowNumber, '活动开始时间,活动结束时间', `${startWallClock}|${endWallClock}`,
         error?.details?.code || 'CARBON_ACTIVITY_WALL_CLOCK_INVALID', error.message);
@@ -556,8 +575,8 @@ function normalizeCarbonActivityImportRow(row, context) {
     organizationUnitCode: organizationUnit?.unitCode || organizationUnitCode || null,
     energyTypeId: energyType ? Number(energyType.id) : null,
     energyTypeCode: energyType?.code || energyTypeCode || null,
-    startWallClock: startWallClock || null,
-    endWallClock: endWallClock || null,
+    startWallClock: normalizedStartWallClock,
+    endWallClock: normalizedEndWallClock,
     sourceTimezone: sourceTimezone || null,
     startUtc: utcRange?.startUtc || null,
     endUtc: utcRange?.endUtc || null,

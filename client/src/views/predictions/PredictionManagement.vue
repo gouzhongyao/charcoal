@@ -11,7 +11,7 @@
           <el-form-item label="能源类型"><el-select v-model="configDraftFilters.energyTypeCode" clearable placeholder="全部能源类型"><el-option v-for="item in energyTypes" :key="item.code" :label="`${item.name}（${item.code}）`" :value="item.code" /></el-select></el-form-item>
           <el-form-item label="算法"><el-select v-model="configDraftFilters.algorithm" clearable placeholder="全部算法"><el-option label="移动平均" value="moving_average" /><el-option label="线性趋势" value="linear_trend" /></el-select></el-form-item>
           <el-form-item label="字符搜索"><el-input v-model.trim="configDraftFilters.keyword" clearable placeholder="名称、说明、组织或能源" /></el-form-item>
-          <template #actions><el-button v-if="canConfigTemplate" :loading="templateLoading" @click="downloadTemplate">下载模板</el-button><el-button v-if="canConfigImport" :loading="demoExampleLoading" @click="downloadDemoExample">下载青岚园区示例</el-button><el-button v-if="canConfigImport" @click="openImport">导入草稿</el-button><el-button v-if="canConfigExport" :loading="configExportLoading" @click="exportConfigs">导出当前筛选</el-button><el-button v-if="canConfigCreate" type="primary" @click="openCreateConfig">新增草稿</el-button></template>
+          <template #actions><el-button v-if="canConfigTemplate" :loading="templateLoading" @click="downloadTemplate">下载模板</el-button><el-button v-if="canConfigImport" @click="openImport">导入草稿</el-button><el-button v-if="canConfigExport" :loading="configExportLoading" @click="exportConfigs">导出当前筛选</el-button><el-button v-if="canConfigCreate" type="primary" @click="openCreateConfig">新增草稿</el-button></template>
         </ManagementToolbar>
         <el-alert v-if="energyTypesError" type="warning" :closable="false" show-icon :title="`能源类型字典读取失败：${energyTypesError}`" />
         <el-alert v-if="configError" type="error" :closable="false" show-icon :title="configError" />
@@ -63,9 +63,10 @@ import HelpIcon from '@/components/HelpIcon.vue';
 import PageState from '@/components/PageState.vue';
 import StatCard from '@/components/StatCard.vue';
 import { getEnergyTypes } from '@/api/energy';
-import { archivePredictionRun, cancelPredictionRun, copyPredictionConfig, createPredictionConfig, downloadPredictionConfigDemoParkExample, downloadPredictionConfigTemplate, executePredictionConfigImport, exportPredictionConfigs, exportPredictionResults, getPredictionConfig, getPredictionConfigs, getPredictionResults, getPredictionRunResults, getPredictionRunStats, getPredictionRuns, previewPredictionConfigImport, runPredictionConfig, updatePredictionConfig, updatePredictionConfigStatus } from '@/api/predictions';
+import { archivePredictionRun, cancelPredictionRun, copyPredictionConfig, createPredictionConfig, downloadPredictionConfigTemplate, executePredictionConfigImport, exportPredictionConfigs, exportPredictionResults, getPredictionConfig, getPredictionConfigs, getPredictionResults, getPredictionRunResults, getPredictionRunStats, getPredictionRuns, previewPredictionConfigImport, runPredictionConfig, updatePredictionConfig, updatePredictionConfigStatus } from '@/api/predictions';
 import { buildPredictionConfigFilters, buildPredictionConfigImportExecutePayload, buildPredictionResultFilters, buildPredictionRunFilters, buildPredictionTrendRows, canArchivePredictionRun, canCancelPredictionRun, nextPredictionConfigStatus, numberValue, predictionCategoryColor } from '@/utils/predictionManagement';
 import { hasPermi } from '@/utils/permission';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 
 /** 返回空预测配置筛选。 */
 const emptyConfigFilters = () => ({ status: '', energyTypeCode: '', algorithm: '', keyword: '' });
@@ -101,7 +102,7 @@ const canManagePredictions = computed(() => hasPermi(['prediction:config:view', 
 
 // 配置草稿、字典和导入抽屉状态。
 const energyTypes = ref([]); const energyTypesError = ref('');
-const configDraftFilters = ref(emptyConfigFilters()); const configAppliedFilters = ref(emptyConfigFilters()); const configs = ref([]); const configPage = ref(1); const configPageSize = ref(20); const configPagination = ref({ total: 0 }); const configLoading = ref(false); const configError = ref(''); const configExportLoading = ref(false); const templateLoading = ref(false); const demoExampleLoading = ref(false);
+const configDraftFilters = ref(emptyConfigFilters()); const configAppliedFilters = ref(emptyConfigFilters()); const configs = ref([]); const configPage = ref(1); const configPageSize = ref(20); const configPagination = ref({ total: 0 }); const configLoading = ref(false); const configError = ref(''); const configExportLoading = ref(false); const templateLoading = ref(false);
 const configDrawerOpen = ref(false); const configEditingId = ref(null); const configForm = ref(emptyConfigForm()); const configFormRef = ref(); const configSaving = ref(false); const configFormError = ref('');
 const importDrawerOpen = ref(false); const executeDrawerOpen = ref(false); const importFile = ref(null); const importPreview = ref(null); const previewLoading = ref(false); const executeLoading = ref(false); const importError = ref(''); const executeError = ref(''); const confirmText = ref('');
 const configRules = { name: [{ required: true, message: '请填写配置名称。', trigger: 'blur' }], energyTypeCode: [{ required: true, message: '请选择 active 能源类型。', trigger: 'change' }], trainStartMonth: [{ required: true, message: '请选择训练开始月份。', trigger: 'change' }], trainEndMonth: [{ required: true, message: '请选择训练结束月份。', trigger: 'change' }], predictStartMonth: [{ required: true, message: '请选择目标开始月份。', trigger: 'change' }], predictEndMonth: [{ required: true, message: '请选择目标结束月份。', trigger: 'change' }], algorithm: [{ required: true, message: '请选择预测算法。', trigger: 'change' }] };
@@ -134,7 +135,7 @@ function formatNumber(value, digits = 2) { return new Intl.NumberFormat('zh-CN',
 /** 格式化整数。 */
 function formatInteger(value) { return formatNumber(value, 0); }
 /** 格式化服务端日期时间。 */
-function formatDateTime(value) { return value ? String(value).replace('T', ' ').replace(/\.\d+Z$/, '') : '—'; }
+function formatDateTime(value) { return formatStrictUtcDateTimeDisplay(value); }
 /** 计算单轴柱状图安全长度。 */
 function percentage(value, maximum) { return Math.max(2, Math.min(100, (numberValue(value) / maximum) * 100)); }
 /** 返回算法可读标签。 */
@@ -204,8 +205,6 @@ async function copyConfig(row) { const result = await safe(() => copyPredictionC
 async function confirmRunConfig(row) { try { await ElMessageBox.confirm(`从草稿“${row.name}”创建预测运行？服务端将读取已入库 active 能耗数据并保存不可变配置快照；样本不足将真实失败且不写结果。`, '确认从草稿运行', { type: 'warning', confirmButtonText: '创建运行', cancelButtonText: '取消' }); } catch { return; } const result = await safe(() => runPredictionConfig(row.id)); if (!result.ok) { ElMessage.error(`创建预测运行失败：${requestError(result)}`); return; } const summary = result.value.data?.summary || {}; ElMessage.success(`服务端运行已结束：${summary.status === 'failed' ? '样本不足或无数据，未生成结果' : `生成 ${formatInteger(summary.resultCount)} 条结果`}。`); await Promise.all([loadRuns(), loadResults()]); }
 /** 下载服务端权限保护的配置模板。 */
 async function downloadTemplate() { templateLoading.value = true; const result = await safe(() => downloadPredictionConfigTemplate()); templateLoading.value = false; if (!result.ok) ElMessage.error(`预测配置模板下载失败：${requestError(result)}`); }
-/** 下载预测配置青岚园区示例；历史能耗复用数据导入页文件，且不会自动运行预测。 */
-async function downloadDemoExample() { demoExampleLoading.value = true; const result = await safe(downloadPredictionConfigDemoParkExample); demoExampleLoading.value = false; if (!result.ok) ElMessage.error(`青岚园区示例下载失败：${requestError(result)}`); }
 /** 导出当前应用的配置筛选，而非尚未查询的草稿筛选。 */
 async function exportConfigs() { configExportLoading.value = true; const result = await safe(() => exportPredictionConfigs(buildPredictionConfigFilters(configAppliedFilters.value))); configExportLoading.value = false; if (!result.ok) ElMessage.error(`预测配置导出失败：${requestError(result)}`); }
 

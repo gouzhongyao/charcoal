@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { parse as parseSfc } from '@vue/compiler-sfc';
+import { baseParse, NodeTypes } from '@vue/compiler-dom';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -12,6 +14,46 @@ const [apiSource, pageSource, topologySource, logicSource] = await Promise.all([
   source('../views/energy/flows/EnergyFlowTopology.vue'),
   source('../utils/energyFlow.js')
 ]);
+
+// 能流页面模板 AST 辅助方法模块，结构契约只读取模板归属和属性，不模拟浏览器行为。
+const parsedPage = parseSfc(pageSource, { filename: resolve(currentDirectory, '../views/energy/flows/index.vue') });
+assert.equal(parsedPage.errors.length, 0, '能流页面 SFC 解析不得产生错误。');
+assert(parsedPage.descriptor.template, '能流页面必须包含模板。');
+const templateAst = baseParse(parsedPage.descriptor.template.content);
+const templateElementRecords = [];
+const collectTemplateElements = (node, ancestors = []) => {
+  if (!node) return;
+  const nextAncestors = node.type === NodeTypes.ELEMENT ? [...ancestors, node] : ancestors;
+  if (node.type === NodeTypes.ELEMENT) templateElementRecords.push({ node, ancestors });
+  for (const child of node.children || []) collectTemplateElements(child, nextAncestors);
+};
+collectTemplateElements(templateAst);
+const findDirective = (node, name, argument) => (node.props || []).find((prop) => prop.type === NodeTypes.DIRECTIVE && prop.name === name && (argument === undefined || prop.arg?.content === argument));
+const findStaticAttribute = (node, name) => (node.props || []).find((prop) => prop.type === NodeTypes.ATTRIBUTE && prop.name === name);
+const staticAttributeValue = (node, name) => findStaticAttribute(node, name)?.value?.content;
+const elementText = (node) => (node.children || []).map((child) => {
+  if (child.type === NodeTypes.TEXT) return child.content;
+  if (child.type === NodeTypes.ELEMENT) return elementText(child);
+  return '';
+}).join('');
+
+// CSS 媒体查询块读取模块，只验证目标媒体查询内部的布局规则。
+const extractCssBlock = (styleText, startIndex) => {
+  const openingBrace = styleText.indexOf('{', startIndex);
+  assert(openingBrace >= 0, '目标 CSS 媒体查询必须包含块起始符。');
+  let depth = 0;
+  for (let index = openingBrace; index < styleText.length; index += 1) {
+    if (styleText[index] === '{') depth += 1;
+    if (styleText[index] === '}') depth -= 1;
+    if (depth === 0) return styleText.slice(openingBrace + 1, index);
+  }
+  throw new Error('目标 CSS 媒体查询缺少闭合块。');
+};
+const scopedStyleSource = parsedPage.descriptor.styles.filter((style) => style.scoped).map((style) => style.content).join('\n');
+const compactStyleSource = scopedStyleSource.replace(/\s+/g, '');
+const narrowMediaMatch = /@media\s*\(\s*max-width\s*:\s*1180px\s*\)/.exec(scopedStyleSource);
+assert(narrowMediaMatch, '能流页面必须声明 1180px 窄屏布局媒体查询。');
+const narrowMediaSource = extractCssBlock(scopedStyleSource, narrowMediaMatch.index).replace(/\s+/g, '');
 
 // API 根路径、HTTP 方法和资源层级必须与后端路由一致。
 for (const endpoint of [
@@ -29,8 +71,8 @@ assert(apiSource.includes('${ENERGY_FLOW_IMPORT_BASE_URL}/${contract.routeSegmen
 assert(apiSource.includes('${ENERGY_FLOW_IMPORT_BASE_URL}/${contract.routeSegment}/execute'), 'API 应通过固定映射构造 execute 路由。');
 for (const method of ["method: 'post'", "method: 'put'", "method: 'patch'"]) assert(apiSource.includes(method), `API 应包含 ${method}`);
 assert(apiSource.includes("data.append('file', file)"), '导入上传字段必须固定为 file。');
-assert(apiSource.includes("import { download, query, request } from '@/api/http';"), '能流模板和示例下载必须复用共享 HTTP download。');
-assert(apiSource.includes('/templates/demo-park/') && apiSource.includes('/templates/${encodeURIComponent(templateType)}'), '能流 API 必须提供空白模板和青岚示例下载。');
+assert(apiSource.includes("import { download, query, request } from '@/api/http';"), '能流模板和受控导入必须复用共享 HTTP download。');
+assert(apiSource.includes('/templates/demo-park/') && apiSource.includes('/templates/${encodeURIComponent(templateType)}'), '集中演示下载 API 仍必须保留受保护路径合同。');
 assert(apiSource.includes('params: query(params)'), 'GET 参数必须使用共享 query 清理空值。');
 assert(apiSource.includes('listAllEnergyFlowNodes') && apiSource.includes('listAllEnergyFlowEdges'), '节点和边维护必须提供全量分页读取 API。');
 assert(apiSource.includes('collectEnergyFlowPaginatedRows'), '全量节点和边必须复用后端分页契约收集器。');
@@ -173,9 +215,71 @@ assert.match(pageSource, /function prepareImportPreview\(kind\) \{\s*if \(import
 for (const state of ['modelImportFile.value = null', 'modelImportPreview.value = null', 'nodeImportFile.value = null', 'nodeImportPreview.value = null', 'bundleImportFile.value = null', 'bundleImportPreview.value = null', "confirmText.value = ''"]) {
   assert(pageSource.includes(state), `上传移除必须清理 ${state}。`);
 }
-assert(pageSource.includes('依赖顺序：1 模型 → 2 节点 → 3 边 → 4 显式边值'), '空库可见导入区必须明确完整依赖顺序。');
-for (const artifact of ['22-energy-flow-models', '23-energy-flow-nodes', '24-energy-flow-edges']) assert(pageSource.includes(artifact), `页面必须提供青岚示例 ${artifact}。`);
-assert(pageSource.indexOf('能流模型与拓扑导入') < pageSource.indexOf('<template v-if="selectedModel">'), '模型导入区必须位于 selectedModel 条件之外。');
+// 导入工作区必须从主内容迁移到顶部入口打开的右侧抽屉，且不改变可见权限入口。
+const managementToolbarRecords = templateElementRecords.filter(({ node }) => node.tag === 'ManagementToolbar');
+assert.equal(managementToolbarRecords.length, 1, '能流页面必须有唯一的管理工具栏。');
+const managementToolbarRecord = managementToolbarRecords[0];
+const actionsSlotRecords = templateElementRecords.filter(({ node, ancestors }) => node.tag === 'template' && findDirective(node, 'slot', 'actions') && ancestors[ancestors.length - 1] === managementToolbarRecord.node);
+assert.equal(actionsSlotRecords.length, 1, '能流导入入口必须位于唯一 ManagementToolbar 的 actions 插槽。');
+const actionsSlotRecord = actionsSlotRecords[0];
+const importActionButtonRecords = templateElementRecords.filter(({ node }) => node.tag === 'el-button' && elementText(node).trim() === '能流模型与拓扑导入');
+assert.equal(importActionButtonRecords.length, 1, '同名能流导入入口按钮必须全页唯一。');
+assert(importActionButtonRecords[0].ancestors.includes(actionsSlotRecord.node), '同名能流导入入口按钮必须位于 ManagementToolbar 的 actions 插槽内部。');
+const importActionButton = importActionButtonRecords[0].node;
+assert.equal(staticAttributeValue(importActionButton, 'type'), 'primary', '能流导入入口按钮必须保持 primary 类型。');
+assert(findStaticAttribute(importActionButton, 'plain'), '能流导入入口按钮必须保持 plain 样式。');
+assert.equal(findDirective(importActionButton, 'on', 'click')?.exp?.content, 'flowImportDrawer = true', '能流导入入口按钮必须打开 flowImportDrawer。');
+assert(pageSource.includes('const flowImportDrawer = ref(false)'), '导入工作区必须使用独立抽屉状态。');
+
+const flowImportDrawerRecords = templateElementRecords.filter(({ node }) => node.tag === 'el-drawer' && findDirective(node, 'model')?.exp?.content === 'flowImportDrawer');
+assert.equal(flowImportDrawerRecords.length, 1, '能流导入必须有唯一绑定 flowImportDrawer 的 Element Plus 抽屉。');
+const flowImportDrawerRecord = flowImportDrawerRecords[0];
+const flowImportDrawerNode = flowImportDrawerRecord.node;
+assert.equal(staticAttributeValue(flowImportDrawerNode, 'title'), '能流模型与拓扑导入', '能流导入抽屉标题必须与入口同名。');
+assert.equal(staticAttributeValue(flowImportDrawerNode, 'direction'), 'rtl', '能流导入抽屉必须从右侧打开。');
+assert.equal(staticAttributeValue(flowImportDrawerNode, 'size'), 'min(960px, 96vw)', '能流导入抽屉必须约束为 min(960px, 96vw)。');
+const flowImportDrawerSource = flowImportDrawerNode.loc.source;
+const importWorkspaceRecords = templateElementRecords.filter(({ node }) => staticAttributeValue(node, 'class')?.split(/\s+/).includes('import-workspace'));
+assert.equal(importWorkspaceRecords.length, 1, '能流导入工作区必须全页唯一，主内容不得重复内嵌。');
+assert(importWorkspaceRecords[0].ancestors.includes(flowImportDrawerNode), '唯一 import-workspace 必须位于 flowImportDrawer 抽屉内部。');
+const selectedModelConditionalRecords = templateElementRecords.filter(({ node }) => ['if', 'else-if'].some((directiveName) => findDirective(node, directiveName)?.exp?.content === 'selectedModel'));
+assert.equal(selectedModelConditionalRecords.length, 1, '页面必须保留唯一 selectedModel 条件内容区作为抽屉归属对照。');
+const flowImportDrawerAncestorConditions = flowImportDrawerRecord.ancestors.flatMap((ancestor) => (ancestor.props || []).filter((prop) => prop.type === NodeTypes.DIRECTIVE && ['if', 'else-if'].includes(prop.name)).map((prop) => prop.exp?.content || ''));
+assert.equal(flowImportDrawerAncestorConditions.some((condition) => /\bselectedModel\b/.test(condition)), false, 'flowImportDrawer 抽屉不得位于 selectedModel 条件祖先内，空模型库仍必须能够打开。');
+for (const importSection of [
+  '依赖顺序：1 模型 → 2 节点 → 3 边 → 4 显式边值',
+  '@click="downloadFlowTemplate(definition)"',
+  '模型导入',
+  '节点导入',
+  '边与显式边值导入',
+  ':file-list="modelImportFileList"',
+  ':file-list="nodeImportFileList"',
+  ':file-list="bundleImportFileList"',
+  ':on-remove="() => clearImportSelection(\'model\')"',
+  ':on-remove="() => clearImportSelection(\'node\')"',
+  ':on-remove="() => clearImportSelection(\'bundle\')"',
+  '@click="previewModelImport"',
+  '@click="previewNodeImport"',
+  '@click="previewBundleImport"',
+  '@click="openImportExecute(\'model\')"',
+  '@click="openImportExecute(\'node\')"',
+  '@click="openImportExecute(\'bundle\')"',
+  '<ImportPreviewTable',
+  'v-if="importError"'
+]) {
+  assert(flowImportDrawerSource.includes(importSection), `抽屉内必须保留完整导入内容：${importSection}`);
+}
+
+// 静态结构只约束抽屉未启用销毁属性且没有关闭清理绑定；关闭重开状态由手工测试验证。
+const destroyOnCloseBindings = (flowImportDrawerNode.props || []).filter((prop) => (prop.type === NodeTypes.ATTRIBUTE && prop.name === 'destroy-on-close') || (prop.type === NodeTypes.DIRECTIVE && prop.name === 'bind' && prop.arg?.content === 'destroy-on-close'));
+assert.equal(destroyOnCloseBindings.length, 0, '导入抽屉组件不得声明 destroy-on-close 属性。');
+const closeCleanupBindings = (flowImportDrawerNode.props || []).filter((prop) => prop.type === NodeTypes.DIRECTIVE && prop.name === 'on' && ['before-close', 'close', 'closed'].includes(prop.arg?.content));
+assert.equal(closeCleanupBindings.length, 0, '导入抽屉组件不得声明关闭时清理绑定；状态保留由手工测试验证。');
+
+// 桌面布局保持双栏，目标 1180px 媒体查询内将导入卡片切换为单栏。
+assert(compactStyleSource.includes('.maintenance-grid,.import-grid,.analysis-detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))'), '导入网格必须保留桌面双栏规则。');
+assert(narrowMediaSource.includes('.maintenance-grid,.import-grid,.analysis-detail-grid{grid-template-columns:1fr}'), '导入网格单栏规则必须位于 1180px 窄屏媒体查询内。');
+assert.doesNotMatch(pageSource, /downloadFlowDemo|downloadEnergyFlowDemoArtifact|天坤集团示例/, '能流业务页面不得继续分散提供演示下载入口。');
 assert(pageSource.includes("if (executeSnapshot.kind !== 'model' && selectedModel.value) await selectModel(selectedModel.value);"), '模型 execute 成功后只刷新模型列表并清理旧 preview，不得依赖旧模型选择刷新。');
 assert(pageSource.includes('value: null, sourceMapping'), '新增储能变化默认值必须为空。');
 assert(!pageSource.includes("value: 0, sourceMapping: { reference: '' }"), '新增储能变化不得默认伪造真实零。');

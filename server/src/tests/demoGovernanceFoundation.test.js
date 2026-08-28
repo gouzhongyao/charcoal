@@ -14,7 +14,9 @@ process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
 const {
+  CANONICAL_SCHEMA_VERSION,
   blockDatabaseAdmission,
+  calculateSchemaFingerprint,
   getDatabaseAdmissionState,
   initDatabase,
   migrateDemoRunImportBatchRole,
@@ -34,6 +36,11 @@ const {
 } = require('../services/demoRuntimeService');
 const { runWithMaintenance } = require('../services/maintenanceState');
 const { toPublicRestoreResult } = require('../routes/backups');
+
+// 当前初始化必须写入 v3；唯一可信 predecessor 是 strategy_rules 尚无 provenance 的 v2。
+const CURRENT_CANONICAL_SCHEMA_VERSION = '2026-08-28-formal-canonical-v3';
+const CANONICAL_PREDECESSOR_VERSION = '2026-08-27-formal-canonical-v2';
+const REJECTED_LEGACY_SCHEMA_VERSION = '2026-08-26-formal-canonical-v1';
 
 // 生产 server/src 仅数据库基础层可加载 SQLite driver；backupService 仅允许只读备份验证例外。
 function assertProductionSqliteDriverBoundary() {
@@ -66,7 +73,7 @@ function assertProductionSqliteDriverBoundary() {
   });
 }
 
-// 阶段 1 必须创建的全部治理表。
+// 当前 canonical 必须创建的全部演示治理表。
 const GOVERNANCE_TABLES = [
   'demo_runtime_settings',
   'demo_dataset_runs',
@@ -75,7 +82,9 @@ const GOVERNANCE_TABLES = [
   'demo_data_registry',
   'demo_data_relations',
   'demo_legacy_claim_runs',
-  'demo_cleanup_runs'
+  'demo_cleanup_runs',
+  'demo_post_action_runs',
+  'demo_post_action_outputs'
 ];
 // 阶段 1 新增的五项后端权限。
 const DEMO_PERMISSIONS = [
@@ -134,6 +143,20 @@ const GOVERNANCE_INDEX_CONTRACTS = {
   ux_demo_run_import_batches_primary_context: {
     tableName: 'demo_run_import_batches', unique: true, columns: ['context_id'],
     where: "batch_role = 'primary'", weakColumn: 'id'
+  },
+  idx_demo_post_action_runs_run_status: {
+    tableName: 'demo_post_action_runs', unique: false,
+    columns: ['run_id', 'action_key', 'status', 'created_at'],
+    descending: [false, false, false, true], weakColumn: 'action_run_id'
+  },
+  idx_demo_post_action_runs_actor_created: {
+    tableName: 'demo_post_action_runs', unique: false,
+    columns: ['requested_by', 'created_at'],
+    descending: [false, true], weakColumn: 'action_run_id'
+  },
+  idx_demo_post_action_outputs_run: {
+    tableName: 'demo_post_action_outputs', unique: false,
+    columns: ['action_run_id', 'output_entity_type', 'output_id'], weakColumn: 'output_id'
   }
 };
 
@@ -177,6 +200,31 @@ function request(server, method, pathname, body = null, token = null, extraHeade
     req.on('error', reject);
     req.end(rawBody);
   });
+}
+
+/** 快照只读目录请求绝不能改写的演示治理状态。 */
+function snapshotDemoReadState() {
+  const db = openDatabase();
+  try {
+    const tableNames = [
+      'demo_runtime_settings',
+      'demo_dataset_runs',
+      'demo_import_contexts',
+      'demo_cleanup_runs',
+      'demo_data_registry',
+      'demo_data_relations',
+      'demo_run_import_batches',
+      'demo_post_action_runs',
+      'demo_post_action_outputs',
+      'sys_operation_logs'
+    ];
+    return Object.fromEntries(tableNames.map((tableName) => [
+      tableName,
+      db.prepare(`SELECT * FROM ${tableName} ORDER BY rowid`).all()
+    ]));
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -239,6 +287,8 @@ function createLegacyBackupWithoutDemoGovernance(backupPath) {
         SELECT id FROM sys_menus WHERE permission_code LIKE 'system:demo:%'
       );
       DELETE FROM sys_menus WHERE permission_code LIKE 'system:demo:%';
+      DROP TABLE IF EXISTS demo_post_action_outputs;
+      DROP TABLE IF EXISTS demo_post_action_runs;
       DROP TABLE IF EXISTS demo_data_relations;
       DROP TABLE IF EXISTS demo_run_import_batches;
       DROP TABLE IF EXISTS demo_data_registry;
@@ -309,23 +359,50 @@ function degradeAllGovernanceIndexes() {
   }
 }
 
-/** 断言全部治理索引的 unique、列顺序和 WHERE 条件符合 canonical contract。 */
+/** 断言全部治理索引的 unique、列顺序、排序方向和 WHERE 条件符合 canonical contract。 */
 function assertAllGovernanceIndexesCanonical(db) {
   Object.entries(GOVERNANCE_INDEX_CONTRACTS).forEach(([indexName, contract]) => {
     const indexListRow = db.prepare(`PRAGMA index_list(${contract.tableName})`).all()
       .find((index) => index.name === indexName);
     assert(indexListRow, `缺少治理索引 ${indexName}`);
     assert.strictEqual(Boolean(indexListRow.unique), contract.unique, `${indexName} unique 不符合契约。`);
-    const columns = db.prepare(`PRAGMA index_info(${indexName})`).all()
-      .sort((left, right) => left.seqno - right.seqno)
-      .map((column) => column.name);
-    assert.deepStrictEqual(columns, contract.columns, `${indexName} 列顺序不符合契约。`);
+    const indexedColumns = db.prepare(`PRAGMA index_xinfo(${indexName})`).all()
+      .filter((column) => column.key === 1)
+      .sort((left, right) => left.seqno - right.seqno);
+    assert.deepStrictEqual(indexedColumns.map((column) => column.name), contract.columns, `${indexName} 列顺序不符合契约。`);
+    if (contract.descending) {
+      assert.deepStrictEqual(indexedColumns.map((column) => Boolean(column.desc)), contract.descending,
+        `${indexName} 排序方向不符合契约。`);
+    }
     const indexSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?").get(indexName).sql;
     const whereMatch = String(indexSql).match(/\bWHERE\b([\s\S]*)$/i);
     const actualWhere = whereMatch ? whereMatch[1].replace(/\s+/g, ' ').trim().toLowerCase() : null;
     const expectedWhere = contract.where ? contract.where.replace(/\s+/g, ' ').trim().toLowerCase() : null;
     assert.strictEqual(actualWhere, expectedWhere, `${indexName} WHERE 条件不符合契约。`);
   });
+}
+
+/** 在测试中按 schema.sql 原始语句显式恢复治理索引，模拟人工修复后的重新入场。 */
+function restoreGovernanceIndexesAndFingerprint() {
+  const schemaSql = fs.readFileSync(path.join(__dirname, '..', 'db', 'schema.sql'), 'utf8');
+  const schemaStatements = schemaSql.split(';').map((statement) => statement.trim()).filter(Boolean);
+  const db = openDatabase();
+  try {
+    db.transaction(() => {
+      Object.keys(GOVERNANCE_INDEX_CONTRACTS).forEach((indexName) => {
+        const createStatement = schemaStatements.find((statement) =>
+          statement.includes(`INDEX IF NOT EXISTS ${indexName}`)
+        );
+        assert(createStatement, `schema.sql 缺少治理索引定义 ${indexName}`);
+        db.exec(`DROP INDEX IF EXISTS ${indexName}`);
+        db.exec(createStatement);
+      });
+      const fingerprint = calculateSchemaFingerprint(db);
+      db.prepare(`UPDATE app_meta SET value = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE key = 'schema_fingerprint'`).run(fingerprint);
+    })();
+  } finally {
+    db.close();
+  }
 }
 
 /** 断言新库 SHA-256 字段严格拒绝长度和字符集边界，并保留 upload NULL 语义。 */
@@ -368,6 +445,12 @@ function assertDemoSha256Constraints(db) {
   let server;
   try {
     assertProductionSqliteDriverBoundary();
+    assert.strictEqual(CANONICAL_SCHEMA_VERSION, CURRENT_CANONICAL_SCHEMA_VERSION,
+      '生产数据库模块导出的 current canonical 版本必须保持 v3。');
+    assert.notStrictEqual(CANONICAL_SCHEMA_VERSION, CANONICAL_PREDECESSOR_VERSION,
+      'strategy_rules provenance v2 predecessor 不得被误当成 current canonical。');
+    assert(![CANONICAL_SCHEMA_VERSION, CANONICAL_PREDECESSOR_VERSION].includes(REJECTED_LEGACY_SCHEMA_VERSION),
+      'v1 不得被列入 current 或唯一 accepted predecessor。');
     initDatabase();
 
     backupServiceTest.assertCheckpointComplete([{ busy: 0, log: 7, checkpointed: 7 }], 'TEST_CHECKPOINT');
@@ -435,8 +518,9 @@ function assertDemoSha256Constraints(db) {
         changeReason: 'schema_default'
       });
       assert.strictEqual(newDb.prepare('SELECT COUNT(*) AS total FROM demo_runtime_settings').get().total, 1);
-      assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_stage'").get().value, 'demo-context-foundation');
-      assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value, '2026-08-13-demo-context-v4');
+      assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_stage'").get().value, 'formal-canonical');
+      assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value,
+        CURRENT_CANONICAL_SCHEMA_VERSION, 'fresh/current 初始化必须写入 formal-canonical v2。');
 
       const activeRegistryIndex = newDb.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'ux_demo_data_registry_active_entity'").get();
       assert(activeRegistryIndex && /WHERE cleaned_at IS NULL/i.test(activeRegistryIndex.sql), 'active registry 必须使用部分唯一索引。');
@@ -763,18 +847,32 @@ function assertDemoSha256Constraints(db) {
           runtime_epoch INTEGER NOT NULL DEFAULT 1 CHECK (runtime_epoch >= 1),
           revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
           updated_by INTEGER,
-          updated_at TEXT NOT NULL,
-          change_reason TEXT NOT NULL CHECK (length(trim(change_reason)) BETWEEN 1 AND 500),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          change_reason TEXT NOT NULL DEFAULT 'schema_default' CHECK (length(trim(change_reason)) BETWEEN 1 AND 500),
           FOREIGN KEY (updated_by) REFERENCES sys_users(id) ON DELETE SET NULL
         );
-        INSERT INTO demo_runtime_settings VALUES
-          (1, 1, 4, 4, NULL, '2026-08-13T00:00:00.000Z', 'test-repair');`);
+        INSERT INTO demo_runtime_settings
+          (id, enabled, runtime_epoch, revision, updated_by, updated_at, change_reason)
+        VALUES (1, 1, 4, 4, NULL, '2026-08-13T00:00:00.000Z', 'test-repair');`);
     } finally {
       restoreCanonicalRuntimeDb.close();
     }
 
     degradeCriticalGovernanceIndexes();
-    initDatabase();
+    assert.throws(
+      () => initDatabase(),
+      (error) => error.code === 'SCHEMA_FINGERPRINT_MISMATCH',
+      '治理索引漂移后正式初始化必须拒绝继续，而不是自动修复未知结构。'
+    );
+    const degradedIndexDb = openDatabase();
+    try {
+      const activeRun = degradedIndexDb.prepare("PRAGMA index_list(demo_dataset_runs)").all()
+        .find((index) => index.name === 'ux_demo_dataset_runs_active_dataset');
+      assert.strictEqual(activeRun.unique, 0, '指纹漂移失败后不得偷偷修复弱索引。');
+    } finally {
+      degradedIndexDb.close();
+    }
+    restoreGovernanceIndexesAndFingerprint();
     const repairedIndexDb = openDatabase();
     try {
       const activeRun = repairedIndexDb.prepare("PRAGMA index_list(demo_dataset_runs)").all()
@@ -794,7 +892,12 @@ function assertDemoSha256Constraints(db) {
     }
 
     degradeAllGovernanceIndexes();
-    initDatabase();
+    assert.throws(
+      () => initDatabase(),
+      (error) => error.code === 'SCHEMA_FINGERPRINT_MISMATCH',
+      '任一治理索引漂移都必须 fail-closed。'
+    );
+    restoreGovernanceIndexesAndFingerprint();
     const allIndexContractDb = openDatabase();
     try {
       assertAllGovernanceIndexesCanonical(allIndexContractDb);
@@ -815,8 +918,10 @@ function assertDemoSha256Constraints(db) {
     }
     assert.throws(
       () => initDatabase(),
-      /active 冲突/,
-      'canonical 唯一索引已缺失且数据冲突时必须明确安全失败。'
+      (error) => error.code === 'SCHEMA_FINGERPRINT_MISMATCH'
+        || error.code === 'SQLITE_CONSTRAINT_UNIQUE'
+        || /UNIQUE constraint failed/i.test(error.message),
+      'canonical 唯一索引漂移且数据存在冲突时必须安全失败。'
     );
     const conflictCleanupDb = openDatabase();
     try {
@@ -829,6 +934,7 @@ function assertDemoSha256Constraints(db) {
     } finally {
       conflictCleanupDb.close();
     }
+    restoreGovernanceIndexesAndFingerprint();
     initDatabase();
 
     createUserWithPermissions('demo_none', 'demo-none', []);
@@ -895,11 +1001,33 @@ function assertDemoSha256Constraints(db) {
       centralPreviewExecuteContext: true,
       retainedUploadReplayContext: false,
       ownershipRegistration: false,
+      ownershipSummary: true,
       legacyClaimPreview: false,
       legacyClaimExecute: false,
-      cleanupPreview: false,
-      cleanupExecute: false
+      cleanupPreview: true,
+      cleanupExecute: false,
+      cleanupRunStatus: true,
+      postActionRegistry: true,
+      postActionPreview: true,
+      postActionExecute: true,
+      postActionRunStatus: true,
+      postActionRetry: false
     });
+    assert.deepStrictEqual(viewerStatus.body.data.allowedActions, {
+      toggleRuntime: false,
+      loadCatalog: false,
+      prepareRun: false,
+      downloadArtifacts: false,
+      reassociateContext: false,
+      readOwnershipSummary: true,
+      previewCleanup: false,
+      executeCleanup: false,
+      readCleanupRunStatus: true
+    }, 'capability 只描述服务实现，viewer 的 allowedActions 必须严格按真实 RBAC 收敛。');
+    assert.strictEqual(viewerStatus.body.data.activeRun.runId, 'shape-run');
+    assert.strictEqual(viewerStatus.body.data.activeRunCompatibility.state, 'manifest-conflict');
+    assert.strictEqual(viewerStatus.body.data.activeRunCompatibility.manifestCompatible, false);
+    assert.strictEqual(viewerStatus.body.data.activeRunCompatibility.writeEligible, false);
     assert.strictEqual((await request(server, 'POST', '/api/system/demo-data/toggle', { enabled: false }, viewerToken)).status, 403);
 
     const invalidTokenStatus = await request(server, 'GET', '/api/system/demo-data/status', null, 'invalid-token');
@@ -933,6 +1061,72 @@ function assertDemoSha256Constraints(db) {
     const adminStatusViaSuperAdminFallback = await request(server, 'GET', '/api/system/demo-data/status', null, adminToken);
     assert.strictEqual(adminStatusViaSuperAdminFallback.status, 200, 'super_admin 无 view 角色关联时仍应沿用全局服务端兜底。');
     assert.strictEqual(adminStatusViaSuperAdminFallback.body.data.runtime.enabled, true, '系统开关状态必须对 super_admin 明确返回且不能被权限兜底改写。');
+    assert.deepStrictEqual(adminStatusViaSuperAdminFallback.body.data.allowedActions, {
+      toggleRuntime: true,
+      loadCatalog: true,
+      prepareRun: true,
+      downloadArtifacts: true,
+      reassociateContext: true,
+      readOwnershipSummary: true,
+      previewCleanup: true,
+      executeCleanup: true,
+      readCleanupRunStatus: true
+    }, 'super_admin 必须继续复用全局服务端兜底，但 capability=false 的功能仍不得因此启用。');
+    assert.strictEqual(adminStatusViaSuperAdminFallback.body.data.capabilities.cleanupExecute, false);
+
+    const readStateBeforeCatalogs = snapshotDemoReadState();
+    const conflictCatalog = await request(server, 'GET', '/api/system/demo-data/catalog', null, adminToken);
+    assert.strictEqual(conflictCatalog.status, 200, JSON.stringify(conflictCatalog.body));
+    assert.strictEqual(conflictCatalog.body.data.datasetId, 'qinglan-park-v1');
+    assert.strictEqual(conflictCatalog.body.data.run.runId, 'shape-run');
+    assert.strictEqual(conflictCatalog.body.data.activeRunCompatibility.state, 'manifest-conflict');
+    assert.strictEqual(conflictCatalog.body.data.activeRunCompatibility.writeEligible, false);
+    const conflictManifest = await request(server, 'GET', '/api/templates/demo-park/manifest', null, adminToken);
+    assert.strictEqual(conflictManifest.status, 200, JSON.stringify(conflictManifest.body));
+    assert.strictEqual(conflictManifest.body.data.datasetId, 'qinglan-park-v1');
+    assert.strictEqual(conflictManifest.body.data.run.runId, 'shape-run');
+    assert.strictEqual(conflictManifest.body.data.activeRunCompatibility.state, 'manifest-conflict');
+    assert.deepStrictEqual(snapshotDemoReadState(), readStateBeforeCatalogs,
+      'GET catalog 与 GET manifest 必须零副作用，不能自动退役、创建 run、签发 context 或写审计。');
+
+    const conflictOwnership = await request(server, 'GET', '/api/system/demo-data/runs/shape-run/ownership-summary', null, adminToken);
+    assert.strictEqual(conflictOwnership.status, 200, JSON.stringify(conflictOwnership.body));
+    assert.strictEqual(conflictOwnership.body.data.run.runId, 'shape-run');
+    assert.strictEqual(conflictOwnership.body.data.compatibility.state, 'manifest-conflict');
+    assert.strictEqual(conflictOwnership.body.data.compatibility.readable, true);
+    assert.strictEqual(conflictOwnership.body.data.cleanupWriteEligible, false);
+    const conflictPrepareRun = await request(server, 'POST', '/api/system/demo-data/run', {}, adminToken);
+    assert.strictEqual(conflictPrepareRun.status, 409);
+    assert.strictEqual(conflictPrepareRun.body.error.code, 'DEMO_ACTIVE_RUN_MANIFEST_CONFLICT');
+    assert.strictEqual(conflictPrepareRun.body.error.details.retirement, 'blocked_manifest_conflict');
+    const conflictCleanupPreview = await request(server, 'POST', '/api/system/demo-data/cleanup/preview', {
+      runId: 'shape-run',
+      clientRequestId: 'shape-run-conflict-cleanup'
+    }, adminToken);
+    assert.strictEqual(conflictCleanupPreview.status, 409);
+    assert.strictEqual(conflictCleanupPreview.body.error.code, 'DEMO_RUN_INVALID');
+    assert.deepStrictEqual(snapshotDemoReadState(), readStateBeforeCatalogs,
+      'manifest 冲突下 POST /run、cleanup preview 与 ownership 只读查询均不得改写治理状态。');
+
+    const unassociatedConflictDb = openDatabase();
+    try {
+      unassociatedConflictDb.transaction(() => {
+        unassociatedConflictDb.prepare("DELETE FROM demo_data_relations WHERE run_id = 'shape-run'").run();
+        unassociatedConflictDb.prepare("DELETE FROM demo_data_registry WHERE run_id = 'shape-run'").run();
+        unassociatedConflictDb.prepare("DELETE FROM demo_run_import_batches WHERE run_id = 'shape-run'").run();
+        unassociatedConflictDb.prepare("DELETE FROM demo_import_contexts WHERE run_id = 'shape-run'").run();
+      }).immediate();
+    } finally {
+      unassociatedConflictDb.close();
+    }
+    const unassociatedConflictState = snapshotDemoReadState();
+    const unassociatedConflictPrepareRun = await request(server, 'POST', '/api/system/demo-data/run', {}, adminToken);
+    assert.strictEqual(unassociatedConflictPrepareRun.status, 409);
+    assert.strictEqual(unassociatedConflictPrepareRun.body.error.code, 'DEMO_ACTIVE_RUN_MANIFEST_CONFLICT');
+    assert.strictEqual(unassociatedConflictPrepareRun.body.error.details.retirement, 'blocked_manifest_conflict');
+    assert.deepStrictEqual(snapshotDemoReadState(), unassociatedConflictState,
+      '旧 manifest run 即使无 context、ownership、关系和业务批次关联，POST /run 仍必须 409 且旧 run 保持不变。');
+
     const invalidToggle = await request(server, 'POST', '/api/system/demo-data/toggle', { enabled: 'false' }, adminToken);
     assert.strictEqual(invalidToggle.status, 400);
     const adminToggle = await request(server, 'POST', '/api/system/demo-data/toggle', { enabled: false }, adminToken);
@@ -1048,63 +1242,28 @@ function assertDemoSha256Constraints(db) {
     }
 
     const beforeLegacyRestore = toggleDemoRuntime({ enabled: true, actorUserId: 1 });
-    const restoreResult = await restoreBackup(legacyBackupName, {
+    const beforeLegacyRestoreSha = require('crypto').createHash('sha256')
+      .update(fs.readFileSync(process.env.SQLITE_PATH)).digest('hex');
+    await assert.rejects(() => restoreBackup(legacyBackupName, {
       userId: 1,
       username: 'not-admin',
       displayName: '未确认的请求身份',
       ip: '127.0.0.1'
+    }), (error) => {
+      assert.strictEqual(error.code, 'BACKUP_RESTORE_FAILED');
+      assert.strictEqual(error.details.phase, 'candidate_prepare');
+      assert.strictEqual(error.details.code, 'RESTORE_CANDIDATE_REJECTED');
+      assert(!JSON.stringify(error.details).includes(tmpDir));
+      return true;
     });
-    assert.strictEqual(restoreResult.restoredFrom.backupName, legacyBackupName);
-    assert.strictEqual(restoreResult.demoRuntimeSafetyReset.enabled, false);
-    assert.strictEqual(restoreResult.demoRuntimeSafetyReset.runtimeEpoch, beforeLegacyRestore.runtimeEpoch + 1);
-    assert.strictEqual(restoreResult.demoRuntimeSafetyReset.revision, beforeLegacyRestore.revision + 1);
-    assert.strictEqual(restoreResult.demoRuntimeSafetyReset.changeReason, DATABASE_RESTORE_SAFETY_REASON);
-    assert(!JSON.stringify({
-      restoredFrom: restoreResult.restoredFrom,
-      preRestoreBackup: restoreResult.preRestoreBackup,
-      demoRuntimeSafetyReset: restoreResult.demoRuntimeSafetyReset,
-      note: restoreResult.note
-    }).includes(tmpDir), '备份对外白名单信息不得包含隔离目录。');
-
-    const restoredDb = openDatabase();
-    try {
-      GOVERNANCE_TABLES.forEach((tableName) => {
-        assert.strictEqual(restoredDb.prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName).total, 1, `旧备份恢复后必须迁移 ${tableName}`);
-      });
-      const restoredSetting = restoredDb.prepare(`SELECT enabled, runtime_epoch AS runtimeEpoch, revision,
-          updated_by AS updatedBy, change_reason AS changeReason FROM demo_runtime_settings WHERE id = 1`).get();
-      assert.deepStrictEqual(restoredSetting, {
-        enabled: 0,
-        runtimeEpoch: beforeLegacyRestore.runtimeEpoch + 1,
-        revision: beforeLegacyRestore.revision + 1,
-        updatedBy: null,
-        changeReason: DATABASE_RESTORE_SAFETY_REASON
-      });
-      assert.strictEqual(restoredDb.pragma('foreign_key_check').length, 0);
-      const restoreAudit = restoredDb.prepare(`SELECT user_id AS userId, operation, ip, detail_json AS detailJson
-        FROM sys_operation_logs WHERE operation = 'system.demo.runtime.restore-safety-reset'
-        ORDER BY id DESC LIMIT 1`).get();
-      assert(restoreAudit && restoreAudit.detailJson.includes(DATABASE_RESTORE_SAFETY_REASON));
-      assert.strictEqual(restoreAudit.userId, null);
-      const restoreAuditDetail = JSON.parse(restoreAudit.detailJson);
-      assert.strictEqual(restoreAuditDetail.actorResolvedInRestoredDatabase, false);
-      assert.strictEqual(restoreAuditDetail.requestActorSnapshot.username, 'not-admin');
-      assert.strictEqual(restoreAuditDetail.requestActorSnapshot.displayName, '未确认的请求身份');
-      assert.strictEqual(restoreAuditDetail.resolvedActor, null);
-      const backupRestoreAudit = restoredDb.prepare(`SELECT user_id AS userId, operation, ip, detail_json AS detailJson
-        FROM sys_operation_logs WHERE operation = 'system.backup.restore'
-        ORDER BY id DESC LIMIT 1`).get();
-      assert(backupRestoreAudit, '恢复成功必须写独立 system.backup.restore 审计。');
-      const backupRestoreDetail = JSON.parse(backupRestoreAudit.detailJson);
-      assert.strictEqual(backupRestoreAudit.userId, null);
-      assert.strictEqual(backupRestoreDetail.backupName, legacyBackupName);
-      assert.strictEqual(backupRestoreDetail.requestActorSnapshot.username, 'not-admin');
-      assert.strictEqual(backupRestoreDetail.requestActorSnapshot.displayName, '未确认的请求身份');
-      assert.strictEqual(backupRestoreDetail.actorResolvedInRestoredDatabase, false);
-      assert.strictEqual(backupRestoreDetail.resolvedActor, null);
-    } finally {
-      restoredDb.close();
-    }
+    const afterLegacyRestoreSha = require('crypto').createHash('sha256')
+      .update(fs.readFileSync(process.env.SQLITE_PATH)).digest('hex');
+    assert.strictEqual(afterLegacyRestoreSha, beforeLegacyRestoreSha,
+      '未知旧备份必须被 canonical admission 拒绝，且不得切换正式数据库。');
+    const unchangedRuntime = getDemoRuntimeStatus();
+    assert.strictEqual(unchangedRuntime.enabled, true);
+    assert.strictEqual(unchangedRuntime.runtimeEpoch, beforeLegacyRestore.runtimeEpoch);
+    assert.strictEqual(unchangedRuntime.revision, beforeLegacyRestore.revision);
 
     console.log('demo governance foundation tests passed');
   } finally {

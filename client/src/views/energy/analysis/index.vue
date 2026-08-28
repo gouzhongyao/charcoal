@@ -38,7 +38,7 @@
                 <StatCard label="月度累计消费" :value="formatAnalysisValue(selectedMonthlyFacetData?.totals?.value, { unit: selectedMonthlyFacetData?.unit })" :note="monthlyTotalNote" />
                 <StatCard label="时序窗口总能耗" :value="formatAnalysisValue(loadSummary.metrics?.totalEnergy, { unit: loadSummary.metrics?.energyUnit, calculable: loadSummary.metrics?.totalEnergyComplete !== false })" :note="qualityStatusText(loadSummary.quality)" />
                 <StatCard label="平均负荷" :value="formatAnalysisValue(loadSummary.metrics?.averageLoad, { unit: loadSummary.metrics?.loadUnit })" :note="reasonCodesText(loadSummary.quality?.reasonCodes)" />
-                <StatCard label="最大负荷" :value="formatAnalysisValue(loadSummary.metrics?.maxLoad, { unit: loadSummary.metrics?.loadUnit })" :note="loadSummary.maxLoadInterval?.startUtc || '缺少可计算区间'" />
+                <StatCard label="最大负荷" :value="formatAnalysisValue(loadSummary.metrics?.maxLoad, { unit: loadSummary.metrics?.loadUnit })" :note="formatStrictUtcDateTimeDisplay(loadSummary.maxLoadInterval?.startUtc, '缺少可计算区间')" />
                 <StatCard label="负载率" :value="formatAnalysisValue(loadSummary.metrics?.loadRatePercent, { unit: '%', calculable: loadSummary.metrics?.loadRateCalculable !== false })" :note="loadSummary.metrics?.loadRateReason || '平均负荷 / 最大负荷'" />
                 <StatCard label="单位产量强度" :value="intensityHeadline" :note="intensityHeadlineNote" />
                 <StatCard label="月度分面" :value="String(monthlyFacets.length)" note="按能源类型与单位独立分面" />
@@ -59,12 +59,12 @@
                         <circle :cx="point.x" :cy="point.y" r="12" class="point-hit" />
                         <circle :cx="point.x" :cy="point.y" r="4" class="point-dot" />
                       </g>
-                      <text x="58" y="248" class="axis-text">{{ curveRows[0]?.startUtc || '' }}</text>
-                      <text x="700" y="248" text-anchor="end" class="axis-text">{{ curveRows.at(-1)?.endUtc || '' }}</text>
+                      <text x="58" y="248" class="axis-text">{{ formatStrictUtcDateTimeDisplay(curveRows[0]?.startUtc, '') }}</text>
+                      <text x="700" y="248" text-anchor="end" class="axis-text">{{ formatStrictUtcDateTimeDisplay(curveRows.at(-1)?.endUtc, '') }}</text>
                     </svg>
                   </div>
                   <p v-if="curveTooltip" class="chart-tooltip" role="status">{{ curvePointLabel(curveTooltip) }}</p>
-                  <div class="wide-scroll"><el-table :data="curveRows" size="small" max-height="320"><el-table-column prop="startUtc" label="桶开始 UTC" min-width="180" /><el-table-column prop="endUtc" label="桶结束 UTC" min-width="180" /><el-table-column label="能耗" min-width="130"><template #default="{ row }">{{ formatAnalysisValue(row.energy, { unit: row.energyUnit }) }}</template></el-table-column><el-table-column label="平均负荷" min-width="130"><template #default="{ row }">{{ formatAnalysisValue(row.averageLoad, { unit: row.loadUnit }) }}</template></el-table-column><el-table-column prop="observationMode" label="观测模式" min-width="120" /></el-table></div>
+                  <div class="wide-scroll"><el-table :data="curveRows" size="small" max-height="320"><el-table-column label="桶开始 UTC" min-width="180"><template #default="{ row }">{{ formatStrictUtcDateTimeDisplay(row.startUtc) }}</template></el-table-column><el-table-column label="桶结束 UTC" min-width="180"><template #default="{ row }">{{ formatStrictUtcDateTimeDisplay(row.endUtc) }}</template></el-table-column><el-table-column label="能耗" min-width="130"><template #default="{ row }">{{ formatAnalysisValue(row.energy, { unit: row.energyUnit }) }}</template></el-table-column><el-table-column label="平均负荷" min-width="130"><template #default="{ row }">{{ formatAnalysisValue(row.averageLoad, { unit: row.loadUnit }) }}</template></el-table-column><el-table-column prop="observationMode" label="观测模式" min-width="120" /></el-table></div>
                 </template>
               </article>
 
@@ -143,7 +143,7 @@
                 <header class="panel-heading"><div><h2>{{ definition.label }}导入</h2><span>preview / execute</span></div></header>
                 <el-alert v-if="!hasPermissionCode(definition.previewPermission)" type="warning" :closable="false" show-icon title="当前账号没有该类导入预演权限。" />
                 <template v-else>
-                  <div class="action-row import-downloads"><el-button @click="downloadImportTemplate(definition)">空白模板</el-button><el-button @click="downloadImportDemo(definition)">青岚示例</el-button></div>
+                  <div class="action-row import-downloads"><el-button @click="downloadImportTemplate(definition)">空白模板</el-button></div>
                   <el-upload :auto-upload="false" :limit="1" :file-list="importStates[definition.key].files" :on-change="(file) => selectImportFile(definition.key, file)" :on-remove="() => clearImport(definition.key)" :accept="definition.accept"><el-button>选择导入文件</el-button><template #tip><div class="el-upload__tip">仅接受 {{ definition.accept }}；文件大小由服务端限制，HTTP 413 会明确区分文件与 execute 正文超限。</div></template></el-upload>
                   <div class="action-row"><el-button :loading="importStates[definition.key].loading" :disabled="!importStates[definition.key].file" @click="previewImport(definition)">服务端预演</el-button><el-button v-if="hasPermissionCode(definition.executePermission)" type="primary" :disabled="!canExecuteEnergyAnalysisImport(importStates[definition.key].preview)" @click="openImportExecute(definition)">受控执行</el-button></div>
                   <el-alert v-if="importStates[definition.key].error" type="error" :closable="false" show-icon :title="importStates[definition.key].error" />
@@ -194,7 +194,7 @@ import TimeOfDayInput from '@/components/TimeOfDayInput.vue';
 import { ledgerApi } from '@/api/ledger';
 import {
   createShiftDefinition, createShiftDefinitionVersion, createStrategyRule, createStrategyRuleVersion,
-  createTouScheme, createTouSchemeVersion, downloadEnergyAnalysisDemoArtifact,
+  createTouScheme, createTouSchemeVersion,
   downloadEnergyAnalysisImportTemplate, evaluateEnergyStrategies, executeEnergyAnalysisImport,
   getDeviceStateConsumptionAnalysis, getEnergyIntensityAnalysis, getEnergyLoadCurve, getEnergyLoadSummary,
   getMonthlyConsumptionAnalysis, getPeakContributionAnalysis, getShiftConsumptionAnalysis, getTimeOfUseAnalysis,
@@ -202,6 +202,7 @@ import {
   runEnergyStrategies, setShiftDefinitionStatus, setStrategyRuleStatus, setTouSchemeStatus
 } from '@/api/energyAnalysis';
 import { hasPermi } from '@/utils/permission';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 import {
   ENERGY_ANALYSIS_CONFIGURATION_CONTRACT, ENERGY_ANALYSIS_IMPORT_TYPES, ENERGY_ANALYSIS_PERMISSIONS,
   ENERGY_ANALYSIS_TOU_PRESENTATION, STRATEGY_STATUS_LABELS,
@@ -307,7 +308,7 @@ const curveChartDescription = computed(() => {
   const last = curveRows.value.at(-1);
   const unit = curveRows.value.find((row) => row.energyUnit)?.energyUnit || '未提供单位';
   const missingCount = curveRows.value.filter((row) => !Number.isFinite(row.energy)).length;
-  return `单位 ${unit}；范围 ${first?.startUtc || '未知'} 至 ${last?.endUtc || '未知'}；共有 ${curveRows.value.length} 个时间桶，${missingCount} 个缺失桶以断线表示。详细数值见图后等价表格。`;
+  return `单位 ${unit}；范围 ${formatStrictUtcDateTimeDisplay(first?.startUtc, '未知')} 至 ${formatStrictUtcDateTimeDisplay(last?.endUtc, '未知')}；共有 ${curveRows.value.length} 个时间桶，${missingCount} 个缺失桶以断线表示。详细数值见图后等价表格。`;
 });
 const monthlyFacets = computed(() => monthlyAnalysis.value.facets || []);
 const selectedMonthlyFacetData = computed(() => monthlyFacets.value[selectedMonthlyFacet.value] || monthlyFacets.value[0] || null);
@@ -355,7 +356,7 @@ function isTimeseriesReady(filters = {}) { return ['meterDeviceId', 'energyTypeC
 /** 将分钟数格式化为本地时刻。 */
 function minuteLabel(value) { const minutes = Number(value) || 0; return `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`; }
 /** 返回曲线点无障碍与悬浮文案。 */
-function curvePointLabel(point) { return `${point.startUtc} 至 ${point.endUtc}：${formatAnalysisValue(point.energy, { unit: point.energyUnit })}；观测模式 ${point.observationMode}`; }
+function curvePointLabel(point) { return `${formatStrictUtcDateTimeDisplay(point.startUtc)} 至 ${formatStrictUtcDateTimeDisplay(point.endUtc)}：${formatAnalysisValue(point.energy, { unit: point.energyUnit })}；观测模式 ${point.observationMode}`; }
 /** 返回策略阈值文案。 */
 function thresholdLabel(threshold = {}) { return threshold.operator === 'between' ? `${threshold.minimum ?? threshold.min} - ${threshold.maximum ?? threshold.max} ${threshold.unit || ''}` : `${threshold.operator || ''} ${threshold.value ?? '缺失'} ${threshold.unit || ''}`; }
 /** 返回冻结策略指标的中文标签。 */
@@ -571,11 +572,6 @@ async function toggleConfigStatus(kind, row) { const target = row.status === 'ac
 async function downloadImportTemplate(definition) {
   const result = await safeRequest(() => downloadEnergyAnalysisImportTemplate(definition.templateType, 'xlsx'));
   if (!result.ok) importStates[definition.key].error = energyAnalysisErrorText(result.error, '空白模板下载失败。', { suppressGlobalHandledStatus: true });
-}
-/** 下载当前导入类型的 XLSX 青岚示例。 */
-async function downloadImportDemo(definition) {
-  const result = await safeRequest(() => downloadEnergyAnalysisDemoArtifact(definition.demoArtifactKey, 'xlsx'));
-  if (!result.ok) importStates[definition.key].error = energyAnalysisErrorText(result.error, '青岚示例下载失败。', { suppressGlobalHandledStatus: true });
 }
 /** 选择导入文件并清理旧预演见证。 */
 function selectImportFile(key, uploadFile) { const state = importStates[key]; state.file = uploadFile.raw; state.files = [uploadFile]; state.preview = null; state.error = ''; }

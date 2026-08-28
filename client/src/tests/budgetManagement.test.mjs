@@ -71,9 +71,10 @@ assert.equal(
 const budgetPageSource = readFileSync(new URL('../views/energy/BudgetManagement.vue', import.meta.url), 'utf8');
 const budgetApiSource = readFileSync(new URL('../api/budgets.js', import.meta.url), 'utf8');
 assert.match(budgetApiSource, /\/templates\/demo-park\/10-energy-budgets\.xlsx/);
-assert.match(budgetPageSource, /v-if="canImport" :loading="demoExampleLoading" @click="downloadDemoExample">下载青岚园区示例/);
+assert.doesNotMatch(budgetPageSource, /demoExampleLoading|downloadDemoExample|天坤集团示例/);
 assert.match(budgetPageSource, /hasPermi\('energy:budget:import'\)/);
-assert.match(budgetPageSource, /青岚园区示例下载失败/);
+assert.match(budgetPageSource, /下载模板/);
+assert.match(budgetPageSource, /导入预算/);
 assert.match(budgetPageSource, /v-for="row in comparisonChartRows"/);
 assert.match(budgetPageSource, /:data="comparisonTableRows"/);
 assert.match(budgetPageSource, /budgetComparisonBudgetUnit\(row\)/);

@@ -18,6 +18,7 @@
         <el-form-item label="版本"><el-input v-model.trim="modelDraft.version" clearable placeholder="精确版本" /></el-form-item>
         <el-form-item label="字符搜索"><el-input v-model.trim="modelDraft.keyword" clearable placeholder="名称、来源或文号" /></el-form-item>
         <template #actions>
+          <el-button type="primary" plain @click="flowImportDrawer = true">能流模型与拓扑导入</el-button>
           <el-button v-if="canManage" type="primary" @click="openModelCreate">新增模型版本</el-button>
         </template>
       </ManagementToolbar>
@@ -49,7 +50,7 @@
               <el-table-column prop="modelName" label="模型名称" min-width="170" />
               <el-table-column prop="version" label="版本" min-width="110" />
               <el-table-column prop="sourceTimeZone" label="来源时区" min-width="135" />
-              <el-table-column label="有效期" min-width="250"><template #default="{ row }">{{ row.effectiveStartUtc }} 至 {{ row.effectiveEndUtc }}</template></el-table-column>
+              <el-table-column label="有效期" min-width="250"><template #default="{ row }">{{ formatStrictUtcDateTimeDisplay(row.effectiveStartUtc) }} 至 {{ formatStrictUtcDateTimeDisplay(row.effectiveEndUtc) }}</template></el-table-column>
               <el-table-column label="节点 / 边 / 边值" min-width="135"><template #default="{ row }">{{ row.nodeCount }} / {{ row.edgeCount }} / {{ row.recordCount }}</template></el-table-column>
               <el-table-column label="状态" min-width="90"><template #default="{ row }"><StatusTag :status="row.status" /></template></el-table-column>
               <el-table-column label="操作" fixed="right" min-width="245"><template #default="{ row }">
@@ -64,47 +65,49 @@
         </template>
       </article>
 
-      <article class="page-card import-workspace">
-        <header class="section-heading"><div><h2>能流模型与拓扑导入</h2><span>依赖顺序：1 模型 → 2 节点 → 3 边 → 4 显式边值</span></div></header>
-        <el-alert v-if="!canImportPreview" type="info" :closable="false" show-icon title="当前账号没有 energy:flows:import:preview 权限。" />
-        <template v-else>
-          <div class="import-dependency-list">
-            <div v-for="definition in flowImportDownloads" :key="definition.key" class="import-dependency-row">
-              <span><strong>{{ definition.order }}. {{ definition.label }}</strong>：{{ definition.description }}</span>
-              <div class="action-row"><el-button @click="downloadFlowTemplate(definition)">空白模板</el-button><el-button @click="downloadFlowDemo(definition)">青岚示例</el-button></div>
+      <el-drawer v-model="flowImportDrawer" title="能流模型与拓扑导入" direction="rtl" size="min(960px, 96vw)" class="flow-import-drawer">
+        <section class="import-workspace">
+          <p class="import-drawer-intro">依赖顺序：1 模型 → 2 节点 → 3 边 → 4 显式边值</p>
+          <el-alert v-if="!canImportPreview" type="info" :closable="false" show-icon title="当前账号没有 energy:flows:import:preview 权限。" />
+          <template v-else>
+            <div class="import-dependency-list">
+              <div v-for="definition in flowImportDownloads" :key="definition.key" class="import-dependency-row">
+                <span><strong>{{ definition.order }}. {{ definition.label }}</strong>：{{ definition.description }}</span>
+                <div class="action-row"><el-button @click="downloadFlowTemplate(definition)">空白模板</el-button></div>
+              </div>
             </div>
-          </div>
-          <section class="import-grid">
-            <article class="page-card import-card">
-              <header class="section-heading"><div><h2>模型导入</h2><span>XLSX 或 CSV；空库可直接预演</span></div></header>
-              <p>模型身份固定为模型编码 + 版本；完全重复按 skip，身份冲突阻断，active 新版本会在 execute 事务内切换。</p>
-              <el-upload :auto-upload="false" :limit="1" accept=".xlsx,.csv" :disabled="importExecuteLoading" :file-list="modelImportFileList" :on-change="(file) => selectImportFile('model', file)" :on-remove="() => clearImportSelection('model')"><el-button :disabled="importExecuteLoading">选择模型文件</el-button></el-upload>
-              <el-button type="primary" :disabled="!modelImportFile || importExecuteLoading" :loading="modelImportLoading" @click="previewModelImport">运行模型预演</el-button>
-              <ImportPreviewTable v-if="modelImportPreview" :preview="modelImportPreview" />
-              <el-button v-if="canImportExecute" type="danger" :disabled="!canExecuteModelPreview" @click="openImportExecute('model')">执行模型导入</el-button>
-            </article>
+            <section class="import-grid">
+              <article class="page-card import-card">
+                <header class="section-heading"><div><h2>模型导入</h2><span>XLSX 或 CSV；空库可直接预演</span></div></header>
+                <p>模型身份固定为模型编码 + 版本；完全重复按 skip，身份冲突阻断，active 新版本会在 execute 事务内切换。</p>
+                <el-upload :auto-upload="false" :limit="1" accept=".xlsx,.csv" :disabled="importExecuteLoading" :file-list="modelImportFileList" :on-change="(file) => selectImportFile('model', file)" :on-remove="() => clearImportSelection('model')"><el-button :disabled="importExecuteLoading">选择模型文件</el-button></el-upload>
+                <el-button type="primary" :disabled="!modelImportFile || importExecuteLoading" :loading="modelImportLoading" @click="previewModelImport">运行模型预演</el-button>
+                <ImportPreviewTable v-if="modelImportPreview" :preview="modelImportPreview" />
+                <el-button v-if="canImportExecute" type="danger" :disabled="!canExecuteModelPreview" @click="openImportExecute('model')">执行模型导入</el-button>
+              </article>
 
-            <article class="page-card import-card">
-              <header class="section-heading"><div><h2>节点导入</h2><span>XLSX 或 CSV；只绑定已存在 active 模型</span></div></header>
-              <p>preview 不写节点；execute 使用预演签名、候选行、固定确认文本、跳过风险确认和自动备份。</p>
-              <el-upload :auto-upload="false" :limit="1" accept=".xlsx,.csv" :disabled="importExecuteLoading" :file-list="nodeImportFileList" :on-change="(file) => selectImportFile('node', file)" :on-remove="() => clearImportSelection('node')"><el-button :disabled="importExecuteLoading">选择节点文件</el-button></el-upload>
-              <el-button type="primary" :disabled="!nodeImportFile || importExecuteLoading" :loading="nodeImportLoading" @click="previewNodeImport">运行节点预演</el-button>
-              <ImportPreviewTable v-if="nodeImportPreview" :preview="nodeImportPreview" />
-              <el-button v-if="canImportExecute" type="danger" :disabled="!canExecuteNodePreview" @click="openImportExecute('node')">执行节点导入</el-button>
-            </article>
+              <article class="page-card import-card">
+                <header class="section-heading"><div><h2>节点导入</h2><span>XLSX 或 CSV；只绑定已存在 active 模型</span></div></header>
+                <p>preview 不写节点；execute 使用预演签名、候选行、固定确认文本、跳过风险确认和自动备份。</p>
+                <el-upload :auto-upload="false" :limit="1" accept=".xlsx,.csv" :disabled="importExecuteLoading" :file-list="nodeImportFileList" :on-change="(file) => selectImportFile('node', file)" :on-remove="() => clearImportSelection('node')"><el-button :disabled="importExecuteLoading">选择节点文件</el-button></el-upload>
+                <el-button type="primary" :disabled="!nodeImportFile || importExecuteLoading" :loading="nodeImportLoading" @click="previewNodeImport">运行节点预演</el-button>
+                <ImportPreviewTable v-if="nodeImportPreview" :preview="nodeImportPreview" />
+                <el-button v-if="canImportExecute" type="danger" :disabled="!canExecuteNodePreview" @click="openImportExecute('node')">执行节点导入</el-button>
+              </article>
 
-            <article class="page-card import-card">
-              <header class="section-heading"><div><h2>边与显式边值导入</h2><span>必须使用包含“能流边”和“显式边值”的 XLSX</span></div></header>
-              <p>双工作表预演分别创建边批次和边值批次；执行只提交批次 ID 和确认字段，候选与签名由服务端恢复。</p>
-              <el-upload :auto-upload="false" :limit="1" accept=".xlsx" :disabled="importExecuteLoading" :file-list="bundleImportFileList" :on-change="(file) => selectImportFile('bundle', file)" :on-remove="() => clearImportSelection('bundle')"><el-button :disabled="importExecuteLoading">选择双工作表文件</el-button></el-upload>
-              <el-button type="primary" :disabled="!bundleImportFile || importExecuteLoading" :loading="bundleImportLoading" @click="previewBundleImport">运行边与边值预演</el-button>
-              <template v-if="bundleImportPreview"><ImportPreviewTable title="能流边预演" :preview="bundleImportPreview.edgePreview" /><ImportPreviewTable title="显式边值预演" :preview="bundleImportPreview.recordPreview" /></template>
-              <el-button v-if="canImportExecute" type="danger" :disabled="!canExecuteBundlePreview" @click="openImportExecute('bundle')">执行边与显式边值导入</el-button>
-            </article>
-          </section>
-          <el-alert v-if="importError" type="error" :closable="false" show-icon :title="importError" />
-        </template>
-      </article>
+              <article class="page-card import-card">
+                <header class="section-heading"><div><h2>边与显式边值导入</h2><span>必须使用包含“能流边”和“显式边值”的 XLSX</span></div></header>
+                <p>双工作表预演分别创建边批次和边值批次；执行只提交批次 ID 和确认字段，候选与签名由服务端恢复。</p>
+                <el-upload :auto-upload="false" :limit="1" accept=".xlsx" :disabled="importExecuteLoading" :file-list="bundleImportFileList" :on-change="(file) => selectImportFile('bundle', file)" :on-remove="() => clearImportSelection('bundle')"><el-button :disabled="importExecuteLoading">选择双工作表文件</el-button></el-upload>
+                <el-button type="primary" :disabled="!bundleImportFile || importExecuteLoading" :loading="bundleImportLoading" @click="previewBundleImport">运行边与边值预演</el-button>
+                <template v-if="bundleImportPreview"><ImportPreviewTable title="能流边预演" :preview="bundleImportPreview.edgePreview" /><ImportPreviewTable title="显式边值预演" :preview="bundleImportPreview.recordPreview" /></template>
+                <el-button v-if="canImportExecute" type="danger" :disabled="!canExecuteBundlePreview" @click="openImportExecute('bundle')">执行边与显式边值导入</el-button>
+              </article>
+            </section>
+            <el-alert v-if="importError" type="error" :closable="false" show-icon :title="importError" />
+          </template>
+        </section>
+      </el-drawer>
 
       <template v-if="selectedModel">
         <PageState v-if="modelSelectionLoading" loading description="正在读取所选模型详情、完整拓扑及全部节点和边。" />
@@ -344,7 +347,6 @@ import {
   createEnergyFlowEdge,
   createEnergyFlowModel,
   createEnergyFlowNode,
-  downloadEnergyFlowDemoArtifact,
   downloadEnergyFlowImportTemplate,
   executeEnergyFlowBundleImport,
   executeEnergyFlowModelImport,
@@ -366,6 +368,7 @@ import {
 } from '@/api/energyFlows';
 import { hasPermi } from '@/utils/permission';
 import { parseStrictUtcDateTime } from '@/utils/dateTimeFields';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 import { isIanaTimeZone } from '@/utils/ianaTimeZones';
 import {
   ENERGY_FLOW_NODE_TYPES,
@@ -463,7 +466,7 @@ const analysisSnapshotRangeLabel = computed(() => {
   const filters = analysisRequestSnapshot.value?.filters;
   if (!filters) return '未记录统计期';
   return filters.rangeMode === 'utc'
-    ? `${filters.startUtc || '未填写'} 至 ${filters.endUtc || '未填写'}（UTC）`
+    ? `${formatStrictUtcDateTimeDisplay(filters.startUtc, '未填写')} 至 ${formatStrictUtcDateTimeDisplay(filters.endUtc, '未填写')}（UTC）`
     : `${filters.startMonth || '未填写'} 至 ${filters.endMonth || '未填写'}（月份）`;
 });
 const nodeBalanceRows = computed(() => (analysisResult.value?.nodeBalances || []).flatMap((node) => (node.facets || []).map((facet) => ({ ...facet, nodeId: node.nodeId, nodeCode: node.nodeCode, nodeName: node.nodeName, nodeType: node.nodeType }))));
@@ -498,13 +501,15 @@ const edgeFormRef = ref(null);
 const edgeForm = ref({});
 const edgeBindingFrozen = computed(() => Number(edgeEditing.value?.recordCount || 0) > 0);
 
-// 能流模板和青岚示例依赖顺序模块；边与显式边值共享同一双工作表文件。
+// 能流标准模板依赖顺序模块；边与显式边值共享同一双工作表文件。
 const flowImportDownloads = Object.freeze([
-  Object.freeze({ key: 'model', order: 1, label: '模型', description: '先建立模型编码和版本。', templateType: 'energy-flow-models', demoArtifactKey: '22-energy-flow-models' }),
-  Object.freeze({ key: 'node', order: 2, label: '节点', description: '依赖已存在的 active 模型。', templateType: 'energy-flow-nodes', demoArtifactKey: '23-energy-flow-nodes' }),
-  Object.freeze({ key: 'edge', order: 3, label: '边', description: '依赖模型内已存在的节点。', templateType: 'energy-flow-edges', demoArtifactKey: '24-energy-flow-edges' }),
-  Object.freeze({ key: 'record', order: 4, label: '显式边值', description: '与边共用双工作表 XLSX，不改变半开时间重叠契约。', templateType: 'energy-flow-edges', demoArtifactKey: '24-energy-flow-edges' })
+  Object.freeze({ key: 'model', order: 1, label: '模型', description: '先建立模型编码和版本。', templateType: 'energy-flow-models' }),
+  Object.freeze({ key: 'node', order: 2, label: '节点', description: '依赖已存在的 active 模型。', templateType: 'energy-flow-nodes' }),
+  Object.freeze({ key: 'edge', order: 3, label: '边', description: '依赖模型内已存在的节点。', templateType: 'energy-flow-edges' }),
+  Object.freeze({ key: 'record', order: 4, label: '显式边值', description: '与边共用双工作表 XLSX，不改变半开时间重叠契约。', templateType: 'energy-flow-edges' })
 ]);
+// 能流模型与拓扑导入工作区抽屉状态模块。
+const flowImportDrawer = ref(false);
 // 导入状态模块。
 const modelImportFile = ref(null);
 const modelImportFileList = ref([]);
@@ -1033,11 +1038,6 @@ async function downloadFlowTemplate(definition) {
   const result = await safeRequest(() => downloadEnergyFlowImportTemplate(definition.templateType, 'xlsx'));
   if (!result.ok) importError.value = requestMessage(result, '能流空白模板下载失败。', '当前导入文件选择和预演状态保持不变。');
 }
-/** 下载能流依赖阶段的青岚示例。 */
-async function downloadFlowDemo(definition) {
-  const result = await safeRequest(() => downloadEnergyFlowDemoArtifact(definition.demoArtifactKey, 'xlsx'));
-  if (!result.ok) importError.value = requestMessage(result, '青岚能流示例下载失败。', '当前导入文件选择和预演状态保持不变。');
-}
 /** 执行模型导入预演，并丢弃文件被替换或移除前的旧响应。 */
 async function previewModelImport() {
   if (importExecuteLoading.value) return;
@@ -1150,5 +1150,38 @@ onMounted(async () => { if (!canView.value) return; await Promise.all([loadDepen
 </script>
 
 <style scoped>
-.section-alert{margin-top:12px}.import-workspace{margin-top:16px}.import-dependency-list{display:grid;gap:8px}.import-dependency-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:1px solid #e1e8f2;border-radius:8px;color:#516170;font-size:13px}.action-row{display:flex;flex-wrap:wrap;gap:8px}.dependency-error,.state-error{display:flex;align-items:center;gap:10px;margin-top:12px}.dependency-error :deep(.el-alert),.state-error :deep(.el-alert){flex:1}.page-card{min-width:0}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}.section-heading h2{margin:0;color:#123b79;font-size:16px}.section-heading span{display:block;margin-top:5px;color:#7385a2;font-size:12px}.table-scroll{max-width:100%;overflow-x:auto}.pagination{display:flex;justify-content:flex-end;margin-top:16px}.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.flow-tabs{min-width:0}.maintenance-grid,.import-grid,.analysis-detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:16px}.maintenance-card,.import-card{min-width:0}.analysis-card{display:grid;gap:12px}.analysis-filters{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:10px 14px}.analysis-filters :deep(.el-form-item){margin-bottom:0}.coordinate-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.reason-card{display:grid;gap:9px}.reason-card .section-heading{margin-bottom:2px}.import-card{display:flex;flex-direction:column;align-items:flex-start;gap:12px}.import-card>p{margin:0;color:#516170;font-size:13px;line-height:1.7}.import-preview{width:100%;padding-top:10px;border-top:1px solid #e1e8f2}.import-preview>p{margin:6px 0;color:#516170;font-size:13px}.drawer-notice{margin:0 0 16px;color:#516170;line-height:1.7}@media(max-width:1180px){.analysis-filters{grid-template-columns:repeat(3,minmax(150px,1fr))}.maintenance-grid,.import-grid,.analysis-detail-grid{grid-template-columns:1fr}.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:720px){.stat-grid,.analysis-filters,.coordinate-grid{grid-template-columns:1fr}.section-heading,.import-dependency-row{align-items:flex-start;flex-direction:column}}
+.section-alert{margin-top:12px}
+.import-workspace{min-width:0}
+.import-drawer-intro{margin:0 0 16px;padding:10px 12px;border:1px solid #dce9fb;border-radius:8px;background:#f5f9ff;color:#516170;font-size:13px;line-height:1.6}
+:deep(.flow-import-drawer){max-width:100vw}
+:deep(.flow-import-drawer .el-drawer__header){margin-bottom:0;padding:20px;border-bottom:1px solid #dce9fb;color:#123b79}
+:deep(.flow-import-drawer .el-drawer__body){min-width:0;overflow-x:hidden;padding:20px}
+.import-dependency-list{display:grid;gap:8px}
+.import-dependency-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:1px solid #e1e8f2;border-radius:8px;color:#516170;font-size:13px}
+.action-row{display:flex;flex-wrap:wrap;gap:8px}
+.dependency-error,.state-error{display:flex;align-items:center;gap:10px;margin-top:12px}
+.dependency-error :deep(.el-alert),.state-error :deep(.el-alert){flex:1}
+.page-card{min-width:0}
+.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}
+.section-heading h2{margin:0;color:#123b79;font-size:16px}
+.section-heading span{display:block;margin-top:5px;color:#7385a2;font-size:12px}
+.table-scroll{max-width:100%;overflow-x:auto}
+.pagination{display:flex;justify-content:flex-end;margin-top:16px}
+.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+.flow-tabs{min-width:0}
+.maintenance-grid,.import-grid,.analysis-detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:16px}
+.maintenance-card,.import-card{min-width:0}
+.analysis-card{display:grid;gap:12px}
+.analysis-filters{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:10px 14px}
+.analysis-filters :deep(.el-form-item){margin-bottom:0}
+.coordinate-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.reason-card{display:grid;gap:9px}
+.reason-card .section-heading{margin-bottom:2px}
+.import-card{display:flex;flex-direction:column;align-items:flex-start;gap:12px}
+.import-card>p{margin:0;color:#516170;font-size:13px;line-height:1.7}
+.import-preview{width:100%;padding-top:10px;border-top:1px solid #e1e8f2}
+.import-preview>p{margin:6px 0;color:#516170;font-size:13px}
+.drawer-notice{margin:0 0 16px;color:#516170;line-height:1.7}
+@media(max-width:1180px){.analysis-filters{grid-template-columns:repeat(3,minmax(150px,1fr))}.maintenance-grid,.import-grid,.analysis-detail-grid{grid-template-columns:1fr}.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:720px){.stat-grid,.analysis-filters,.coordinate-grid{grid-template-columns:1fr}.section-heading,.import-dependency-row{align-items:flex-start;flex-direction:column}:deep(.flow-import-drawer .el-drawer__body){padding:16px 12px}}
 </style>

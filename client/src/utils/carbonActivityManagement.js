@@ -1,4 +1,5 @@
 // 独立碳活动管理纯逻辑模块：筛选、受控导入、状态和墙钟展示均不执行浏览器时区换算。
+import { formatSourceWallClockDisplay } from './dateTimeDisplay.js';
 
 // 独立碳活动固定执行确认文本：与服务端冻结合同一致。
 export const CARBON_ACTIVITY_IMPORT_CONFIRM_TEXT = '确认导入独立碳活动';
@@ -99,7 +100,7 @@ export function buildCarbonActivityVoidPayload(reason, activity = {}) {
   };
 }
 
-/** 原样显示来源墙钟，绝不追加 Z 或通过 Date 转换。 */
+/** 格式化来源墙钟供用户查看，绝不追加 Z 或通过 Date 转换。 */
 export function formatSourceWallClock(value) {
-  return value === null || value === undefined || value === '' ? '—' : String(value);
+  return formatSourceWallClockDisplay(value);
 }

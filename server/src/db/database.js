@@ -23,6 +23,14 @@ const backupsDir = process.env.BACKUPS_DIR || path.join(dataDir, 'backups');
 const databasePath = process.env.SQLITE_PATH || path.join(dataDir, 'energy-carbon.sqlite');
 const schemaPath = path.join(__dirname, 'schema.sql');
 
+// 最终正式库只接受当前 canonical 身份及唯一已审查 predecessor；任何其他旧版本继续 fail-closed。
+const CANONICAL_SCHEMA_STAGE = 'formal-canonical';
+const CANONICAL_SCHEMA_VERSION = '2026-08-28-formal-canonical-v3';
+const CANONICAL_SCHEMA_PREDECESSOR_VERSION = '2026-08-27-formal-canonical-v2';
+const CANONICAL_SCHEMA_FINGERPRINT_ALGORITHM = 'sqlite-master-sha256-v1';
+// v2 后置动作切片固定由两表、三索引和九个跨行/跨表触发器组成。
+const DEMO_POST_ACTION_CANONICAL_SCHEMA_OBJECT_COUNT = 14;
+
 // 正式数据库切换期间阻止新连接进入，避免 Windows 文件替换窗口出现并发句柄。
 let databaseAdmissionBlocked = false;
 // 原子替换回滚失败后保持数据库 poison，所有后续数据库 API 均 fail-closed。
@@ -143,7 +151,81 @@ const ENERGY_FLOW_LEGACY_V1_TABLES = Object.freeze([
   'energy_flow_edges',
   'energy_flow_records'
 ]);
-const ENERGY_FLOW_EXPECTED_TRIGGERS = Object.freeze([]);
+const ENERGY_FLOW_EXPECTED_TRIGGERS = Object.freeze({
+  energy_flow_edges: Object.freeze([
+    'trg_energy_flow_edges_source_insert',
+    'trg_energy_flow_edges_source_update'
+  ]),
+  energy_flow_records: Object.freeze([
+    'trg_energy_flow_records_source_insert',
+    'trg_energy_flow_records_source_update'
+  ])
+});
+
+// 能流边与显式边值来源 provenance 的规范触发器，兼容旧 canonical v2 表的幂等升级。
+const ENERGY_FLOW_IMPORT_SOURCE_TRIGGERS_SQL = `CREATE TRIGGER IF NOT EXISTS trg_energy_flow_edges_source_insert
+BEFORE INSERT ON energy_flow_edges
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy flow edge import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_flow_edges_source_update
+BEFORE UPDATE OF source_batch_id, source_row_number ON energy_flow_edges
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy flow edge import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_flow_records_source_insert
+BEFORE INSERT ON energy_flow_records
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy flow record import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_energy_flow_records_source_update
+BEFORE UPDATE OF source_batch_id, source_row_number ON energy_flow_records
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy flow record import source must contain batch and positive row together');
+END;`;
 
 // 已知 v1 指纹仅用于机械迁移；任何列、约束、索引或触发器漂移都不得按已知旧库猜测处理。
 const ENERGY_FLOW_LEGACY_V1_SCHEMA_SQL = `CREATE TABLE energy_flow_models (
@@ -287,6 +369,36 @@ const ENERGY_FLOW_LEGACY_V1_COLUMNS = Object.freeze({
   ])
 });
 
+// 更早的精确已知 v1 仅在 edge/record 缺少成对 provenance 列、对应外键与 batch 索引；其余指纹必须完全一致。
+const ENERGY_FLOW_LEGACY_V1_NO_EDGE_RECORD_PROVENANCE_COLUMNS = Object.freeze({
+  energy_flow_models: ENERGY_FLOW_LEGACY_V1_COLUMNS.energy_flow_models,
+  energy_flow_nodes: ENERGY_FLOW_LEGACY_V1_COLUMNS.energy_flow_nodes,
+  energy_flow_edges: Object.freeze(ENERGY_FLOW_LEGACY_V1_COLUMNS.energy_flow_edges
+    .filter((columnName) => !['source_batch_id', 'source_row_number'].includes(columnName))),
+  energy_flow_records: Object.freeze(ENERGY_FLOW_LEGACY_V1_COLUMNS.energy_flow_records
+    .filter((columnName) => !['source_batch_id', 'source_row_number'].includes(columnName)))
+});
+const ENERGY_FLOW_LEGACY_V1_NO_EDGE_RECORD_PROVENANCE_INDEXES = Object.freeze({
+  energy_flow_models: ENERGY_FLOW_LEGACY_V1_TABLE_INDEXES.energy_flow_models,
+  energy_flow_nodes: ENERGY_FLOW_LEGACY_V1_TABLE_INDEXES.energy_flow_nodes,
+  energy_flow_edges: Object.freeze(['idx_energy_flow_edges_model_type']),
+  energy_flow_records: Object.freeze(['idx_energy_flow_records_edge_range'])
+});
+const ENERGY_FLOW_LEGACY_V1_PROFILES = Object.freeze([
+  Object.freeze({
+    profileKey: 'with-edge-record-provenance',
+    columns: ENERGY_FLOW_LEGACY_V1_COLUMNS,
+    indexes: ENERGY_FLOW_LEGACY_V1_TABLE_INDEXES,
+    edgeRecordProvenance: true
+  }),
+  Object.freeze({
+    profileKey: 'without-edge-record-provenance',
+    columns: ENERGY_FLOW_LEGACY_V1_NO_EDGE_RECORD_PROVENANCE_COLUMNS,
+    indexes: ENERGY_FLOW_LEGACY_V1_NO_EDGE_RECORD_PROVENANCE_INDEXES,
+    edgeRecordProvenance: false
+  })
+]);
+
 // 独立碳活动 schema 片段标记用于新旧库一致的幂等迁移和失败回滚测试。
 const CARBON_ACTIVITY_SCHEMA_START_MARKER = '-- CARBON_ACTIVITY_SCHEMA_START';
 const CARBON_ACTIVITY_SCHEMA_END_MARKER = '-- CARBON_ACTIVITY_SCHEMA_END';
@@ -417,7 +529,9 @@ const DEMO_GOVERNANCE_TABLES = Object.freeze([
   'demo_cleanup_runs',
   'demo_data_registry',
   'demo_data_relations',
-  'demo_run_import_batches'
+  'demo_run_import_batches',
+  'demo_post_action_runs',
+  'demo_post_action_outputs'
 ]);
 
 // 每张治理表的 canonical contract 同时检查字段、关键 CHECK/FK/UNIQUE 文本和必要索引。
@@ -429,6 +543,7 @@ const DEMO_GOVERNANCE_CONTRACTS = Object.freeze({
   demo_dataset_runs: {
     columns: ['run_id', 'dataset_id', 'manifest_version', 'manifest_digest', 'status', 'created_by', 'created_at', 'completed_at', 'cleanup_started_at', 'cleaned_at', 'failure_reason'],
     sqlTokens: ['length(manifest_digest) = 64', "manifest_digest NOT GLOB '*[^a-f0-9]*'", "status = 'cleaned' AND cleaned_at IS NOT NULL", "status <> 'cleaned' AND cleaned_at IS NULL", 'REFERENCES sys_users(id)'],
+    triggers: ['trg_demo_dataset_runs_post_action_dataset_update'],
     indexes: {
       ux_demo_dataset_runs_active_dataset: {
         unique: true,
@@ -457,8 +572,8 @@ const DEMO_GOVERNANCE_CONTRACTS = Object.freeze({
     }
   },
   demo_cleanup_runs: {
-    columns: ['cleanup_run_id', 'client_request_id', 'preview_digest', 'preview_expires_at', 'runtime_revision', 'registry_watermark', 'candidate_count', 'blocker_count', 'summary_json', 'confirmation_text', 'requested_by', 'status', 'backup_metadata_json', 'deleted_count', 'already_missing_count', 'created_at', 'started_at', 'completed_at', 'failure_reason'],
-    sqlTokens: ['client_request_id TEXT NOT NULL UNIQUE', 'runtime_revision >= 1', 'REFERENCES sys_users(id)'],
+    columns: ['cleanup_run_id', 'run_id', 'client_request_id', 'preview_digest', 'preview_expires_at', 'runtime_revision', 'registry_watermark', 'candidate_count', 'blocker_count', 'summary_json', 'confirmation_text', 'requested_by', 'status', 'backup_metadata_json', 'deleted_count', 'already_missing_count', 'created_at', 'started_at', 'completed_at', 'failure_reason'],
+    sqlTokens: ['client_request_id TEXT NOT NULL UNIQUE', 'runtime_revision >= 1', 'REFERENCES demo_dataset_runs(run_id)', 'REFERENCES sys_users(id)'],
     indexes: {
       idx_demo_cleanup_runs_status_created: { unique: false, columns: ['status', 'created_at'] }
     }
@@ -496,6 +611,51 @@ const DEMO_GOVERNANCE_CONTRACTS = Object.freeze({
         columns: ['context_id'],
         where: "batch_role = 'primary'"
       }
+    }
+  },
+  demo_post_action_runs: {
+    columns: ['action_run_id', 'run_id', 'dataset_id', 'action_key', 'registry_version', 'resolver_version', 'executor_version', 'client_request_id', 'manifest_version', 'manifest_digest', 'registry_digest', 'runtime_epoch', 'runtime_revision', 'input_digest', 'preview_digest', 'output_count', 'result_digest', 'preview_expires_at', 'input_json', 'blocker_json', 'result_json', 'requested_by', 'status', 'retry_count', 'failure_reason', 'created_at', 'started_at', 'completed_at', 'updated_at'],
+    sqlTokens: [
+      'UNIQUE (run_id, action_key, client_request_id, requested_by)',
+      'typeof(manifest_digest) = \'text\'',
+      'typeof(output_count) = \'integer\' AND output_count >= 0',
+      "status IN ('previewed', 'blocked', 'executing', 'succeeded', 'failed', 'expired')",
+      'json_valid(input_json) = 1 AND json_type(input_json) = \'object\'',
+      '(result_digest IS NULL) = (result_json IS NULL)',
+      'julianday(updated_at) >= julianday(created_at)',
+      'started_at IS NULL OR julianday(started_at) >= julianday(created_at)',
+      'completed_at IS NULL OR julianday(completed_at) >= julianday(created_at)',
+      'status = \'previewed\' AND blocker_json IS NULL AND result_digest IS NULL AND result_json IS NULL',
+      'status = \'blocked\' AND blocker_json IS NOT NULL AND result_digest IS NULL AND result_json IS NULL',
+      'status = \'executing\' AND blocker_json IS NULL AND result_digest IS NULL AND result_json IS NULL',
+      "status = 'succeeded' AND blocker_json IS NULL AND result_digest IS NOT NULL AND result_json IS NOT NULL",
+      'status = \'failed\' AND blocker_json IS NULL AND result_digest IS NULL AND result_json IS NULL',
+      'status = \'expired\' AND blocker_json IS NULL AND result_digest IS NULL AND result_json IS NULL',
+      'REFERENCES demo_dataset_runs(run_id)',
+      'REFERENCES sys_users(id)'
+    ],
+    triggers: [
+      'trg_demo_post_action_runs_dataset_insert',
+      'trg_demo_post_action_runs_dataset_update',
+      'trg_demo_post_action_runs_preview_expiry_insert',
+      'trg_demo_post_action_runs_output_count_insert',
+      'trg_demo_post_action_runs_output_count_update'
+    ],
+    indexes: {
+      idx_demo_post_action_runs_run_status: { unique: false, columns: ['run_id', 'action_key', 'status', 'created_at'], descending: [false, false, false, true] },
+      idx_demo_post_action_runs_actor_created: { unique: false, columns: ['requested_by', 'created_at'], descending: [false, true] }
+    }
+  },
+  demo_post_action_outputs: {
+    columns: ['output_id', 'action_run_id', 'output_entity_type', 'output_entity_id', 'output_ref_json', 'created_at'],
+    sqlTokens: ['REFERENCES demo_post_action_runs(action_run_id)', 'UNIQUE (action_run_id, output_entity_type, output_entity_id)', 'json_valid(output_ref_json) = 1 AND json_type(output_ref_json) = \'object\'', 'is_strict_utc_iso(created_at) = 1'],
+    triggers: [
+      'trg_demo_post_action_outputs_count_insert',
+      'trg_demo_post_action_outputs_count_delete',
+      'trg_demo_post_action_outputs_count_update'
+    ],
+    indexes: {
+      idx_demo_post_action_outputs_run: { unique: false, columns: ['action_run_id', 'output_entity_type', 'output_id'] }
     }
   }
 });
@@ -773,6 +933,101 @@ END;`;
 
 // 两个规范来源触发器在迁移事务中统一创建。
 const BENCHMARK_TARGET_SOURCE_TRIGGERS_SQL = `${BENCHMARK_TARGET_SOURCE_INSERT_TRIGGER_SQL}\n\n${BENCHMARK_TARGET_SOURCE_UPDATE_TRIGGER_SQL}`;
+
+// 平衡边界与项目来源触发器作为旧库 provenance 成对约束的规范定义。
+const ENERGY_BALANCE_IMPORT_SOURCE_TRIGGERS_SQL = `CREATE TRIGGER trg_energy_balance_boundaries_source_insert
+BEFORE INSERT ON energy_balance_boundaries
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance boundary import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER trg_energy_balance_boundaries_source_update
+BEFORE UPDATE OF source_batch_id, source_row_number ON energy_balance_boundaries
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance boundary import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER trg_energy_balance_items_source_insert
+BEFORE INSERT ON energy_balance_items
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance item import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER trg_energy_balance_items_source_update
+BEFORE UPDATE OF source_batch_id, source_row_number ON energy_balance_items
+FOR EACH ROW
+WHEN NOT (
+  (NEW.source_batch_id IS NULL AND NEW.source_row_number IS NULL)
+  OR (
+    NEW.source_batch_id IS NOT NULL
+    AND NEW.source_row_number IS NOT NULL
+    AND typeof(NEW.source_row_number) = 'integer'
+    AND NEW.source_row_number >= 1
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'energy balance item import source must contain batch and positive row together');
+END;
+
+CREATE TRIGGER trg_energy_balance_import_batch_provenance_clear
+BEFORE DELETE ON import_batches
+BEGIN
+  UPDATE energy_balance_boundaries
+  SET source_batch_id = NULL, source_row_number = NULL
+  WHERE source_batch_id = OLD.id;
+  UPDATE energy_balance_items
+  SET source_batch_id = NULL, source_row_number = NULL
+  WHERE source_batch_id = OLD.id;
+END;`;
+
+// 平衡来源迁移只允许新增以下固定索引和触发器，其他 sqlite_master 对象必须保持 canonical。
+const ENERGY_BALANCE_IMPORT_SOURCE_SCHEMA_OBJECTS = Object.freeze([
+  Object.freeze({ type: 'index', name: 'idx_energy_balance_boundaries_source', tableName: 'energy_balance_boundaries' }),
+  Object.freeze({ type: 'index', name: 'idx_energy_balance_items_source', tableName: 'energy_balance_items' }),
+  Object.freeze({ type: 'trigger', name: 'trg_energy_balance_boundaries_source_insert', tableName: 'energy_balance_boundaries' }),
+  Object.freeze({ type: 'trigger', name: 'trg_energy_balance_boundaries_source_update', tableName: 'energy_balance_boundaries' }),
+  Object.freeze({ type: 'trigger', name: 'trg_energy_balance_items_source_insert', tableName: 'energy_balance_items' }),
+  Object.freeze({ type: 'trigger', name: 'trg_energy_balance_items_source_update', tableName: 'energy_balance_items' }),
+  Object.freeze({ type: 'trigger', name: 'trg_energy_balance_import_batch_provenance_clear', tableName: 'import_batches' })
+]);
+
+// 已部署旧 canonical 可能同时缺少四个能流来源触发器，仅允许“全部缺少”或“全部 canonical”两种精确 profile。
+const ENERGY_FLOW_IMPORT_SOURCE_TRIGGER_SCHEMA_OBJECTS = Object.freeze([
+  Object.freeze({ type: 'trigger', name: 'trg_energy_flow_edges_source_insert', tableName: 'energy_flow_edges' }),
+  Object.freeze({ type: 'trigger', name: 'trg_energy_flow_edges_source_update', tableName: 'energy_flow_edges' }),
+  Object.freeze({ type: 'trigger', name: 'trg_energy_flow_records_source_insert', tableName: 'energy_flow_records' }),
+  Object.freeze({ type: 'trigger', name: 'trg_energy_flow_records_source_update', tableName: 'energy_flow_records' })
+]);
 
 // 对标定义迁移使用 canonical 临时表，保留历史文号和兼容版本但解除外部标准文号必填约束。
 const BENCHMARK_DEFINITIONS_INTERNAL_REVISION_TABLE_SQL = `CREATE TABLE benchmark_definitions__migration_new (
@@ -1078,9 +1333,8 @@ const PREDICTION_CONFIGS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS prediction_conf
   name TEXT NOT NULL,
   note TEXT,
   energy_type_id INTEGER,
-  organization_scope TEXT,
-  site TEXT,
-  department TEXT,
+  organization_unit_id INTEGER,
+  meter_device_id INTEGER,
   source_batch_filter_id INTEGER,
   train_start_month TEXT NOT NULL,
   train_end_month TEXT NOT NULL,
@@ -1093,7 +1347,9 @@ const PREDICTION_CONFIGS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS prediction_conf
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   archived_at TEXT,
   FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,
-  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE SET NULL
+  FOREIGN KEY (energy_type_id) REFERENCES energy_types(id) ON DELETE SET NULL,
+  FOREIGN KEY (organization_unit_id) REFERENCES organization_units(id) ON DELETE SET NULL,
+  FOREIGN KEY (meter_device_id) REFERENCES meter_devices(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_prediction_configs_status_updated ON prediction_configs(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_prediction_configs_energy_month ON prediction_configs(energy_type_id, predict_start_month, predict_end_month);
@@ -1437,6 +1693,23 @@ function openDatabase(options = {}) {
   return db;
 }
 
+/**
+ * 以严格只读方式打开既有 SQLite，不创建 data/uploads/backups，不切换 journal_mode。
+ * @param {object} options 只读数据库路径选项。
+ * @returns {object} 已注册项目 SQLite 函数的只读连接。
+ */
+function openReadOnlyDatabase(options = {}) {
+  if (!options.databasePath) {
+    throw new TypeError('只读数据库打开必须提供明确 databasePath。');
+  }
+  const targetDatabasePath = path.resolve(options.databasePath);
+  const Database = loadDatabaseDriver();
+  const db = new Database(targetDatabasePath, { readonly: true, fileMustExist: true });
+  registerEnergyAnalysisSqliteFunctions(db);
+  db.pragma('foreign_keys = ON');
+  return db;
+}
+
 /** 阻止正式数据库新连接进入切换窗口，并返回仅限本次屏障内部使用的 permit。 */
 function blockDatabaseAdmission() {
   if (databasePoisoned) throw createDatabasePoisonedError();
@@ -1561,7 +1834,7 @@ function extractEnergyAnalysisSchemaSql(schemaText) {
   return schemaText.slice(startIndex + ENERGY_ANALYSIS_SCHEMA_START_MARKER.length, endIndex).trim();
 }
 
-/** 返回指定 N8 表挂载的全部触发器名称，canonical 集合固定为空。 */
+/** 返回指定 N8 表挂载的全部触发器名称，顺序固定用于 canonical 校验。 */
 function getEnergyFlowTableTriggers(db, tableName) {
   if (!ENERGY_FLOW_TABLES.includes(tableName)) return [];
   return db.prepare(`SELECT name FROM sqlite_master
@@ -1579,7 +1852,7 @@ function getEnergyFlowExplicitIndexNames(db, tableName) {
 }
 
 /** 判断 N8 表的 CREATE、列属性、外键、CHECK、UNIQUE、显式索引和触发器是否完整 canonical。 */
-function energyFlowTableIsCanonical(db, tableName, energyAnalysisSql = null) {
+function energyFlowTableIsCanonical(db, tableName, energyAnalysisSql = null, options = {}) {
   if (!ENERGY_FLOW_TABLES.includes(tableName)) return false;
   const createTableSql = getTableCreateSql(db, tableName);
   if (!createTableSql) return false;
@@ -1591,7 +1864,25 @@ function energyFlowTableIsCanonical(db, tableName, energyAnalysisSql = null) {
   }
 
   const triggerNames = getEnergyFlowTableTriggers(db, tableName);
-  if (JSON.stringify(triggerNames) !== JSON.stringify(ENERGY_FLOW_EXPECTED_TRIGGERS)) return false;
+  const expectedTriggerNames = [...(ENERGY_FLOW_EXPECTED_TRIGGERS[tableName] || [])].sort();
+  const triggerNamesMatch = JSON.stringify(triggerNames) === JSON.stringify(expectedTriggerNames);
+  const mayUpgradeMissingOrWeakSourceTriggers = options.allowImportSourceTriggerUpgrade === true
+    && expectedTriggerNames.length > 0
+    && (triggerNames.length === 0 || triggerNamesMatch);
+  if (!triggerNamesMatch && !mayUpgradeMissingOrWeakSourceTriggers) return false;
+  if (triggerNamesMatch && options.allowImportSourceTriggerUpgrade !== true) {
+    const expectedStatements = ENERGY_FLOW_IMPORT_SOURCE_TRIGGERS_SQL.match(/CREATE TRIGGER[\s\S]*?END;/g) || [];
+    const expectedTriggerSql = new Map(expectedStatements.map((sql) => [
+      sql.match(/^CREATE TRIGGER(?: IF NOT EXISTS)?\s+(\S+)/i)?.[1],
+      sql
+    ]));
+    const triggersCanonical = expectedTriggerNames.every((triggerName) => {
+      const actualSql = db.prepare(`SELECT sql FROM sqlite_master
+        WHERE type = 'trigger' AND name = ? AND tbl_name = ?`).get(triggerName, tableName)?.sql;
+      return normalizeTriggerSql(actualSql) === normalizeTriggerSql(expectedTriggerSql.get(triggerName));
+    });
+    if (!triggersCanonical) return false;
+  }
 
   const expectedIndexNames = [...ENERGY_FLOW_TABLE_INDEXES[tableName]].sort();
   if (JSON.stringify(getEnergyFlowExplicitIndexNames(db, tableName)) !== JSON.stringify(expectedIndexNames)) return false;
@@ -1604,20 +1895,38 @@ function energyFlowTableIsCanonical(db, tableName, energyAnalysisSql = null) {
   });
 }
 
-/** 判断当前四张旧表是否精确匹配项目已知 energy-flow v1 指纹。 */
-function energyFlowLegacyV1IsCanonical(db) {
+/** 返回指定精确 v1 profile 的预期建表 SQL；无 provenance profile 只移除已授权的固定片段。 */
+function getEnergyFlowLegacyV1ExpectedTableSql(tableName, profile) {
+  const expectedTableSql = extractNamedCreateStatement(ENERGY_FLOW_LEGACY_V1_SCHEMA_SQL, 'table', tableName);
+  if (!expectedTableSql || profile.edgeRecordProvenance || !['energy_flow_edges', 'energy_flow_records'].includes(tableName)) {
+    return expectedTableSql;
+  }
+  const provenanceColumnsSql = `  source_batch_id INTEGER,\n  source_row_number INTEGER CHECK (source_row_number IS NULL OR source_row_number >= 1),\n`;
+  const provenanceForeignKeySql = '  FOREIGN KEY (source_batch_id) REFERENCES import_batches(id) ON DELETE SET NULL,\n';
+  const withoutColumns = expectedTableSql.replace(provenanceColumnsSql, '');
+  const withoutForeignKey = withoutColumns.replace(provenanceForeignKeySql, '');
+  if (withoutForeignKey === expectedTableSql
+    || withoutForeignKey.includes('source_batch_id')
+    || withoutForeignKey.includes('source_row_number')) {
+    throw new Error(`energy-flow 精确 v1 profile 生成失败：${tableName}`);
+  }
+  return withoutForeignKey;
+}
+
+/** 判断当前四张旧表是否精确匹配指定 energy-flow v1 profile。 */
+function energyFlowLegacyV1ProfileIsCanonical(db, profile) {
   return ENERGY_FLOW_LEGACY_V1_TABLES.every((tableName) => {
     const actualTableSql = getTableCreateSql(db, tableName);
-    const expectedTableSql = extractNamedCreateStatement(ENERGY_FLOW_LEGACY_V1_SCHEMA_SQL, 'table', tableName);
+    const expectedTableSql = getEnergyFlowLegacyV1ExpectedTableSql(tableName, profile);
     if (!actualTableSql || !expectedTableSql
       || normalizeCanonicalCreateFingerprint(actualTableSql) !== normalizeCanonicalCreateFingerprint(expectedTableSql)) {
       return false;
     }
-    if (JSON.stringify(getTableColumns(db, tableName)) !== JSON.stringify(ENERGY_FLOW_LEGACY_V1_COLUMNS[tableName])) {
+    if (JSON.stringify(getTableColumns(db, tableName)) !== JSON.stringify(profile.columns[tableName])) {
       return false;
     }
     if (getEnergyFlowTableTriggers(db, tableName).length > 0) return false;
-    const expectedIndexNames = [...ENERGY_FLOW_LEGACY_V1_TABLE_INDEXES[tableName]].sort();
+    const expectedIndexNames = [...profile.indexes[tableName]].sort();
     if (JSON.stringify(getEnergyFlowExplicitIndexNames(db, tableName)) !== JSON.stringify(expectedIndexNames)) return false;
     return expectedIndexNames.every((indexName) => {
       const actualIndexSql = db.prepare(`SELECT sql FROM sqlite_master
@@ -1630,6 +1939,11 @@ function energyFlowLegacyV1IsCanonical(db) {
     .filter((tableName) => !ENERGY_FLOW_LEGACY_V1_TABLES.includes(tableName))
     .every((tableName) => !getTableCreateSql(db, tableName)
       || Number(db.prepare(`SELECT COUNT(*) AS total FROM ${quoteSqlIdentifier(tableName)}`).get().total) === 0);
+}
+
+/** 返回当前数据库唯一匹配的精确已知 energy-flow v1 profile。 */
+function getEnergyFlowLegacyV1Profile(db) {
+  return ENERGY_FLOW_LEGACY_V1_PROFILES.find((profile) => energyFlowLegacyV1ProfileIsCanonical(db, profile)) || null;
 }
 
 /** 返回 N8 九表作为子表或父表时涉及的全部全库外键违规。 */
@@ -1696,7 +2010,13 @@ function buildEnergyFlowLegacySnapshot(db, tableName, columns = ENERGY_FLOW_LEGA
 }
 
 /** 在复制前验证 v1 稳定键和新 canonical 上限，冲突时拒绝自动修补或猜测。 */
-function assertEnergyFlowLegacyDataCanMigrate(db) {
+function assertEnergyFlowLegacyDataCanMigrate(db, profile) {
+  const edgeSourceRowValidation = profile.edgeRecordProvenance
+    ? " OR (source_row_number IS NOT NULL AND (typeof(source_row_number) <> 'integer' OR source_row_number < 1))"
+    : '';
+  const recordSourceRowValidation = profile.edgeRecordProvenance
+    ? " OR (source_row_number IS NOT NULL AND (typeof(source_row_number) <> 'integer' OR source_row_number < 1))"
+    : '';
   const invalidCounts = {
     models: Number(db.prepare(`SELECT COUNT(*) AS total FROM energy_flow_models
       WHERE is_valid_energy_flow_code(model_code) <> 1
@@ -1714,16 +2034,14 @@ function assertEnergyFlowLegacyDataCanMigrate(db) {
         OR (source_row_number IS NOT NULL AND (typeof(source_row_number) <> 'integer' OR source_row_number < 1))`).get().total),
     edges: Number(db.prepare(`SELECT COUNT(*) AS total FROM energy_flow_edges
       WHERE is_valid_energy_flow_code(edge_code) <> 1
-        OR length(trim(unit)) NOT BETWEEN 1 AND 100
-        OR (source_row_number IS NOT NULL AND (typeof(source_row_number) <> 'integer' OR source_row_number < 1))`).get().total),
+        OR length(trim(unit)) NOT BETWEEN 1 AND 100${edgeSourceRowValidation}`).get().total),
     records: Number(db.prepare(`SELECT COUNT(*) AS total FROM energy_flow_records
       WHERE length(trim(original_unit)) NOT BETWEEN 1 AND 100
         OR abs(original_value) > 1000000000000000
         OR normalize_energy_flow_utc_second(start_utc) IS NULL
         OR normalize_energy_flow_utc_second(end_utc) IS NULL
         OR (voided_at IS NOT NULL AND normalize_energy_flow_utc_second(voided_at) IS NULL)
-        OR length(trim(source_timezone)) NOT BETWEEN 1 AND 100
-        OR (source_row_number IS NOT NULL AND (typeof(source_row_number) <> 'integer' OR source_row_number < 1))`).get().total)
+        OR length(trim(source_timezone)) NOT BETWEEN 1 AND 100${recordSourceRowValidation}`).get().total)
   };
   const normalizedCollisions = {
     models: Number(db.prepare(`SELECT COUNT(*) AS total FROM (
@@ -1765,10 +2083,10 @@ function dropEnergyFlowTables(db) {
 }
 
 /** 将已知 v1 四表机械复制到 canonical v2，不推断路径、阶段、资产、记录编码或能源类型。 */
-function migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql) {
-  assertEnergyFlowLegacyDataCanMigrate(db);
+function migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql, profile) {
+  assertEnergyFlowLegacyDataCanMigrate(db, profile);
   const beforeSnapshots = Object.fromEntries(ENERGY_FLOW_LEGACY_V1_TABLES.map((tableName) => (
-    [tableName, buildEnergyFlowLegacySnapshot(db, tableName)]
+    [tableName, buildEnergyFlowLegacySnapshot(db, tableName, profile.columns[tableName])]
   )));
 
   ENERGY_FLOW_LEGACY_V1_TABLES.forEach((tableName) => {
@@ -1779,6 +2097,12 @@ function migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql) {
   dropEnergyFlowTables(db);
   db.exec(energyAnalysisSql);
 
+  const edgeSourceProjection = profile.edgeRecordProvenance
+    ? 'source_batch_id, source_row_number'
+    : 'NULL, NULL';
+  const recordSourceProjection = profile.edgeRecordProvenance
+    ? 'source_batch_id, source_row_number'
+    : 'NULL, NULL';
   db.exec(`INSERT INTO energy_flow_models (
       id, source_batch_id, source_row_number, model_code, model_name, source, document_no, version,
       effective_start_wall_clock, effective_end_wall_clock, effective_start_utc, effective_end_utc,
@@ -1803,7 +2127,7 @@ function migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql) {
       path_sequence, edge_code, from_node_id, to_node_id, energy_type_id, unit,
       source_type, source_reference, source_mapping_json, status, created_at, updated_at
     )
-    SELECT id, source_batch_id, source_row_number, energy_flow_model_id, NULL,
+    SELECT id, ${edgeSourceProjection}, energy_flow_model_id, NULL,
       NULL, edge_code, from_node_id, to_node_id, energy_type_id, unit,
       source_type, NULL, source_mapping_json, status, created_at, updated_at
     FROM temp.energy_flow_edges__n8_v1 ORDER BY id;
@@ -1815,7 +2139,7 @@ function migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql) {
       source_mapping_json, formula_version, record_status, void_reason, voided_at,
       created_at, updated_at
     )
-    SELECT id, source_batch_id, source_row_number, energy_flow_model_id, NULL, NULL,
+    SELECT id, ${recordSourceProjection}, energy_flow_model_id, NULL, NULL,
       energy_flow_edge_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
       normalize_energy_flow_utc_second(start_utc), normalize_energy_flow_utc_second(end_utc),
       source_timezone, original_unit, original_value, source_type, NULL,
@@ -1825,7 +2149,7 @@ function migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql) {
     FROM temp.energy_flow_records__n8_v1 ORDER BY id;`);
 
   const afterSnapshots = Object.fromEntries(ENERGY_FLOW_LEGACY_V1_TABLES.map((tableName) => (
-    [tableName, buildEnergyFlowLegacySnapshot(db, tableName)]
+    [tableName, buildEnergyFlowLegacySnapshot(db, tableName, profile.columns[tableName])]
   )));
   const snapshotMismatch = ENERGY_FLOW_LEGACY_V1_TABLES.some((tableName) => (
     JSON.stringify(beforeSnapshots[tableName]) !== JSON.stringify(afterSnapshots[tableName])
@@ -1841,7 +2165,13 @@ function migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql) {
           OR energy_flow_node_id IS NOT NULL OR energy_flow_path_id IS NOT NULL OR energy_flow_asset_id IS NOT NULL
           OR stage_code IS NOT NULL OR energy_type_id IS NOT NULL OR start_wall_clock IS NOT NULL
           OR end_wall_clock IS NOT NULL OR source_reference IS NOT NULL) AS total`).get().total);
-  if (snapshotMismatch || legacyClassificationCount > 0 || inferredFieldCount > 0) {
+  const unexpectedInstalledProvenanceCount = profile.edgeRecordProvenance
+    ? 0
+    : Number(db.prepare(`SELECT
+        (SELECT COUNT(*) FROM energy_flow_edges WHERE source_batch_id IS NOT NULL OR source_row_number IS NOT NULL)
+        + (SELECT COUNT(*) FROM energy_flow_records WHERE source_batch_id IS NOT NULL OR source_row_number IS NOT NULL) AS total`).get().total);
+  if (snapshotMismatch || legacyClassificationCount > 0 || inferredFieldCount > 0
+    || unexpectedInstalledProvenanceCount > 0) {
     throw createEnergyFlowMigrationError(
       'N8_ENERGY_FLOW_MIGRATION_VALIDATION_FAILED',
       '能流 v1 迁移后的历史值或 legacy 边界校验失败。'
@@ -1853,10 +2183,107 @@ function migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql) {
   return true;
 }
 
+/** 校验既有能流边或显式边值来源没有违反成对可空与正整数约束。 */
+function validateEnergyFlowImportSources(db, tableName) {
+  const violation = db.prepare(`SELECT id, source_batch_id AS sourceBatchId,
+      source_row_number AS sourceRowNumber
+    FROM ${quoteSqlIdentifier(tableName)}
+    WHERE NOT (
+      (source_batch_id IS NULL AND source_row_number IS NULL)
+      OR (
+        source_batch_id IS NOT NULL
+        AND source_row_number IS NOT NULL
+        AND typeof(source_row_number) = 'integer'
+        AND source_row_number >= 1
+      )
+    )
+    LIMIT 1`).get();
+  if (violation) {
+    throw createEnergyFlowMigrationError(
+      'N8_ENERGY_FLOW_IMPORT_SOURCE_INVALID',
+      `${tableName} 存在不符合 provenance 成对约束的历史记录。`,
+      violation
+    );
+  }
+}
+
+/** 校验能流导入来源外键固定指向 import_batches(id) 且禁止删除来源批次。 */
+function energyFlowImportSourceForeignKeyIsCanonical(db, tableName) {
+  return db.prepare(`PRAGMA foreign_key_list(${quoteSqlIdentifier(tableName)})`).all()
+    .some((foreignKey) => (
+      foreignKey.from === 'source_batch_id'
+      && foreignKey.table === 'import_batches'
+      && foreignKey.to === 'id'
+      && String(foreignKey.on_delete || '').toUpperCase() === 'RESTRICT'
+    ));
+}
+
+/** 严格安装能流来源触发器，同名弱触发器会在数据预检后被规范定义替换。 */
+function ensureEnergyFlowImportSourceTriggers(db) {
+  const expectedStatements = ENERGY_FLOW_IMPORT_SOURCE_TRIGGERS_SQL.match(/CREATE TRIGGER[\s\S]*?END;/g) || [];
+  const expectedByName = new Map(expectedStatements.map((sql) => [
+    sql.match(/^CREATE TRIGGER(?: IF NOT EXISTS)?\s+(\S+)/i)?.[1],
+    sql
+  ]));
+  const triggerNames = [...expectedByName.keys()];
+  const actualByName = new Map(db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'trigger' AND name IN (${triggerNames.map(() => '?').join(', ')})`).all(...triggerNames)
+    .map((row) => [row.name, row.sql]));
+  const isCanonical = triggerNames.length === 4 && triggerNames.every((triggerName) => (
+    normalizeTriggerSql(actualByName.get(triggerName)) === normalizeTriggerSql(expectedByName.get(triggerName))
+  ));
+  if (isCanonical) return false;
+  triggerNames.forEach((triggerName) => db.exec(`DROP TRIGGER IF EXISTS ${quoteSqlIdentifier(triggerName)}`));
+  db.exec(ENERGY_FLOW_IMPORT_SOURCE_TRIGGERS_SQL);
+  return true;
+}
+
+/** 为旧 canonical 能流表幂等补充 provenance 成对约束，并在安装后复核外键。 */
+function migrateEnergyFlowImportSources(db) {
+  const tableNames = ['energy_flow_edges', 'energy_flow_records'];
+  const existingTables = tableNames.filter((tableName) => Boolean(getTableCreateSql(db, tableName)));
+  if (existingTables.length === 0) return false;
+  if (existingTables.length !== tableNames.length || !getTableCreateSql(db, 'import_batches')) {
+    throw createEnergyFlowMigrationError(
+      'N8_ENERGY_FLOW_IMPORT_SOURCE_SCHEMA_INCOMPLETE',
+      '能流来源迁移要求 import_batches、energy_flow_edges 和 energy_flow_records 同时存在。'
+    );
+  }
+  tableNames.forEach((tableName) => {
+    const columns = getTableColumns(db, tableName);
+    if (!columns.includes('source_batch_id') || !columns.includes('source_row_number')) {
+      throw createEnergyFlowMigrationError(
+        'N8_ENERGY_FLOW_IMPORT_SOURCE_SCHEMA_INCOMPLETE',
+        `${tableName} 缺少 imported provenance 来源列。`
+      );
+    }
+    if (!energyFlowImportSourceForeignKeyIsCanonical(db, tableName)) {
+      throw createEnergyFlowMigrationError(
+        'N8_ENERGY_FLOW_IMPORT_SOURCE_FOREIGN_KEY_INVALID',
+        `${tableName} 来源批次外键不符合 canonical 合同。`
+      );
+    }
+    validateEnergyFlowImportSources(db, tableName);
+  });
+  const changed = ensureEnergyFlowImportSourceTriggers(db);
+  const violations = db.prepare('PRAGMA foreign_key_check').all()
+    .filter((row) => tableNames.includes(row.table));
+  if (violations.length > 0) {
+    throw createEnergyFlowMigrationError(
+      'N8_ENERGY_FLOW_IMPORT_SOURCE_FOREIGN_KEY_CHECK_FAILED',
+      '能流来源迁移后外键检查失败。',
+      { foreignKeyViolations: violations }
+    );
+  }
+  return changed;
+}
+
 /** 非 canonical N8 结构仅允许空骨架重建或精确 v1 机械迁移，其他历史结构全部 fail-closed。 */
 function migrateEnergyFlowTables(db, energyAnalysisSql) {
   const nonCanonicalTables = ENERGY_FLOW_TABLES.filter((tableName) => (
-    !energyFlowTableIsCanonical(db, tableName, energyAnalysisSql)
+    !energyFlowTableIsCanonical(db, tableName, energyAnalysisSql, {
+      allowImportSourceTriggerUpgrade: true
+    })
   ));
   if (nonCanonicalTables.length === 0) return false;
 
@@ -1864,9 +2291,10 @@ function migrateEnergyFlowTables(db, energyAnalysisSql) {
     if (!getTableCreateSql(db, tableName)) return false;
     return Number(db.prepare(`SELECT COUNT(*) AS total FROM ${quoteSqlIdentifier(tableName)}`).get().total) > 0;
   });
-  if (energyFlowLegacyV1IsCanonical(db)) {
+  const legacyV1Profile = getEnergyFlowLegacyV1Profile(db);
+  if (legacyV1Profile) {
     try {
-      return migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql);
+      return migrateEnergyFlowLegacyV1Tables(db, energyAnalysisSql, legacyV1Profile);
     } catch (error) {
       if (String(error?.code || '').startsWith('N8_ENERGY_FLOW_')) throw error;
       throw createEnergyFlowMigrationError(
@@ -1914,7 +2342,9 @@ function ensureEnergyAnalysisTables(db, schemaText = fs.readFileSync(schemaPath,
       );
     }
     migrateEnergyFlowTables(db, energyAnalysisSql);
+    migrateEnergyBalanceImportSourceColumns(db);
     db.exec(energyAnalysisSql);
+    migrateEnergyFlowImportSources(db);
     const invalidTables = ENERGY_FLOW_TABLES.filter((tableName) => (
       !energyFlowTableIsCanonical(db, tableName, energyAnalysisSql)
     ));
@@ -2360,9 +2790,11 @@ function ensureDemoGovernanceTables(db, schemaText = fs.readFileSync(schemaPath,
 function demoGovernanceTableIsCanonical(db, tableName) {
   const contract = DEMO_GOVERNANCE_CONTRACTS[tableName];
   if (!demoGovernanceTableStructureIsCanonical(db, tableName)) return false;
-  return Object.entries(contract.indexes || {}).every(([indexName, indexContract]) => (
+  const indexesCanonical = Object.entries(contract.indexes || {}).every(([indexName, indexContract]) => (
     demoGovernanceIndexIsCanonical(db, tableName, indexName, indexContract)
   ));
+  if (!indexesCanonical) return false;
+  return !contract.triggers || demoGovernanceTriggersAreCanonical(db, tableName, contract.triggers);
 }
 
 /**
@@ -2617,6 +3049,28 @@ function demoGovernanceIndexIsCanonical(db, tableName, indexName, contract) {
   const actualWhere = whereMatch ? whereMatch[1].trim() : null;
   const expectedWhere = contract.where ? normalizeSqlContractText(contract.where) : null;
   return actualWhere === expectedWhere;
+}
+
+/** 校验治理表挂载的显式触发器名称集合及其 canonical SQL，防止同名弱触发器绕过合同。 */
+function demoGovernanceTriggersAreCanonical(db, tableName, triggerNames) {
+  const actualTriggers = db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'trigger' AND tbl_name = ? ORDER BY name`).all(tableName);
+  if (actualTriggers.length !== triggerNames.length
+    || actualTriggers.some((trigger) => !triggerNames.includes(trigger.name))) {
+    return false;
+  }
+  const canonicalProfile = buildCanonicalSchemaObjectProfile(fs.readFileSync(schemaPath, 'utf8'));
+  return actualTriggers.every((trigger) => {
+    const triggerKey = getSchemaObjectProfileKey({
+      type: 'trigger',
+      name: trigger.name,
+      tableName
+    });
+    const canonicalTrigger = canonicalProfile.get(triggerKey);
+    return canonicalTrigger
+      && normalizeSchemaObjectProfileSql(trigger.sql)
+        === normalizeSchemaObjectProfileSql(canonicalTrigger.sql);
+  });
 }
 
 /**
@@ -3254,6 +3708,125 @@ function addColumnIfMissing(db, tableName, columnName, columnSql) {
   }
   db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnSql}`);
   return true;
+}
+
+/** 校验平衡来源批次外键固定指向 import_batches，并使用 SET NULL。 */
+function energyBalanceSourceForeignKeyIsCanonical(db, tableName) {
+  return db.prepare(`PRAGMA foreign_key_list(${tableName})`).all().some((foreignKey) => (
+    foreignKey.from === 'source_batch_id'
+    && foreignKey.table === 'import_batches'
+    && foreignKey.to === 'id'
+    && String(foreignKey.on_delete || '').toUpperCase() === 'SET NULL'
+  ));
+}
+
+/** 校验既有平衡来源列没有违反成对可空和正整数约束。 */
+function validateEnergyBalanceImportSources(db, tableName) {
+  const violation = db.prepare(`SELECT id, source_batch_id AS sourceBatchId,
+      source_row_number AS sourceRowNumber
+    FROM ${tableName}
+    WHERE NOT (
+      (source_batch_id IS NULL AND source_row_number IS NULL)
+      OR (
+        source_batch_id IS NOT NULL
+        AND source_row_number IS NOT NULL
+        AND typeof(source_row_number) = 'integer'
+        AND source_row_number >= 1
+      )
+    )
+    LIMIT 1`).get();
+  if (violation) {
+    const error = new Error(`${tableName} 存在不符合 provenance 成对约束的历史记录。`);
+    error.code = 'ENERGY_BALANCE_IMPORT_SOURCE_INVALID';
+    error.details = violation;
+    throw error;
+  }
+}
+
+/** 严格安装平衡来源约束触发器，拒绝保留同名弱触发器。 */
+function ensureEnergyBalanceImportSourceTriggers(db) {
+  const expectedStatements = ENERGY_BALANCE_IMPORT_SOURCE_TRIGGERS_SQL.match(/CREATE TRIGGER[\s\S]*?END;/g) || [];
+  const expectedByName = new Map(expectedStatements.map((sql) => {
+    const name = sql.match(/^CREATE TRIGGER\s+(\S+)/i)?.[1];
+    return [name, sql];
+  }));
+  const triggerNames = [...expectedByName.keys()];
+  const actualByName = new Map(db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'trigger' AND name IN (${triggerNames.map(() => '?').join(', ')})`).all(...triggerNames)
+    .map((row) => [row.name, row.sql]));
+  const isCanonical = triggerNames.length === 5 && triggerNames.every((name) => (
+    normalizeTriggerSql(actualByName.get(name)) === normalizeTriggerSql(expectedByName.get(name))
+  ));
+  if (isCanonical) return false;
+  triggerNames.forEach((name) => db.exec(`DROP TRIGGER IF EXISTS ${name}`));
+  db.exec(ENERGY_BALANCE_IMPORT_SOURCE_TRIGGERS_SQL);
+  return true;
+}
+
+/**
+ * 为既有平衡边界和项目补充 imported provenance，保留正式手工记录的 NULL/NULL 来源。
+ * @param {object} db SQLite 数据库连接。
+ * @returns {boolean} 是否修改了旧库结构、索引或触发器。
+ */
+function migrateEnergyBalanceImportSourceColumns(db) {
+  const boundaryExists = Boolean(getTableCreateSql(db, 'energy_balance_boundaries'));
+  const itemExists = Boolean(getTableCreateSql(db, 'energy_balance_items'));
+  if (!boundaryExists && !itemExists) return false;
+  if (!boundaryExists || !itemExists || !getTableCreateSql(db, 'import_batches')) {
+    const error = new Error('平衡来源迁移要求 import_batches、energy_balance_boundaries 和 energy_balance_items 同时存在。');
+    error.code = 'ENERGY_BALANCE_IMPORT_SOURCE_SCHEMA_INCOMPLETE';
+    throw error;
+  }
+
+  ['energy_balance_boundaries', 'energy_balance_items'].forEach((tableName) => {
+    const columns = getTableColumns(db, tableName);
+    if (columns.includes('source_batch_id') && !energyBalanceSourceForeignKeyIsCanonical(db, tableName)) {
+      const error = new Error(`${tableName} 已有 source_batch_id，但来源外键不符合 canonical 合同。`);
+      error.code = 'ENERGY_BALANCE_IMPORT_SOURCE_FOREIGN_KEY_INVALID';
+      throw error;
+    }
+  });
+
+  let changed = false;
+  db.transaction(() => {
+    ['energy_balance_boundaries', 'energy_balance_items'].forEach((tableName) => {
+      changed = addColumnIfMissing(
+        db,
+        tableName,
+        'source_batch_id',
+        'source_batch_id INTEGER REFERENCES import_batches(id) ON DELETE SET NULL'
+      ) || changed;
+      changed = addColumnIfMissing(
+        db,
+        tableName,
+        'source_row_number',
+        'source_row_number INTEGER'
+      ) || changed;
+      validateEnergyBalanceImportSources(db, tableName);
+      if (!energyBalanceSourceForeignKeyIsCanonical(db, tableName)) {
+        throw new Error(`${tableName} 来源批次外键迁移后仍不符合 canonical 合同。`);
+      }
+    });
+    changed = ensureEnergyBalanceImportSourceTriggers(db) || changed;
+    const sourceIndexes = [
+      ['idx_energy_balance_boundaries_source', 'energy_balance_boundaries'],
+      ['idx_energy_balance_items_source', 'energy_balance_items']
+    ];
+    sourceIndexes.forEach(([indexName, tableName]) => {
+      const existed = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(indexName));
+      db.exec(`CREATE INDEX IF NOT EXISTS ${indexName} ON ${tableName}(source_batch_id, source_row_number)`);
+      changed = !existed || changed;
+    });
+    const foreignKeyViolations = db.prepare(`PRAGMA foreign_key_check`).all()
+      .filter((row) => ['energy_balance_boundaries', 'energy_balance_items'].includes(row.table));
+    if (foreignKeyViolations.length > 0) {
+      const error = new Error('平衡来源迁移后外键检查失败。');
+      error.code = 'ENERGY_BALANCE_IMPORT_SOURCE_FOREIGN_KEY_CHECK_FAILED';
+      error.details = foreignKeyViolations;
+      throw error;
+    }
+  })();
+  return changed;
 }
 
 /**
@@ -4041,36 +4614,6 @@ function migrateSupplierCodeKeys(db) {
   return true;
 }
 
-function migrateEnergyRecordLedgerColumns(db) {
-  const createTableSql = getTableCreateSql(db, 'energy_records');
-  if (!createTableSql) {
-    return false;
-  }
-
-  db.exec(LEDGER_TABLES_SQL);
-  db.exec(SUPPLIER_TABLES_SQL);
-  db.exec(PRODUCTION_TABLES_SQL);
-  const addedImportType = addColumnIfMissing(
-    db,
-    'import_batches',
-    'import_type',
-    `import_type TEXT NOT NULL DEFAULT 'energy_record' CHECK (import_type IN (${IMPORT_BATCH_TYPES_SQL}))`
-  );
-  const addedOrganizationUnit = addColumnIfMissing(
-    db,
-    'energy_records',
-    'organization_unit_id',
-    'organization_unit_id INTEGER REFERENCES organization_units(id) ON DELETE SET NULL'
-  );
-  const addedMeterDevice = addColumnIfMissing(
-    db,
-    'energy_records',
-    'meter_device_id',
-    'meter_device_id INTEGER REFERENCES meter_devices(id) ON DELETE SET NULL'
-  );
-  return addedImportType || addedOrganizationUnit || addedMeterDevice;
-}
-
 function ensureEnergyBudgetsTable(db) {
   const beforeSql = getTableCreateSql(db, 'energy_budgets');
   db.exec(ENERGY_BUDGETS_TABLE_SQL);
@@ -4244,6 +4787,8 @@ const RBAC_MENU_SEEDS = [
   ['menu', '组织管理', '/ledger/organization', 'ledger/organization/index', 'ledger:units:view', 'OfficeBuilding', 51, '/ledger'],
   ['menu', '计量器具', '/ledger/meters', 'ledger/meters/index', 'ledger:meters:view', 'Monitor', 52, '/ledger'],
   ['menu', '计量抄表', '/ledger/meter-readings', 'ledger/meter-readings/index', 'ledger:readings:view', 'DocumentChecked', 53, '/ledger'],
+  ['button', '抄表转能耗预演', null, null, 'ledger:readings:preview', null, 531, '/ledger/meter-readings'],
+  ['button', '抄表转能耗执行', null, null, 'ledger:readings:execute', null, 532, '/ledger/meter-readings'],
   ['menu', '生产单元', '/ledger/production-units', 'ledger/production-units/index', 'ledger:production-unit:view', 'Box', 54, '/ledger'],
   ['menu', '月度产量', '/ledger/production-output', 'ledger/production-output/index', 'ledger:production-output:view', 'Tickets', 55, '/ledger'],
   ['menu', '发电自用', '/ledger/generation', 'ledger/generation/index', 'ledger:generation:view', 'Lightning', 56, '/ledger'],
@@ -4627,6 +5172,723 @@ function ensureRbacSeedData(db) {
   transaction();
 }
 
+/** 将 seed 行转换为稳定业务键，避免 candidate 校验依赖自增主键。 */
+function getStableMenuBusinessKey(menu) {
+  if (menu.permissionCode) return `permission:${menu.permissionCode}`;
+  if (menu.routePath) return `route:${menu.routePath}`;
+  return `name:${menu.menuType}:${menu.menuName}`;
+}
+
+/** 读取当前数据库中的稳定 RBAC 与能源 reference seed 合同。 */
+function readCanonicalSeedContract(db) {
+  const roles = db.prepare(`SELECT role_code AS roleCode, role_name AS roleName, description,
+      status, is_builtin AS isBuiltin FROM sys_roles ORDER BY role_code`).all();
+  const menuRows = db.prepare(`SELECT m.id, m.parent_id AS parentId, m.menu_type AS menuType,
+      m.menu_name AS menuName, m.route_path AS routePath, m.component,
+      m.permission_code AS permissionCode, m.icon, m.sort_order AS sortOrder,
+      m.visible, m.status, m.is_builtin AS isBuiltin
+    FROM sys_menus m ORDER BY m.id`).all();
+  const menuKeyById = new Map(menuRows.map((menu) => [menu.id, getStableMenuBusinessKey(menu)]));
+  const menus = menuRows.map((menu) => ({
+    key: getStableMenuBusinessKey(menu),
+    parentKey: menu.parentId === null ? null : menuKeyById.get(menu.parentId) || null,
+    menuType: menu.menuType,
+    menuName: menu.menuName,
+    routePath: menu.routePath,
+    component: menu.component,
+    permissionCode: menu.permissionCode,
+    icon: menu.icon,
+    sortOrder: menu.sortOrder,
+    visible: menu.visible,
+    status: menu.status,
+    isBuiltin: menu.isBuiltin
+  })).sort((left, right) => left.key.localeCompare(right.key));
+  const grants = db.prepare(`SELECT r.role_code AS roleCode, m.id AS menuId,
+      m.menu_type AS menuType, m.menu_name AS menuName, m.route_path AS routePath,
+      m.permission_code AS permissionCode
+    FROM sys_role_menus rm JOIN sys_roles r ON r.id = rm.role_id
+    JOIN sys_menus m ON m.id = rm.menu_id ORDER BY r.role_code, m.id`).all()
+    .map((grant) => ({
+      roleCode: grant.roleCode,
+      menuKey: menuKeyById.get(grant.menuId)
+        || getStableMenuBusinessKey(grant)
+    }))
+    .sort((left, right) => left.roleCode.localeCompare(right.roleCode)
+      || left.menuKey.localeCompare(right.menuKey));
+  const energyTypes = db.prepare(`SELECT code, name, category, default_unit AS defaultUnit,
+      standard_unit AS standardUnit, carbon_factor_required AS carbonFactorRequired,
+      is_active AS isActive, display_order AS displayOrder
+    FROM energy_types ORDER BY code`).all();
+  return { roles, menus, grants, energyTypes };
+}
+
+/** 从 schema.sql 与当前 RBAC seed 逻辑构造独立内存 reference contract。 */
+function getCanonicalSeedContract() {
+  const Database = loadDatabaseDriver();
+  const referenceDb = new Database(':memory:');
+  try {
+    registerEnergyAnalysisSqliteFunctions(referenceDb);
+    const schemaText = fs.readFileSync(schemaPath, 'utf8');
+    referenceDb.exec(schemaText);
+    ensureRbacSeedData(referenceDb);
+    return readCanonicalSeedContract(referenceDb);
+  } finally {
+    referenceDb.close();
+  }
+}
+
+/** 读取初始化前的数据库身份；全部持久 schema 对象为空时才视为全新库。 */
+function readExistingSchemaIdentity(db) {
+  const userSchemaObjects = db.prepare(`SELECT type, name, tbl_name AS tableName, sql
+    FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%'
+    ORDER BY type, name, tbl_name`).all();
+  if (userSchemaObjects.length === 0) {
+    return { fresh: true, version: null, stage: null, fingerprint: null, fingerprintAlgorithm: null };
+  }
+  const hasAppMeta = userSchemaObjects.some((row) => row.type === 'table' && row.name === 'app_meta');
+  if (!hasAppMeta) {
+    const error = new Error('检测到没有 schema 身份的现有 SQLite，正式版本禁止自动升级未知旧库；请按授权边界清空后重建。');
+    error.code = 'UNKNOWN_EXISTING_SCHEMA';
+    throw error;
+  }
+  const metadata = Object.fromEntries(db.prepare(`SELECT key, value FROM app_meta
+    WHERE key IN ('schema_stage', 'schema_version', 'schema_fingerprint', 'schema_fingerprint_algorithm')`).all()
+    .map((row) => [row.key, row.value]));
+  const acceptedVersions = new Set([CANONICAL_SCHEMA_VERSION, CANONICAL_SCHEMA_PREDECESSOR_VERSION]);
+  if (!acceptedVersions.has(metadata.schema_version)
+    || metadata.schema_stage !== CANONICAL_SCHEMA_STAGE) {
+    const error = new Error('现有 SQLite 不是当前正式 canonical 版本或唯一已授权 predecessor，已拒绝历史迁移或自动修补。');
+    error.code = 'INCOMPATIBLE_EXISTING_SCHEMA';
+    error.details = {
+      expectedStage: CANONICAL_SCHEMA_STAGE,
+      expectedVersion: CANONICAL_SCHEMA_VERSION,
+      actualStage: metadata.schema_stage || null,
+      actualVersion: metadata.schema_version || null
+    };
+    throw error;
+  }
+  if (!/^[a-f0-9]{64}$/.test(String(metadata.schema_fingerprint || ''))
+    || metadata.schema_fingerprint_algorithm !== CANONICAL_SCHEMA_FINGERPRINT_ALGORITHM) {
+    const error = new Error('现有正式 SQLite 缺少有效 schema fingerprint，已拒绝继续初始化。');
+    error.code = 'SCHEMA_FINGERPRINT_MISSING';
+    throw error;
+  }
+  return {
+    fresh: false,
+    version: metadata.schema_version,
+    stage: metadata.schema_stage,
+    fingerprint: metadata.schema_fingerprint,
+    fingerprintAlgorithm: metadata.schema_fingerprint_algorithm
+  };
+}
+
+/** 基于 sqlite_master 的规范 SQL 生成稳定结构指纹，不包含业务数据和 SQLite 自动索引。 */
+function calculateSchemaFingerprint(db) {
+  const schemaRows = db.prepare(`SELECT type, name, tbl_name AS tableName, sql
+    FROM sqlite_master
+    WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+    ORDER BY type, name, tbl_name`).all();
+  const canonicalSchema = schemaRows.map((row) => ({
+    type: row.type,
+    name: row.name,
+    tableName: row.tableName,
+    sql: String(row.sql).replace(/\s+/g, ' ').trim()
+  }));
+  return crypto.createHash('sha256').update(JSON.stringify(canonicalSchema), 'utf8').digest('hex');
+}
+
+/** 返回 sqlite_master 对象的稳定 profile 键。 */
+function getSchemaObjectProfileKey(schemaObject) {
+  return `${schemaObject.type}:${schemaObject.name}:${schemaObject.tableName}`;
+}
+
+/** 读取全部显式 schema 对象，供精确旧结构 profile 比对。 */
+function readSchemaObjectProfile(db) {
+  return new Map(db.prepare(`SELECT type, name, tbl_name AS tableName, sql
+    FROM sqlite_master
+    WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+    ORDER BY type, name, tbl_name`).all().map((schemaObject) => (
+    [getSchemaObjectProfileKey(schemaObject), schemaObject]
+  )));
+}
+
+/** 按正式指纹算法计算指定对象 profile，并允许替换已审核对象 SQL。 */
+function calculateSchemaObjectProfileFingerprint(schemaProfile, sqlOverrides = new Map()) {
+  // profile 指纹对象按 sqlite_master 查询使用的稳定字段顺序排序。
+  const canonicalSchema = [...schemaProfile.values()]
+    .sort((left, right) => {
+      const leftKey = [left.type, left.name, left.tableName].join('|');
+      const rightKey = [right.type, right.name, right.tableName].join('|');
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    })
+    .map((schemaObject) => {
+      // SQL override 来自已审核的 ALTER 物理结构；去除执行分号以匹配 sqlite_master.sql。
+      const profileKey = getSchemaObjectProfileKey(schemaObject);
+      const profileSql = sqlOverrides.has(profileKey)
+        ? String(sqlOverrides.get(profileKey)).replace(/;\s*$/, '')
+        : schemaObject.sql;
+      return {
+        type: schemaObject.type,
+        name: schemaObject.name,
+        tableName: schemaObject.tableName,
+        sql: String(profileSql).replace(/\s+/g, ' ').trim()
+      };
+    });
+  return crypto.createHash('sha256').update(JSON.stringify(canonicalSchema), 'utf8').digest('hex');
+}
+
+/** 规范化 schema profile SQL，仅忽略 IF NOT EXISTS、空白和简单标识符引号差异。 */
+function normalizeSchemaObjectProfileSql(sql) {
+  return normalizeSqlContractText(sql)
+    .replace(/^create ((?:unique )?index|table|trigger|view) if not exists /, 'create $1 ');
+}
+
+/** 判断 CREATE TABLE 顶层片段是否为平衡来源字段、来源外键或成对约束。 */
+function isEnergyBalanceImportSourceClause(clause) {
+  if (isSqlColumnClause(clause, 'source_batch_id') || isSqlColumnClause(clause, 'source_row_number')) {
+    return true;
+  }
+  const normalizedClause = normalizeSqlContractText(clause);
+  const isSourceForeignKey = normalizedClause.startsWith('foreign key ( source_batch_id )');
+  const isSourcePairCheck = normalizedClause.startsWith('check (')
+    && normalizedClause.includes('source_batch_id')
+    && normalizedClause.includes('source_row_number');
+  return isSourceForeignKey || isSourcePairCheck;
+}
+
+/** 判断 CREATE TABLE 顶层片段是否为表级约束。 */
+function isTableConstraintClause(clause) {
+  return /^(?:constraint\b|primary\s+key\b|unique\b|check\b|foreign\s+key\b)/i.test(clause.trim());
+}
+
+/**
+ * 从当前 schema 精确派生已知旧来源表或 ALTER 补列后的目标表 SQL。
+ * @param {string} schemaText 完整事务化 schema 文本。
+ * @param {string} tableName 平衡边界或项目表名。
+ * @param {boolean} migrated 是否生成 ALTER ADD COLUMN 后的目标结构。
+ * @returns {string} 用于 profile 比对的建表 SQL。
+ */
+function buildEnergyBalanceImportSourceProfileTableSql(schemaText, tableName, migrated) {
+  const canonicalTableSql = extractNamedCreateStatement(schemaText, 'table', tableName);
+  const bodyStart = canonicalTableSql.indexOf('(');
+  const bodyEnd = canonicalTableSql.lastIndexOf(')');
+  if (!canonicalTableSql || bodyStart < 0 || bodyEnd <= bodyStart) {
+    throw new Error(`无法从 canonical schema 提取平衡来源表：${tableName}`);
+  }
+  const canonicalClauses = splitSqlDefinitionClauses(canonicalTableSql.slice(bodyStart + 1, bodyEnd));
+  const legacyClauses = canonicalClauses.filter((clause) => !isEnergyBalanceImportSourceClause(clause));
+  if (legacyClauses.length >= canonicalClauses.length
+    || normalizeSqlContractText(legacyClauses.join(',')).includes('source_batch_id')
+    || normalizeSqlContractText(legacyClauses.join(',')).includes('source_row_number')) {
+    throw new Error(`无法精确派生平衡来源旧表 profile：${tableName}`);
+  }
+  if (migrated) {
+    // SQLite 会把 ALTER ADD COLUMN 字段写在原字段与表级约束之间，必须精确复现该目标 SQL。
+    const firstConstraintIndex = legacyClauses.findIndex(isTableConstraintClause);
+    const sourceColumnIndex = firstConstraintIndex < 0 ? legacyClauses.length : firstConstraintIndex;
+    legacyClauses.splice(
+      sourceColumnIndex,
+      0,
+      'source_batch_id INTEGER REFERENCES import_batches(id) ON DELETE SET NULL',
+      'source_row_number INTEGER'
+    );
+  }
+  return `CREATE TABLE ${tableName} (\n  ${legacyClauses.join(',\n  ')}\n);`;
+}
+
+/** 构造两张平衡表经 ALTER ADD COLUMN 后唯一已审核的 SQL override。 */
+function buildEnergyBalanceImportSourceMigratedSqlOverrides(schemaText) {
+  return new Map([
+    [
+      'table:energy_balance_boundaries:energy_balance_boundaries',
+      buildEnergyBalanceImportSourceProfileTableSql(schemaText, 'energy_balance_boundaries', true)
+    ],
+    [
+      'table:energy_balance_items:energy_balance_items',
+      buildEnergyBalanceImportSourceProfileTableSql(schemaText, 'energy_balance_items', true)
+    ]
+  ]);
+}
+
+/** 判断 CREATE TABLE 顶层片段是否为 strategy_rules provenance 字段或成对约束。 */
+function isStrategyRulesProvenanceClause(clause) {
+  if (isSqlColumnClause(clause, 'source_batch_id') || isSqlColumnClause(clause, 'source_row_number')) {
+    return true;
+  }
+  const normalizedClause = normalizeSqlContractText(clause);
+  return normalizedClause.startsWith('foreign key ( source_batch_id )')
+    || (normalizedClause.startsWith('check (')
+      && normalizedClause.includes('source_batch_id')
+      && normalizedClause.includes('source_row_number'));
+}
+
+/** 从当前 schema 精确派生 strategy_rules v2 predecessor 建表 SQL。 */
+function buildStrategyRulesPredecessorTableSql(schemaText) {
+  const canonicalTableSql = extractNamedCreateStatement(schemaText, 'table', 'strategy_rules');
+  const bodyStart = canonicalTableSql.indexOf('(');
+  const bodyEnd = canonicalTableSql.lastIndexOf(')');
+  if (!canonicalTableSql || bodyStart < 0 || bodyEnd <= bodyStart) {
+    throw new Error('无法从 canonical schema 提取 strategy_rules predecessor 建表 SQL。');
+  }
+  const canonicalClauses = splitSqlDefinitionClauses(canonicalTableSql.slice(bodyStart + 1, bodyEnd));
+  const removedClauses = canonicalClauses.filter(isStrategyRulesProvenanceClause);
+  const predecessorClauses = canonicalClauses.filter((clause) => !isStrategyRulesProvenanceClause(clause));
+  if (removedClauses.length !== 4
+    || predecessorClauses.some((clause) => normalizeSqlContractText(clause).includes('source_batch_id')
+      || normalizeSqlContractText(clause).includes('source_row_number'))) {
+    throw new Error('strategy_rules provenance predecessor profile 无法由 canonical schema 精确派生。');
+  }
+  return `CREATE TABLE strategy_rules (\n  ${predecessorClauses.join(',\n  ')}\n);`;
+}
+
+/** 构造 strategy_rules v2 predecessor 的唯一 SQL override。 */
+function buildStrategyRulesPredecessorSqlOverrides(schemaText) {
+  return new Map([
+    [
+      'table:strategy_rules:strategy_rules',
+      buildStrategyRulesPredecessorTableSql(schemaText)
+    ]
+  ]);
+}
+
+/** 精确校验 strategy_rules v2 predecessor profile，拒绝 partial 或未知 SQL 漂移。 */
+function assertStrategyRulesPredecessorSchemaProfile(
+  db,
+  schemaText,
+  canonicalProfile,
+  predecessorOverrides = buildStrategyRulesPredecessorSqlOverrides(schemaText)
+) {
+  const issues = compareSchemaObjectProfile(
+    readSchemaObjectProfile(db),
+    canonicalProfile,
+    new Set(),
+    predecessorOverrides
+  );
+  if (issues.length > 0) {
+    const error = new Error('当前 SQLite 不符合 strategy_rules provenance 已授权 predecessor profile。');
+    error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+    error.details = { profileStage: 'strategy-rules-predecessor', issues: issues.slice(0, 20) };
+    throw error;
+  }
+  return predecessorOverrides;
+}
+
+/** 迁移 strategy_rules provenance，同时保留业务行、主键、高水位、索引及入向外键。 */
+function migrateStrategyRulesProvenance(
+  db,
+  schemaText,
+  canonicalProfile = buildCanonicalSchemaObjectProfile(schemaText),
+  predecessorOverrides = buildStrategyRulesPredecessorSqlOverrides(schemaText)
+) {
+  assertStrategyRulesPredecessorSchemaProfile(
+    db,
+    schemaText,
+    canonicalProfile,
+    predecessorOverrides
+  );
+  const oldColumns = [
+    'id', 'rule_code', 'rule_name', 'rule_version', 'formula_version', 'metric_code',
+    'threshold_operator', 'threshold_value', 'threshold_min', 'threshold_max',
+    'threshold_unit', 'reduction_rate', 'priority', 'evidence_requirements_json',
+    'recommendation_text', 'source', 'effective_start_utc', 'effective_end_utc',
+    'source_timezone', 'status', 'created_at', 'updated_at'
+  ];
+  const oldRows = db.prepare(`SELECT ${oldColumns.join(', ')} FROM strategy_rules ORDER BY id`).all();
+  const sequenceRow = db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'strategy_rules'").get();
+  const oldMaxId = oldRows.reduce((maximum, row) => Math.max(maximum, Number(row.id)), 0);
+  const preservedIndexes = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'strategy_rules' AND sql IS NOT NULL ORDER BY name"
+  ).all().map((row) => row.sql);
+  const preservedTriggers = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'strategy_rules' AND sql IS NOT NULL ORDER BY name"
+  ).all().map((row) => row.sql);
+
+  db.exec('DROP TABLE IF EXISTS temp.strategy_rules__migration_backup');
+  db.exec('CREATE TEMP TABLE strategy_rules__migration_backup AS SELECT * FROM strategy_rules ORDER BY id');
+  db.exec('DROP TABLE strategy_rules');
+  db.exec(extractNamedCreateStatement(schemaText, 'table', 'strategy_rules'));
+  db.exec(`INSERT INTO strategy_rules (${[
+    'id', 'source_batch_id', 'source_row_number', ...oldColumns.slice(1)
+  ].join(', ')}) SELECT ${[
+    'id', 'NULL', 'NULL', ...oldColumns.slice(1)
+  ].join(', ')} FROM temp.strategy_rules__migration_backup ORDER BY id`);
+  preservedIndexes.forEach((sql) => db.exec(sql));
+  preservedTriggers.forEach((sql) => db.exec(sql));
+
+  const targetSequence = Math.max(
+    Number(sequenceRow?.seq || 0),
+    oldMaxId
+  );
+  if (sequenceRow) {
+    db.prepare("UPDATE sqlite_sequence SET seq = ? WHERE name = 'strategy_rules'").run(targetSequence);
+  } else if (targetSequence > 0) {
+    db.prepare("INSERT INTO sqlite_sequence (name, seq) VALUES ('strategy_rules', ?)").run(targetSequence);
+  }
+  db.exec('DROP TABLE temp.strategy_rules__migration_backup');
+
+  const newRows = db.prepare(`SELECT ${oldColumns.join(', ')} FROM strategy_rules ORDER BY id`).all();
+  if (JSON.stringify(newRows) !== JSON.stringify(oldRows)) {
+    const error = new Error('strategy_rules provenance 迁移未逐值保留历史业务行。');
+    error.code = 'STRATEGY_RULES_MIGRATION_DATA_LOSS';
+    throw error;
+  }
+  const invalidProvenance = db.prepare(`SELECT id FROM strategy_rules
+    WHERE source_batch_id IS NOT NULL OR source_row_number IS NOT NULL LIMIT 1`).get();
+  if (invalidProvenance) {
+    const error = new Error('历史正式 strategy_rules provenance 必须保持 NULL/NULL。');
+    error.code = 'STRATEGY_RULES_MIGRATION_PROVENANCE_INVALID';
+    error.details = invalidProvenance;
+    throw error;
+  }
+  return { predecessorOverrides, migrated: true };
+}
+
+/** 迁移后精确复核 strategy_rules canonical profile 与历史 NULL/NULL provenance。 */
+function assertStrategyRulesMigratedSchemaProfile(
+  db,
+  schemaText,
+  canonicalProfile,
+  targetOverrides = new Map()
+) {
+  const issues = compareSchemaObjectProfile(
+    readSchemaObjectProfile(db),
+    canonicalProfile,
+    new Set(),
+    targetOverrides
+  );
+  if (issues.length > 0) {
+    const error = new Error('strategy_rules provenance 迁移后未命中 canonical schema profile。');
+    error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+    error.details = { profileStage: 'strategy-rules-migrated', issues: issues.slice(0, 20) };
+    throw error;
+  }
+  const invalidProvenance = db.prepare(`SELECT id FROM strategy_rules
+    WHERE source_batch_id IS NOT NULL OR source_row_number IS NOT NULL LIMIT 1`).get();
+  if (invalidProvenance) {
+    const error = new Error('strategy_rules 历史正式规则不得被回填 provenance。');
+    error.code = 'STRATEGY_RULES_MIGRATION_PROVENANCE_INVALID';
+    error.details = invalidProvenance;
+    throw error;
+  }
+}
+
+/** 在隔离内存库执行 schema，生成不受业务数据影响的 canonical 对象 profile。 */
+function buildCanonicalSchemaObjectProfile(schemaText) {
+  const Database = loadDatabaseDriver();
+  const referenceDb = new Database(':memory:');
+  try {
+    registerEnergyAnalysisSqliteFunctions(referenceDb);
+    referenceDb.exec(schemaText);
+    return readSchemaObjectProfile(referenceDb);
+  } finally {
+    referenceDb.close();
+  }
+}
+
+/** 精确生成缺少两张后置动作治理表及其索引的 predecessor profile。 */
+function buildLegacyDemoPostActionSchemaProfile(schemaText, sqlOverrides = new Map()) {
+  const Database = loadDatabaseDriver();
+  const referenceDb = new Database(':memory:');
+  try {
+    registerEnergyAnalysisSqliteFunctions(referenceDb);
+    referenceDb.exec(schemaText);
+    referenceDb.exec(`DROP TRIGGER IF EXISTS trg_demo_dataset_runs_post_action_dataset_update;
+      DROP TABLE demo_post_action_outputs;
+      DROP TABLE demo_post_action_runs;`);
+    const profile = readSchemaObjectProfile(referenceDb);
+    return {
+      profile,
+      sqlOverrides,
+      fingerprint: calculateSchemaObjectProfileFingerprint(profile, sqlOverrides)
+    };
+  } finally {
+    referenceDb.close();
+  }
+}
+
+/** 返回新切片治理对象在完整 canonical profile 中的显式对象键。 */
+function getDemoPostActionSchemaObjectKeys(canonicalProfile) {
+  const postActionTriggerKeys = new Set([
+    'trigger:trg_demo_dataset_runs_post_action_dataset_update:demo_dataset_runs'
+  ]);
+  return new Set([...canonicalProfile.entries()]
+    .filter(([key, schemaObject]) => (
+      ['demo_post_action_runs', 'demo_post_action_outputs'].includes(schemaObject.tableName)
+      || postActionTriggerKeys.has(key)
+    ))
+    .map(([key]) => key));
+}
+
+/** 比较实际对象与指定 canonical profile，返回缺失、额外和 SQL 漂移对象。 */
+function compareSchemaObjectProfile(actualProfile, canonicalProfile, omittedKeys, sqlOverrides) {
+  const expectedKeys = [...canonicalProfile.keys()].filter((key) => !omittedKeys.has(key)).sort();
+  const actualKeys = [...actualProfile.keys()].sort();
+  const issues = [];
+  expectedKeys.filter((key) => !actualProfile.has(key)).forEach((key) => issues.push(`missing:${key}`));
+  actualKeys.filter((key) => !canonicalProfile.has(key) || omittedKeys.has(key))
+    .forEach((key) => issues.push(`unexpected:${key}`));
+  expectedKeys.filter((key) => actualProfile.has(key)).forEach((key) => {
+    const actualSql = actualProfile.get(key).sql;
+    const expectedSql = sqlOverrides.get(key) || canonicalProfile.get(key).sql;
+    if (normalizeSchemaObjectProfileSql(actualSql) !== normalizeSchemaObjectProfileSql(expectedSql)) {
+      issues.push(`changed:${key}`);
+    }
+  });
+  return issues;
+}
+
+/**
+ * 从全新 canonical 与平衡来源 ALTER 两个已审核 profile 中选择精确匹配项。
+ * @returns {object} 迁移后 canonical 复核继续使用的 profile、SQL override 和指纹。
+ */
+function selectDemoPostActionPredecessorSchemaProfile(db, schemaText, admissionFingerprint) {
+  // 实际对象 profile 只读取 sqlite_master，不接触业务数据。
+  const actualProfile = readSchemaObjectProfile(db);
+  // canonical 候选保持 schema.sql 全新建表物理结构。
+  const canonicalCandidate = buildLegacyDemoPostActionSchemaProfile(schemaText);
+  canonicalCandidate.profileName = 'canonical';
+  // ALTER 候选仅替换两张平衡表 SQL，其他对象仍必须与 canonical 完全一致。
+  const alteredCandidate = buildLegacyDemoPostActionSchemaProfile(
+    schemaText,
+    buildEnergyBalanceImportSourceMigratedSqlOverrides(schemaText)
+  );
+  alteredCandidate.profileName = 'energy-balance-alter';
+  // 候选评估同时要求对象 profile 和正式 fingerprint 精确命中。
+  const candidateEvaluations = [canonicalCandidate, alteredCandidate].map((candidate) => ({
+    ...candidate,
+    issues: compareSchemaObjectProfile(actualProfile, candidate.profile, new Set(), candidate.sqlOverrides)
+  }));
+  const matchingCandidates = candidateEvaluations.filter((candidate) => (
+    candidate.fingerprint === admissionFingerprint && candidate.issues.length === 0
+  ));
+  if (matchingCandidates.length === 1) return matchingCandidates[0];
+
+  const error = new Error('当前 SQLite 不符合后置动作治理表已授权 predecessor profile。');
+  error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+  error.details = {
+    profileStage: 'demo-post-action-predecessor',
+    actual: admissionFingerprint,
+    expectedProfiles: candidateEvaluations.map((candidate) => ({
+      profileName: candidate.profileName,
+      fingerprint: candidate.fingerprint
+    })),
+    issues: candidateEvaluations.flatMap((candidate) => (
+      candidate.issues.map((issue) => `${candidate.profileName}:${issue}`)
+    )).slice(0, 20)
+  };
+  throw error;
+}
+
+/** 基于 schema.sql 和已审核 ALTER 契约生成当前版及唯一 predecessor 的可信 profiles。 */
+function buildTrustedCanonicalSchemaProfiles() {
+  const schemaText = fs.readFileSync(schemaPath, 'utf8')
+    .replace(/^PRAGMA journal_mode = WAL;\s*/i, '')
+    .replace(/^PRAGMA foreign_keys = ON;\s*/i, '');
+  const canonicalProfile = buildCanonicalSchemaObjectProfile(schemaText);
+  const alteredOverrides = buildEnergyBalanceImportSourceMigratedSqlOverrides(schemaText);
+  const currentProfiles = [
+    {
+      profileName: 'canonical',
+      profile: canonicalProfile,
+      sqlOverrides: new Map(),
+      fingerprint: calculateSchemaObjectProfileFingerprint(canonicalProfile)
+    },
+    {
+      profileName: 'energy-balance-alter',
+      profile: canonicalProfile,
+      sqlOverrides: alteredOverrides,
+      fingerprint: calculateSchemaObjectProfileFingerprint(canonicalProfile, alteredOverrides)
+    }
+  ];
+  const strategyPredecessorOverrides = buildStrategyRulesPredecessorSqlOverrides(schemaText);
+  const strategyPredecessorProfiles = [
+    {
+      profileName: 'strategy-rules-predecessor',
+      profile: canonicalProfile,
+      sqlOverrides: strategyPredecessorOverrides,
+      fingerprint: calculateSchemaObjectProfileFingerprint(canonicalProfile, strategyPredecessorOverrides)
+    },
+    {
+      profileName: 'energy-balance-alter-strategy-rules-predecessor',
+      profile: canonicalProfile,
+      sqlOverrides: new Map([
+        ...alteredOverrides.entries(),
+        ...strategyPredecessorOverrides.entries()
+      ]),
+      fingerprint: calculateSchemaObjectProfileFingerprint(canonicalProfile, new Map([
+        ...alteredOverrides.entries(),
+        ...strategyPredecessorOverrides.entries()
+      ]))
+    }
+  ];
+  return new Map([
+    [CANONICAL_SCHEMA_VERSION, currentProfiles],
+    [CANONICAL_SCHEMA_PREDECESSOR_VERSION, strategyPredecessorProfiles]
+  ]);
+}
+
+/**
+ * 将来源 SQLite 的实际 sqlite_master 与代码控制的可信 profile 精确比对。
+ * metadata 只用于选择允许版本，不能自行声明新的可信 fingerprint。
+ */
+function matchTrustedCanonicalSchemaProfile(db, schemaVersion) {
+  const trustedProfiles = buildTrustedCanonicalSchemaProfiles().get(schemaVersion) || [];
+  const actualProfile = readSchemaObjectProfile(db);
+  const actualFingerprint = calculateSchemaFingerprint(db);
+  const evaluations = trustedProfiles.map((candidate) => ({
+    ...candidate,
+    issues: compareSchemaObjectProfile(actualProfile, candidate.profile, new Set(), candidate.sqlOverrides)
+  }));
+  const selected = evaluations.find((candidate) => (
+    candidate.fingerprint === actualFingerprint && candidate.issues.length === 0
+  ));
+  if (!selected) {
+    const error = new Error('当前 SQLite 未命中代码控制的 canonical schema profile。');
+    error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+    error.details = {
+      schemaVersion,
+      actualFingerprint,
+      expectedProfiles: evaluations.map((candidate) => ({
+        profileName: candidate.profileName,
+        fingerprint: candidate.fingerprint
+      })),
+      issues: evaluations.flatMap((candidate) => candidate.issues
+        .map((issue) => `${candidate.profileName}:${issue}`)).slice(0, 20)
+    };
+    throw error;
+  }
+  return {
+    profileName: selected.profileName,
+    fingerprint: selected.fingerprint,
+    schemaVersion,
+    profile: selected.profile,
+    sqlOverrides: selected.sqlOverrides
+  };
+}
+
+/** 构造 canonical profile 不匹配错误，统一保持初始化 fail-closed。 */
+function createEnergyBalanceImportSourceProfileError(profileStage, issues) {
+  const error = new Error('当前 SQLite 不符合已授权的平衡来源 canonical 迁移 profile。');
+  error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+  error.details = { profileStage, issues: issues.slice(0, 20) };
+  return error;
+}
+
+/** 构造后置动作治理表 profile 不匹配错误，避免复用其他领域的错误语义。 */
+function createDemoPostActionSchemaProfileError(profileStage, issues) {
+  const error = new Error('当前 SQLite 不符合已授权的后置动作治理 canonical 迁移 profile。');
+  error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+  error.details = { profileStage, issues: issues.slice(0, 20) };
+  return error;
+}
+
+/**
+ * 在任何结构写入前验证旧库仅缺少已授权的平衡来源对象，并拒绝全部无关漂移。
+ * @returns {Map<string, object>} 后续迁移后复核复用的 canonical profile。
+ */
+function assertEnergyBalanceImportSourceLegacySchemaProfile(
+  db,
+  schemaText,
+  canonicalProfile = buildCanonicalSchemaObjectProfile(schemaText)
+) {
+  const actualProfile = readSchemaObjectProfile(db);
+  const balanceSourceKeys = new Set(ENERGY_BALANCE_IMPORT_SOURCE_SCHEMA_OBJECTS.map(getSchemaObjectProfileKey));
+  const flowSourceKeys = ENERGY_FLOW_IMPORT_SOURCE_TRIGGER_SCHEMA_OBJECTS.map(getSchemaObjectProfileKey);
+  const presentFlowSourceKeys = flowSourceKeys.filter((key) => actualProfile.has(key));
+  if (![0, flowSourceKeys.length].includes(presentFlowSourceKeys.length)) {
+    throw createEnergyBalanceImportSourceProfileError('legacy', ['partial:energy-flow-import-source-triggers']);
+  }
+  if (presentFlowSourceKeys.length === 0) {
+    flowSourceKeys.forEach((key) => balanceSourceKeys.add(key));
+  }
+  const legacySqlOverrides = new Map([
+    [
+      'table:energy_balance_boundaries:energy_balance_boundaries',
+      buildEnergyBalanceImportSourceProfileTableSql(schemaText, 'energy_balance_boundaries', false)
+    ],
+    [
+      'table:energy_balance_items:energy_balance_items',
+      buildEnergyBalanceImportSourceProfileTableSql(schemaText, 'energy_balance_items', false)
+    ]
+  ]);
+  const issues = compareSchemaObjectProfile(actualProfile, canonicalProfile, balanceSourceKeys, legacySqlOverrides);
+  if (issues.length > 0) {
+    throw createEnergyBalanceImportSourceProfileError('legacy', issues);
+  }
+  return canonicalProfile;
+}
+
+/** 迁移后要求对象集合与 canonical 完全一致，仅允许两个表呈现已审核的 ALTER 补列结构。 */
+function assertEnergyBalanceImportSourceMigratedSchemaProfile(db, schemaText, canonicalProfile) {
+  const migratedSqlOverrides = buildEnergyBalanceImportSourceMigratedSqlOverrides(schemaText);
+  const issues = compareSchemaObjectProfile(
+    readSchemaObjectProfile(db),
+    canonicalProfile,
+    new Set(),
+    migratedSqlOverrides
+  );
+  if (issues.length > 0) {
+    throw createEnergyBalanceImportSourceProfileError('migrated', issues);
+  }
+}
+
+/** 提交前复核后置动作跨表数据合同，防止历史弱表中的 dataset 或输出计数漂移进入 canonical。 */
+function verifyDemoPostActionDataContracts(db) {
+  const datasetMismatch = db.prepare(`SELECT action.action_run_id AS actionRunId,
+      action.run_id AS runId, action.dataset_id AS datasetId,
+      dataset.dataset_id AS parentDatasetId
+    FROM demo_post_action_runs action
+    LEFT JOIN demo_dataset_runs dataset ON dataset.run_id = action.run_id
+    WHERE dataset.run_id IS NULL OR dataset.dataset_id <> action.dataset_id
+    ORDER BY action.action_run_id LIMIT 1`).get();
+  if (datasetMismatch) {
+    const error = new Error('后置动作运行 dataset_id 与父运行不一致。');
+    error.code = 'DEMO_POST_ACTION_DATASET_MISMATCH';
+    error.details = datasetMismatch;
+    throw error;
+  }
+  const outputCountMismatch = db.prepare(`SELECT action.action_run_id AS actionRunId,
+      action.output_count AS outputCount, COUNT(output.output_id) AS actualOutputCount
+    FROM demo_post_action_runs action
+    LEFT JOIN demo_post_action_outputs output ON output.action_run_id = action.action_run_id
+    GROUP BY action.action_run_id
+    HAVING action.output_count <> COUNT(output.output_id)
+    ORDER BY action.action_run_id LIMIT 1`).get();
+  if (outputCountMismatch) {
+    const error = new Error('后置动作运行 output_count 与输出明细行数不一致。');
+    error.code = 'DEMO_POST_ACTION_OUTPUT_COUNT_MISMATCH';
+    error.details = outputCountMismatch;
+    throw error;
+  }
+}
+
+/** 运行 SQLite 完整性检查，任何非 ok 结果或外键违规都阻断初始化完成。 */
+function verifyCanonicalDatabaseIntegrity(db) {
+  const quickCheck = db.prepare('PRAGMA quick_check').all().map((row) => Object.values(row)[0]);
+  const integrityCheck = db.prepare('PRAGMA integrity_check').all().map((row) => Object.values(row)[0]);
+  const foreignKeyViolations = db.prepare('PRAGMA foreign_key_check').all();
+  if (quickCheck.length !== 1 || quickCheck[0] !== 'ok') {
+    const error = new Error('SQLite quick_check 未通过。');
+    error.code = 'SQLITE_QUICK_CHECK_FAILED';
+    error.details = { quickCheck };
+    throw error;
+  }
+  if (integrityCheck.length !== 1 || integrityCheck[0] !== 'ok') {
+    const error = new Error('SQLite integrity_check 未通过。');
+    error.code = 'SQLITE_INTEGRITY_CHECK_FAILED';
+    error.details = { integrityCheck };
+    throw error;
+  }
+  if (foreignKeyViolations.length > 0) {
+    const error = new Error('SQLite foreign_key_check 未通过。');
+    error.code = 'SQLITE_FOREIGN_KEY_CHECK_FAILED';
+    error.details = { foreignKeyViolations };
+    throw error;
+  }
+  return { quickCheck: 'ok', integrityCheck: 'ok', foreignKeyViolations: [] };
+}
+
 function initDatabase(options = {}) {
   const targetDatabasePath = options.databasePath ? path.resolve(options.databasePath) : databasePath;
   const isOfficialDatabase = path.resolve(targetDatabasePath) === path.resolve(databasePath);
@@ -4637,10 +5899,9 @@ function initDatabase(options = {}) {
     reconcilePendingDatabaseRestore();
   }
   const db = openDatabase({ databasePath: targetDatabasePath, admissionPermit: options.admissionPermit });
-  const wasForeignKeysEnabled = db.pragma('foreign_keys', { simple: true }) === 1;
-  db.pragma('foreign_keys = OFF');
   try {
-    // journal_mode 不能在活动事务中切换；所有正式库和恢复候选库都必须在统一事务前进入 WAL。
+    const existingIdentity = readExistingSchemaIdentity(db);
+    // journal_mode 不能在活动事务中切换；正式库只允许当前版本或唯一 predecessor 的精确迁移。
     const journalMode = db.pragma('journal_mode = WAL', { simple: true });
     if (String(journalMode).toLowerCase() !== 'wal') {
       throw new Error('SQLite 数据库未能进入 WAL 日志模式。');
@@ -4649,30 +5910,113 @@ function initDatabase(options = {}) {
     const transactionalSchema = schema
       .replace(/^PRAGMA journal_mode = WAL;\s*/i, '')
       .replace(/^PRAGMA foreign_keys = ON;\s*/i, '');
-    // 全部可事务化业务迁移、治理 DDL、RBAC 和完成标记共享同一初始化事务，后段失败时结构和数据整体回滚。
-    db.transaction(() => {
-      migrateCarbonEmissionsStatusCheck(db);
-      migrateImportAuditSourceColumns(db);
-      migrateEnergyRecordLedgerColumns(db);
-      migrateImportBatchesImportTypeCheck(db);
-      migrateSupplierCodeKeys(db);
-      migrateGenerationRecordsDataSourceCheck(db);
-      migrateEnergyBudgetImportSourceColumns(db);
-      ensureEnergyBudgetsTable(db);
-      migratePredictionRunsStatusCheck(db);
-      ensurePredictionConfigsTable(db);
-      migrateBenchmarkTargetsImportSourceColumns(db);
-      migrateEnergyBenchmarkInternalRevisions(db);
-      migrateEnergyBalanceCalculationRuns(db);
-      ensureEnergyAnalysisTables(db, schema);
-      ensureCarbonActivityTables(db, schema);
-      ensureCarbonEmissionReportTables(db, schema);
-      ensureGhgReportTables(db, schema);
-      db.exec('DROP INDEX IF EXISTS ux_carbon_emissions_record_method');
-      prepareDemoGovernanceTablesForMigration(db);
+    // canonical v3 仅允许当前版本幂等初始化，或 v2 strategy_rules provenance 唯一 predecessor 迁移。
+    let canonicalSchemaMigrated = false;
+    let canonicalSchemaProfile = null;
+    let strategyRulesProvenanceMigrated = false;
+    let strategyRulesCanonicalProfile = null;
+    let trustedAdmissionProfile = null;
+    const shouldDisableForeignKeys = !existingIdentity.fresh;
+    const wasForeignKeysEnabled = db.pragma('foreign_keys', { simple: true }) === 1;
+    if (shouldDisableForeignKeys && wasForeignKeysEnabled) {
+      // strategy_rules 是 strategy_rule_hits 的父表，必须在同一初始化事务开始前关闭 pragma，
+      // 否则 SQLite 会阻止父表重建且无法在活动事务内切换 foreign_keys。
+      db.pragma('foreign_keys = OFF');
+    }
+    try {
+      db.transaction(() => {
+        if (!existingIdentity.fresh) {
+          trustedAdmissionProfile = matchTrustedCanonicalSchemaProfile(
+            db,
+            existingIdentity.version
+          );
+          const admissionFingerprint = calculateSchemaFingerprint(db);
+          if (admissionFingerprint !== existingIdentity.fingerprint
+            || admissionFingerprint !== trustedAdmissionProfile.fingerprint) {
+            const error = new Error('当前 SQLite 结构与代码控制的 schema fingerprint 不一致。');
+            error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+            error.details = {
+              metadataFingerprint: existingIdentity.fingerprint,
+              actual: admissionFingerprint,
+              trustedFingerprint: trustedAdmissionProfile.fingerprint
+            };
+            throw error;
+          }
+          if (existingIdentity.version === CANONICAL_SCHEMA_PREDECESSOR_VERSION) {
+            strategyRulesProvenanceMigrated = true;
+            strategyRulesCanonicalProfile = buildCanonicalSchemaObjectProfile(transactionalSchema);
+          }
+        }
+
+      if (!existingIdentity.fresh) {
+        const balanceSourceColumnsMissing = ['energy_balance_boundaries', 'energy_balance_items']
+          .some((tableName) => {
+            const columns = getTableColumns(db, tableName);
+            return !columns.includes('source_batch_id') || !columns.includes('source_row_number');
+          });
+        if (balanceSourceColumnsMissing) {
+          // 来源列必须先于 schema 中引用这些列的索引创建，且旧库必须精确匹配已审查 profile。
+          canonicalSchemaProfile = buildCanonicalSchemaObjectProfile(transactionalSchema);
+          assertEnergyBalanceImportSourceLegacySchemaProfile(db, transactionalSchema, canonicalSchemaProfile);
+          canonicalSchemaMigrated = migrateEnergyBalanceImportSourceColumns(db);
+        }
+        if (strategyRulesProvenanceMigrated) {
+          migrateStrategyRulesProvenance(
+            db,
+            transactionalSchema,
+            strategyRulesCanonicalProfile,
+            trustedAdmissionProfile?.sqlOverrides
+          );
+        }
+      }
+      // schema.sql 是最终新库唯一事实源；已有非 canonical 库在进入这里前已被拒绝。
       db.exec(transactionalSchema);
-      ensureDemoGovernanceTables(db, schema);
+      assertDemoGovernanceContracts(db);
+      verifyDemoPostActionDataContracts(db);
       ensureRbacSeedData(db);
+      const fingerprint = calculateSchemaFingerprint(db);
+      if (existingIdentity.fresh) {
+        // 全新 schema 执行完成后、写入 app_meta 前必须命中代码控制的 current canonical profile。
+        trustedAdmissionProfile = matchTrustedCanonicalSchemaProfile(db, CANONICAL_SCHEMA_VERSION);
+        if (trustedAdmissionProfile.profileName !== 'canonical'
+          || trustedAdmissionProfile.fingerprint !== fingerprint) {
+          const error = new Error('全新 SQLite 结构与代码控制的 current canonical fingerprint 不一致。');
+          error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+          error.details = {
+            actual: fingerprint,
+            trustedProfileName: trustedAdmissionProfile.profileName,
+            trustedFingerprint: trustedAdmissionProfile.fingerprint
+          };
+          throw error;
+        }
+      }
+      if (!existingIdentity.fresh && canonicalSchemaMigrated) {
+        // 迁移后仍需精确复核目标 profile，任何无关对象漂移都会使事务回滚。
+        assertEnergyBalanceImportSourceMigratedSchemaProfile(
+          db,
+          transactionalSchema,
+          canonicalSchemaProfile || buildCanonicalSchemaObjectProfile(transactionalSchema)
+        );
+      }
+      if (!existingIdentity.fresh && strategyRulesProvenanceMigrated) {
+        const targetOverrides = new Map(trustedAdmissionProfile?.sqlOverrides || []);
+        targetOverrides.delete('table:strategy_rules:strategy_rules');
+        assertStrategyRulesMigratedSchemaProfile(
+          db,
+          transactionalSchema,
+          strategyRulesCanonicalProfile || buildCanonicalSchemaObjectProfile(transactionalSchema),
+          targetOverrides
+        );
+      }
+      if (!existingIdentity.fresh
+        && !canonicalSchemaMigrated
+        && !strategyRulesProvenanceMigrated
+        && fingerprint !== existingIdentity.fingerprint) {
+        const error = new Error('当前 SQLite 结构与已登记 canonical schema fingerprint 不一致。');
+        error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+        error.details = { expected: existingIdentity.fingerprint, actual: fingerprint };
+        throw error;
+      }
       const upsertAppMeta = db.prepare(
         `INSERT INTO app_meta (key, value, updated_at)
          VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -4680,11 +6024,17 @@ function initDatabase(options = {}) {
            value = excluded.value,
            updated_at = excluded.updated_at`
       );
-      upsertAppMeta.run('schema_stage', 'demo-context-foundation');
-      upsertAppMeta.run('schema_version', '2026-08-13-demo-context-v4');
-    })();
+      upsertAppMeta.run('schema_stage', CANONICAL_SCHEMA_STAGE);
+      upsertAppMeta.run('schema_version', CANONICAL_SCHEMA_VERSION);
+      upsertAppMeta.run('schema_fingerprint_algorithm', CANONICAL_SCHEMA_FINGERPRINT_ALGORITHM);
+      upsertAppMeta.run('schema_fingerprint', fingerprint);
+      // 完整性检查必须在 canonical DDL、RBAC seed 与 metadata 同一事务提交前完成。
+      verifyCanonicalDatabaseIntegrity(db);
+    }).immediate();
+    } finally {
+      if (wasForeignKeysEnabled) db.pragma('foreign_keys = ON');
+    }
   } finally {
-    if (wasForeignKeysEnabled) db.pragma('foreign_keys = ON');
     db.close();
   }
 
@@ -4709,8 +6059,12 @@ module.exports = {
   backupsDir,
   databasePath,
   schemaPath,
+  CANONICAL_SCHEMA_FINGERPRINT_ALGORITHM,
+  CANONICAL_SCHEMA_STAGE,
+  CANONICAL_SCHEMA_VERSION,
   IMPORT_BATCH_TYPES,
   blockDatabaseAdmission,
+  calculateSchemaFingerprint,
   buildCarbonEmissionsStatusMigrationSql,
   buildGenerationRecordsDataSourceMigrationSql,
   buildImportBatchesImportTypeMigrationSql,
@@ -4729,6 +6083,8 @@ module.exports = {
   ensurePredictionConfigsTable,
   ensureRbacSeedData,
   generationRecordsDataSourceCheckAllowsUpload,
+  getCanonicalSeedContract,
+  readCanonicalSeedContract,
   getDatabaseAdmissionState,
   getDatabaseInfo,
   getTableColumns,
@@ -4750,7 +6106,8 @@ module.exports = {
   prepareDemoGovernanceTablesForMigration,
   preflightDemoGovernanceData,
   migrateEnergyBalanceCalculationRuns,
-  migrateEnergyRecordLedgerColumns,
+  migrateEnergyBalanceImportSourceColumns,
+  migrateStrategyRulesProvenance,
   migrateEnergyBudgetImportSourceColumns,
   migrateGenerationRecordsDataSourceCheck,
   migrateImportAuditSourceColumns,
@@ -4759,8 +6116,11 @@ module.exports = {
   migrateCarbonMenuPermissionStructure,
   migrateLegacyImportMenuPermission,
   migrateSupplierCodeKeys,
+  matchTrustedCanonicalSchemaProfile,
   normalizeSqlContractText,
   openDatabase,
+  openReadOnlyDatabase,
   poisonDatabaseAdmission,
-  unblockDatabaseAdmission
+  unblockDatabaseAdmission,
+  verifyCanonicalDatabaseIntegrity
 };

@@ -63,11 +63,14 @@ function multipart(server, pathname, filename, content, token) {
     const comparisonDb = openDatabase();
     try {
       const electricityId = comparisonDb.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
+      const organizationUnitId = comparisonDb.prepare(`INSERT INTO organization_units
+        (unit_code, unit_name, unit_path, unit_type, status, created_at, updated_at)
+        VALUES ('BUD-API-OU', '接口无预算单元', '/BUD-API-OU', 'department', 'active', datetime('now'), datetime('now'))`).run().lastInsertRowid;
       comparisonDb.prepare(`INSERT INTO energy_records (
-        energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value,
-        organization, site, department, duplicate_key, record_status, created_at, updated_at
-      ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'), datetime('now'))`)
-        .run(electricityId, '2029-01', '2029-01', 'kWh', 18, 'kWh', 18, '接口总厂', '接口园区', '接口无预算单元', 'budget-api-missing-budget');
+        energy_type_id, organization_unit_id, original_month, normalized_month, original_unit,
+        original_value, normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'), datetime('now'))`)
+        .run(electricityId, organizationUnitId, '2029-01', '2029-01', 'kWh', 18, 'kWh', 18, 'budget-api-missing-budget');
     } finally {
       comparisonDb.close();
     }

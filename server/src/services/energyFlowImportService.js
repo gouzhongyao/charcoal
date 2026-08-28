@@ -8,6 +8,13 @@ const {
   bindDemoContextPreviewInTransaction,
   markDemoContextExecutedInTransaction
 } = require('./demoContextService');
+const {
+  createDemoOwnershipInsertWitness,
+  markDemoContextExecutedWithOwnershipTransaction,
+  registerImportedDemoOwnershipInTransaction,
+  runWithDemoOwnershipTransactionAsync,
+  updateDemoExecuteAuditInOwnershipTransaction
+} = require('./demoOwnershipService');
 const { parseImportBuffer } = require('./import/parser');
 const { normalizeUnitAndValue } = require('./import/normalization');
 const {
@@ -83,6 +90,11 @@ const CONFIG_STATUSES = Object.freeze(['active', 'inactive']);
 const IMPORTABLE_RECORD_STATUS = 'active';
 // 能流模型和公式版本使用阶段契约冻结值。
 const ENERGY_FLOW_VERSION = ENERGY_ANALYSIS_VERSIONS.energyFlow;
+// ownership registrar 的内部关系错误必须投影为不泄漏实现细节的稳定能流领域码。
+const ENERGY_FLOW_OWNERSHIP_RELATION_ERROR_CODES = Object.freeze({
+  DEMO_OWNERSHIP_RELATION_ENDPOINT_NOT_OWNED: 'ENERGY_FLOW_OWNERSHIP_RELATION_ENDPOINT_NOT_OWNED',
+  DEMO_OWNERSHIP_RELATION_CROSS_RUN: 'ENERGY_FLOW_OWNERSHIP_RELATION_CROSS_RUN'
+});
 
 /**
  * 判断导入单元格是否为空白。
@@ -674,26 +686,73 @@ function requireModelImportAuditOptions(options = {}) {
   };
 }
 
-/** 在统一事务内通过能流领域服务插入模型候选和操作审计。 */
+/** 在统一事务内插入模型候选；演示路径只通过私有 witness helper 写入。 */
 function insertEnergyFlowModelCandidates(input) {
   const auditOptions = requireModelImportAuditOptions(input.options);
   const importedIds = [];
   const importedItems = [];
+  const demoInsertSql = `INSERT INTO energy_flow_models (
+    source_batch_id, source_row_number, model_code, model_name, source, document_no, version,
+    effective_start_utc, effective_end_utc, source_timezone, status
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
   input.candidateRows.forEach((candidate, index) => {
     if (typeof input.options.beforeInsertCandidate === 'function') input.options.beforeInsertCandidate({ candidate, index, db: input.db });
-    const importedModel = createEnergyFlowModel(candidate, { db: input.db, ...auditOptions });
-    importedIds.push(importedModel.id);
-    importedItems.push({ id: importedModel.id, candidateRowId: candidate.candidateRowId, sourceRowNumber: candidate.sourceRowNumber });
-    if (typeof input.options.afterInsertCandidate === 'function') input.options.afterInsertCandidate({ candidate, index, importedId: importedModel.id, db: input.db });
+    let importedId;
+    let rowWitness;
+    if (input.transactionScope) {
+      rowWitness = createDemoOwnershipInsertWitness({
+        transactionScope: input.transactionScope,
+        entityType: 'energy_flow_model',
+        sourceBatchId: input.batchId,
+        sourceRowNumber: candidate.sourceRowNumber,
+        insertSql: demoInsertSql,
+        insertParams: [
+          input.batchId,
+          candidate.sourceRowNumber,
+          candidate.modelCode,
+          candidate.modelName,
+          candidate.source,
+          candidate.documentNo,
+          candidate.version,
+          candidate.effectiveStartUtc,
+          candidate.effectiveEndUtc,
+          candidate.sourceTimeZone,
+          candidate.status
+        ]
+      });
+      importedId = Number(rowWitness.lastInsertRowid);
+    } else {
+      const importedModel = createEnergyFlowModel(candidate, {
+        db: input.db,
+        ...auditOptions,
+        sourceBatchId: input.batchId,
+        sourceRowNumber: candidate.sourceRowNumber
+      });
+      importedId = importedModel.id;
+    }
+    importedIds.push(importedId);
+    importedItems.push({
+      id: importedId,
+      candidateRowId: candidate.candidateRowId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      ...(rowWitness ? { rowWitness } : {})
+    });
+    if (typeof input.options.afterInsertCandidate === 'function') input.options.afterInsertCandidate({ candidate, index, importedId, db: input.db });
   });
   return { imported: importedIds.length, importedIds, importedItems };
 }
 
-// 模型导入复用单批次底座的固定描述器。
+// 模型导入复用单批次底座，并以静态 artifact 22 绑定演示 ownership。
 const ENERGY_FLOW_MODEL_IMPORT_DESCRIPTOR = Object.freeze({
   templateType: ENERGY_FLOW_MODEL_TEMPLATE_TYPE,
   buildPreview: buildEnergyFlowModelImportPreview,
-  insertCandidates: insertEnergyFlowModelCandidates
+  insertCandidates: insertEnergyFlowModelCandidates,
+  demoOwnership: Object.freeze({
+    artifactKey: '22-energy-flow-models',
+    entityType: 'energy_flow_model',
+    batchRole: 'primary',
+    expectedImportType: 'energy_flow_model'
+  })
 });
 
 /** 创建能流模型 preview 审计批次。 */
@@ -955,22 +1014,21 @@ function buildEnergyFlowNodeImportPreview(input) {
 }
 
 /**
- * 在调用方事务内插入已复核的节点候选。
+ * 在调用方事务内插入已复核的节点候选；演示路径只通过私有 witness helper 写入。
  * @param {object} input 数据库、批次和候选上下文。
  * @returns {object} 插入结果。
  */
 function insertEnergyFlowNodeCandidates(input) {
-  const insertNode = input.db.prepare(
-    `INSERT INTO energy_flow_nodes (
-       source_batch_id, source_row_number, energy_flow_model_id, node_code, node_name,
-       node_type, organization_unit_id, x, y, status
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
+  const insertNodeSql = `INSERT INTO energy_flow_nodes (
+    source_batch_id, source_row_number, energy_flow_model_id, node_code, node_name,
+    node_type, organization_unit_id, x, y, status
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const insertNode = input.transactionScope ? null : input.db.prepare(insertNodeSql);
   const importedIds = [];
   const importedItems = [];
   input.candidateRows.forEach((candidate, index) => {
     if (typeof input.options.beforeInsertCandidate === 'function') input.options.beforeInsertCandidate({ candidate, index, db: input.db });
-    const result = insertNode.run(
+    const insertParams = [
       input.batchId,
       candidate.sourceRowNumber,
       candidate.energyFlowModelId,
@@ -981,20 +1039,43 @@ function insertEnergyFlowNodeCandidates(input) {
       candidate.x,
       candidate.y,
       candidate.status
-    );
-    const importedId = Number(result.lastInsertRowid);
+    ];
+    const rowWitness = input.transactionScope
+      ? createDemoOwnershipInsertWitness({
+        transactionScope: input.transactionScope,
+        entityType: 'energy_flow_node',
+        sourceBatchId: input.batchId,
+        sourceRowNumber: candidate.sourceRowNumber,
+        insertSql: insertNodeSql,
+        insertParams
+      })
+      : null;
+    const importedId = rowWitness
+      ? Number(rowWitness.lastInsertRowid)
+      : Number(insertNode.run(...insertParams).lastInsertRowid);
     importedIds.push(importedId);
-    importedItems.push({ id: importedId, candidateRowId: candidate.candidateRowId, sourceRowNumber: candidate.sourceRowNumber });
+    importedItems.push({
+      id: importedId,
+      candidateRowId: candidate.candidateRowId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      ...(rowWitness ? { rowWitness } : {})
+    });
     if (typeof input.options.afterInsertCandidate === 'function') input.options.afterInsertCandidate({ candidate, index, importedId, db: input.db });
   });
   return { imported: importedIds.length, importedIds, importedItems };
 }
 
-// 节点导入复用单批次底座的固定描述器。
+// 节点导入复用单批次底座，并以静态 artifact 23 绑定演示 ownership。
 const ENERGY_FLOW_NODE_IMPORT_DESCRIPTOR = Object.freeze({
   templateType: ENERGY_FLOW_NODE_TEMPLATE_TYPE,
   buildPreview: buildEnergyFlowNodeImportPreview,
-  insertCandidates: insertEnergyFlowNodeCandidates
+  insertCandidates: insertEnergyFlowNodeCandidates,
+  demoOwnership: Object.freeze({
+    artifactKey: '23-energy-flow-nodes',
+    entityType: 'energy_flow_node',
+    batchRole: 'primary',
+    expectedImportType: 'energy_flow_node'
+  })
 });
 
 /**
@@ -1944,8 +2025,102 @@ function authorizePersistedBundleExecute(body, edgeBatch, recordBatch, securedPr
   });
 }
 
+/** 将锁内 preview 中明确 skipped 的行投影为不登记 ownership 的结果。 */
+function buildSkippedEnergyFlowOwnershipRecords(preview, contract, batchRole) {
+  return (Array.isArray(preview.items) ? preview.items : [])
+    .filter((item) => item && item.status === 'skipped')
+    .map((item) => ({
+      entityType: contract.recordKind,
+      entityPk: null,
+      batchRole,
+      sourceRowNumber: Number.isSafeInteger(item.sourceRowNumber) ? item.sourceRowNumber : null,
+      reason: String(item.issues?.find((issue) => issue.severity === 'warning')?.code
+        || 'DUPLICATE_ENERGY_FLOW_RECORD_SKIPPED').slice(0, 256)
+    }));
+}
+
 /**
- * 在同一事务内先插入边，再将候选临时引用解析为真实 ID 后插入显式边值。
+ * 只依据当前 ownership 私有事务内的业务事实构造服务端 contains 关系。
+ * @param {object} insertion 本次双批次插入结果及 witness。
+ * @param {object} transactionDb ownership 私有事务只读 facade。
+ * @returns {object[]} model/node/edge/record 完整关系集合。
+ */
+function buildInsertedEnergyFlowOwnershipRelations(insertion, transactionDb) {
+  const edgeOwnershipRecords = Array.isArray(insertion.edge.ownershipRecords)
+    ? insertion.edge.ownershipRecords
+    : [];
+  const recordOwnershipRecords = Array.isArray(insertion.record.ownershipRecords)
+    ? insertion.record.ownershipRecords
+    : [];
+  const modelIds = new Set();
+  edgeOwnershipRecords.forEach((record) => {
+    const modelId = Number(record.rowWitness?.projectedRow?.energy_flow_model_id);
+    if (Number.isSafeInteger(modelId) && modelId > 0) modelIds.add(modelId);
+  });
+  recordOwnershipRecords.forEach((record) => {
+    const modelId = Number(record.rowWitness?.projectedRow?.energy_flow_model_id);
+    if (Number.isSafeInteger(modelId) && modelId > 0) modelIds.add(modelId);
+  });
+  if (modelIds.size > 0 && (!transactionDb || typeof transactionDb.prepare !== 'function')) {
+    throw badRequest('能流 ownership 关系生成缺少服务端事务只读查询上下文。', {
+      code: 'ENERGY_FLOW_OWNERSHIP_RELATION_CONTEXT_REQUIRED'
+    });
+  }
+  const relations = [];
+  const seen = new Set();
+  const appendRelation = (from, to) => {
+    const relation = { from, to, relationType: 'contains' };
+    const key = `${from.entityType}\0${from.entityPk}\0${to.entityType}\0${to.entityPk}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      relations.push(relation);
+    }
+  };
+  // model/node 是独立 artifact 的事实；仅当 model 已存在 active registry 时生成 model 族关系，避免 24 单独导入接管正式 model/node。
+  const registeredModelIds = new Set();
+  modelIds.forEach((modelId) => {
+    const modelRegistry = transactionDb.prepare(`SELECT registry_id AS registryId FROM demo_data_registry
+      WHERE entity_type = 'energy_flow_model' AND entity_pk = ? AND cleaned_at IS NULL`).get(String(modelId));
+    if (!modelRegistry) return;
+    registeredModelIds.add(modelId);
+    const nodes = transactionDb.prepare(
+      'SELECT id FROM energy_flow_nodes WHERE energy_flow_model_id = ? ORDER BY id'
+    ).all(modelId);
+    nodes.forEach((node) => appendRelation(
+      { entityType: 'energy_flow_model', entityPk: modelId },
+      { entityType: 'energy_flow_node', entityPk: Number(node.id) }
+    ));
+  });
+  edgeOwnershipRecords.forEach((record) => {
+    const modelId = Number(record.rowWitness?.projectedRow?.energy_flow_model_id);
+    if (!registeredModelIds.has(modelId)) return;
+    appendRelation(
+      { entityType: 'energy_flow_model', entityPk: modelId },
+      { entityType: ENERGY_FLOW_EDGE_BATCH_CONTRACT.recordKind, entityPk: record.entityPk }
+    );
+  });
+  recordOwnershipRecords.forEach((record) => {
+    const modelId = Number(record.rowWitness?.projectedRow?.energy_flow_model_id);
+    if (!registeredModelIds.has(modelId)) return;
+    appendRelation(
+      { entityType: 'energy_flow_model', entityPk: modelId },
+      { entityType: ENERGY_FLOW_RECORD_BATCH_CONTRACT.recordKind, entityPk: record.entityPk }
+    );
+  });
+  recordOwnershipRecords.forEach((record) => {
+    // edge ID 来自服务端 record witness；无论 edge 是本批新插入还是既有事实，均交由 registrar 校验同 run 活跃 ownership。
+    const edgeId = record.rowWitness?.projectedRow?.energy_flow_edge_id;
+    if (edgeId === null || edgeId === undefined) return;
+    appendRelation(
+      { entityType: ENERGY_FLOW_EDGE_BATCH_CONTRACT.recordKind, entityPk: edgeId },
+      { entityType: ENERGY_FLOW_RECORD_BATCH_CONTRACT.recordKind, entityPk: record.entityPk }
+    );
+  });
+  return relations;
+}
+
+/**
+ * 在同一正式无 context 事务内先插入边，再将候选临时引用解析为真实 ID 后插入显式边值。
  * @param {object} input 数据库、两个批次、重算 preview 和选项。
  * @returns {object} 双表插入结果。
  */
@@ -1961,7 +2136,7 @@ function insertEnergyFlowBundleCandidates(input) {
        source_batch_id, source_row_number, energy_flow_model_id, energy_flow_edge_id,
        start_utc, end_utc, source_timezone, original_unit, original_value,
        source_type, source_mapping_json, formula_version, record_status
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const edgeIdByCandidateRowId = new Map();
   const edgeImportedIds = [];
@@ -2014,7 +2189,8 @@ function insertEnergyFlowBundleCandidates(input) {
       candidate.originalValue,
       candidate.sourceType,
       candidate.sourceMappingJson,
-      candidate.formulaVersion
+      candidate.formulaVersion,
+      IMPORTABLE_RECORD_STATUS
     );
     const importedId = Number(result.lastInsertRowid);
     recordImportedIds.push(importedId);
@@ -2022,8 +2198,125 @@ function insertEnergyFlowBundleCandidates(input) {
     if (typeof input.options.afterInsertRecord === 'function') input.options.afterInsertRecord({ candidate, index, importedId, edgeId: Number(edgeId), db: input.db });
   });
   return {
-    edge: { imported: edgeImportedIds.length, importedIds: edgeImportedIds, importedItems: edgeImportedItems },
-    record: { imported: recordImportedIds.length, importedIds: recordImportedIds, importedItems: recordImportedItems }
+    edge: { imported: edgeImportedIds.length, importedIds: edgeImportedIds, importedItems: edgeImportedItems, ownershipRecords: [] },
+    record: { imported: recordImportedIds.length, importedIds: recordImportedIds, importedItems: recordImportedItems, ownershipRecords: [] }
+  };
+}
+
+/** 在同一 ownership 私有事务中声明式插入双角色业务行并生成不可伪造的 row witness。 */
+function insertDemoEnergyFlowBundleCandidates(input) {
+  const edgeInsertSql = `INSERT INTO energy_flow_edges (
+    source_batch_id, source_row_number, energy_flow_model_id, edge_code,
+    from_node_id, to_node_id, energy_type_id, unit, source_type, source_mapping_json, status
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const recordInsertSql = `INSERT INTO energy_flow_records (
+    source_batch_id, source_row_number, energy_flow_model_id, energy_flow_edge_id,
+    start_utc, end_utc, source_timezone, original_unit, original_value,
+    source_type, source_mapping_json, formula_version, record_status
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const edgeIdByCandidateRowId = new Map();
+  const edgeImportedItems = [];
+  const edgeOwnershipRecords = [];
+  input.edgeCandidates.forEach((candidate, index) => {
+    if (typeof input.options.beforeInsertEdge === 'function') input.options.beforeInsertEdge({ candidate, index, db: input.db });
+    const rowWitness = createDemoOwnershipInsertWitness({
+      transactionScope: input.transactionScope,
+      entityType: ENERGY_FLOW_EDGE_BATCH_CONTRACT.recordKind,
+      sourceBatchId: input.edgeBatchId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      insertSql: edgeInsertSql,
+      insertParams: [
+        input.edgeBatchId,
+        candidate.sourceRowNumber,
+        candidate.energyFlowModelId,
+        candidate.edgeCode,
+        candidate.fromNodeId,
+        candidate.toNodeId,
+        candidate.energyTypeId,
+        candidate.unit,
+        candidate.sourceType,
+        candidate.sourceMappingJson,
+        candidate.status
+      ]
+    });
+    const entityPk = Number(rowWitness.lastInsertRowid);
+    edgeIdByCandidateRowId.set(candidate.candidateRowId, entityPk);
+    edgeImportedItems.push({ id: entityPk, candidateRowId: candidate.candidateRowId, sourceRowNumber: candidate.sourceRowNumber });
+    edgeOwnershipRecords.push({
+      entityType: ENERGY_FLOW_EDGE_BATCH_CONTRACT.recordKind,
+      entityPk,
+      batchRole: 'edge',
+      sourceRowNumber: candidate.sourceRowNumber,
+      rowWitness
+    });
+    if (typeof input.options.afterInsertEdge === 'function') input.options.afterInsertEdge({ candidate, index, importedId: entityPk, db: input.db });
+  });
+
+  const recordImportedItems = [];
+  const recordOwnershipRecords = [];
+  input.recordCandidates.forEach((candidate, index) => {
+    if (typeof input.options.beforeInsertRecord === 'function') input.options.beforeInsertRecord({ candidate, index, db: input.db });
+    const edgeId = candidate.edgeReferenceKind === 'candidate'
+      ? edgeIdByCandidateRowId.get(candidate.edgeCandidateRowId)
+      : candidate.existingEdgeId;
+    if (!Number.isSafeInteger(Number(edgeId)) || Number(edgeId) <= 0) {
+      throw badRequest('显式边值候选边临时引用无法解析。', {
+        code: 'ENERGY_FLOW_RECORD_EDGE_REFERENCE_UNRESOLVED',
+        candidateRowId: candidate.candidateRowId,
+        edgeCandidateRowId: candidate.edgeCandidateRowId
+      });
+    }
+    const rowWitness = createDemoOwnershipInsertWitness({
+      transactionScope: input.transactionScope,
+      entityType: ENERGY_FLOW_RECORD_BATCH_CONTRACT.recordKind,
+      sourceBatchId: input.recordBatchId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      insertSql: recordInsertSql,
+      insertParams: [
+        input.recordBatchId,
+        candidate.sourceRowNumber,
+        candidate.energyFlowModelId,
+        Number(edgeId),
+        candidate.startUtc,
+        candidate.endUtc,
+        candidate.sourceTimeZone,
+        candidate.originalUnit,
+        candidate.originalValue,
+        candidate.sourceType,
+        candidate.sourceMappingJson,
+        candidate.formulaVersion,
+        IMPORTABLE_RECORD_STATUS
+      ]
+    });
+    const entityPk = Number(rowWitness.lastInsertRowid);
+    recordImportedItems.push({
+      id: entityPk,
+      candidateRowId: candidate.candidateRowId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      energyFlowEdgeId: Number(edgeId)
+    });
+    recordOwnershipRecords.push({
+      entityType: ENERGY_FLOW_RECORD_BATCH_CONTRACT.recordKind,
+      entityPk,
+      batchRole: 'record',
+      sourceRowNumber: candidate.sourceRowNumber,
+      rowWitness
+    });
+    if (typeof input.options.afterInsertRecord === 'function') input.options.afterInsertRecord({ candidate, index, importedId: entityPk, edgeId: Number(edgeId), db: input.db });
+  });
+  return {
+    edge: {
+      imported: edgeImportedItems.length,
+      importedIds: edgeImportedItems.map((item) => item.id),
+      importedItems: edgeImportedItems,
+      ownershipRecords: edgeOwnershipRecords
+    },
+    record: {
+      imported: recordImportedItems.length,
+      importedIds: recordImportedItems.map((item) => item.id),
+      importedItems: recordImportedItems,
+      ownershipRecords: recordOwnershipRecords
+    }
   };
 }
 
@@ -2062,6 +2355,12 @@ function normalizeSafeEnergyFlowExecuteError(error, stage = 'preflight') {
   const detailCode = error?.details?.code;
   if (isSafeEnergyFlowExecuteErrorCode(detailCode)) {
     return badRequest(getSafeEnergyFlowExecuteErrorMessage(detailCode), { code: detailCode });
+  }
+  const ownershipRelationCode = ENERGY_FLOW_OWNERSHIP_RELATION_ERROR_CODES[String(error?.code || '')];
+  if (ownershipRelationCode) {
+    return badRequest(getSafeEnergyFlowExecuteErrorMessage(ownershipRelationCode), {
+      code: ownershipRelationCode
+    });
   }
   const stageCode = stage === 'backup'
     ? 'ENERGY_ANALYSIS_IMPORT_BACKUP_FAILED'
@@ -2135,6 +2434,11 @@ async function executeEnergyFlowBundleImport(body = {}, options = {}) {
   let trustedPairContext = null;
   let failureStage = 'preflight';
   try {
+    if (Object.prototype.hasOwnProperty.call(body, 'relations')) {
+      throw badRequest('能流 ownership 关系只能由服务端根据业务事实生成。', {
+        code: 'ENERGY_FLOW_BUNDLE_CLIENT_RELATIONS_FORBIDDEN'
+      });
+    }
     const edgeBatchId = normalizeBatchId(body.edgeBatchId);
     const recordBatchId = normalizeBatchId(body.recordBatchId);
     if (edgeBatchId === recordBatchId) {
@@ -2173,13 +2477,220 @@ async function executeEnergyFlowBundleImport(body = {}, options = {}) {
         secret,
         trustedPairContext
       );
-      if (!authorization.valid) throwAuthorizationFailure(authorization);
-      if (Number(authorization.expectedWouldImport || 0) <= 0) throwAuthorizationFailure(authorization);
+      const allowNoInsertedRecords = (candidateAuthorization) => Boolean(
+        options.demoContext
+        && Number(candidateAuthorization.expectedWouldImport || 0) === 0
+        && Array.isArray(candidateAuthorization.errors)
+        && candidateAuthorization.errors.length === 1
+        && candidateAuthorization.errors[0].code === 'ENERGY_ANALYSIS_IMPORT_EMPTY_CANDIDATES_REJECTED'
+      );
+      const requireAuthorization = (candidateAuthorization) => {
+        if (!candidateAuthorization.valid && !allowNoInsertedRecords(candidateAuthorization)) {
+          throwAuthorizationFailure(candidateAuthorization);
+        }
+        if (Number(candidateAuthorization.expectedWouldImport || 0) <= 0
+          && !allowNoInsertedRecords(candidateAuthorization)) {
+          throwAuthorizationFailure(candidateAuthorization);
+        }
+      };
+      requireAuthorization(authorization);
 
       const createBackup = typeof options.createBackup === 'function' ? options.createBackup : backupService.createBackup;
       if (typeof options.beforeBundleBeginImmediate === 'function') {
         await options.beforeBundleBeginImmediate({ edgeBatchId, recordBatchId });
       }
+      if (options.demoContext) {
+        failureStage = 'lock';
+        return await runWithDemoOwnershipTransactionAsync(databaseContext.db, async (transactionScope, transactionDb) => {
+          const latestEdgeBatch = getImportAuditBatchDetail(edgeBatchId, { db: transactionDb, includeIssues: false });
+          const latestRecordBatch = getImportAuditBatchDetail(recordBatchId, { db: transactionDb, includeIssues: false });
+          const latestTrustedPair = createTrustedBundlePairContext(latestEdgeBatch, latestRecordBatch, template);
+          if (latestTrustedPair.fingerprint !== trustedPairContext.fingerprint) {
+            throw badRequest('锁内双批次配对与首次校验结果不一致。', { code: 'ENERGY_FLOW_BUNDLE_PAIR_CHANGED' });
+          }
+          assertBundleRequestMetadata(latestTrustedPair, body);
+          const latestSafeFile = readSafeUploadFile(uploadsDir, latestTrustedPair.storedFilename, {
+            expectedSizeBytes: latestTrustedPair.fileSizeBytes,
+            maxSizeBytes: options.maxFileSizeBytes
+          });
+          if (latestSafeFile.fileSha256 !== latestTrustedPair.fileSha256) {
+            throw badRequest('锁内原文件 SHA-256 与 preview 批次不一致。', {
+              code: 'ENERGY_ANALYSIS_IMPORT_CURRENT_FILE_SHA256_MISMATCH'
+            });
+          }
+          const latestDomainPreview = buildEnergyFlowBundleImportPreview({
+            db: transactionDb,
+            buffer: latestSafeFile.buffer,
+            originalFilename: latestTrustedPair.originalFilename,
+            fileSha256: latestSafeFile.fileSha256,
+            fileSizeBytes: latestSafeFile.sizeBytes,
+            template,
+            options
+          });
+          const latestSecuredPreview = securePreviewResult(latestDomainPreview, {
+            template,
+            fileSha256: latestSafeFile.fileSha256,
+            secret
+          });
+          const latestAuthorization = authorizePersistedBundleExecute(
+            body,
+            latestEdgeBatch,
+            latestRecordBatch,
+            latestSecuredPreview,
+            latestSafeFile.buffer,
+            secret,
+            latestTrustedPair
+          );
+          requireAuthorization(latestAuthorization);
+          trustedPairContext = latestTrustedPair;
+
+          failureStage = 'backup';
+          backup = await createBackup({
+            reason: ENERGY_ANALYSIS_IMPORT_BACKUP_REASON,
+            skipCheckpoint: true
+          });
+
+          failureStage = 'write';
+          const insertion = insertDemoEnergyFlowBundleCandidates({
+            db: transactionDb,
+            transactionScope,
+            edgeBatchId,
+            recordBatchId,
+            edgeCandidates: latestDomainPreview.edgePreview.candidateRows,
+            recordCandidates: latestDomainPreview.recordPreview.candidateRows,
+            options
+          });
+          const edgeSkipped = buildSkippedEnergyFlowOwnershipRecords(
+            latestDomainPreview.edgePreview,
+            ENERGY_FLOW_EDGE_BATCH_CONTRACT,
+            'edge'
+          );
+          const recordSkipped = buildSkippedEnergyFlowOwnershipRecords(
+            latestDomainPreview.recordPreview,
+            ENERGY_FLOW_RECORD_BATCH_CONTRACT,
+            'record'
+          );
+          const insertedRecords = [
+            ...insertion.edge.ownershipRecords,
+            ...insertion.record.ownershipRecords
+          ];
+          const ownership = registerImportedDemoOwnershipInTransaction({
+            transactionScope,
+            demoContext: {
+              ...options.demoContext,
+              uploadFileSha256: latestSafeFile.fileSha256,
+              previewDigest: latestSecuredPreview.previewAuditDigest
+            },
+            actorUserId: options.demoContext.userId,
+            batchBindings: [
+              { batchId: edgeBatchId, batchRole: 'edge', entityType: ENERGY_FLOW_EDGE_BATCH_CONTRACT.recordKind },
+              { batchId: recordBatchId, batchRole: 'record', entityType: ENERGY_FLOW_RECORD_BATCH_CONTRACT.recordKind }
+            ],
+            insertedRecords,
+            skippedRecords: [...edgeSkipped, ...recordSkipped],
+            noInsertedRecords: insertedRecords.length === 0,
+            relations: buildInsertedEnergyFlowOwnershipRelations(insertion, transactionDb)
+          });
+          const safeBackup = projectSafeBackupSummary(backup);
+          const buildRoleExecute = (contract, rolePreview, roleInsertion) => ({
+            executed: true,
+            writesBusinessRecords: roleInsertion.imported > 0,
+            templateType: template.templateType,
+            operation: contract.operation,
+            recordKind: contract.recordKind,
+            bundleOperation: template.operation,
+            bundleRecordKind: template.recordKind,
+            importTypes: [...template.importTypes],
+            importType: contract.importType,
+            uploadGroupId: latestTrustedPair.uploadGroupId,
+            imported: roleInsertion.imported,
+            skipped: Number(rolePreview.summary.skipped || 0),
+            blocked: Number(rolePreview.summary.blocked || 0),
+            warnings: Number(rolePreview.summary.warnings || 0),
+            errors: Number(rolePreview.summary.errors || 0),
+            expectedWouldImport: rolePreview.candidateRows.length,
+            combinedExpectedWouldImport: latestSecuredPreview.candidateRows.length,
+            candidateRowIds: rolePreview.candidateRows.map((row) => row.candidateRowId),
+            candidateRows: rolePreview.candidateRows,
+            combinedCandidateRowIds: latestSecuredPreview.candidateRowIds,
+            previewSignature: latestSecuredPreview.previewSignature,
+            previewAuditDigest: latestSecuredPreview.previewAuditDigest,
+            previewAudit: latestSecuredPreview.previewAudit,
+            importedIds: roleInsertion.importedIds,
+            importedItems: roleInsertion.importedItems,
+            backup: safeBackup
+          });
+          const edgeExecuteResult = buildRoleExecute(
+            ENERGY_FLOW_EDGE_BATCH_CONTRACT,
+            latestDomainPreview.edgePreview,
+            insertion.edge
+          );
+          const recordExecuteResult = buildRoleExecute(
+            ENERGY_FLOW_RECORD_BATCH_CONTRACT,
+            latestDomainPreview.recordPreview,
+            insertion.record
+          );
+          const updateRoleAudit = (batchId, rolePreview, roleInsertion, executeResult) => (
+            updateDemoExecuteAuditInOwnershipTransaction({
+              transactionScope,
+              batchId,
+              status: Number(rolePreview.summary.blocked || 0) > 0 || Number(rolePreview.summary.skipped || 0) > 0
+                ? 'completed_with_errors'
+                : 'completed',
+              statistics: {
+                totalRows: Number(rolePreview.summary.totalRows || 0),
+                successCount: roleInsertion.imported,
+                failureCount: Number(rolePreview.summary.blocked || 0),
+                skippedCount: Number(rolePreview.summary.skipped || 0)
+              },
+              executeResult,
+              backup,
+              errorSummary: buildPreviewErrorSummary(rolePreview.summary)
+            })
+          );
+          const edgeAudit = updateRoleAudit(
+            edgeBatchId,
+            latestDomainPreview.edgePreview,
+            insertion.edge,
+            edgeExecuteResult
+          );
+          const recordAudit = updateRoleAudit(
+            recordBatchId,
+            latestDomainPreview.recordPreview,
+            insertion.record,
+            recordExecuteResult
+          );
+          markDemoContextExecutedWithOwnershipTransaction({
+            transactionScope,
+            demoContext: {
+              token: options.demoContext.token,
+              userId: options.demoContext.userId,
+              artifactKey: options.demoContext.artifactKey,
+              handlerKey: options.demoContext.handlerKey
+            },
+            uploadFileSha256: latestSafeFile.fileSha256,
+            previewDigest: latestSecuredPreview.previewAuditDigest,
+            batchBindings: [
+              { batchId: edgeBatchId, batchRole: 'edge' },
+              { batchId: recordBatchId, batchRole: 'record' }
+            ]
+          });
+          return {
+            executed: true,
+            writesBusinessRecords: insertedRecords.length > 0,
+            uploadGroupId: latestTrustedPair.uploadGroupId,
+            edgeBatchId,
+            recordBatchId,
+            imported: insertion.edge.imported + insertion.record.imported,
+            edge: { ...edgeExecuteResult, ownership },
+            record: { ...recordExecuteResult, ownership },
+            backup: safeBackup,
+            edgeBatch: edgeAudit,
+            recordBatch: recordAudit
+          };
+        });
+      }
+
       let transactionActive = false;
       try {
         failureStage = 'lock';

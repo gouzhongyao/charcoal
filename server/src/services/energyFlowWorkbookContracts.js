@@ -2,9 +2,11 @@
 
 const { AppError } = require('../utils/errors');
 const {
+  normalizeUserVisibleWallClockMinuteInput
+} = require('../utils/userVisibleDateTime');
+const {
   convertSourceWallClockRangeToUtc,
-  isValidIanaTimezone,
-  isStrictWallClockMinute
+  isValidIanaTimezone
 } = require('./sourceWallClockService');
 
 // 固定完整能流工作簿模板身份与安全边界。
@@ -171,19 +173,27 @@ function normalizeWorkbookNumber(issues, rowNumber, fieldName, value, options = 
 
 /** 校验来源墙钟区间并转换为 UTC 秒精度。 */
 function normalizeWorkbookWallClockRange(issues, rowNumber, startValue, endValue, timeZone, fieldPrefix) {
-  const start = normalizeWorkbookText(startValue);
-  const end = normalizeWorkbookText(endValue);
+  const startInput = normalizeWorkbookText(startValue);
+  const endInput = normalizeWorkbookText(endValue);
   const zone = normalizeWorkbookText(timeZone);
   if (zone.normalize('NFKC').trim().length > 100) {
     pushWorkbookIssue(issues, createWorkbookIssue(rowNumber, '来源时区', 'ENERGY_FLOW_WORKBOOK_FIELD_TOO_LONG', '来源时区超过 100 个字符。', timeZone));
   }
-  if (!start || !end || !zone) {
+  if (!startInput || !endInput || !zone) {
     pushWorkbookIssue(issues,createWorkbookIssue(rowNumber, fieldPrefix, 'ENERGY_FLOW_WORKBOOK_REQUIRED_FIELD_MISSING', `${fieldPrefix} 起止时间和来源时区均为必填项。`, null));
-    return { startWallClock: start, endWallClock: end, sourceTimezone: zone, startUtc: null, endUtc: null };
+    return { startWallClock: startInput, endWallClock: endInput, sourceTimezone: zone, startUtc: null, endUtc: null };
   }
-  if (!isStrictWallClockMinute(start) || !isStrictWallClockMinute(end)) {
-    pushWorkbookIssue(issues,createWorkbookIssue(rowNumber, fieldPrefix, 'ENERGY_FLOW_WORKBOOK_WALL_CLOCK_INVALID', `${fieldPrefix} 必须使用 YYYY-MM-DDTHH:mm 来源墙钟格式。`, `${start}/${end}`));
-    return { startWallClock: start, endWallClock: end, sourceTimezone: zone, startUtc: null, endUtc: null };
+  let start;
+  let end;
+  try {
+    start = normalizeUserVisibleWallClockMinuteInput(startInput);
+    end = normalizeUserVisibleWallClockMinuteInput(endInput);
+  } catch (error) {
+    const code = error?.code === 'WALL_CLOCK_INPUT_SECOND_MUST_BE_ZERO'
+      ? 'ENERGY_FLOW_WORKBOOK_WALL_CLOCK_SECOND_MUST_BE_ZERO'
+      : 'ENERGY_FLOW_WORKBOOK_WALL_CLOCK_INVALID';
+    pushWorkbookIssue(issues,createWorkbookIssue(rowNumber, fieldPrefix, code, `${fieldPrefix} 必须使用 YYYY-MM-DD HH:mm:00 或历史 YYYY-MM-DDTHH:mm 来源墙钟格式，秒只能为 00。`, `${startInput}/${endInput}`));
+    return { startWallClock: startInput, endWallClock: endInput, sourceTimezone: zone, startUtc: null, endUtc: null };
   }
   if (!isValidIanaTimezone(zone)) {
     pushWorkbookIssue(issues,createWorkbookIssue(rowNumber, '来源时区', 'ENERGY_FLOW_WORKBOOK_TIMEZONE_INVALID', '来源时区必须是有效 IANA 时区。', zone));

@@ -23,7 +23,7 @@
           <el-table-column prop="emissionScope" label="排放范围" min-width="105" />
           <el-table-column prop="activityCategory" label="活动类别" min-width="150" />
           <el-table-column label="组织 / 能源" min-width="210"><template #default="scope">{{ scope.row.organizationUnitName }}（{{ scope.row.organizationUnitCode }}）<br />{{ scope.row.energyTypeName }}（{{ scope.row.energyTypeCode }}）</template></el-table-column>
-          <el-table-column label="来源墙钟" min-width="225"><template #default="scope">{{ scope.row.activityStartWallClock }}<br />至 {{ scope.row.activityEndWallClock }}</template></el-table-column>
+          <el-table-column label="来源墙钟" min-width="225"><template #default="scope">{{ formatSourceWallClockDisplay(scope.row.activityStartWallClock) }}<br />至 {{ formatSourceWallClockDisplay(scope.row.activityEndWallClock) }}</template></el-table-column>
           <el-table-column label="活动值" min-width="135"><template #default="scope">{{ formatNullableCarbonValue(scope.row.activityValue) }} {{ scope.row.activityUnit || '' }}</template></el-table-column>
           <el-table-column label="因子" min-width="180"><template #default="scope"><span v-if="scope.row.status === 'factor_missing'">—（factor_missing）</span><span v-else>{{ formatNullableCarbonValue(scope.row.factorValue) }} {{ scope.row.factorUnit || '' }}</span></template></el-table-column>
           <el-table-column label="排放量" min-width="185"><template #default="scope"><span v-if="scope.row.emissionValue === null">—（factor_missing）</span><span v-else>{{ formatNullableCarbonValue(scope.row.emissionValue) }} {{ scope.row.emissionUnit || '' }}</span></template></el-table-column>
@@ -37,7 +37,7 @@
           <el-table-column label="活动值" min-width="135"><template #default="scope">{{ formatNullableCarbonValue(scope.row.activityValue) }} {{ scope.row.activityUnit || '' }}</template></el-table-column>
           <el-table-column label="因子" min-width="180"><template #default="scope"><span v-if="scope.row.status === 'factor_missing'">—（factor_missing）</span><span v-else>{{ formatNullableCarbonValue(scope.row.factorValue) }}</span></template></el-table-column>
           <el-table-column label="排放量" min-width="185"><template #default="scope"><span v-if="scope.row.emissionValue === null">—（factor_missing）</span><span v-else>{{ formatNullableCarbonValue(scope.row.emissionValue) }} {{ scope.row.emissionUnit || '' }}</span></template></el-table-column>
-          <el-table-column prop="calculatedAt" label="计算时间（UTC）" min-width="190" />
+          <el-table-column label="计算时间（UTC）" min-width="190"><template #default="scope">{{ formatStrictUtcDateTimeDisplay(scope.row.calculatedAt) }}</template></el-table-column>
         </template>
         <el-table-column label="状态" width="120" fixed="right"><template #default="scope"><el-tag :type="carbonAccountingStatusType(scope.row.status)">{{ carbonAccountingStatusLabel(scope.row.status) }}</el-tag></template></el-table-column>
       </el-table>
@@ -59,6 +59,7 @@
 <script setup>
 import { computed } from 'vue';
 import PageState from '@/components/PageState.vue';
+import { formatSourceWallClockDisplay, formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 import {
   carbonAccountingStatusLabel,
   carbonAccountingStatusType,

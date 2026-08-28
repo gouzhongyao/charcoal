@@ -26,6 +26,13 @@ const {
   createEnergyAnalysisSingleBatchPreview,
   executeEnergyAnalysisSingleBatchImport
 } = require('./energyAnalysisSingleBatchImportService');
+const {
+  createDemoOwnershipInsertWitness,
+  deactivateShiftDefinitionSiblingsInOwnershipTransaction,
+  deactivateStrategyRuleSiblingsInOwnershipTransaction,
+  writeShiftDefinitionImportAuditInOwnershipTransaction,
+  writeStrategyRuleImportAuditInOwnershipTransaction
+} = require('./demoOwnershipService');
 
 // 三类配置导入固定模板 ID。
 const SHIFT_DEFINITION_TEMPLATE_TYPE = 'shift-definitions';
@@ -672,8 +679,89 @@ function writeConfigurationImportAudit(db, auditOptions, audit) {
   });
 }
 
-/** 在统一事务内插入班次定义候选。 */
+/** 在 ownership 私有事务内使用声明式 row witness 插入班次定义候选。 */
+function insertManagedShiftDefinitionCandidates(input) {
+  const importedIds = [];
+  const importedItems = [];
+  input.candidateRows.forEach((candidate, index) => {
+    if (typeof input.options.beforeInsertCandidate === 'function') {
+      input.options.beforeInsertCandidate({ candidate, index, db: input.db });
+    }
+    const nowUtc = new Date().toISOString();
+    if (candidate.status === 'active') {
+      deactivateShiftDefinitionSiblingsInOwnershipTransaction({
+        transactionScope: input.transactionScope,
+        shiftCode: candidate.shiftCode,
+        updatedAt: nowUtc
+      });
+    }
+    const normalized = normalizeShiftDefinitionInput(candidate);
+    const insertSql = `INSERT INTO shift_definitions (
+       source_batch_id, source_row_number, shift_code, shift_name,
+       start_minute, end_minute, crosses_midnight, source_timezone, source,
+       version, effective_start_utc, effective_end_utc, status, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    const insertParams = [
+      input.batchId,
+      candidate.sourceRowNumber,
+      normalized.shiftCode,
+      normalized.shiftName,
+      normalized.startMinute,
+      normalized.endMinute,
+      normalized.crossesMidnight ? 1 : 0,
+      normalized.sourceTimeZone,
+      normalized.source,
+      normalized.version,
+      normalized.effectiveStartUtc,
+      normalized.effectiveEndUtc,
+      normalized.status,
+      nowUtc,
+      nowUtc
+    ];
+    const rowWitness = createDemoOwnershipInsertWitness({
+      transactionScope: input.transactionScope,
+      entityType: 'shift_definition',
+      insertParams,
+      insertSql,
+      sourceBatchId: input.batchId,
+      sourceRowNumber: candidate.sourceRowNumber
+    });
+    const importedId = Number(rowWitness.lastInsertRowid);
+    writeShiftDefinitionImportAuditInOwnershipTransaction({
+      transactionScope: input.transactionScope,
+      actorUserId: input.options.actorUserId ?? input.options.demoContext?.userId,
+      actorIp: input.options.actorIp ?? null,
+      targetId: importedId,
+      batchId: input.batchId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      shiftCode: normalized.shiftCode,
+      version: normalized.version,
+      status: normalized.status,
+      createdAt: nowUtc
+    });
+    importedIds.push(importedId);
+    importedItems.push({
+      id: importedId,
+      candidateRowId: candidate.candidateRowId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      rowWitness
+    });
+    if (typeof input.options.afterInsertCandidate === 'function') {
+      input.options.afterInsertCandidate({
+        candidate,
+        index,
+        importedId,
+        rowWitness,
+        db: input.db
+      });
+    }
+  });
+  return { imported: importedIds.length, importedIds, importedItems };
+}
+
+/** 在统一事务内插入班次定义候选；正式路径保持既有数据库写 helper。 */
 function insertShiftDefinitionCandidates(input) {
+  if (input.transactionScope) return insertManagedShiftDefinitionCandidates(input);
   const auditOptions = requireConfigurationImportAuditOptions(input.options);
   const importedIds = [];
   const importedItems = [];
@@ -725,8 +813,96 @@ function insertTouSchemeCandidates(input) {
   return { imported: importedIds.length, importedIds, importedItems };
 }
 
-/** 在统一事务内插入受控策略规则，不执行策略。 */
+/** 在 ownership 私有事务内插入受控策略规则，只保存配置且返回待登记 row witness。 */
+function insertManagedStrategyRuleCandidates(input) {
+  const importedIds = [];
+  const importedItems = [];
+  input.candidateRows.forEach((candidate, index) => {
+    if (typeof input.options.beforeInsertCandidate === 'function') {
+      input.options.beforeInsertCandidate({ candidate, index, db: input.db });
+    }
+    const nowUtc = new Date().toISOString();
+    if (candidate.status === 'active') {
+      deactivateStrategyRuleSiblingsInOwnershipTransaction({
+        transactionScope: input.transactionScope,
+        ruleCode: candidate.ruleCode,
+        updatedAt: nowUtc
+      });
+    }
+    const normalized = normalizeStrategyRuleInput(candidate);
+    const insertSql = `INSERT INTO strategy_rules (
+       source_batch_id, source_row_number,
+       rule_code, rule_name, rule_version, formula_version, metric_code,
+       threshold_operator, threshold_value, threshold_min, threshold_max,
+       threshold_unit, reduction_rate, priority, evidence_requirements_json,
+       recommendation_text, source, effective_start_utc, effective_end_utc,
+       source_timezone, status, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    const insertParams = [
+      input.batchId,
+      candidate.sourceRowNumber,
+      normalized.ruleCode,
+      normalized.ruleName,
+      normalized.ruleVersion,
+      normalized.formulaVersion,
+      normalized.metricCode,
+      normalized.thresholdOperator,
+      normalized.thresholdValue,
+      normalized.thresholdMin,
+      normalized.thresholdMax,
+      normalized.thresholdUnit,
+      normalized.reductionRate,
+      normalized.priority,
+      normalized.evidenceRequirementsJson,
+      normalized.recommendationText,
+      normalized.source,
+      normalized.effectiveStartUtc,
+      normalized.effectiveEndUtc,
+      normalized.sourceTimeZone,
+      normalized.status,
+      nowUtc,
+      nowUtc
+    ];
+    const rowWitness = createDemoOwnershipInsertWitness({
+      transactionScope: input.transactionScope,
+      entityType: 'strategy_rule',
+      insertParams,
+      insertSql,
+      sourceBatchId: input.batchId,
+      sourceRowNumber: candidate.sourceRowNumber
+    });
+    const importedId = Number(rowWitness.lastInsertRowid);
+    writeStrategyRuleImportAuditInOwnershipTransaction({
+      transactionScope: input.transactionScope,
+      actorUserId: input.options.actorUserId ?? input.options.demoContext?.userId,
+      actorIp: input.options.actorIp ?? null,
+      targetId: importedId,
+      batchId: input.batchId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      ruleCode: normalized.ruleCode,
+      ruleVersion: normalized.ruleVersion,
+      formulaVersion: normalized.formulaVersion,
+      metricCode: normalized.metricCode,
+      status: normalized.status,
+      createdAt: nowUtc
+    });
+    importedIds.push(importedId);
+    importedItems.push({
+      id: importedId,
+      candidateRowId: candidate.candidateRowId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      rowWitness
+    });
+    if (typeof input.options.afterInsertCandidate === 'function') {
+      input.options.afterInsertCandidate({ candidate, index, importedId, rowWitness, db: input.db });
+    }
+  });
+  return { imported: importedIds.length, importedIds, importedItems };
+}
+
+/** 在统一事务内插入受控策略规则；正式路径保持 NULL/NULL provenance 且不执行策略。 */
 function insertStrategyRuleCandidates(input) {
+  if (input.transactionScope) return insertManagedStrategyRuleCandidates(input);
   const auditOptions = requireConfigurationImportAuditOptions(input.options);
   const importedIds = [];
   const importedItems = [];
@@ -754,7 +930,13 @@ function insertStrategyRuleCandidates(input) {
 const SHIFT_DEFINITION_IMPORT_DESCRIPTOR = Object.freeze({
   templateType: SHIFT_DEFINITION_TEMPLATE_TYPE,
   buildPreview: buildShiftDefinitionImportPreview,
-  insertCandidates: insertShiftDefinitionCandidates
+  insertCandidates: insertShiftDefinitionCandidates,
+  demoOwnership: Object.freeze({
+    artifactKey: '13-shift-definitions',
+    batchRole: 'primary',
+    entityType: 'shift_definition',
+    expectedImportType: 'shift_definition'
+  })
 });
 const TOU_SCHEME_IMPORT_DESCRIPTOR = Object.freeze({
   templateType: TOU_SCHEME_TEMPLATE_TYPE,
@@ -764,7 +946,13 @@ const TOU_SCHEME_IMPORT_DESCRIPTOR = Object.freeze({
 const STRATEGY_RULE_IMPORT_DESCRIPTOR = Object.freeze({
   templateType: STRATEGY_RULE_TEMPLATE_TYPE,
   buildPreview: buildStrategyRuleImportPreview,
-  insertCandidates: insertStrategyRuleCandidates
+  insertCandidates: insertStrategyRuleCandidates,
+  demoOwnership: Object.freeze({
+    artifactKey: '18-strategy-rules',
+    batchRole: 'primary',
+    entityType: 'strategy_rule',
+    expectedImportType: 'strategy_rule'
+  })
 });
 
 /** 创建班次定义 preview 审计批次。 */

@@ -23,9 +23,9 @@ export function downloadEnergyBudgetTemplate(format = 'xlsx') {
   return download({ url: `/templates/energy-budgets.${safeFormat}` }, `用能预算导入模板.${safeFormat}`);
 }
 
-/** 下载用能预算青岚园区示例，权限与真实内容由服务端 manifest 校验。 */
+/** 下载用能预算天坤集团示例，权限与真实内容由服务端 manifest 校验。 */
 export function downloadEnergyBudgetDemoParkExample() {
-  return download({ url: '/templates/demo-park/10-energy-budgets.xlsx' }, '青岚园区示例-用能预算.xlsx');
+  return download({ url: '/templates/demo-park/10-energy-budgets.xlsx' }, '天坤集团示例-用能预算.xlsx');
 }
 
 export function previewEnergyBudgetImport(file) {

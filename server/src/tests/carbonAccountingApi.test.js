@@ -143,7 +143,20 @@ function multipart(server, pathname, filename, content, token) {
     const db = openDatabase();
     try {
       const electricityId = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
-      db.prepare(`INSERT INTO energy_records (energy_type_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, site, department, duplicate_key, record_status, created_at, updated_at) VALUES (?, '2028-01', '2028-01', 'kWh', 100, 'kWh', 100, '碳统计组织', '碳统计厂区', '碳统计部门', 'carbon-api-energy-record', 'active', datetime('now'), datetime('now'))`).run(electricityId);
+      const organizationUnitId = db.prepare(`INSERT INTO organization_units
+        (unit_code, unit_name, unit_path, unit_type, status, created_at, updated_at)
+        VALUES ('CARBON-API-OU', '碳统计组织', '/CARBON-API-OU', 'department', 'active', datetime('now'), datetime('now'))`).run().lastInsertRowid;
+      const meterDeviceId = db.prepare(`INSERT INTO meter_devices
+        (meter_code, meter_name, meter_type, energy_type_id, organization_unit_id, install_location, status, created_at, updated_at)
+        VALUES ('CARBON-API-METER', '碳统计电表', 'electricity', ?, ?, '碳统计厂区', 'active', datetime('now'), datetime('now'))`)
+        .run(electricityId, organizationUnitId).lastInsertRowid;
+      db.prepare(`INSERT INTO energy_records (
+        energy_type_id, organization_unit_id, meter_device_id, original_month, normalized_month,
+        original_unit, original_value, normalized_unit, normalized_value, remark, duplicate_key,
+        record_status, created_at, updated_at
+      ) VALUES (?, ?, ?, '2028-01', '2028-01', 'kWh', 100, 'kWh', 100,
+        '碳统计部门', 'carbon-api-energy-record', 'active', datetime('now'), datetime('now'))`)
+        .run(electricityId, organizationUnitId, meterDeviceId);
     } finally { db.close(); }
 
     const calculated = await request(server, 'POST', '/api/carbon/emissions/calculate', { normalizedMonth: '2028-01' }, adminToken);
@@ -160,7 +173,8 @@ function multipart(server, pathname, filename, content, token) {
     assert.strictEqual(stats.body.data.calculatedCount, 1);
     assert.strictEqual(stats.body.data.byMonth[0].normalizedMonth, '2028-01');
     assert.strictEqual(stats.body.data.byEnergyType[0].energyTypeCode, 'electricity');
-    assert.strictEqual(stats.body.data.byOrganization[0].organization, '碳统计组织');
+    assert.strictEqual(stats.body.data.byOrganizationUnit[0].organizationUnitCode, 'CARBON-API-OU');
+    assert.strictEqual(stats.body.data.byOrganizationUnit[0].organizationUnitName, '碳统计组织');
     assert.strictEqual(stats.body.data.totalsByEmissionUnit[0].totalEmissionValue, 50);
 
     const safeKeyword = await request(server, 'GET', '/api/carbon/factors?keyword=%25', undefined, adminToken);

@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const database = require('../db/database');
 const { AppError, badRequest } = require('../utils/errors');
 const {
@@ -32,6 +33,8 @@ const MAX_QUERY_RANGE_DAYS = 31;
 const MAX_QUERY_RANGE_MS = MAX_QUERY_RANGE_DAYS * 24 * 60 * 60 * 1000;
 // 单次负荷摘要允许参与计算的最大时序事实数量。
 const MAX_TIMESERIES_RECORDS = 50000;
+// exact ID 查询固定按五百个参数分批，连同其他绑定参数仍低于 SQLite 常见最低变量上限。
+const TIMESERIES_EXACT_ID_QUERY_BATCH_SIZE = 500;
 // 查询多取一条，仅用于识别超限并拒绝，禁止静默截断。
 const TIMESERIES_QUERY_LIMIT = MAX_TIMESERIES_RECORDS + 1;
 // 服务端固定要求完整覆盖，调用方不得降低覆盖率阈值。
@@ -108,6 +111,10 @@ const ANALYSIS_LOCAL_TIME_PROJECTION_FAILED_CODE = 'ANALYSIS_LOCAL_TIME_PROJECTI
 const ANALYSIS_LOCAL_TIME_RANGE_UNSUPPORTED_CODE = 'ANALYSIS_LOCAL_TIME_RANGE_UNSUPPORTED';
 // 能源分析查询支持的最小公历年份，拒绝 ISO 公元 0 年进入 Intl 投影。
 const MIN_SUPPORTED_ANALYSIS_YEAR = 1;
+// exact 响应 metadata 只保存在模块私有 WeakMap，并绑定生成响应的 SQLite 连接对象身份。
+const EXACT_LOAD_SCOPE_METADATA = new WeakMap();
+// exact scope capability metadata 绑定 builder 使用的 SQLite 连接；同物理文件的另一连接也不得消费。
+const EXACT_LOAD_SCOPE_CAPABILITY_METADATA = new WeakMap();
 
 /**
  * 判断值是否为非数组普通对象。
@@ -639,15 +646,427 @@ function resolveLoadSummaryScope(db, normalizedInput) {
 }
 
 /**
+ * 规范 exact scope 的正整数 ID 列表；exact 输入重复声明必须拒绝。
+ * @param {*} values 原始 ID 列表。
+ * @param {string} fieldName 字段名。
+ * @returns {number[]} 按数值稳定排序的唯一 ID 列表。
+ */
+function normalizeExactScopeIds(values, fieldName) {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw badRequest('exact scope 必须提供非空记录 ID 列表。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_IDS_REQUIRED',
+      fieldName
+    });
+  }
+  if (values.length > MAX_TIMESERIES_RECORDS) {
+    throw badRequest(`exact scope 记录 ID 不得超过 ${MAX_TIMESERIES_RECORDS} 个。`, {
+      code: 'ENERGY_LOAD_RECORD_LIMIT_EXCEEDED',
+      fieldName,
+      maximumRecords: MAX_TIMESERIES_RECORDS,
+      actualRecords: values.length
+    });
+  }
+  const ids = values.map((value, index) => normalizePositiveInteger(
+    value,
+    `${fieldName}[${index}]`,
+    'ENERGY_LOAD_EXACT_SCOPE_ID_INVALID'
+  ));
+  if (new Set(ids).size !== ids.length) {
+    throw badRequest('exact scope 记录 ID 不得重复。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_ID_DUPLICATE',
+      fieldName
+    });
+  }
+  return ids.sort((left, right) => left - right);
+}
+
+/**
+ * 校验时序 exact scope 是当前 SQLite 连接创建的原始 capability。
+ * @param {object} exactScope 原始时序 exact scope。
+ * @param {object} db 当前 SQLite 连接。
+ * @returns {object} 私有 capability metadata。
+ */
+function assertEnergyLoadExactScopeCapability(exactScope, db) {
+  const capabilityMetadata = exactScope && typeof exactScope === 'object'
+    ? EXACT_LOAD_SCOPE_CAPABILITY_METADATA.get(exactScope)
+    : null;
+  if (!capabilityMetadata) {
+    throw badRequest('负荷摘要 exact scope 必须使用服务端 builder 生成的原始 capability。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_CAPABILITY_REQUIRED'
+    });
+  }
+  if (!db || capabilityMetadata.db !== db) {
+    throw badRequest('负荷摘要 exact scope 与当前 SQLite 连接对象身份不一致。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_DATABASE_MISMATCH'
+    });
+  }
+  return capabilityMetadata;
+}
+
+/**
+ * 从后续服务端 adapter 私有 options 读取时序 exact scope；公开 input 永不参与解析。
+ * @param {object} options 服务私有选项。
+ * @param {object} db 当前 SQLite 连接。
+ * @returns {object|null} 规范 exact scope。
+ */
+function normalizeExactLoadScope(options, db) {
+  const normalizedOptions = isPlainObject(options) ? options : {};
+  const hasExactRequired = Object.prototype.hasOwnProperty.call(normalizedOptions, 'exactRequired');
+  if (hasExactRequired && typeof normalizedOptions.exactRequired !== 'boolean') {
+    throw badRequest('负荷摘要 exact-required 私有门禁必须是布尔值。', {
+      code: 'ENERGY_LOAD_EXACT_REQUIRED_OPTION_INVALID'
+    });
+  }
+  const hasExactScope = Object.prototype.hasOwnProperty.call(normalizedOptions, 'exactScope');
+  if (!hasExactScope) {
+    if (normalizedOptions.exactRequired === true) {
+      throw badRequest('负荷摘要 exact-required 调用缺少服务端私有 exact scope。', {
+        code: 'ENERGY_LOAD_EXACT_SCOPE_REQUIRED'
+      });
+    }
+    return null;
+  }
+  const rawScope = normalizedOptions.exactScope;
+  if (!isPlainObject(rawScope)) {
+    throw badRequest('负荷摘要 exact scope 无效。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_REQUIRED'
+    });
+  }
+  const sourceBatchId = normalizePositiveInteger(
+    rawScope.timeseriesSourceBatchId,
+    'exactScope.timeseriesSourceBatchId',
+    'ENERGY_LOAD_EXACT_SCOPE_SOURCE_BATCH_REQUIRED'
+  );
+  const sourceScopeDigest = rawScope.timeseriesScopeDigest;
+  if (typeof sourceScopeDigest !== 'string' || !/^[a-f0-9]{64}$/.test(sourceScopeDigest)) {
+    throw badRequest('负荷摘要 exact scope 必须提供规范 source scope digest。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_DIGEST_REQUIRED'
+    });
+  }
+  const normalizedScope = {
+    recordIds: normalizeExactScopeIds(
+      rawScope.timeseriesRecordIds,
+      'exactScope.timeseriesRecordIds'
+    ),
+    sourceBatchId,
+    sourceScopeDigest,
+    expectedSnapshots: rawScope.expectedTimeseriesSnapshots
+  };
+  assertEnergyLoadExactScopeCapability(rawScope, db);
+  return normalizedScope;
+}
+
+/**
+ * 对 exact scope 摘要值递归排序，保持与 ownership stable digest 的 JSON 口径一致。
+ * @param {*} value 待规范值。
+ * @returns {*} 规范值。
+ */
+function normalizeExactDigestValue(value) {
+  if (Array.isArray(value)) return value.map(normalizeExactDigestValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [
+      key,
+      normalizeExactDigestValue(value[key])
+    ]));
+  }
+  if (typeof value === 'number' && Object.is(value, -0)) return 0;
+  return value;
+}
+
+/**
+ * 计算 exact scope 的稳定 SHA-256 摘要，不信任调用方传入摘要。
+ * @param {*} value 摘要载荷。
+ * @returns {string} 六十四位十六进制摘要。
+ */
+function createExactScopeDigest(value) {
+  return crypto.createHash('sha256')
+    .update(JSON.stringify(normalizeExactDigestValue(value)), 'utf8')
+    .digest('hex');
+}
+
+/**
+ * 构造时序事实的固定 snapshot 字段，供 exact scope digest 和 expected snapshot 校验复用。
+ * @param {object} row 数据库行。
+ * @returns {object} 固定时序字段。
+ */
+function buildExactTimeseriesSnapshotFields(row) {
+  return {
+    id: Number(row.id),
+    source_batch_id: row.sourceBatchId === null ? null : Number(row.sourceBatchId),
+    source_row_number: row.sourceRowNumber === null ? null : Number(row.sourceRowNumber),
+    organization_unit_id: row.organizationUnitId === null ? null : Number(row.organizationUnitId),
+    meter_device_id: row.meterDeviceId === null ? null : Number(row.meterDeviceId),
+    energy_type_id: Number(row.energyTypeId),
+    start_utc: row.startUtc,
+    end_utc: row.endUtc,
+    source_timezone: row.sourceTimeZone,
+    granularity_minutes: Number(row.granularityMinutes),
+    original_unit: row.originalUnit,
+    original_value: Number(row.originalValue),
+    normalized_unit: row.normalizedUnit,
+    normalized_value: Number(row.normalizedValue),
+    source_reference: row.sourceReference,
+    data_source: row.dataSource,
+    record_status: row.recordStatus,
+    void_reason: row.voidReason,
+    voided_at: row.voidedAt,
+    created_at: row.createdAt,
+    updated_at: row.updatedAt
+  };
+}
+
+/**
+ * 计算固定实体 identity/snapshot 摘要，兼容后续 adapter 传入的 expected snapshots。
+ * @param {object} row 当前时序行。
+ * @returns {object} identityDigest 与 snapshotDigest。
+ */
+function calculateExactTimeseriesDigests(row) {
+  const entityType = 'energy_timeseries';
+  const entityPk = String(Number(row.id));
+  const snapshot = buildExactTimeseriesSnapshotFields(row);
+  try {
+    // 延迟读取 ownership 服务，避免模块初始化阶段形成循环依赖。
+    const {
+      calculateDemoEntityIdentityDigest,
+      calculateDemoEntitySnapshotDigest
+    } = require('./demoOwnershipService');
+    // 固定 ownership snapshot helper 同时执行字段白名单、值域、时间和来源配对校验。
+    const snapshotDigest = calculateDemoEntitySnapshotDigest(entityType, entityPk, snapshot);
+    const identityDigest = calculateDemoEntityIdentityDigest(entityType, entityPk);
+    return { identityDigest, snapshotDigest };
+  } catch (error) {
+    if (typeof error?.code === 'string' && error.code.startsWith('DEMO_OWNERSHIP_')) {
+      throw badRequest('负荷摘要 exact scope 包含 ownership 不兼容的时序事实。', {
+        code: 'ENERGY_LOAD_EXACT_SCOPE_OWNERSHIP_INCOMPATIBLE',
+        recordId: Number(row.id)
+      });
+    }
+    throw error;
+  }
+}
+
+/**
+ * 构造并计算时序 exact scope 摘要；行内容变化会导致 digest 漂移。
+ * @param {object[]} rows 当前查询行。
+ * @param {number} sourceBatchId 来源批次 ID。
+ * @returns {string} 六十四位十六进制摘要。
+ */
+function calculateTimeseriesScopeDigest(rows, sourceBatchId) {
+  return createExactScopeDigest({
+    domain: 'energy-timeseries-exact-scope:v1',
+    entityType: 'energy_timeseries',
+    sourceBatchId,
+    records: rows
+      .map((row) => ({ id: Number(row.id), ...calculateExactTimeseriesDigests(row) }))
+      .sort((left, right) => left.id - right.id)
+  });
+}
+
+/**
+ * 由服务端已证明的时序 ID 与批次生成后续 adapter 私有 exact scope 证据。
+ * @param {object} db SQLite 连接。
+ * @param {*} recordIds 精确时序记录 ID。
+ * @param {*} sourceBatchId 来源批次 ID。
+ * @returns {object} 私有 exact scope 选项。
+ */
+function buildEnergyLoadExactScope(db, recordIds, sourceBatchId) {
+  if (!db || typeof db.prepare !== 'function') {
+    throw badRequest('负荷摘要 exact scope 必须复用服务端 SQLite 连接。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_DATABASE_REQUIRED'
+    });
+  }
+  const normalizedIds = normalizeExactScopeIds(recordIds, 'timeseriesRecordIds');
+  const normalizedBatchId = normalizePositiveInteger(
+    sourceBatchId,
+    'timeseriesSourceBatchId',
+    'ENERGY_LOAD_EXACT_SCOPE_SOURCE_BATCH_REQUIRED'
+  );
+  const sourceBatch = db.prepare(
+    `SELECT id
+       FROM import_batches
+      WHERE id = ? AND import_type = 'energy_timeseries'`
+  ).get(normalizedBatchId);
+  if (!sourceBatch) {
+    throw badRequest('负荷摘要 exact scope 来源批次不存在或类型不匹配。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_SOURCE_BATCH_NOT_FOUND'
+    });
+  }
+  const rows = [];
+  for (
+    let batchStartIndex = 0;
+    batchStartIndex < normalizedIds.length;
+    batchStartIndex += TIMESERIES_EXACT_ID_QUERY_BATCH_SIZE
+  ) {
+    // 每批只绑定固定上限的 ID 和一个来源批次参数，避免触发 SQLite 变量数量限制。
+    const batchIds = normalizedIds.slice(
+      batchStartIndex,
+      batchStartIndex + TIMESERIES_EXACT_ID_QUERY_BATCH_SIZE
+    );
+    const placeholders = batchIds.map(() => '?').join(', ');
+    rows.push(...db.prepare(
+      `SELECT id,
+              source_batch_id AS sourceBatchId,
+              source_row_number AS sourceRowNumber,
+              organization_unit_id AS organizationUnitId,
+              meter_device_id AS meterDeviceId,
+              energy_type_id AS energyTypeId,
+              start_utc AS startUtc,
+              end_utc AS endUtc,
+              source_timezone AS sourceTimeZone,
+              granularity_minutes AS granularityMinutes,
+              original_unit AS originalUnit,
+              original_value AS originalValue,
+              normalized_unit AS normalizedUnit,
+              normalized_value AS normalizedValue,
+              source_reference AS sourceReference,
+              data_source AS dataSource,
+              record_status AS recordStatus,
+              void_reason AS voidReason,
+              voided_at AS voidedAt,
+              created_at AS createdAt,
+              updated_at AS updatedAt
+         FROM energy_timeseries_records
+        WHERE id IN (${placeholders}) AND source_batch_id = ?
+        ORDER BY id ASC`
+    ).all(...batchIds, normalizedBatchId));
+  }
+  rows.sort((left, right) => Number(left.id) - Number(right.id));
+  const actualIds = rows.map((row) => Number(row.id));
+  if (actualIds.length !== normalizedIds.length
+    || normalizedIds.some((id, index) => id !== actualIds[index])) {
+    throw badRequest('负荷摘要 exact scope 生成时记录集合与来源批次不一致。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_RECORD_SET_MISMATCH'
+    });
+  }
+  const exactScope = Object.freeze({
+    timeseriesRecordIds: Object.freeze([...normalizedIds]),
+    timeseriesSourceBatchId: normalizedBatchId,
+    timeseriesScopeDigest: calculateTimeseriesScopeDigest(rows, normalizedBatchId),
+    expectedTimeseriesSnapshots: Object.freeze(rows.map((row) => Object.freeze({
+      id: Number(row.id),
+      ...calculateExactTimeseriesDigests(row)
+    })))
+  });
+  EXACT_LOAD_SCOPE_CAPABILITY_METADATA.set(exactScope, Object.freeze({ db }));
+  return exactScope;
+}
+
+/**
+ * 校验 exact scope expected snapshots 和当前数据库事实完全一致。
+ * @param {object[]} rows 当前查询行。
+ * @param {*} expectedSnapshots adapter 提供的私有快照。
+ */
+function assertExactTimeseriesSnapshots(rows, expectedSnapshots) {
+  if (!Array.isArray(expectedSnapshots) || expectedSnapshots.length === 0) {
+    throw badRequest('负荷摘要 exact scope 必须提供非空时序 expected snapshots。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_SNAPSHOT_REQUIRED'
+    });
+  }
+  if (expectedSnapshots.length !== rows.length) {
+    throw badRequest('负荷摘要 exact scope 快照集合与记录集合不一致。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_SNAPSHOT_MISMATCH'
+    });
+  }
+  const expectedById = new Map();
+  expectedSnapshots.forEach((snapshot, index) => {
+    if (!isPlainObject(snapshot)) {
+      throw badRequest('负荷摘要 exact scope 快照无效。', {
+        code: 'ENERGY_LOAD_EXACT_SCOPE_SNAPSHOT_INVALID',
+        index
+      });
+    }
+    const rawId = snapshot.id ?? snapshot.entityPk ?? snapshot.recordId;
+    const id = normalizePositiveInteger(rawId, `exactScope.expectedSnapshots[${index}].id`, 'ENERGY_LOAD_EXACT_SCOPE_SNAPSHOT_INVALID');
+    if (expectedById.has(id)
+      || typeof snapshot.identityDigest !== 'string'
+      || !/^[a-f0-9]{64}$/.test(snapshot.identityDigest)
+      || typeof snapshot.snapshotDigest !== 'string'
+      || !/^[a-f0-9]{64}$/.test(snapshot.snapshotDigest)) {
+      throw badRequest('负荷摘要 exact scope 快照无效或重复。', {
+        code: 'ENERGY_LOAD_EXACT_SCOPE_SNAPSHOT_INVALID'
+      });
+    }
+    expectedById.set(id, snapshot);
+  });
+  rows.forEach((row) => {
+    const expected = expectedById.get(Number(row.id));
+    const actual = calculateExactTimeseriesDigests(row);
+    if (!expected || expected.identityDigest !== actual.identityDigest
+      || expected.snapshotDigest !== actual.snapshotDigest) {
+      throw badRequest('负荷摘要 exact scope 快照已发生漂移。', {
+        code: 'ENERGY_LOAD_EXACT_SCOPE_SNAPSHOT_DIGEST_MISMATCH'
+      });
+    }
+  });
+}
+
+/**
+ * 校验 exact 时序集合的双向 ID、覆盖和重叠约束。
+ * @param {object[]} rows 当前查询行。
+ * @param {object} normalizedInput 规范查询输入。
+ * @param {object} exactScope 规范 exact scope。
+ */
+function assertExactTimeseriesRows(rows, normalizedInput, exactScope) {
+  const actualIds = rows.map((row) => Number(row.id));
+  const expectedIds = exactScope.recordIds;
+  const actualSet = new Set(actualIds);
+  const expectedSet = new Set(expectedIds);
+  if (actualIds.length !== expectedIds.length
+    || actualSet.size !== actualIds.length
+    || actualSet.size !== expectedSet.size
+    || expectedIds.some((id) => !actualSet.has(id))
+    || actualIds.some((id) => !expectedSet.has(id))) {
+    throw badRequest('负荷摘要 exact scope 记录集合与数据库事实不一致。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_RECORD_SET_MISMATCH'
+    });
+  }
+  const orderedRows = [...rows].sort((left, right) => (
+    Date.parse(left.startUtc) - Date.parse(right.startUtc)
+      || Date.parse(left.endUtc) - Date.parse(right.endUtc)
+      || Number(left.id) - Number(right.id)
+  ));
+  let coveredUntil = normalizedInput.startMs;
+  let previousEnd = null;
+  orderedRows.forEach((row) => {
+    const startMs = Date.parse(row.startUtc);
+    const endMs = Date.parse(row.endUtc);
+    if (startMs < normalizedInput.startMs || endMs > normalizedInput.endMs) {
+      throw badRequest('负荷摘要 exact scope 时序记录超出目标查询窗口。', {
+        code: 'ENERGY_LOAD_EXACT_SCOPE_WINDOW_MISMATCH'
+      });
+    }
+    if (previousEnd !== null && startMs < previousEnd) {
+      throw badRequest('负荷摘要 exact scope 时序记录存在窗口内重叠。', {
+        code: 'ENERGY_LOAD_EXACT_SCOPE_OVERLAP'
+      });
+    }
+    if (startMs > coveredUntil) {
+      throw badRequest('负荷摘要 exact scope 时序记录存在窗口缺口。', {
+        code: 'ENERGY_LOAD_EXACT_SCOPE_GAP'
+      });
+    }
+    previousEnd = Math.max(previousEnd === null ? endMs : previousEnd, endMs);
+    coveredUntil = Math.max(coveredUntil, endMs);
+  });
+  if (coveredUntil < normalizedInput.endMs) {
+    throw badRequest('负荷摘要 exact scope 时序记录未完整覆盖查询窗口。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_GAP'
+    });
+  }
+  assertExactTimeseriesSnapshots(rows, exactScope.expectedSnapshots);
+}
+
+/**
  * 读取精确数据流内与统计窗口相交的 active 时序事实。
  * @param {object} db SQLite 连接。
  * @param {object} normalizedInput 规范查询输入。
  * @param {object} scope 主数据范围事实。
- * @param {object} options 可选精确组织范围；缺省保持既有分析契约。
+ * @param {object} options 可选组织范围或服务端 exact scope；缺省保持既有分析契约。
  * @returns {object[]} 最多 50001 条原始查询行。
  */
 function queryLoadSummaryRows(db, normalizedInput, scope, options = {}) {
   const normalizedOptions = isPlainObject(options) ? options : {};
+  const exactScope = normalizedOptions.exactScope || null;
   const requiresExactOrganization = Object.prototype.hasOwnProperty.call(
     normalizedOptions,
     'organizationUnitId'
@@ -655,6 +1074,70 @@ function queryLoadSummaryRows(db, normalizedInput, scope, options = {}) {
   const organizationPredicate = requiresExactOrganization
     ? '\n       AND etr.organization_unit_id = @organizationUnitId'
     : '';
+  const selectClause = `SELECT etr.id,
+            etr.source_batch_id AS sourceBatchId,
+            etr.source_row_number AS sourceRowNumber,
+            etr.organization_unit_id AS organizationUnitId,
+            etr.meter_device_id AS meterDeviceId,
+            etr.energy_type_id AS energyTypeId,
+            etr.start_utc AS startUtc,
+            etr.end_utc AS endUtc,
+            etr.source_timezone AS sourceTimeZone,
+            etr.granularity_minutes AS granularityMinutes,
+            etr.original_unit AS originalUnit,
+            etr.original_value AS originalValue,
+            etr.normalized_unit AS normalizedUnit,
+            etr.normalized_value AS normalizedValue,
+            etr.source_reference AS sourceReference,
+            etr.data_source AS dataSource,
+            etr.record_status AS recordStatus,
+            etr.void_reason AS voidReason,
+            etr.voided_at AS voidedAt,
+            etr.created_at AS createdAt,
+            etr.updated_at AS updatedAt
+     FROM energy_timeseries_records etr`;
+  if (exactScope) {
+    const rows = [];
+    for (
+      let batchStartIndex = 0;
+      batchStartIndex < exactScope.recordIds.length;
+      batchStartIndex += TIMESERIES_EXACT_ID_QUERY_BATCH_SIZE
+    ) {
+      // exact scope 查询与 builder 使用相同的小批次参数上限，避免大 IN 列表触发 SQLite 变量错误。
+      const batchIds = exactScope.recordIds.slice(
+        batchStartIndex,
+        batchStartIndex + TIMESERIES_EXACT_ID_QUERY_BATCH_SIZE
+      );
+      const idPlaceholders = batchIds.map(() => '?').join(', ');
+      rows.push(...db.prepare(
+        `${selectClause}
+         WHERE etr.record_status = 'active'
+           AND etr.meter_device_id = ?
+           AND etr.energy_type_id = ?
+           AND etr.normalized_unit = ?
+           AND etr.source_timezone = ?${requiresExactOrganization ? '\n       AND etr.organization_unit_id = ?' : ''}
+           AND etr.id IN (${idPlaceholders})
+           AND etr.source_batch_id = ?
+           AND julianday(etr.start_utc) < julianday(?)
+           AND julianday(etr.end_utc) > julianday(?)`
+      ).all(
+        normalizedInput.meterDeviceId,
+        scope.energyType.id,
+        normalizedInput.unit,
+        normalizedInput.sourceTimeZone,
+        ...(requiresExactOrganization ? [normalizedOptions.organizationUnitId] : []),
+        ...batchIds,
+        exactScope.sourceBatchId,
+        normalizedInput.endUtc,
+        normalizedInput.startUtc
+      ));
+    }
+    return rows.sort((left, right) => (
+      left.startUtc.localeCompare(right.startUtc)
+        || left.endUtc.localeCompare(right.endUtc)
+        || Number(left.id) - Number(right.id)
+    ));
+  }
   const queryParameters = {
     meterDeviceId: normalizedInput.meterDeviceId,
     energyTypeId: scope.energyType.id,
@@ -663,22 +1146,9 @@ function queryLoadSummaryRows(db, normalizedInput, scope, options = {}) {
     startUtc: normalizedInput.startUtc,
     endUtc: normalizedInput.endUtc
   };
-  if (requiresExactOrganization) {
-    queryParameters.organizationUnitId = normalizedOptions.organizationUnitId;
-  }
+  if (requiresExactOrganization) queryParameters.organizationUnitId = normalizedOptions.organizationUnitId;
   return db.prepare(
-    `SELECT etr.id,
-            etr.source_batch_id AS sourceBatchId,
-            etr.source_row_number AS sourceRowNumber,
-            etr.start_utc AS startUtc,
-            etr.end_utc AS endUtc,
-            etr.source_timezone AS sourceTimeZone,
-            etr.granularity_minutes AS granularityMinutes,
-            etr.normalized_unit AS normalizedUnit,
-            etr.normalized_value AS normalizedValue,
-            etr.source_reference AS sourceReference,
-            etr.data_source AS dataSource
-     FROM energy_timeseries_records etr
+    `${selectClause}
      WHERE etr.record_status = 'active'
        AND etr.meter_device_id = @meterDeviceId
        AND etr.energy_type_id = @energyTypeId
@@ -1264,17 +1734,51 @@ function buildMaxLoadIntervalSummary(
  */
 function getEnergyLoadSummary(input, options = {}) {
   const normalizedInput = normalizeEnergyLoadSummaryInput(input);
-  const callerDatabase = isPlainObject(options) && options.db ? options.db : null;
+  const normalizedOptions = isPlainObject(options) ? options : {};
+  const callerDatabase = normalizedOptions.db || null;
   const db = callerDatabase || database.openDatabase();
   const shouldCloseDatabase = callerDatabase === null;
+  let exactScope = null;
+  let shouldOwnReadTransaction = false;
 
   try {
+    exactScope = normalizeExactLoadScope(normalizedOptions, db);
+    shouldOwnReadTransaction = exactScope !== null && db.inTransaction !== true;
+    if (shouldOwnReadTransaction) db.exec('BEGIN DEFERRED');
     const scope = resolveLoadSummaryScope(db, normalizedInput);
-    const rows = queryLoadSummaryRows(db, normalizedInput, scope);
+    if (exactScope) {
+      const sourceBatch = db.prepare(
+        `SELECT id
+           FROM import_batches
+          WHERE id = ? AND import_type = 'energy_timeseries'`
+      ).get(exactScope.sourceBatchId);
+      if (!sourceBatch) {
+        throw badRequest('负荷摘要 exact scope 来源批次不存在。', {
+          code: 'ENERGY_LOAD_EXACT_SCOPE_SOURCE_BATCH_NOT_FOUND'
+        });
+      }
+    }
+    const rows = queryLoadSummaryRows(db, normalizedInput, scope, { exactScope });
     if (rows.length > MAX_TIMESERIES_RECORDS) {
       throw badRequest(`匹配时序记录超过 ${MAX_TIMESERIES_RECORDS} 条，请缩小查询范围。`, {
         code: 'ENERGY_LOAD_RECORD_LIMIT_EXCEEDED',
         maximumRecords: MAX_TIMESERIES_RECORDS
+      });
+    }
+    let exactMetadata = null;
+    if (exactScope) {
+      assertExactTimeseriesRows(rows, normalizedInput, exactScope);
+      const actualDigest = calculateTimeseriesScopeDigest(rows, exactScope.sourceBatchId);
+      if (actualDigest !== exactScope.sourceScopeDigest) {
+        throw badRequest('负荷摘要 exact scope 来源摘要已发生漂移。', {
+          code: 'ENERGY_LOAD_EXACT_SCOPE_DIGEST_MISMATCH'
+        });
+      }
+      exactMetadata = Object.freeze({
+        sourceBatchId: exactScope.sourceBatchId,
+        recordIds: Object.freeze(rows.map((row) => Number(row.id))),
+        sourceScopeDigest: actualDigest,
+        rows: Object.freeze(rows.map((row) => Object.freeze({ ...row })))
       });
     }
 
@@ -1339,7 +1843,7 @@ function getEnergyLoadSummary(input, options = {}) {
         reasonCodes: mergeReasonCodes(peakResult.reasonCodes, ['UNIT_NOT_COMPARABLE'])
       }, loadUnit);
 
-    return {
+    const response = {
       contractVersion: ENERGY_ANALYSIS_VERSIONS.contract,
       formulaVersion: ENERGY_ANALYSIS_VERSIONS.loadAnalysis,
       scope: {
@@ -1414,11 +1918,42 @@ function getEnergyLoadSummary(input, options = {}) {
         callerDatabaseConnection: callerDatabase !== null
       }
     };
+    if (exactMetadata) {
+      EXACT_LOAD_SCOPE_METADATA.set(response, Object.freeze({
+        db,
+        metadata: exactMetadata
+      }));
+    }
+    if (shouldOwnReadTransaction && db.inTransaction) db.exec('COMMIT');
+    return response;
+  } catch (error) {
+    if (shouldOwnReadTransaction && db.inTransaction) db.exec('ROLLBACK');
+    throw error;
   } finally {
     if (shouldCloseDatabase) {
       db.close();
     }
   }
+}
+
+/**
+ * 读取服务端私有 exact scope metadata；该字段不会进入 JSON 公共响应。
+ * @param {object} loadSummary 负荷摘要响应。
+ * @param {object} options 当前 SQLite 连接选项。
+ * @returns {object|null} 私有 exact scope metadata。
+ */
+function getExactScopeMetadata(loadSummary, options = {}) {
+  const binding = loadSummary && typeof loadSummary === 'object'
+    ? EXACT_LOAD_SCOPE_METADATA.get(loadSummary) || null
+    : null;
+  if (!binding) return null;
+  const db = isPlainObject(options) ? options.db : null;
+  if (!db || binding.db !== db) {
+    throw badRequest('负荷摘要 exact metadata 与当前 SQLite 连接对象身份不一致。', {
+      code: 'ENERGY_LOAD_EXACT_SCOPE_DATABASE_MISMATCH'
+    });
+  }
+  return binding.metadata;
 }
 
 /**
@@ -3114,10 +3649,14 @@ module.exports = {
   SHIFT_CONSUMPTION_ANALYSIS_FORMULA_VERSION,
   SHIFT_SCHEDULE_QUERY_LIMIT,
   TIME_OF_USE_CONSUMPTION_ANALYSIS_FORMULA_VERSION,
+  TIMESERIES_EXACT_ID_QUERY_BATCH_SIZE,
   TIMESERIES_QUERY_LIMIT,
+  assertEnergyLoadExactScopeCapability,
+  buildEnergyLoadExactScope,
   getDeviceStateConsumptionAnalysis,
   getEnergyLoadCurve,
   getEnergyLoadSummary,
+  getExactScopeMetadata,
   getMonthlyConsumptionAnalysis,
   getShiftConsumptionAnalysis,
   getTimeOfUseConsumptionAnalysis,

@@ -52,6 +52,7 @@
 
 <script setup>
 import { computed, ref } from 'vue';
+import { formatDashboardMeasurement, formatDashboardPercentage } from '@/utils/dashboardCockpit';
 
 /** 单一单位环图输入属性。 */
 const props = defineProps({
@@ -59,6 +60,8 @@ const props = defineProps({
   title: { type: String, required: true },
   description: { type: String, default: '' },
   unit: { type: String, required: true },
+  /** 碳排结构使用安全小数格式，能源结构保留原有常规精度。 */
+  kind: { type: String, default: 'energy' },
   rows: { type: Array, default: () => [] },
   centerLabel: { type: String, default: '合计' },
   /** 窄面板使用单列图表与图例，避免依赖视口宽度判断。 */
@@ -110,16 +113,20 @@ const separators = computed(() => segments.value.slice(1).map((segment) => {
 /** 环图整体可访问说明。 */
 const chartDescription = computed(() => `${props.description}。仅包含单位 ${props.unit} 的 ${normalizedRows.value.length} 个分类，总量 ${formatNumber(totalValue.value)} ${props.unit}；真实零值不绘制伪扇区。`);
 
-/** 格式化环图真实数值。 */
+/** 格式化环图真实数值；碳排非零小值不得显示成精确零。 */
 function formatNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 }).format(number) : '—';
+  return formatDashboardMeasurement(value, {
+    kind: props.kind === 'carbon' ? 'carbon' : 'energy',
+    maximumFractionDigits: 4
+  });
 }
 
-/** 返回真实占比文本，总量为零时所有行均为 0%。 */
+/** 返回真实占比文本，总量为零时所有行均为 0%，极小非零占比使用阈值文本。 */
 function percentageLabel(value) {
   if (totalValue.value <= 0) return '0%';
-  return `${formatNumber((Number(value || 0) / totalValue.value) * 100)}%`;
+  return formatDashboardPercentage((Number(value || 0) / totalValue.value) * 100, {
+    maximumFractionDigits: 4
+  });
 }
 
 /** 生成扇区 tooltip 与 ARIA 文本。 */

@@ -418,6 +418,11 @@ function grantPermissions(userId, permissionCodes) {
     assert(csvText.includes("'+meter-api"));
     assert(csvText.includes("'@evidence-api"));
     assert(csvText.includes("'=SUM(1,1)"));
+    assert(csvText.includes('"2026-08-24 09:00:00"'), 'CSV 墙钟应输出用户可见零秒格式。');
+    assert(csvText.includes('"2026-08-24 10:00:00"'), 'CSV 墙钟应输出用户可见零秒格式。');
+    assert(csvText.includes('"2026-08-24 01:00:00"'), 'CSV UTC 应输出用户可见空格格式。');
+    assert(csvText.includes('"2026-08-24 02:00:00"'), 'CSV UTC 应输出用户可见空格格式。');
+    assert(/"创建时间"[\s\S]*"20\d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"/.test(csvText));
 
     const xlsxExport = await request(server, 'GET', '/api/carbon/activities/export?format=xlsx', undefined, adminToken);
     assert.strictEqual(xlsxExport.status, 200);
@@ -428,6 +433,17 @@ function grantPermissions(userId, permissionCodes) {
     assert(exportRows[1].includes("'+meter-api"));
     assert(exportRows[1].includes("'@evidence-api"));
     assert(exportRows[1].includes("'=SUM(1,1)"));
+    const exportHeaderIndexes = Object.fromEntries(exportRows[0].map((header, index) => [header, index]));
+    assert.strictEqual(exportRows[1][exportHeaderIndexes['活动开始时间']], '2026-08-24 09:00:00');
+    assert.strictEqual(exportRows[1][exportHeaderIndexes['活动结束时间']], '2026-08-24 10:00:00');
+    assert.strictEqual(exportRows[1][exportHeaderIndexes['开始UTC']], '2026-08-24 01:00:00');
+    assert.strictEqual(exportRows[1][exportHeaderIndexes['结束UTC']], '2026-08-24 02:00:00');
+    assert.match(exportRows[1][exportHeaderIndexes['创建时间']], /^20\d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+    assert.match(exportRows[1][exportHeaderIndexes['更新时间']], /^20\d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+    assert.match(detail.body.data.createdAt, /^20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/,
+      'API DTO 创建时间必须保持严格 UTC 技术合同。');
+    assert.match(detail.body.data.updatedAt, /^20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/,
+      '乐观锁更新时间必须保持严格 UTC 技术合同。');
 
     // 作废请求未知字段和 stale 时间戳 fail-closed，正确乐观锁保留历史事实。
     const unknownVoidField = await request(server, 'POST', `/api/carbon/activities/${activityId}/void`, {

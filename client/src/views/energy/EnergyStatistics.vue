@@ -69,7 +69,7 @@
       </section>
 
       <article class="page-card chart-panel">
-        <header class="chart-heading"><div><h2>{{ dimensionLabel }}维度结构</h2><span>单序列条形图</span></div><el-radio-group v-model="dimension" size="small" @change="loadDimension"><el-radio-button label="organization">组织</el-radio-button><el-radio-button label="department">部门</el-radio-button></el-radio-group></header>
+        <header class="chart-heading"><div><h2>{{ dimensionLabel }}维度结构</h2><span>单序列条形图</span></div><el-radio-group v-model="dimension" size="small" @change="loadDimension"><el-radio-button label="organizationUnit">用能单元</el-radio-button><el-radio-button label="meterDevice">计量器具</el-radio-button></el-radio-group></header>
         <PageState v-if="dimensionLoading" loading />
         <PageState v-else-if="dimensionError" :error="dimensionError" @retry="loadDimension" />
         <PageState v-else-if="!dimensionRows.length" :description="`暂无${dimensionLabel}维度数据`" />
@@ -113,7 +113,7 @@ const emptyFilters = () => ({ normalizedMonthStart: '', normalizedMonthEnd: '', 
 const draftFilters = ref(emptyFilters()); const appliedFilters = ref(emptyFilters());
 const energyTypes = ref([]); const energyTypesError = ref(''); const summary = ref({}); const trendRows = ref([]); const breakdownRows = ref([]); const records = ref([]); const pagination = ref({ total: 0 });
 const loading = ref(false); const summaryError = ref(''); const trendError = ref(''); const breakdownError = ref(''); const recordsError = ref('');
-const page = ref(1); const pageSize = ref(20); const dimension = ref('organization'); const dimensionRows = ref([]); const dimensionLoading = ref(false); const dimensionError = ref('');
+const page = ref(1); const pageSize = ref(20); const dimension = ref('organizationUnit'); const dimensionRows = ref([]); const dimensionLoading = ref(false); const dimensionError = ref('');
 const trendTooltip = ref(null); const breakdownTooltip = ref(null); const dimensionTooltip = ref(null);
 const backfillPreview = ref(null); const previewLoading = ref(false); const exportLoading = ref(false); const executeLoading = ref(false); const backfillError = ref(''); const executeDrawerOpen = ref(false); const confirmText = ref(''); const recordsExportLoading = ref(false); const recordsExportError = ref('');
 
@@ -127,7 +127,7 @@ const linePoints = computed(() => visibleTrend.value.map((row, index) => `${xFor
 const typeBreakdown = computed(() => fixedEnergyTypeBreakdown(breakdownRows.value));
 const typeMax = computed(() => Math.max(...typeBreakdown.value.map((row) => numberValue(row.totalNormalizedValue)), 1));
 const dimensionMax = computed(() => Math.max(...dimensionRows.value.map((row) => numberValue(row.totalNormalizedValue)), 1));
-const dimensionLabel = computed(() => dimension.value === 'department' ? '部门' : '组织');
+const dimensionLabel = computed(() => dimension.value === 'meterDevice' ? '计量器具' : '用能单元');
 const allRequestsFailed = computed(() => Boolean(summaryError.value && trendError.value && breakdownError.value && recordsError.value));
 const pageError = computed(() => summaryError.value || recordsError.value || trendError.value || breakdownError.value);
 const canLedgerPreview = computed(() => hasPermi(['energy:records:view', 'energy-records:view']));

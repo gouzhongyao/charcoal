@@ -21,6 +21,7 @@ const {
   createEnergyFlowEdge: createEnergyFlowEdgeWithoutAudit,
   createEnergyFlowModel: createEnergyFlowModelWithoutAudit,
   createEnergyFlowNode: createEnergyFlowNodeWithoutAudit,
+  getEnergyFlowModel,
   getEnergyFlowTopology,
   listEnergyFlowEdges,
   listEnergyFlowModels,
@@ -41,6 +42,26 @@ const MODEL_RANGE = Object.freeze({
 });
 // 正常业务写统一使用隔离库内置管理员身份。
 let auditActorUserId = null;
+// 正式能流公共 JSON 禁止暴露的导入追溯和原始映射字段。
+const PRIVATE_PROVENANCE_KEYS = Object.freeze([
+  'sourceBatchId',
+  'sourceRowNumber',
+  'source_mapping_json',
+  'sourceMappingJson',
+  '_sourceMappingJson'
+]);
+
+/**
+ * 断言公共 JSON 序列化结果不包含内部追溯或原始映射字段。
+ * @param {*} value 待检查服务结果。
+ * @param {string} label 断言场景。
+ */
+function assertPublicJsonOmitsProvenance(value, label) {
+  const serialized = JSON.stringify(value);
+  PRIVATE_PROVENANCE_KEYS.forEach((fieldName) => {
+    assert(!serialized.includes(`"${fieldName}"`), `${label} 不得暴露 ${fieldName}。`);
+  });
+}
 
 /**
  * 构造能流写操作审计选项。
@@ -137,6 +158,77 @@ function createModel(modelCode, version = 'v1') {
     version,
     ...MODEL_RANGE,
     status: 'active'
+  });
+}
+
+/**
+ * 验证模型导入追溯只接受服务端受信 options，写入数据库但不进入公共模型 JSON。
+ */
+function testTrustedModelProvenance() {
+  const provenanceDb = openDatabase();
+  let sourceBatchId;
+  try {
+    sourceBatchId = Number(provenanceDb.prepare(
+      `INSERT INTO import_batches (
+         import_type, original_filename, file_type, status, audit_phase,
+         total_rows, success_count
+       ) VALUES ('energy_flow_model', 'trusted-model.xlsx', 'xlsx', 'completed', 'execute', 1, 1)`
+    ).run().lastInsertRowid);
+  } finally {
+    provenanceDb.close();
+  }
+
+  const model = createEnergyFlowModelWithoutAudit({
+    modelCode: 'FLOW-SERVICE-TRUSTED-PROVENANCE',
+    modelName: '受信追溯模型',
+    source: '隔离测试',
+    documentNo: 'DOC-FLOW-SERVICE-TRUSTED-PROVENANCE',
+    version: 'v1',
+    ...MODEL_RANGE,
+    status: 'active'
+  }, {
+    ...createAuditOptions('energy.flow.model.import', 'energy_flow_model'),
+    sourceBatchId,
+    sourceRowNumber: 2
+  });
+  assertPublicJsonOmitsProvenance(model, '模型创建结果');
+  const detail = getEnergyFlowModel(model.id);
+  assertPublicJsonOmitsProvenance(detail, '模型详情结果');
+
+  const persistedDb = openDatabase();
+  try {
+    const persisted = persistedDb.prepare(
+      'SELECT source_batch_id AS sourceBatchId, source_row_number AS sourceRowNumber FROM energy_flow_models WHERE id = ?'
+    ).get(model.id);
+    assert.strictEqual(persisted.sourceBatchId, sourceBatchId);
+    assert.strictEqual(persisted.sourceRowNumber, 2);
+  } finally {
+    persistedDb.close();
+  }
+
+  [
+    { sourceBatchId: sourceBatchId, sourceRowNumber: null },
+    { sourceBatchId: null, sourceRowNumber: 3 },
+    { sourceBatchId: 0, sourceRowNumber: 3 },
+    { sourceBatchId, sourceRowNumber: 0 },
+    { sourceBatchId: 1.5, sourceRowNumber: 3 },
+    { sourceBatchId, sourceRowNumber: '3' },
+    { sourceBatchId: Number.MAX_SAFE_INTEGER + 1, sourceRowNumber: 3 }
+  ].forEach((provenance, index) => {
+    assertThrowsCode(
+      () => createEnergyFlowModelWithoutAudit({
+        modelCode: `FLOW-SERVICE-TRUSTED-PROVENANCE-INVALID-${index}`,
+        modelName: '非法受信追溯模型',
+        source: '隔离测试',
+        version: 'v1',
+        ...MODEL_RANGE,
+        status: 'active'
+      }, {
+        ...createAuditOptions('energy.flow.model.import', 'energy_flow_model'),
+        ...provenance
+      }),
+      index < 2 ? 'ENERGY_FLOW_MODEL_PROVENANCE_PAIR_INVALID' : 'ENERGY_FLOW_MODEL_PROVENANCE_INVALID'
+    );
   });
 }
 
@@ -351,6 +443,43 @@ function testConfigurationCrudAndTopology() {
   const models = listEnergyFlowModels({ pageSize: 999, keyword: 'FLOW-SERVICE' });
   assert.strictEqual(models.pagination.pageSize, 200);
   assert(models.rows.length >= 2);
+
+  const projectionDb = openDatabase();
+  try {
+    const sourceBatchId = Number(projectionDb.prepare(
+      `INSERT INTO import_batches (
+         import_type, original_filename, file_type, status, audit_phase,
+         total_rows, success_count
+       ) VALUES ('energy_flow_edge', 'public-projection.xlsx', 'xlsx', 'completed', 'execute', 3, 3)`
+    ).run().lastInsertRowid);
+    projectionDb.prepare(
+      'UPDATE energy_flow_nodes SET source_batch_id = ?, source_row_number = ? WHERE energy_flow_model_id = ?'
+    ).run(sourceBatchId, 2, model.id);
+    projectionDb.prepare(
+      'UPDATE energy_flow_edges SET source_batch_id = ?, source_row_number = ? WHERE energy_flow_model_id = ?'
+    ).run(sourceBatchId, 3, model.id);
+    projectionDb.prepare(
+      'UPDATE energy_flow_edges SET source_mapping_json = ? WHERE id = ?'
+    ).run(JSON.stringify({ reference: 'explicit:edge-in', password: 'must-remain-private' }), incoming.id);
+  } finally {
+    projectionDb.close();
+  }
+
+  const publicNodes = listEnergyFlowNodes(model.id, { pageSize: 20 });
+  const publicEdges = listEnergyFlowEdges(model.id, { pageSize: 20 });
+  const publicIncoming = publicEdges.rows.find((edge) => edge.id === incoming.id);
+  assert.strictEqual(publicNodes.rows.find((node) => node.id === source.id).nodeCode, 'SOURCE');
+  assert.strictEqual(publicIncoming.edgeCode, 'EDGE-IN-RENAMED');
+  assert.deepStrictEqual(publicIncoming.sourceMapping, { reference: 'explicit:edge-in' });
+  const rawMappingDescriptor = Object.getOwnPropertyDescriptor(publicIncoming, '_sourceMappingJson');
+  assert(rawMappingDescriptor && rawMappingDescriptor.enumerable === false, '原始来源映射仅可作为不可枚举内部字段存在。');
+  assertPublicJsonOmitsProvenance(publicNodes, '节点列表');
+  assertPublicJsonOmitsProvenance(publicEdges, '边列表');
+  const publicTopology = getEnergyFlowTopology(model.id);
+  assert.strictEqual(publicTopology.nodes.length, 3);
+  assert.strictEqual(publicTopology.edges.length, 2);
+  assert.strictEqual(publicTopology.contract.topologyMode, 'explicit_only');
+  assertPublicJsonOmitsProvenance(publicTopology, '拓扑结果');
   return { electricity, model, source, storage, sink, incoming: renamedIncoming, outgoing };
 }
 
@@ -518,6 +647,11 @@ function testAnalysisQualityAndConversion(master) {
     }]
   });
   assert.strictEqual(analysis.coverage.completeRate, 1);
+  assert.strictEqual(analysis.contract.sourceMode, 'explicit_mapping_only');
+  assert.strictEqual(analysis.contract.autoOffsetsGeneration, false);
+  assert.strictEqual(analysis.topology.nodes.find((node) => node.id === master.source.id).nodeCode, 'SOURCE');
+  assert.strictEqual(analysis.topology.edges.find((edge) => edge.id === master.incoming.id).edgeCode, 'EDGE-IN-RENAMED');
+  assertPublicJsonOmitsProvenance(analysis, '分析结果');
   const storageBalance = analysis.nodeBalances.find((node) => node.nodeId === master.storage.id).facets[0];
   assert.strictEqual(storageBalance.inflow, 100);
   assert.strictEqual(storageBalance.outflow, 90);
@@ -671,18 +805,18 @@ function testExplicitSourceResolvers() {
     ).run().lastInsertRowid);
     timeseriesRecordId = Number(db.prepare(
       `INSERT INTO energy_timeseries_records (
-         energy_type_id, start_utc, end_utc, source_timezone, granularity_minutes,
+         organization_unit_id, energy_type_id, start_utc, end_utc, source_timezone, granularity_minutes,
          original_unit, original_value, normalized_unit, normalized_value,
          source_reference, data_source, record_status
-       ) VALUES (?, '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z', 'Asia/Shanghai', 60,
+       ) VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z', 'Asia/Shanghai', 60,
          'kWh', 5, 'kWh', 5, 'timeseries:test', 'manual', 'active')`
-    ).run(electricity.id).lastInsertRowid);
+    ).run(organizationId, electricity.id).lastInsertRowid);
     monthlyRecordId = Number(db.prepare(
       `INSERT INTO energy_records (
-         energy_type_id, original_month, normalized_month, original_unit, original_value,
+         energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value,
          normalized_unit, normalized_value, duplicate_key, record_status
-       ) VALUES (?, '2026-01', '2026-01', 'kWh', 40, 'kWh', 40, 'flow-monthly-test', 'active')`
-    ).run(electricity.id).lastInsertRowid);
+       ) VALUES (?, ?, '2026-01', '2026-01', 'kWh', 40, 'kWh', 40, 'flow-monthly-test', 'active')`
+    ).run(electricity.id, organizationId).lastInsertRowid);
     db.prepare(
       `INSERT INTO generation_records (
          organization_unit_id, energy_type_id, normalized_month, generation_value_kwh,
@@ -796,18 +930,18 @@ function testConversionFactorPeriodSegmentation() {
     ).run().lastInsertRowid);
     timeseriesRecordId = Number(db.prepare(
       `INSERT INTO energy_timeseries_records (
-         energy_type_id, start_utc, end_utc, source_timezone, granularity_minutes,
+         organization_unit_id, energy_type_id, start_utc, end_utc, source_timezone, granularity_minutes,
          original_unit, original_value, normalized_unit, normalized_value,
          source_reference, data_source, record_status
-       ) VALUES (?, '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z', 'Asia/Shanghai', 60,
+       ) VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z', 'Asia/Shanghai', 60,
          'kWh', 100, 'kWh', 100, 'factor-split:timeseries', 'manual', 'active')`
-    ).run(photovoltaic.id).lastInsertRowid);
+    ).run(organizationId, photovoltaic.id).lastInsertRowid);
     monthlyRecordId = Number(db.prepare(
       `INSERT INTO energy_records (
-         energy_type_id, original_month, normalized_month, original_unit, original_value,
+         energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value,
          normalized_unit, normalized_value, duplicate_key, record_status
-       ) VALUES (?, '2026-01', '2026-01', 'kWh', 100, 'kWh', 100, 'factor-split:monthly', 'active')`
-    ).run(photovoltaic.id).lastInsertRowid);
+       ) VALUES (?, ?, '2026-01', '2026-01', 'kWh', 100, 'kWh', 100, 'factor-split:monthly', 'active')`
+    ).run(photovoltaic.id, organizationId).lastInsertRowid);
     generationRecordId = Number(db.prepare(
       `INSERT INTO generation_records (
          organization_unit_id, energy_type_id, normalized_month, generation_value_kwh,
@@ -927,18 +1061,18 @@ function testCrossEdgeSourceReuseDetection() {
     ).run().lastInsertRowid);
     timeseriesRecordId = Number(db.prepare(
       `INSERT INTO energy_timeseries_records (
-         energy_type_id, start_utc, end_utc, source_timezone, granularity_minutes,
+         organization_unit_id, energy_type_id, start_utc, end_utc, source_timezone, granularity_minutes,
          original_unit, original_value, normalized_unit, normalized_value,
          source_reference, data_source, record_status
-       ) VALUES (?, '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z', 'Asia/Shanghai', 60,
+       ) VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z', 'Asia/Shanghai', 60,
          'kWh', 20, 'kWh', 20, 'source-reuse:timeseries', 'manual', 'active')`
-    ).run(electricity.id).lastInsertRowid);
+    ).run(organizationId, electricity.id).lastInsertRowid);
     monthlyRecordId = Number(db.prepare(
       `INSERT INTO energy_records (
-         energy_type_id, original_month, normalized_month, original_unit, original_value,
+         energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value,
          normalized_unit, normalized_value, duplicate_key, record_status
-       ) VALUES (?, '2026-01', '2026-01', 'kWh', 40, 'kWh', 40, 'source-reuse:monthly', 'active')`
-    ).run(electricity.id).lastInsertRowid);
+       ) VALUES (?, ?, '2026-01', '2026-01', 'kWh', 40, 'kWh', 40, 'source-reuse:monthly', 'active')`
+    ).run(electricity.id, organizationId).lastInsertRowid);
     generationRecordId = Number(db.prepare(
       `INSERT INTO generation_records (
          organization_unit_id, energy_type_id, normalized_month, generation_value_kwh,
@@ -1137,6 +1271,7 @@ function run() {
     actorDb.close();
   }
   testAuditActorRequired();
+  testTrustedModelProvenance();
   const master = testConfigurationCrudAndTopology();
   testCanonicalIdentityGuards();
   testUtcSecondContract();

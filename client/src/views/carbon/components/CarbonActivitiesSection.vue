@@ -64,7 +64,7 @@
           <el-table-column label="用能单元" min-width="180"><template #default="scope">{{ scope.row.organizationUnitName }}（{{ scope.row.organizationUnitCode }}）</template></el-table-column>
           <el-table-column label="能源与活动值" min-width="190"><template #default="scope">{{ scope.row.energyTypeName }}：{{ formatNumber(scope.row.activityValue) }} {{ scope.row.activityUnit }}</template></el-table-column>
           <el-table-column label="来源墙钟" min-width="230"><template #default="scope">{{ formatSourceWallClock(scope.row.startWallClock) }} 至 {{ formatSourceWallClock(scope.row.endWallClock) }}<br /><small>{{ scope.row.sourceTimezone }}</small></template></el-table-column>
-          <el-table-column label="对应 UTC" min-width="230"><template #default="scope">{{ scope.row.startUtc }}<br />至 {{ scope.row.endUtc }}</template></el-table-column>
+          <el-table-column label="对应 UTC" min-width="230"><template #default="scope">{{ formatStrictUtcDateTimeDisplay(scope.row.startUtc) }}<br />至 {{ formatStrictUtcDateTimeDisplay(scope.row.endUtc) }}</template></el-table-column>
           <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="activityStatusType(scope.row.status)">{{ carbonActivityStatusLabel(scope.row.status) }}</el-tag></template></el-table-column>
           <el-table-column label="操作" width="150" fixed="right">
             <template #default="scope">
@@ -99,7 +99,7 @@
         <el-descriptions-item label="能源类型">{{ detailActivity.energyTypeName }}（{{ detailActivity.energyTypeCode }}）</el-descriptions-item>
         <el-descriptions-item label="来源墙钟">{{ formatSourceWallClock(detailActivity.startWallClock) }} 至 {{ formatSourceWallClock(detailActivity.endWallClock) }}</el-descriptions-item>
         <el-descriptions-item label="来源时区">{{ detailActivity.sourceTimezone }}</el-descriptions-item>
-        <el-descriptions-item label="对应 UTC">{{ detailActivity.startUtc }} 至 {{ detailActivity.endUtc }}</el-descriptions-item>
+        <el-descriptions-item label="对应 UTC">{{ formatStrictUtcDateTimeDisplay(detailActivity.startUtc) }} 至 {{ formatStrictUtcDateTimeDisplay(detailActivity.endUtc) }}</el-descriptions-item>
         <el-descriptions-item label="活动数据">{{ formatNumber(detailActivity.activityValue) }} {{ detailActivity.activityUnit }}</el-descriptions-item>
         <el-descriptions-item label="因子地区">{{ detailActivity.factorRegion }}</el-descriptions-item>
         <el-descriptions-item label="来源标识">{{ detailActivity.sourceReference || '—' }}</el-descriptions-item>
@@ -110,9 +110,9 @@
         <el-descriptions-item label="替代后继">{{ traceLabel(detailActivity.supersededByActivityId, detailActivity.supersededByActivityCode) }}</el-descriptions-item>
         <el-descriptions-item label="来源批次 / 行">{{ detailActivity.sourceBatchId || '—' }} / {{ detailActivity.sourceRowNumber || '—' }}</el-descriptions-item>
         <el-descriptions-item label="作废原因">{{ detailActivity.voidReason || '—' }}</el-descriptions-item>
-        <el-descriptions-item label="作废审计">{{ detailActivity.voidedAt || '—' }} / {{ detailActivity.voidedByName || detailActivity.voidedBy || '—' }}</el-descriptions-item>
-        <el-descriptions-item label="创建审计">{{ detailActivity.createdAt }} / {{ detailActivity.createdByName || detailActivity.createdBy || '—' }}</el-descriptions-item>
-        <el-descriptions-item label="更新时间">{{ detailActivity.updatedAt }}</el-descriptions-item>
+        <el-descriptions-item label="作废审计">{{ formatStrictUtcDateTimeDisplay(detailActivity.voidedAt) }} / {{ detailActivity.voidedByName || detailActivity.voidedBy || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="创建审计">{{ formatStrictUtcDateTimeDisplay(detailActivity.createdAt) }} / {{ detailActivity.createdByName || detailActivity.createdBy || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="更新时间">{{ formatStrictUtcDateTimeDisplay(detailActivity.updatedAt) }}</el-descriptions-item>
       </el-descriptions>
     </el-drawer>
 
@@ -143,6 +143,7 @@ import {
 } from '@/utils/carbonActivityManagement';
 import { hasPermi } from '@/utils/permission';
 import { areStrictUtcInputsValid } from '@/utils/dateTimeFields';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 import { isLatestRequestGeneration, nextRequestGeneration } from '@/utils/requestGeneration';
 import CarbonActivityImportPanel from './CarbonActivityImportPanel.vue';
 

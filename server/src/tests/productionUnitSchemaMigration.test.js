@@ -79,21 +79,20 @@ try {
     legacyDb.close();
   }
 
-  initDatabase();
+  assert.throws(
+    () => initDatabase(),
+    (error) => error?.code === 'UNKNOWN_EXISTING_SCHEMA'
+  );
   const db = openDatabase();
   try {
-    assert(getTableColumns(db, 'production_units').includes('source_batch_id'), '旧 production_units 必须补充 source_batch_id。');
-    assert(getTableColumns(db, 'production_units').includes('source_row_number'), '旧 production_units 必须补充 source_row_number。');
-    assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM production_units WHERE unit_code = 'LEGACY-PU' AND source_batch_id IS NULL AND source_row_number IS NULL").get().total, 1, '旧产能单元必须保留，来源字段默认 NULL。');
-    const batchId = db.prepare("INSERT INTO import_batches (import_type, original_filename, file_type, status, total_rows, success_count, failure_count, skipped_count) VALUES ('production_unit', 'production-units.csv', 'csv', 'completed', 1, 1, 0, 0)").run().lastInsertRowid;
-    const organizationUnitId = db.prepare("SELECT id FROM organization_units WHERE unit_code = 'LEGACY-ORG'").get().id;
-    db.prepare("INSERT INTO production_units (source_batch_id, source_row_number, unit_code, unit_name, organization_unit_id, product_name, output_unit, status) VALUES (?, 2, 'MIGRATED-PU', '迁移后产能单元', ?, '产品A', '件', 'active')").run(batchId, organizationUnitId);
-    assert(getTableColumns(db, 'import_batches').includes('audit_context_json'), '旧 import_batches 必须保留统一审计字段兼容。');
-    assert.deepStrictEqual(db.prepare('PRAGMA foreign_key_check').all(), [], '旧库升级后外键必须有效。');
+    assert.strictEqual(getTableColumns(db, 'production_units').includes('source_batch_id'), false,
+      '未知旧库被拒绝时不得自动补充来源字段。');
+    assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM production_units WHERE unit_code = 'LEGACY-PU'").get().total, 1,
+      '未知旧库被拒绝时不得删除旧产能单元。');
   } finally {
     db.close();
   }
-  console.log('production unit schema migration tests passed');
+  console.log('production unit unknown schema rejection tests passed');
 } finally {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 }

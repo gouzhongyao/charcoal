@@ -27,6 +27,7 @@ import PredictionManagement from '@/views/predictions/PredictionManagement.vue';
 import Dashboard from '@/views/dashboard/Dashboard.vue';
 import ImportCenter from '@/views/imports/ImportCenter.vue';
 import Backups from '@/views/system/Backups.vue';
+import DemoData from '@/views/system/DemoData.vue';
 import NotFound from '@/views/NotFound.vue';
 import { useUserStore } from '@/stores/user';
 import { usePermissionStore } from '@/stores/permission';
@@ -61,7 +62,8 @@ const componentMap = Object.freeze({
   'ledger/suppliers/index': SupplierManagement,
   'carbon/index': CarbonManagement,
   'predictions/index': PredictionManagement,
-  'system/backups/index': Backups
+  'system/backups/index': Backups,
+  'system/demo-data/index': DemoData
 });
 // 动态路由名称集合用于幂等注册、刷新重试识别和退出后的完整清理。
 const dynamicRouteNames = new Set();
@@ -72,7 +74,7 @@ let activeBootstrapCount = 0;
 // 会话失效事件处理标记用于合并同一批并发 401，避免重复清理和跳转。
 let unauthenticatedEventHandling = false;
 
-// 将后端菜单转换为安全的前端动态路由记录，未知组件继续落到迁移占位页。
+// 将后端菜单转换为安全的前端动态路由记录，未知组件进入正式不可用提示页。
 function safeRoute(menu) {
   const routeContract = projectDynamicRouteContract(menu);
   if (!routeContract) return null;
@@ -83,7 +85,8 @@ function safeRoute(menu) {
     component,
     meta: {
       ...routeContract.meta,
-      migration: component === MigrationPlaceholder
+      trustedInternalRoute: component !== MigrationPlaceholder,
+      unavailable: component === MigrationPlaceholder
     }
   };
 }

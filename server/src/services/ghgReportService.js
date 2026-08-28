@@ -3,6 +3,7 @@
 const XLSX = require('xlsx');
 const { openDatabase } = require('../db/database');
 const { badRequest, notFound } = require('../utils/errors');
+const { formatStrictUtcForUser } = require('../utils/userVisibleDateTime');
 const {
   buildGhgReportCodeKey,
   normalizeGhgReportDate,
@@ -288,7 +289,7 @@ function exportGhgReport(reportIdValue) {
     ['报告编码', '报告名称', '报告组织', '报告开始日期', '报告结束日期', '模板标识', '模板版本', '备注', '来源批次ID', '来源行号', '创建者', '创建时间'], [[
       report.reportCode, report.reportName, report.reportOrganization, report.periodStart, report.periodEnd,
       report.templateId, report.templateVersion, report.note, report.sourceBatchId, report.sourceRowNumber,
-      report.createdByName, report.createdAt
+      report.createdByName, formatStrictUtcForUser(report.createdAt)
     ]]);
   appendGhgReportWorksheet(workbook, '组织边界',
     ['边界编码', '组织单元', '纳入方式', '边界说明', '来源行号'], organizationBoundaries.map((row) => [

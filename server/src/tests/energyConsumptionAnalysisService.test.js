@@ -35,10 +35,13 @@ const {
   SHIFT_CONSUMPTION_ANALYSIS_FORMULA_VERSION,
   SHIFT_SCHEDULE_QUERY_LIMIT,
   TIME_OF_USE_CONSUMPTION_ANALYSIS_FORMULA_VERSION,
+  TIMESERIES_EXACT_ID_QUERY_BATCH_SIZE,
   TIMESERIES_QUERY_LIMIT,
+  buildEnergyLoadExactScope,
   getDeviceStateConsumptionAnalysis,
   getEnergyLoadCurve,
   getEnergyLoadSummary,
+  getExactScopeMetadata,
   getMonthlyConsumptionAnalysis,
   getShiftConsumptionAnalysis,
   getTimeOfUseConsumptionAnalysis,
@@ -532,6 +535,19 @@ function clearTimeseriesRecords(db) {
 }
 
 /**
+ * 创建隔离导入批次，供 exact scope provenance 测试使用。
+ * @param {object} db SQLite 连接。
+ * @param {string} importType 导入类型。
+ * @returns {number} 批次 ID。
+ */
+function createImportBatch(db, importType) {
+  return Number(db.prepare(
+    `INSERT INTO import_batches (import_type, original_filename, file_type, status)
+     VALUES (?, ?, 'csv', 'completed')`
+  ).run(importType, `${importType}-exact-scope.csv`).lastInsertRowid);
+}
+
+/**
  * 创建时序事实写入函数。
  * @param {object} db SQLite 连接。
  * @param {object} ids 主数据 ID。
@@ -540,6 +556,8 @@ function clearTimeseriesRecords(db) {
 function createTimeseriesInserter(db, ids) {
   const insert = db.prepare(
     `INSERT INTO energy_timeseries_records (
+       source_batch_id,
+       source_row_number,
        organization_unit_id,
        meter_device_id,
        energy_type_id,
@@ -557,6 +575,8 @@ function createTimeseriesInserter(db, ids) {
        void_reason,
        voided_at
      ) VALUES (
+       @sourceBatchId,
+       @sourceRowNumber,
        @organizationUnitId,
        @meterDeviceId,
        @energyTypeId,
@@ -584,6 +604,12 @@ function createTimeseriesInserter(db, ids) {
       ? overrides.normalizedValue
       : 10;
     return Number(insert.run({
+      sourceBatchId: Object.prototype.hasOwnProperty.call(overrides, 'sourceBatchId')
+        ? overrides.sourceBatchId
+        : null,
+      sourceRowNumber: Object.prototype.hasOwnProperty.call(overrides, 'sourceRowNumber')
+        ? overrides.sourceRowNumber
+        : null,
       organizationUnitId: Object.prototype.hasOwnProperty.call(overrides, 'organizationUnitId')
         ? overrides.organizationUnitId
         : ids.organizationUnitId,
@@ -614,10 +640,13 @@ function createTimeseriesInserter(db, ids) {
  * @param {object} overrides 公共覆盖字段。
  */
 function insertQuarterHourSeries(insertRecord, values, overrides = {}) {
-  values.forEach((value, index) => {
+  return values.map((value, index) => {
     const startMs = Date.parse('2026-07-15T00:00:00.000Z') + index * 15 * 60 * 1000;
-    insertRecord({
+    return insertRecord({
       ...overrides,
+      sourceRowNumber: Object.prototype.hasOwnProperty.call(overrides, 'sourceRowNumber')
+        ? overrides.sourceRowNumber + index
+        : overrides.sourceRowNumber,
       startUtc: new Date(startMs).toISOString(),
       endUtc: new Date(startMs + 15 * 60 * 1000).toISOString(),
       granularityMinutes: 15,
@@ -634,6 +663,7 @@ function insertQuarterHourSeries(insertRecord, values, overrides = {}) {
 function testInputValidation(meterDeviceId) {
   assert.strictEqual(MAX_QUERY_RANGE_DAYS, 31);
   assert.strictEqual(MAX_TIMESERIES_RECORDS, 50000);
+  assert.strictEqual(TIMESERIES_EXACT_ID_QUERY_BATCH_SIZE, 500);
   assert.strictEqual(TIMESERIES_QUERY_LIMIT, 50001);
   assert.strictEqual(MINIMUM_COVERAGE_RATE, 1);
   assert.strictEqual(MIN_SUPPORTED_ANALYSIS_YEAR, 1);
@@ -704,6 +734,81 @@ function testInputValidation(meterDeviceId) {
   assertBadRequestCode(
     () => normalizeEnergyLoadSummaryInput(createInput({ meterDeviceId: '1 OR 1=1' })),
     'INVALID_METER_DEVICE_ID'
+  );
+}
+
+/**
+ * 验证 exact ID 大集合按固定安全批次查询，并在业务上限处稳定拒绝。
+ * @param {object} db SQLite 连接。
+ * @param {number} meterDeviceId 有效表计 ID。
+ */
+function testExactScopeIdQueryLimits(db, meterDeviceId) {
+  // 有效导入批次确保大集合测试真实进入 exact builder 的参数化查询阶段。
+  const sourceBatchId = createImportBatch(db, 'energy_timeseries');
+  // 三万二千七百六十六个 ID 加批次参数可复现原单语句常见变量上限边界。
+  const commonVariableBoundaryIds = Array.from(
+    { length: 32766 },
+    (_value, index) => 1000000 + index
+  );
+  // 受控连接代理把最低常见变量上限固定为九百九十九，同时仍执行真实隔离 SQLite 查询。
+  const guardedDb = {
+    // 标记为调用方事务，避免受控代理接管真实连接的事务生命周期。
+    inTransaction: true,
+    // 每条 SQL 超过九百九十九个位置参数时模拟 SQLite 原始变量错误。
+    prepare(sql) {
+      const parameterCount = (sql.match(/\?/g) || []).length;
+      if (parameterCount > 999) {
+        const rawVariableError = new Error('too many SQL variables');
+        rawVariableError.code = 'SQLITE_ERROR';
+        throw rawVariableError;
+      }
+      return db.prepare(sql);
+    }
+  };
+  const boundaryError = assertBadRequestCode(
+    () => buildEnergyLoadExactScope(guardedDb, commonVariableBoundaryIds, sourceBatchId),
+    'ENERGY_LOAD_EXACT_SCOPE_RECORD_SET_MISMATCH'
+  );
+  assert.strictEqual(
+    boundaryError.message.includes('SQL variables'),
+    false,
+    '大 exact ID 集合必须完成安全分批并返回业务集合错误，不得暴露 SQLite 变量错误。'
+  );
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId }), {
+      db: guardedDb,
+      exactScope: {
+        timeseriesRecordIds: commonVariableBoundaryIds,
+        timeseriesSourceBatchId: sourceBatchId,
+        timeseriesScopeDigest: '0'.repeat(64),
+        expectedTimeseriesSnapshots: []
+      }
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+
+  // 五万零一个 ID 必须在任何 SQL 查询前由共享 normalizer 稳定拒绝，不得静默截断。
+  const overBusinessLimitIds = Array.from(
+    { length: MAX_TIMESERIES_RECORDS + 1 },
+    (_value, index) => index + 1
+  );
+  const builderLimitError = assertBadRequestCode(
+    () => buildEnergyLoadExactScope(db, overBusinessLimitIds, sourceBatchId),
+    'ENERGY_LOAD_RECORD_LIMIT_EXCEEDED'
+  );
+  assert.strictEqual(builderLimitError.details.maximumRecords, MAX_TIMESERIES_RECORDS);
+  assert.strictEqual(builderLimitError.details.actualRecords, MAX_TIMESERIES_RECORDS + 1);
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId }), {
+      db,
+      exactScope: {
+        timeseriesRecordIds: overBusinessLimitIds,
+        timeseriesSourceBatchId: sourceBatchId,
+        timeseriesScopeDigest: '0'.repeat(64),
+        expectedTimeseriesSnapshots: []
+      }
+    }),
+    'ENERGY_LOAD_RECORD_LIMIT_EXCEEDED'
   );
 }
 
@@ -950,6 +1055,265 @@ function testFullCoverageAndExactScope(db, ids, insertRecord) {
   assert.strictEqual(result.meta.monthlyEnergyRecordsRead, false);
   assert.strictEqual(result.meta.queryLimit, 50001);
   assert.strictEqual(result.meta.callerDatabaseConnection, true);
+}
+
+/**
+ * 验证服务端私有 exact scope 的成功、阻断、漂移、覆盖和连接所有权边界。
+ * @param {object} db SQLite 连接。
+ * @param {object} ids 主数据 ID。
+ * @param {Function} insertRecord 单条写入函数。
+ */
+function testServerPrivateExactScope(db, ids, insertRecord) {
+  clearTimeseriesRecords(db);
+  const exactBatchId = createImportBatch(db, 'energy_timeseries');
+  const otherBatchId = createImportBatch(db, 'energy_timeseries');
+  const exactRecordIds = insertQuarterHourSeries(insertRecord, [10, 20, 30, 40], {
+    sourceBatchId: exactBatchId,
+    sourceRowNumber: 1
+  });
+  const otherRunRecordIds = insertQuarterHourSeries(insertRecord, [100, 100, 100, 100], {
+    sourceBatchId: otherBatchId,
+    sourceRowNumber: 1,
+    sourceReference: 'other-demo-run'
+  });
+  const sameBatchExtraRecordId = insertRecord({
+    sourceBatchId: exactBatchId,
+    sourceRowNumber: 5,
+    startUtc: '2026-07-15T01:00:00.000Z',
+    endUtc: '2026-07-15T01:15:00.000Z',
+    sourceReference: 'same-batch-extra'
+  });
+  const exactScope = buildEnergyLoadExactScope(db, exactRecordIds, exactBatchId);
+  // builder 必须先执行 ownership 固定 projection，来源批次和来源行号不成对时拒绝。
+  const incompatibleOwnershipRecordId = insertRecord({
+    sourceBatchId: exactBatchId,
+    sourceRowNumber: null,
+    sourceReference: 'ownership-incompatible-source-pair'
+  });
+  assertBadRequestCode(
+    () => buildEnergyLoadExactScope(db, [incompatibleOwnershipRecordId], exactBatchId),
+    'ENERGY_LOAD_EXACT_SCOPE_OWNERSHIP_INCOMPATIBLE'
+  );
+  db.prepare('DELETE FROM energy_timeseries_records WHERE id = ?').run(incompatibleOwnershipRecordId);
+  const result = getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+    db,
+    exactScope
+  });
+  assert.strictEqual(result.recordCount, 4, 'exact scope 不得读取其他 demo run 时序。');
+  assert.strictEqual(result.metrics.totalEnergy, 100);
+  assert.strictEqual(result.meta.callerDatabaseConnection, true);
+  assert.strictEqual(db.inTransaction, false, 'exact 负荷摘要必须提交服务自建读取事务。');
+  const requiredResult = getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+    db,
+    exactRequired: true,
+    exactScope
+  });
+  assert.strictEqual(requiredResult.recordCount, 4);
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactRequired: true
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_REQUIRED'
+  );
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactRequired: true,
+      exactScope: JSON.parse(JSON.stringify(exactScope))
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  const metadata = getExactScopeMetadata(result, { db });
+  assert(metadata, 'exact 响应必须关联服务端私有 metadata。');
+  assert.deepStrictEqual(metadata.recordIds, exactRecordIds);
+  assert.strictEqual(metadata.sourceBatchId, exactBatchId);
+  const publicJson = JSON.stringify(result);
+  [
+    'sourceBatchId',
+    'sourceRowNumber',
+    'timeseriesScopeDigest',
+    'expectedTimeseriesSnapshots',
+    'registry',
+    'context',
+    'handler',
+    'SELECT '
+  ].forEach((privateToken) => {
+    assert.strictEqual(publicJson.includes(privateToken), false, `公共负荷响应泄露 ${privateToken}`);
+  });
+
+  // exact scope 只能来自 options；同名公开 input 字段不得缩窄 legacy 查询。
+  const ignoredBodyScope = getEnergyLoadSummary(createInput({
+    meterDeviceId: ids.primaryMeterId,
+    recordIds: [exactRecordIds[0]],
+    sourceBatchId: exactBatchId,
+    digest: exactScope.timeseriesScopeDigest,
+    registry: { connected: true },
+    context: { private: true }
+  }), { db });
+  assert.strictEqual(ignoredBodyScope.recordCount, 8);
+
+  const duplicateScope = JSON.parse(JSON.stringify(exactScope));
+  duplicateScope.timeseriesRecordIds.push(exactRecordIds[0]);
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope: duplicateScope
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_ID_DUPLICATE'
+  );
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope: {
+        timeseriesRecordIds: [],
+        timeseriesSourceBatchId: exactBatchId,
+        timeseriesScopeDigest: exactScope.timeseriesScopeDigest,
+        expectedTimeseriesSnapshots: []
+      }
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_IDS_REQUIRED'
+  );
+  const missingBatchFieldScope = JSON.parse(JSON.stringify(exactScope));
+  delete missingBatchFieldScope.timeseriesSourceBatchId;
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope: missingBatchFieldScope
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_SOURCE_BATCH_REQUIRED'
+  );
+  const missingBatchScope = JSON.parse(JSON.stringify(exactScope));
+  missingBatchScope.timeseriesSourceBatchId = 999999999;
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope: missingBatchScope
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  const missingRecordScope = JSON.parse(JSON.stringify(exactScope));
+  missingRecordScope.timeseriesRecordIds.splice(1, 1);
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope: missingRecordScope
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  const extraRecordScope = JSON.parse(JSON.stringify(exactScope));
+  extraRecordScope.timeseriesRecordIds.push(sameBatchExtraRecordId);
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope: extraRecordScope
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  const crossBatchScope = JSON.parse(JSON.stringify(exactScope));
+  crossBatchScope.timeseriesRecordIds.push(otherRunRecordIds[0]);
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope: crossBatchScope
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  const digestDriftScope = JSON.parse(JSON.stringify(exactScope));
+  digestDriftScope.timeseriesScopeDigest = '0'.repeat(64);
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope: digestDriftScope
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+
+  // 调用方已有事务必须复用且不得由服务提交或回滚。
+  db.exec('BEGIN DEFERRED');
+  try {
+    getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope
+    });
+    assert.strictEqual(db.inTransaction, true);
+  } finally {
+    db.exec('ROLLBACK');
+  }
+
+  // active 漂移必须在精确集合校验阶段阻断。
+  db.prepare(
+    `UPDATE energy_timeseries_records
+        SET record_status = 'void', void_reason = 'exact active drift',
+            voided_at = '2026-07-16T00:00:00.000Z'
+      WHERE id = ?`
+  ).run(exactRecordIds[0]);
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_RECORD_SET_MISMATCH'
+  );
+
+  clearTimeseriesRecords(db);
+  const gapBatchId = createImportBatch(db, 'energy_timeseries');
+  const gapRecordIds = [
+    insertRecord({
+      sourceBatchId: gapBatchId,
+      sourceRowNumber: 1,
+      startUtc: '2026-07-15T00:00:00.000Z',
+      endUtc: '2026-07-15T00:15:00.000Z'
+    }),
+    insertRecord({
+      sourceBatchId: gapBatchId,
+      sourceRowNumber: 2,
+      startUtc: '2026-07-15T00:30:00.000Z',
+      endUtc: '2026-07-15T01:00:00.000Z',
+      granularityMinutes: 30
+    })
+  ];
+  const gapScope = buildEnergyLoadExactScope(db, gapRecordIds, gapBatchId);
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope: gapScope
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_GAP'
+  );
+
+  clearTimeseriesRecords(db);
+  const overlapBatchId = createImportBatch(db, 'energy_timeseries');
+  const overlapRecordIds = [
+    insertRecord({
+      sourceBatchId: overlapBatchId,
+      sourceRowNumber: 1,
+      startUtc: '2026-07-15T00:00:00.000Z',
+      endUtc: '2026-07-15T00:30:00.000Z',
+      granularityMinutes: 30
+    }),
+    insertRecord({
+      sourceBatchId: overlapBatchId,
+      sourceRowNumber: 2,
+      startUtc: '2026-07-15T00:15:00.000Z',
+      endUtc: '2026-07-15T00:45:00.000Z',
+      granularityMinutes: 30
+    }),
+    insertRecord({
+      sourceBatchId: overlapBatchId,
+      sourceRowNumber: 3,
+      startUtc: '2026-07-15T00:45:00.000Z',
+      endUtc: '2026-07-15T01:00:00.000Z'
+    })
+  ];
+  const overlapScope = buildEnergyLoadExactScope(db, overlapRecordIds, overlapBatchId);
+  assertBadRequestCode(
+    () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+      db,
+      exactScope: overlapScope
+    }),
+    'ENERGY_LOAD_EXACT_SCOPE_OVERLAP'
+  );
 }
 
 /**
@@ -2941,7 +3305,7 @@ function seedMonthlyMasterData(db, baseIds) {
 }
 
 /**
- * 创建月度能耗事实写入函数，显式支持空组织和空表计关联。
+ * 创建月度能耗事实写入函数，组织必填并显式支持空表计关联。
  * @param {object} db SQLite 连接。
  * @param {object} baseIds 既有主数据 ID。
  * @param {object} monthlyIds 月度主数据 ID。
@@ -3120,7 +3484,6 @@ function seedMonthlyComprehensiveScenario(db, baseIds, monthlyIds, insertMonthly
   insertMonthly({
     month: '2026-01',
     value: 50,
-    organizationUnitId: null,
     meterDeviceId: null
   });
   insertMonthly({
@@ -3286,8 +3649,8 @@ function testMonthlyAnalysisContract(db, baseIds, monthlyIds, insertMonthly) {
   ]);
 
   assert.deepStrictEqual(electricity.structure.organization, {
-    linked: { value: 350, recordCount: 6 },
-    unlinked: { value: 50, recordCount: 1 }
+    linked: { value: 400, recordCount: 7 },
+    unlinked: { value: 0, recordCount: 0 }
   });
   assert.deepStrictEqual(electricity.structure.meter, {
     linked: { value: 350, recordCount: 6 },
@@ -3296,13 +3659,13 @@ function testMonthlyAnalysisContract(db, baseIds, monthlyIds, insertMonthly) {
   assert.strictEqual(
     electricity.organizationTopN.some((item) => item.organizationUnitId === null),
     false,
-    '未关联事实不得伪造组织 ID。'
+    'canonical 能耗事实必须始终保留真实组织 ID。'
   );
   assert.strictEqual(electricity.organizationTopN[0].organizationUnitId, monthlyIds.inactiveOrganizationId);
   assert.strictEqual(electricity.organizationTopN[0].organizationUnitStatus, 'inactive');
-  assert.strictEqual(electricity.organizationTopN[0].totalValue, 150);
-  assert.strictEqual(electricity.organizationTopN[0].recordCount, 2);
-  assertClose(electricity.organizationTopN[0].share, 0.375);
+  assert.strictEqual(electricity.organizationTopN[0].totalValue, 200);
+  assert.strictEqual(electricity.organizationTopN[0].recordCount, 3);
+  assertClose(electricity.organizationTopN[0].share, 0.5);
   assert.strictEqual(electricity.organizationTopN[1].organizationUnitId, monthlyIds.activeOrganizationBId);
   assert.strictEqual(electricity.organizationTopN[1].totalValue, 100);
   assert.strictEqual(electricity.organizationTopN[1].recordCount, 2);
@@ -3360,7 +3723,7 @@ function testMonthlyOrganizationScope(db, monthlyIds) {
   }), { db });
   assert.strictEqual(result.scope.organizationUnit.status, 'inactive');
   const electricity = getMonthlyFacet(result, 'electricity', 'kWh');
-  assert.strictEqual(electricity.totals.value, 150);
+  assert.strictEqual(electricity.totals.value, 200);
   assert.strictEqual(electricity.organizationTopN.length, 1);
   assert.strictEqual(electricity.organizationTopN[0].organizationUnitId, monthlyIds.inactiveOrganizationId);
   assert.strictEqual(
@@ -5167,8 +5530,10 @@ try {
   const insertRecord = createTimeseriesInserter(db, ids);
 
   testInputValidation(ids.primaryMeterId);
+  testExactScopeIdQueryLimits(db, ids.primaryMeterId);
   testCurveInputValidation(ids.primaryMeterId);
   testFullCoverageAndExactScope(db, ids, insertRecord);
+  testServerPrivateExactScope(db, ids, insertRecord);
   testHalfOpenBoundary(db, ids, insertRecord);
   testMillisecondHalfOpenBoundary(db, ids, insertRecord);
   testInactiveMeterHistory(db, ids);

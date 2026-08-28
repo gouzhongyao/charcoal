@@ -3,6 +3,10 @@
 const XLSX = require('xlsx');
 const { openDatabase } = require('../db/database');
 const { AppError, badRequest, notFound } = require('../utils/errors');
+const {
+  formatStrictUtcForUser,
+  formatWallClockMinuteForUser
+} = require('../utils/userVisibleDateTime');
 const { escapeSpreadsheetFormula } = require('./carbonActivityService');
 const {
   assertCarbonAccountingQueryContract,
@@ -112,16 +116,21 @@ const ENERGY_RESULT_SELECT_SQL = `SELECT emission.id,
   energy.name AS energyTypeName,
   record.energy_type_id AS energyTypeId,
   record.organization_unit_id AS organizationUnitId,
+  organization.unit_code AS organizationUnitCode,
+  organization.unit_name AS organizationUnitName,
+  organization.unit_path AS organizationUnitPath,
+  record.meter_device_id AS meterDeviceId,
+  meter.meter_code AS meterCode,
+  meter.meter_name AS meterName,
   record.normalized_month AS normalizedMonth,
-  record.organization,
-  record.site,
-  record.department,
   factor.region AS factorRegion,
   factor.factor_year AS factorYear,
   factor.source AS factorSource
 FROM carbon_emissions emission
 JOIN energy_records record ON record.id = emission.energy_record_id
 JOIN energy_types energy ON energy.id = record.energy_type_id
+JOIN organization_units organization ON organization.id = record.organization_unit_id
+LEFT JOIN meter_devices meter ON meter.id = record.meter_device_id
 LEFT JOIN carbon_factors factor ON factor.id = emission.carbon_factor_id`;
 
 /** 读取同一语义的一组兼容查询字段，并拒绝同时提交多个别名。 */
@@ -517,9 +526,11 @@ function buildEnergyResultWhere(filters) {
     params.keyword = `%${escapeLikePattern(filters.keyword)}%`;
     clauses.push(`(energy.code LIKE @keyword ESCAPE '${LIKE_ESCAPE_CHARACTER}'
       OR energy.name LIKE @keyword ESCAPE '${LIKE_ESCAPE_CHARACTER}'
-      OR record.organization LIKE @keyword ESCAPE '${LIKE_ESCAPE_CHARACTER}'
-      OR record.site LIKE @keyword ESCAPE '${LIKE_ESCAPE_CHARACTER}'
-      OR record.department LIKE @keyword ESCAPE '${LIKE_ESCAPE_CHARACTER}'
+      OR organization.unit_code LIKE @keyword ESCAPE '${LIKE_ESCAPE_CHARACTER}'
+      OR organization.unit_name LIKE @keyword ESCAPE '${LIKE_ESCAPE_CHARACTER}'
+      OR organization.unit_path LIKE @keyword ESCAPE '${LIKE_ESCAPE_CHARACTER}'
+      OR meter.meter_code LIKE @keyword ESCAPE '${LIKE_ESCAPE_CHARACTER}'
+      OR meter.meter_name LIKE @keyword ESCAPE '${LIKE_ESCAPE_CHARACTER}'
       OR emission.note LIKE @keyword ESCAPE '${LIKE_ESCAPE_CHARACTER}')`);
   }
   return { whereSql: `WHERE ${clauses.join(' AND ')}`, params };
@@ -560,6 +571,8 @@ function listEnergyResultFacet(db, filters, pagination) {
     FROM carbon_emissions emission
     JOIN energy_records record ON record.id = emission.energy_record_id
     JOIN energy_types energy ON energy.id = record.energy_type_id
+    JOIN organization_units organization ON organization.id = record.organization_unit_id
+    LEFT JOIN meter_devices meter ON meter.id = record.meter_device_id
     LEFT JOIN carbon_factors factor ON factor.id = emission.carbon_factor_id ${whereSql}`)
     .get(params).total || 0);
   const rows = db.prepare(`${ENERGY_RESULT_SELECT_SQL} ${whereSql}
@@ -673,6 +686,8 @@ function buildEnergyStatisticsFacet(db, filters) {
   const fromSql = `FROM carbon_emissions emission
     JOIN energy_records record ON record.id = emission.energy_record_id
     JOIN energy_types energy ON energy.id = record.energy_type_id
+    JOIN organization_units organization ON organization.id = record.organization_unit_id
+    LEFT JOIN meter_devices meter ON meter.id = record.meter_device_id
     LEFT JOIN carbon_factors factor ON factor.id = emission.carbon_factor_id ${whereSql}`;
   const summary = db.prepare(`SELECT COUNT(*) AS totalRecords,
       SUM(CASE WHEN emission.status = 'calculated' THEN 1 ELSE 0 END) AS calculatedCount,
@@ -771,21 +786,32 @@ const INDEPENDENT_EXPORT_FIELDS = Object.freeze([
   ['emissionValue', '排放量'], ['emissionUnit', '排放单位'], ['status', '状态'],
   ['missingReason', '缺因子原因'], ['matchPriority', '匹配优先级'], ['createdAt', '核算时间']
 ]);
-// 旧能耗来源导出字段保持原结果语义并新增显式来源列。
+// 能耗来源导出字段只使用 canonical 外键及其 JOIN 派生名称。
 const ENERGY_EXPORT_FIELDS = Object.freeze([
   ['sourceType', '来源类型'], ['id', '碳排放记录ID'], ['energyRecordId', '能耗记录ID'],
   ['normalizedMonth', '月份'], ['energyTypeCode', '能源类型编码'], ['energyTypeName', '能源类型名称'],
-  ['organization', '组织'], ['site', '厂区'], ['department', '部门'],
+  ['organizationUnitId', '用能单元ID'], ['organizationUnitCode', '用能单元编码'],
+  ['organizationUnitName', '用能单元名称'], ['organizationUnitPath', '用能单元路径'],
+  ['meterDeviceId', '计量器具ID'], ['meterCode', '计量器具编码'], ['meterName', '计量器具名称'],
   ['calculationMethod', '核算方法'], ['activityValue', '活动数据值'], ['activityUnit', '活动数据单位'],
   ['carbonFactorId', '碳因子ID'], ['factorValue', '因子值'], ['factorRegion', '因子地区'],
   ['factorYear', '因子年份'], ['factorSource', '因子来源'], ['emissionValue', '排放量'],
   ['emissionUnit', '排放单位'], ['status', '状态'], ['calculatedAt', '核算时间'], ['note', '备注']
 ]);
 
-/** 将对象结果映射为经过公式注入防护的二维表格。 */
+// 核算导出中的来源墙钟和严格 UTC 字段使用固定字段语义，不按值形态猜测。
+const USER_VISIBLE_WALL_CLOCK_EXPORT_FIELDS = new Set(['activityStartWallClock', 'activityEndWallClock']);
+const USER_VISIBLE_UTC_EXPORT_FIELDS = new Set(['activityStartUtc', 'activityEndUtc', 'createdAt', 'calculatedAt']);
+
+/** 将对象结果映射为经过时间展示和公式注入防护的二维表格。 */
 function buildSafeExportMatrix(rows, fields) {
   const headers = fields.map(([, header]) => header);
-  const values = rows.map((row) => fields.map(([fieldName]) => escapeSpreadsheetFormula(row[fieldName])));
+  const values = rows.map((row) => fields.map(([fieldName]) => {
+    let value = row[fieldName];
+    if (USER_VISIBLE_WALL_CLOCK_EXPORT_FIELDS.has(fieldName)) value = formatWallClockMinuteForUser(value);
+    if (USER_VISIBLE_UTC_EXPORT_FIELDS.has(fieldName)) value = formatStrictUtcForUser(value);
+    return escapeSpreadsheetFormula(value);
+  }));
   return { headers, values };
 }
 

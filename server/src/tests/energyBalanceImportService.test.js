@@ -103,6 +103,8 @@ function executeBody(preview) {
 /** 准备主数据及稳定来源事实。 */
 function seedData(db) {
   const electricity = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get();
+  // 发电服务首期固定写入 photovoltaic，平衡导入应允许其计入 electricity 消费口径。
+  const photovoltaic = db.prepare("SELECT id FROM energy_types WHERE code = 'photovoltaic'").get();
   db.prepare("INSERT INTO organization_units (unit_code, unit_name, unit_type, unit_path, status, sort_order) VALUES ('ORG-PARK', '园区', 'enterprise', '/ORG-PARK', 'active', 0)").run();
   db.prepare("INSERT INTO organization_units (parent_id, unit_code, unit_name, unit_type, unit_path, status, sort_order) VALUES ((SELECT id FROM organization_units WHERE unit_code='ORG-PARK'), 'ORG-SHOP', '车间', 'workshop', '/ORG-PARK/ORG-SHOP', 'active', 0)").run();
   db.prepare("INSERT INTO organization_units (unit_code, unit_name, unit_type, unit_path, status, sort_order) VALUES ('ORG-OUTSIDE', '边界外组织', 'enterprise', '/ORG-OUTSIDE', 'active', 0)").run();
@@ -114,7 +116,7 @@ function seedData(db) {
   db.prepare(`INSERT INTO generation_records (
     organization_unit_id, energy_type_id, normalized_month, generation_value_kwh, self_use_value_kwh,
     grid_export_value_kwh, data_source, record_status
-  ) VALUES (?, ?, '2026-07', 50, 40, 10, 'manual', 'active')`).run(organizationId, electricity.id);
+  ) VALUES (?, ?, '2026-07', 50, 40, 10, 'manual', 'active')`).run(organizationId, photovoltaic.id);
 }
 
 /** 批量插入同一 sourceReference 的非重叠时序来源。 */
@@ -200,6 +202,8 @@ async function run() {
     ];
     const sourcePreview = buildEnergyBalanceBundleImportPreview({ db, buffer: createWorkbookBuffer([boundaryRow()], sourceItems), originalFilename: 'sources.xlsx' });
     assert.strictEqual(sourcePreview.summary.wouldImport, 3, '稳定组织、能源和月份来源应解析为候选。');
+    const generationCandidate = sourcePreview.itemPreview.items.find((item) => item.normalizedRecord?.input?.itemCode === 'GEN');
+    assert.strictEqual(generationCandidate.normalizedRecord.sourceWitness.sourceEnergyTypeCode, 'photovoltaic', 'electricity 平衡必须保留 photovoltaic 发电事实见证。');
 
     seedTimeseriesSources(db, 'TIMESERIES-500', 500);
     seedTimeseriesSources(db, 'TIMESERIES-501', 501);

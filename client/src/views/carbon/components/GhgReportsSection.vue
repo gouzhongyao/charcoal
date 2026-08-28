@@ -63,7 +63,7 @@
           <el-table-column label="报告期间" min-width="210"><template #default="scope">{{ scope.row.periodStart }} 至 {{ scope.row.periodEnd }}</template></el-table-column>
           <el-table-column label="结构数量" min-width="360"><template #default="scope">组织边界 {{ scope.row.organizationBoundaryCount }} / 运行边界 {{ scope.row.operationalBoundaryCount }} / 项目 {{ scope.row.itemCount }} / 汇总 {{ scope.row.summaryCount }} / 证据 {{ scope.row.evidenceCount }}</template></el-table-column>
           <el-table-column label="来源批次" min-width="150"><template #default="scope">#{{ scope.row.sourceBatchId }}<br /><small>{{ scope.row.sourceBatchStatus || '—' }}</small></template></el-table-column>
-          <el-table-column prop="createdAt" label="创建时间" min-width="190" />
+          <el-table-column label="创建时间" min-width="190"><template #default="scope">{{ formatStrictUtcDateTimeDisplay(scope.row.createdAt) }}</template></el-table-column>
           <el-table-column label="操作" width="250" fixed="right">
             <template #default="scope">
               <el-button link type="primary" @click="openReportDetail(scope.row)">六部分详情</el-button>
@@ -110,7 +110,7 @@
               <el-descriptions-item label="来源批次 / 行">#{{ detail.report.sourceBatchId }} / {{ detail.report.sourceRowNumber }}</el-descriptions-item>
               <el-descriptions-item label="原始文件">{{ detail.report.sourceOriginalFilename || '—' }}</el-descriptions-item>
               <el-descriptions-item label="批次状态">{{ detail.report.sourceBatchStatus || '—' }}</el-descriptions-item>
-              <el-descriptions-item label="创建审计">{{ detail.report.createdAt }} / {{ detail.report.createdByName || detail.report.createdBy || '—' }}</el-descriptions-item>
+              <el-descriptions-item label="创建审计">{{ formatStrictUtcDateTimeDisplay(detail.report.createdAt) }} / {{ detail.report.createdByName || detail.report.createdBy || '—' }}</el-descriptions-item>
             </el-descriptions>
           </el-collapse-item>
           <el-collapse-item :title="`2. 组织边界（${detail.organizationBoundaries.length}）`" name="organizationBoundaries">
@@ -202,6 +202,7 @@ import {
   projectGhgReportPagination
 } from '@/utils/ghgReportManagement';
 import { hasPermi } from '@/utils/permission';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 import { isLatestRequestGeneration, nextRequestGeneration } from '@/utils/requestGeneration';
 import GhgReportImportPanel from './GhgReportImportPanel.vue';
 

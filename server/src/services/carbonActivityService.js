@@ -4,6 +4,10 @@ const XLSX = require('xlsx');
 const { openDatabase } = require('../db/database');
 const { AppError, badRequest, notFound } = require('../utils/errors');
 const {
+  formatStrictUtcForUser,
+  formatWallClockMinuteForUser
+} = require('../utils/userVisibleDateTime');
+const {
   CARBON_ACTIVITY_FIELD_LIMITS,
   buildCarbonActivityCodeKey,
   normalizeCarbonActivityScope,
@@ -299,10 +303,13 @@ function exportCarbonActivities(query = {}) {
   const values = rows.map((row) => [
     row.id, row.sourceType, row.activityCode, row.supersedesActivityCode, row.emissionScope,
     row.activityCategory, row.organizationUnitCode, row.organizationUnitName, row.energyTypeCode,
-    row.energyTypeName, row.startWallClock, row.endWallClock, row.sourceTimezone, row.startUtc,
-    row.endUtc, row.activityValue, row.activityUnit, row.factorRegion, row.sourceReference,
+    row.energyTypeName, formatWallClockMinuteForUser(row.startWallClock),
+    formatWallClockMinuteForUser(row.endWallClock), row.sourceTimezone,
+    formatStrictUtcForUser(row.startUtc), formatStrictUtcForUser(row.endUtc),
+    row.activityValue, row.activityUnit, row.factorRegion, row.sourceReference,
     row.evidenceReference, row.note, row.status, row.sourceBatchId, row.sourceRowNumber,
-    row.voidReason, row.voidedAt, row.createdAt, row.updatedAt
+    row.voidReason, formatStrictUtcForUser(row.voidedAt), formatStrictUtcForUser(row.createdAt),
+    formatStrictUtcForUser(row.updatedAt)
   ].map(escapeSpreadsheetFormula));
   if (format === 'csv') {
     const csv = `﻿${[headers, ...values].map((row) => row.map(escapeCsvCell).join(',')).join('\n')}\n`;

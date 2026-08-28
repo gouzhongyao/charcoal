@@ -42,7 +42,7 @@
       <article class="summary-card summary-card--carbon">
         <span>已保存碳排</span>
         <template v-if="viewModel.carbonPanel.status === 'success'">
-          <strong v-if="!viewModel.carbonProjection.hasOnlyMissingFactors">{{ formatNumber(viewModel.selectedCarbonTotal, 4) }} <small>{{ viewModel.selectedCarbonUnit }}</small></strong>
+          <strong v-if="!viewModel.carbonProjection.hasOnlyMissingFactors">{{ formatCarbonNumber(viewModel.selectedCarbonTotal) }} <small>{{ viewModel.selectedCarbonUnit }}</small></strong>
           <strong v-else class="summary-card__gap">无法形成</strong>
           <p>已计算 {{ formatInteger(viewModel.carbonProjection.calculatedCount) }} 条 · 因子缺失 {{ formatInteger(viewModel.carbonProjection.missingFactorCount) }} 条</p>
         </template>
@@ -106,7 +106,7 @@
         </template>
         <template #empty><strong class="panel-empty-value">0</strong><span>{{ viewModel.selectedYear }} 年暂无碳排放结果。</span></template>
         <div class="metric-row metric-row--compact">
-          <div><span>排放总量</span><strong v-if="!viewModel.carbonProjection.hasOnlyMissingFactors">{{ formatNumber(viewModel.selectedCarbonTotal, 4) }} <small>{{ viewModel.selectedCarbonUnit }}</small></strong><strong v-else class="metric-gap-text">无法形成</strong></div>
+          <div><span>排放总量</span><strong v-if="!viewModel.carbonProjection.hasOnlyMissingFactors">{{ formatCarbonNumber(viewModel.selectedCarbonTotal) }} <small>{{ viewModel.selectedCarbonUnit }}</small></strong><strong v-else class="metric-gap-text">无法形成</strong></div>
           <div><span>已计算结果</span><strong>{{ formatInteger(viewModel.carbonProjection.calculatedCount) }} <small>条</small></strong></div>
           <div><span>因子缺失</span><strong>{{ formatInteger(viewModel.carbonProjection.missingFactorCount) }} <small>条</small></strong></div>
         </div>
@@ -117,7 +117,7 @@
         <template v-else>
           <div class="analysis-grid">
             <EnergyTrendChart v-if="viewModel.selectedCarbonSeries" :series="viewModel.selectedCarbonSeries" :color="viewModel.carbonTrendColor" />
-            <UnitDonutChart v-if="viewModel.carbonStructureRows.length" chart-id="standard-carbon-structure" title="按能源类型的碳排结构" description="仅比较当前排放单位下已有真实核算结果。" :unit="viewModel.selectedCarbonUnit" :rows="viewModel.carbonStructureRows" center-label="已核算总量" />
+            <UnitDonutChart v-if="viewModel.carbonStructureRows.length" chart-id="standard-carbon-structure" title="按能源类型的碳排结构" description="仅比较当前排放单位下已有真实核算结果。" :unit="viewModel.selectedCarbonUnit" kind="carbon" :rows="viewModel.carbonStructureRows" center-label="已核算总量" />
           </div>
           <p v-if="viewModel.carbonProjection.hasMissingGap" class="boundary-note">当前仅展示真实已核算总量和趋势；另有 {{ formatInteger(viewModel.carbonProjection.missingFactorCount) }} 条记录因子缺失，未纳入排放总量与趋势。</p>
         </template>
@@ -183,6 +183,8 @@ import { ENERGY_TYPE_COLORS } from '@/utils/energyStatistics';
 import CockpitPanel from './CockpitPanel.vue';
 import EnergyTrendChart from './EnergyTrendChart.vue';
 import UnitDonutChart from './UnitDonutChart.vue';
+import { formatDashboardMeasurement } from '@/utils/dashboardCockpit';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 
 /** 普通驾驶舱视图只读输入。 */
 defineProps({ viewModel: { type: Object, required: true } });
@@ -196,6 +198,11 @@ function formatNumber(value, digits = 0) {
   return Number.isFinite(number) ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: digits }).format(number) : '—';
 }
 
+/** 格式化碳排真实数值，保留安全小数精度。 */
+function formatCarbonNumber(value) {
+  return formatDashboardMeasurement(value, { kind: 'carbon' });
+}
+
 /** 格式化真实整数。 */
 function formatInteger(value) {
   return formatNumber(value, 0);
@@ -203,9 +210,7 @@ function formatInteger(value) {
 
 /** 格式化真实更新时间。 */
 function formatDateTime(value) {
-  if (!value) return '尚未成功更新';
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(date);
+  return formatStrictUtcDateTimeDisplay(value, '尚未成功更新');
 }
 
 /** 返回面板非成功状态的摘要文案。 */

@@ -5,6 +5,12 @@ const { TextDecoder } = require('util');
 const { parse: parseCsv } = require('csv-parse/sync');
 const XLSX = require('xlsx');
 const {
+  formatStrictUtcForUser,
+  formatWallClockMinuteForUser,
+  normalizeUserVisibleStrictUtcInput,
+  normalizeUserVisibleWallClockMinuteInput
+} = require('../utils/userVisibleDateTime');
+const {
   ENERGY_FLOW_WORKBOOK_HEADERS,
   ENERGY_FLOW_WORKBOOK_TEMPLATE_TYPE,
   buildEnergyFlowWorkbookExamples
@@ -30,6 +36,15 @@ const ENERGY_FLOW_EDGE_SHEET_NAMES = Object.freeze(['能流边', '显式边值']
 const TOU_SCHEME_SHEET_NAMES = Object.freeze(['TOU方案', '时段规则']);
 // 能效平衡配置模板固定要求的两个工作表名称。
 const ENERGY_BALANCE_CONFIG_SHEET_NAMES = Object.freeze(['平衡边界', '九角色项目']);
+// 完整能流工作簿来源墙钟列由精确中文标题显式声明，禁止按单元格内容猜测。
+const ENERGY_FLOW_WORKBOOK_WALL_CLOCK_HEADERS = new Set([
+  '生效开始时间',
+  '生效结束时间',
+  '期间开始时间',
+  '期间结束时间',
+  '证据开始时间',
+  '证据结束时间'
+]);
 
 // XLSX 解析资源上限统一冻结，避免超大文件、压缩炸弹和异常稀疏工作表耗尽本机资源。
 const ENERGY_ANALYSIS_TEMPLATE_LIMITS = Object.freeze({
@@ -109,6 +124,10 @@ function createColumn(
 ) {
   // 完整别名集合始终包含中文标题、camelCase 和 snake_case。
   const completeAliases = [name, key, key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`), ...aliases];
+  // UTC 列在保留原业务说明的同时补充用户文件格式，避免时间格式说明覆盖字段语义。
+  const userVisibleDescription = dataType === 'utc'
+    ? `${description} 用户文件填写 YYYY-MM-DD HH:mm:ss；历史 YYYY-MM-DDTHH:mm:ssZ 继续兼容，导入后归一化为严格 UTC Z 秒精度。`
+    : description;
   return Object.freeze({
     name,
     header: name,
@@ -117,7 +136,7 @@ function createColumn(
     dataType,
     aliases: Object.freeze([...new Set(completeAliases)]),
     required,
-    description,
+    description: userVisibleDescription,
     example,
     sample: example,
     suspectedAliases: Object.freeze([...new Set(suspectedAliases)])
@@ -202,12 +221,12 @@ const ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS = Object.freeze(Object.assign(Object.
     sheets: Object.freeze([
       createSheet('班次定义', [
         createColumn('班次编码', 'shiftCode', ['班别编码', 'shift_code'], true, '填写稳定且唯一的班次业务编码。', 'QL-SHIFT-DAY'),
-        createColumn('班次名称', 'shiftName', ['班别名称', 'shift_name'], true, '填写班次中文名称。', '青岚白班'),
+        createColumn('班次名称', 'shiftName', ['班别名称', 'shift_name'], true, '填写班次中文名称。', '天坤集团白班'),
         createColumn('开始分钟', 'startMinute', ['班次开始分钟', 'start_minute'], true, '填写来源时区本地自然日内开始分钟，范围 0 至 1439。', 480),
         createColumn('结束分钟', 'endMinute', ['班次结束分钟', 'end_minute'], true, '填写来源时区本地自然日内结束分钟，范围 0 至 1439。', 1200),
         createColumn('是否跨日', 'crossesMidnight', ['跨日', 'crosses_midnight'], true, '填写 0/1 或等价布尔值，并与起止分钟保持一致。', 0),
         createColumn('来源时区', 'sourceTimeZone', ['IANA时区', 'source_timezone'], true, '填写有效 IANA 来源时区；班次分钟按该时区的墙钟语义解释。', 'Asia/Shanghai'),
-        createColumn('来源', 'source', ['定义来源'], true, '填写班次制度来源。', '青岚园区排班制度'),
+        createColumn('来源', 'source', ['定义来源'], true, '填写班次制度来源。', '天坤集团排班制度'),
         createColumn('版本', 'version', ['定义版本'], true, '填写不可混淆的班次版本。', 'QL-SHIFT:v1'),
         createColumn('生效开始时间（UTC）', 'effectiveStartUtc', ['有效开始时间', 'effective_start_utc'], true, '填写严格 UTC 秒精度时间，尾部必须为 Z。', '2025-01-01T00:00:00Z'),
         createColumn('生效结束时间（UTC）', 'effectiveEndUtc', ['有效结束时间', 'effective_end_utc'], true, '填写严格 UTC 秒精度时间，尾部必须为 Z。', '2027-01-01T00:00:00Z'),
@@ -224,9 +243,9 @@ const ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS = Object.freeze(Object.assign(Object.
     sheets: Object.freeze([
       createSheet('TOU方案', [
         createColumn('方案编码', 'schemeCode', ['TOU方案编码', 'scheme_code'], true, '填写稳定且唯一的 TOU 方案编码。', 'QL-TOU-2026'),
-        createColumn('方案名称', 'schemeName', ['TOU方案名称', 'scheme_name'], true, '填写 TOU 方案中文名称。', '青岚园区峰平谷方案'),
+        createColumn('方案名称', 'schemeName', ['TOU方案名称', 'scheme_name'], true, '填写 TOU 方案中文名称。', '天坤集团峰平谷方案'),
         createColumn('来源时区', 'sourceTimeZone', ['IANA时区', 'source_timezone'], true, '填写有效 IANA 来源时区；时段分钟按该时区墙钟语义解释。', 'Asia/Shanghai'),
-        createColumn('来源', 'source', ['方案来源'], true, '填写方案业务来源。', '青岚园区用电制度'),
+        createColumn('来源', 'source', ['方案来源'], true, '填写方案业务来源。', '天坤集团用电制度'),
         createColumn('文号', 'documentNo', ['来源文号', 'document_no'], false, '可填写方案来源文号。', 'QL-TOU-2026-01'),
         createColumn('版本', 'version', ['方案版本'], true, '填写不可混淆的方案版本。', 'QL-TOU:v1'),
         createColumn('生效开始时间（UTC）', 'effectiveStartUtc', ['有效开始时间', 'effective_start_utc'], true, '填写严格 UTC 秒精度时间，尾部必须为 Z。', '2025-01-01T00:00:00Z'),
@@ -267,7 +286,7 @@ const ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS = Object.freeze(Object.assign(Object.
         createColumn('最大证据数', 'maxEvidenceItems', ['max_evidence_items'], false, '受控证据字段，填写有限正整数。', 10),
         createColumn('节省依据', 'savingBasis', ['saving_basis'], false, '受控证据字段，只允许填写 window_total_energy 或留空。', 'window_total_energy'),
         createColumn('建议内容', 'recommendationText', ['recommendation', 'recommendation_text'], true, '填写需人工复核的建议内容，不得宣称自动控制设备。', '建议复核峰段设备错峰安排。'),
-        createColumn('来源', 'source', ['规则来源'], true, '填写规则来源。', '青岚园区能源制度'),
+        createColumn('来源', 'source', ['规则来源'], true, '填写规则来源。', '天坤集团能源制度'),
         createColumn('生效开始时间（UTC）', 'effectiveStartUtc', ['effective_start_utc'], true, '填写严格 UTC 秒精度时间。', '2025-01-01T00:00:00Z'),
         createColumn('生效结束时间（UTC）', 'effectiveEndUtc', ['effective_end_utc'], true, '填写严格 UTC 秒精度时间。', '2027-01-01T00:00:00Z'),
         createColumn('来源时区', 'sourceTimeZone', ['IANA时区', 'source_timezone'], true, '填写有效 IANA 来源时区。', 'Asia/Shanghai'),
@@ -427,8 +446,8 @@ const ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS = Object.freeze(Object.assign(Object.
     sheets: Object.freeze([
       createSheet('能流模型', [
         createColumn('模型编码', 'modelCode', ['能流模型编码', 'model_code'], true, '填写稳定且唯一的能流模型编码。', 'QL-FLOW-PARK'),
-        createColumn('模型名称', 'modelName', ['能流模型名称', 'model_name'], true, '填写模型中文名称。', '青岚园区综合能流模型'),
-        createColumn('来源', 'source', ['模型来源'], true, '填写模型业务来源。', '青岚园区能源审计'),
+        createColumn('模型名称', 'modelName', ['能流模型名称', 'model_name'], true, '填写模型中文名称。', '天坤集团综合能流模型'),
+        createColumn('来源', 'source', ['模型来源'], true, '填写模型业务来源。', '天坤集团能源审计'),
         createColumn('文号', 'documentNo', ['模型文号', 'document_no'], false, '可填写模型来源文号。', 'QL-FLOW-2026-01'),
         createColumn('版本', 'version', ['模型版本'], true, '填写不可混淆的模型版本。', 'QL-FLOW:v1'),
         createColumn('生效开始时间（UTC）', 'effectiveStartUtc', ['effective_start_utc'], true, '填写严格 UTC 秒精度时间，尾部必须为 Z。', '2025-01-01T00:00:00Z'),
@@ -447,9 +466,9 @@ const ENERGY_ANALYSIS_TEMPLATE_DEFINITIONS = Object.freeze(Object.assign(Object.
     sheets: Object.freeze([
       createSheet('平衡边界', [
         createColumn('边界编码', 'boundaryCode', ['balanceBoundaryCode', 'boundary_code'], true, '填写稳定且唯一的平衡边界编码。', 'QL-BAL-PARK'),
-        createColumn('边界名称', 'boundaryName', ['boundary_name'], true, '填写边界中文名称。', '青岚园区综合能效平衡边界'),
+        createColumn('边界名称', 'boundaryName', ['boundary_name'], true, '填写边界中文名称。', '天坤集团综合能效平衡边界'),
         createColumn('组织编码', 'organizationUnitCode', ['用能单元编码', 'organization_unit_code'], false, '可填写已维护的组织业务编码，不填写数据库 ID。', 'QL-PARK'),
-        createColumn('来源', 'source', ['边界来源'], true, '填写边界业务来源。', '青岚园区能源审计'),
+        createColumn('来源', 'source', ['边界来源'], true, '填写边界业务来源。', '天坤集团能源审计'),
         createColumn('文号', 'documentNo', ['来源文号', 'document_no'], false, '可填写来源文号。', 'QL-BAL-2026-01'),
         createColumn('版本', 'version', ['边界版本'], true, '填写不可混淆的边界版本。', 'QL-BAL:v1'),
         createColumn('生效开始时间（UTC）', 'effectiveStartUtc', ['effective_start_utc'], true, '填写严格 UTC 秒精度时间。', '2025-01-01T00:00:00Z'),
@@ -916,18 +935,21 @@ function normalizeWorkbookCellValue(value, column) {
       ? { value: numberValue, valid: true }
       : { value: null, valid: false };
   }
+  // UTC 列只按显式 UTC 语义归一化，禁止 Date 字符串走服务器本地时区。
+  let rawValue = value;
   if (value instanceof Date) {
-    return Number.isNaN(value.getTime())
-      ? { value: null, valid: false }
-      : { value: value.toISOString(), valid: true };
+    rawValue = Number.isNaN(value.getTime()) ? null : value.toISOString();
+  } else if (typeof value === 'number') {
+    rawValue = excelSerialToIso(value);
   }
-  if (typeof value === 'number') {
-    const isoValue = excelSerialToIso(value);
-    return isoValue
-      ? { value: isoValue, valid: true }
-      : { value: null, valid: false };
+  if (!rawValue) {
+    return { value: null, valid: false };
   }
-  return { value: String(value).trim(), valid: true };
+  try {
+    return { value: normalizeUserVisibleStrictUtcInput(rawValue), valid: true };
+  } catch (_error) {
+    return { value: null, valid: false };
+  }
 }
 
 /**
@@ -1142,6 +1164,22 @@ function escapeCsvCell(value) {
   return `"${String(value ?? '').replace(/"/g, '""')}"`;
 }
 
+/** 将能源分析模板行投影为用户可见日期时间，不改变内部模板定义。 */
+function formatTemplateRowsForUser(sheet, rows) {
+  // 只有列定义明确声明为 utc 或固定能流墙钟标题才执行格式化，日期/月和普通文本保持原值。
+  return rows.map((row) => sheet.columns.map((column, columnIndex) => {
+    const value = row?.[columnIndex];
+    if (isBlankCell(value)) return '';
+    if (column.dataType === 'utc') {
+      return formatStrictUtcForUser(normalizeUserVisibleStrictUtcInput(value));
+    }
+    if (ENERGY_FLOW_WORKBOOK_WALL_CLOCK_HEADERS.has(column.name)) {
+      return formatWallClockMinuteForUser(normalizeUserVisibleWallClockMinuteInput(value));
+    }
+    return value;
+  }));
+}
+
 /**
  * 将单工作表定义渲染为带 BOM 的 CSV Buffer。
  * @param {object} sheet 工作表定义。
@@ -1152,8 +1190,9 @@ function renderCsvBuffer(sheet, rows = null) {
   const dataRows = Array.isArray(rows)
     ? rows
     : (Array.isArray(sheet.exampleRows) ? sheet.exampleRows : [sheet.columns.map((column) => column.example)]);
+  const visibleRows = formatTemplateRowsForUser(sheet, dataRows);
   // CSV 尾部固定保留单个换行，避免尾随空格。
-  const csv = [sheet.headers, ...dataRows]
+  const csv = [sheet.headers, ...visibleRows]
     .map((row) => row.map(escapeCsvCell).join(','))
     .join('\n');
   return Buffer.from(`${UTF8_BOM}${csv}\n`, 'utf8');
@@ -1191,8 +1230,9 @@ function renderXlsxBuffer(template, workbookRows = null) {
     const rows = workbookRows && Array.isArray(workbookRows[sheet.name])
       ? workbookRows[sheet.name]
       : (Array.isArray(sheet.exampleRows) ? sheet.exampleRows : [sheet.columns.map((column) => column.example)]);
-    const worksheet = XLSX.utils.aoa_to_sheet([sheet.headers, ...rows]);
-    worksheet['!cols'] = buildColumnWidths(sheet, rows);
+    const visibleRows = formatTemplateRowsForUser(sheet, rows);
+    const worksheet = XLSX.utils.aoa_to_sheet([sheet.headers, ...visibleRows]);
+    worksheet['!cols'] = buildColumnWidths(sheet, visibleRows);
     XLSX.utils.book_append_sheet(workbook, worksheet, sheet.name);
   });
   return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });

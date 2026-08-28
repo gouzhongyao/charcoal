@@ -1004,16 +1004,19 @@ function normalizeStrategyRuleInput(input, existing = null) {
  * @param {string} nowUtc 写入时间。
  * @returns {number} 规则 ID。
  */
-function insertStrategyRuleWithDb(db, input, nowUtc) {
+function insertStrategyRuleWithDb(db, input, nowUtc, trace = {}) {
   const result = db.prepare(
     `INSERT INTO strategy_rules (
+       source_batch_id, source_row_number,
        rule_code, rule_name, rule_version, formula_version, metric_code,
        threshold_operator, threshold_value, threshold_min, threshold_max,
        threshold_unit, reduction_rate, priority, evidence_requirements_json,
        recommendation_text, source, effective_start_utc, effective_end_utc,
        source_timezone, status, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
+    trace.sourceBatchId ?? null,
+    trace.sourceRowNumber ?? null,
     input.ruleCode,
     input.ruleName,
     input.ruleVersion,

@@ -42,4 +42,33 @@ for (const fieldName of ['draftFilters.normalizedMonthStart', 'draftFilters.norm
   );
 }
 
+// 能耗统计维度契约：页面必须发送后端 canonical dimension 值，禁止回退旧枚举。
+assert.match(statisticsPageSource, /const dimension = ref\('organizationUnit'\)/, '默认维度必须使用 organizationUnit。');
+assert.match(
+  statisticsPageSource,
+  /<el-radio-button\b(?=[^>]*\blabel\s*=\s*["']organizationUnit["'])[^>]*>\s*用能单元\s*<\/el-radio-button\s*>/,
+  '用能单元选项必须使用 organizationUnit。'
+);
+assert.match(
+  statisticsPageSource,
+  /<el-radio-button\b(?=[^>]*\blabel\s*=\s*["']meterDevice["'])[^>]*>\s*计量器具\s*<\/el-radio-button\s*>/,
+  '计量器具选项必须使用 meterDevice。'
+);
+// 维度加载方法匹配结果：将请求断言限定在 loadDimension 方法体内。
+const loadDimensionMatch = statisticsPageSource.match(/async\s+function\s+loadDimension\s*\(\s*\)\s*\{([\s\S]*?)\}\s*(?=(?:async\s+)?function\s+\w+\s*\()/);
+assert.ok(loadDimensionMatch, '页面必须保留 loadDimension 方法。');
+// 维度加载方法体：验证 dimension 参数未经条件表达式或旧枚举再次映射。
+const loadDimensionSource = loadDimensionMatch[1];
+assert.match(
+  loadDimensionSource,
+  /getDimensionBreakdown\s*\(\s*\{[\s\S]*?\bdimension\s*:\s*dimension\.value\s*(?=[,}])[\s\S]*?\}\s*\)/,
+  'loadDimension 必须向 getDimensionBreakdown 直接传入 dimension.value。'
+);
+assert.doesNotMatch(
+  loadDimensionSource,
+  /\bdimension\s*:\s*(?:(?![,}]).)*\b(?:organization|department)\b/s,
+  'loadDimension 不得将 dimension.value 映射回 organization 或 department。'
+);
+assert.doesNotMatch(statisticsPageSource, /label="organization"|label="department"|const dimension = ref\('(organization|department)'\)/, '维度值不得回退为 organization 或 department。');
+
 console.log('energyStatistics.test.mjs passed');

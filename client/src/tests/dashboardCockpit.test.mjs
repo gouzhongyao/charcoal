@@ -1,18 +1,25 @@
 import assert from 'node:assert/strict';
 import {
   DASHBOARD_PANEL_STATUS,
+  attachSeriesComparisonRows,
   buildCarbonTrendSeries,
+  buildDashboardBaselineRange,
   buildDashboardYearRange,
   buildEnergyTrendSeries,
   calculateZeroSafePercentage,
   createDashboardPanelState,
+  filterDashboardRowsByMonthRange,
+  formatDashboardMeasurement,
+  formatDashboardPercentage,
   groupCarbonRowsByUnit,
   groupEnergyRowsByUnit,
   isLatestDashboardRequest,
   projectBudgetWarningStatus,
   projectCarbonDashboardStats,
   projectDashboardSceneState,
+  projectSeriesChange,
   resolveDashboardSummaryDomainState,
+  resolveTrendAxisMaximum,
   settleDashboardPanelSuccess
 } from '../utils/dashboardCockpit.js';
 
@@ -23,6 +30,25 @@ assert.deepEqual(buildDashboardYearRange(2026), {
   normalizedMonthEnd: '2026-12'
 });
 assert.equal(buildDashboardYearRange('invalid', 2025).year, 2025);
+const selectedDashboardRange = buildDashboardYearRange(2026);
+const baselineDashboardRange = buildDashboardBaselineRange(selectedDashboardRange);
+assert.deepEqual(baselineDashboardRange, {
+  normalizedMonthStart: '2025-12',
+  normalizedMonthEnd: '2025-12'
+});
+const extendedEnergyRows = [
+  { month: '2025-12', energyTypeCode: 'electricity', energyTypeName: '电力', normalizedUnit: 'kWh', totalNormalizedValue: 100, recordCount: 1 },
+  { month: '2026-01', energyTypeCode: 'electricity', energyTypeName: '电力', normalizedUnit: 'kWh', totalNormalizedValue: 120, recordCount: 1 }
+];
+const selectedEnergyRows = filterDashboardRowsByMonthRange(extendedEnergyRows, selectedDashboardRange);
+const baselineEnergyRows = filterDashboardRowsByMonthRange(extendedEnergyRows, baselineDashboardRange);
+const selectedEnergySeries = buildEnergyTrendSeries(selectedEnergyRows);
+const baselineEnergySeries = buildEnergyTrendSeries(baselineEnergyRows);
+const projectedEnergySeries = attachSeriesComparisonRows(selectedEnergySeries, baselineEnergySeries);
+assert.deepEqual(selectedEnergySeries[0].rows.map((row) => row.month), ['2026-01'], '年度图表行不得包含上一年基线。');
+assert.equal(selectedEnergySeries[0].totalValue, 120, '年度趋势总量不得包含上一年基线。');
+assert.equal(projectSeriesChange(projectedEnergySeries[0]).previousMonth, '2025-12', '跨年基线只能进入环比投影。');
+assert.equal(projectSeriesChange(projectedEnergySeries[0]).delta, 20);
 
 // 能源月度趋势必须按能源类型与标准单位拆分，禁止 kWh 与 MJ 跨单位合并。
 const energySeries = buildEnergyTrendSeries([
@@ -88,6 +114,74 @@ const carbonTrendSeries = buildCarbonTrendSeries([
 assert.equal(carbonTrendSeries.length, 2);
 assert.deepEqual(carbonTrendSeries.find((series) => series.normalizedUnit === 'kgCO2e').rows.map((row) => [row.month, row.totalNormalizedValue]), [['2026-01', 8], ['2026-02', 0]]);
 assert.equal(carbonTrendSeries.find((series) => series.normalizedUnit === 'tCO2e').totalValue, 0.01);
+const currentCarbonProjection = projectCarbonDashboardStats({
+  calculatedCount: 1,
+  missingFactorCount: 0,
+  totalsByEmissionUnit: [{ emissionUnit: 'kgCO2e', totalEmissionValue: 12, emissionRecordCount: 1 }],
+  byMonth: [{ normalizedMonth: '2026-01', emissionUnit: 'kgCO2e', totalEmissionValue: 12, emissionRecordCount: 1, calculatedCount: 1, missingFactorCount: 0 }]
+});
+const baselineCarbonProjection = projectCarbonDashboardStats({
+  calculatedCount: 1,
+  missingFactorCount: 0,
+  totalsByEmissionUnit: [{ emissionUnit: 'kgCO2e', totalEmissionValue: 10, emissionRecordCount: 1 }],
+  byMonth: [{ normalizedMonth: '2025-12', emissionUnit: 'kgCO2e', totalEmissionValue: 10, emissionRecordCount: 1, calculatedCount: 1, missingFactorCount: 0 }]
+});
+const projectedCarbonSeries = attachSeriesComparisonRows(currentCarbonProjection.trendSeries, baselineCarbonProjection.trendSeries);
+assert.equal(currentCarbonProjection.unitGroups[0].totalValue, 12, '年度碳排总量不得包含上一年基线。');
+assert.deepEqual(projectedCarbonSeries[0].rows.map((row) => row.month), ['2026-01'], '年度碳排图表行不得包含上一年基线。');
+assert.equal(projectSeriesChange(projectedCarbonSeries[0]).delta, 2, '上一年十二月只参与碳排环比投影。');
+
+// 沉浸大屏趋势变化必须来自真实有序月份；单点和零基数不得伪造环比百分比。
+assert.deepEqual(projectSeriesChange(null), {
+  status: 'empty', comparisonStatus: 'empty', latestMonth: '', latestValue: null,
+  previousMonth: '', previousValue: null, delta: null, rate: null, direction: 'none'
+});
+assert.deepEqual(projectSeriesChange({ rows: [{ month: '2026-02', totalNormalizedValue: 15 }] }), {
+  status: 'available', comparisonStatus: 'single', latestMonth: '2026-02', latestValue: 15,
+  previousMonth: '2026-01', previousValue: null, delta: null, rate: null, direction: 'single'
+});
+// 非连续月份不得把最近一条有数据记录误称为自然上月，也不得计算伪环比。
+const missingPreviousMonthChange = projectSeriesChange({ rows: [
+  { month: '2026-01', totalNormalizedValue: 100 },
+  { month: '2026-03', totalNormalizedValue: 120 }
+] });
+assert.equal(missingPreviousMonthChange.comparisonStatus, 'missing-previous-month');
+assert.equal(missingPreviousMonthChange.previousMonth, '2026-02');
+assert.equal(missingPreviousMonthChange.previousValue, null);
+assert.equal(missingPreviousMonthChange.delta, null);
+assert.equal(missingPreviousMonthChange.rate, null);
+assert.equal(missingPreviousMonthChange.direction, 'missing');
+// 年初跨年时，上一年 12 月是自然连续月份。
+const crossYearChange = projectSeriesChange({ rows: [
+  { month: '2026-01', totalNormalizedValue: 120 },
+  { month: '2025-12', totalNormalizedValue: 100 }
+] });
+assert.equal(crossYearChange.comparisonStatus, 'available');
+assert.equal(crossYearChange.previousMonth, '2025-12');
+assert.equal(crossYearChange.delta, 20);
+const increasingChange = projectSeriesChange({ rows: [
+  { month: '2026-02', totalNormalizedValue: 120 },
+  { month: '2026-01', totalNormalizedValue: 100 }
+] });
+assert.equal(increasingChange.latestMonth, '2026-02');
+assert.equal(increasingChange.delta, 20);
+assert.equal(increasingChange.rate, 20);
+assert.equal(increasingChange.direction, 'up');
+const zeroBaseChange = projectSeriesChange({ rows: [
+  { month: '2026-01', totalNormalizedValue: 0 },
+  { month: '2026-02', totalNormalizedValue: 5 }
+] });
+assert.equal(zeroBaseChange.delta, 5);
+assert.equal(zeroBaseChange.rate, null);
+assert.equal(zeroBaseChange.direction, 'up');
+assert.equal(projectSeriesChange({ rows: [
+  { month: '2026-01', totalNormalizedValue: 8 },
+  { month: '2026-02', totalNormalizedValue: 8 }
+] }).direction, 'flat');
+assert.equal(projectSeriesChange({ rows: [
+  { month: '2026-01', totalNormalizedValue: 8 },
+  { month: '2026-02', totalNormalizedValue: 3 }
+] }).direction, 'down');
 
 // 预算投影必须保留各类预警计数并选择最高严重级别。
 const budgetProjection = projectBudgetWarningStatus([
@@ -135,6 +229,14 @@ assert.equal(calculateZeroSafePercentage(0, 100), 0);
 assert.equal(calculateZeroSafePercentage(25, 100), 25);
 assert.equal(calculateZeroSafePercentage(200, 100), 100);
 assert.equal(calculateZeroSafePercentage('bad', 100), 0);
+// 碳排格式必须保留足够精度，极小非零值不得显示成精确 0；能源仍按原有最多两位小数展示。
+assert.match(formatDashboardMeasurement(0.00001, { kind: 'carbon' }), /0\.00001/);
+assert.notEqual(formatDashboardMeasurement(0.000000001, { kind: 'carbon' }), '0');
+assert.equal(formatDashboardMeasurement(12.3456, { kind: 'energy', maximumFractionDigits: 2 }), '12.35');
+assert.equal(formatDashboardPercentage(0.001), '<0.1%', '极小非零变化率不得显示为 0.0%。');
+assert.equal(formatDashboardPercentage(0.00001, { maximumFractionDigits: 4 }), '<0.0001%', '极小非零占比不得显示为 0%。');
+assert.equal(resolveTrendAxisMaximum([{ totalNormalizedValue: 0.000001 }]), 0.000001, '非零极小趋势轴不得被抬高到 1。');
+assert.equal(resolveTrendAxisMaximum([{ totalNormalizedValue: 0 }, { totalNormalizedValue: 0 }]), 1, '真实全零趋势轴才回退到 1。');
 
 // 园区场景状态必须聚合五个真实面板，局部失败或无权限不得伪装为整体成功。
 assert.deepEqual(projectDashboardSceneState([
@@ -149,6 +251,34 @@ const partialScene = projectDashboardSceneState([
 ]);
 assert.equal(partialScene.status, 'partial');
 assert.match(partialScene.description, /2 个面板读取失败或无权限/);
+const unavailableMixedScene = projectDashboardSceneState([
+  { status: 'error' }, { status: 'forbidden' }, { status: 'error' }, { status: 'forbidden' }, { status: 'error' }
+]);
+assert.equal(unavailableMixedScene.status, 'partial');
+assert.match(unavailableMixedScene.description, /当前没有可汇总\/展示的真实业务数据/);
+assert.match(unavailableMixedScene.description, /3 个面板读取失败/);
+assert.match(unavailableMixedScene.description, /2 个面板无权限/);
+assert.doesNotMatch(unavailableMixedScene.description, /已汇总部分真实业务数据/);
+// empty 与不可用面板混合但没有 success 时，不得把空响应表述为已汇总真实业务数据。
+const emptyUnavailableMixedScene = projectDashboardSceneState([
+  { status: 'empty' }, { status: 'empty' }, { status: 'error' }, { status: 'forbidden' }, { status: 'empty' }
+]);
+assert.equal(emptyUnavailableMixedScene.status, 'partial');
+assert.match(emptyUnavailableMixedScene.description, /当前没有可汇总\/展示的真实业务数据/);
+assert.match(emptyUnavailableMixedScene.description, /3 个面板暂无数据/);
+assert.match(emptyUnavailableMixedScene.description, /1 个面板读取失败/);
+assert.match(emptyUnavailableMixedScene.description, /1 个面板无权限/);
+assert.doesNotMatch(emptyUnavailableMixedScene.description, /已汇总部分真实业务数据/);
+for (const unavailableStatus of ['error', 'forbidden']) {
+  const emptySingleUnavailableScene = projectDashboardSceneState([
+    { status: 'empty' }, { status: 'empty' }, { status: unavailableStatus }
+  ]);
+  assert.equal(emptySingleUnavailableScene.status, 'partial');
+  assert.match(emptySingleUnavailableScene.description, /当前没有可汇总\/展示的真实业务数据/);
+  assert.match(emptySingleUnavailableScene.description, /2 个面板暂无数据/);
+  assert.match(emptySingleUnavailableScene.description, new RegExp(unavailableStatus === 'error' ? '1 个面板读取失败' : '1 个面板无权限'));
+  assert.doesNotMatch(emptySingleUnavailableScene.description, /已汇总部分真实业务数据/);
+}
 assert.equal(projectDashboardSceneState([
   { status: 'success' }, { status: 'empty' }, { status: 'success' }, { status: 'success' }, { status: 'empty' }
 ]).status, 'success');

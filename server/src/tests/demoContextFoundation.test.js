@@ -366,6 +366,23 @@ function assertLegacyContextMigration() {
     }), (error) => error.code === 'DEMO_CONTEXT_REASSOCIATE_FILE_INVALID');
     fs.rmSync(reassociateUploadPath, { force: true });
     const artifactFileSha256 = sha256Buffer(generated.buffer);
+    // 非 canonical SHA 输入固定覆盖大写、前后空白和非字符串。
+    const invalidSha256Values = [
+      'A'.repeat(64),
+      ` ${artifactFileSha256}`,
+      `${artifactFileSha256} `,
+      123
+    ];
+    invalidSha256Values.forEach((invalidSha256Value) => {
+      // 当前循环值必须由服务入口按原值拒绝，不能被静默修正。
+      assert.throws(() => createDemoContext({
+        userId: 1,
+        runId: firstRun.runId,
+        artifactKey: '13-shift-definitions',
+        handlerKey: 'shift-definitions-import',
+        artifactFileSha256: invalidSha256Value
+      }), (error) => error.details?.code === 'INVALID_DEMO_CONTEXT_DIGEST');
+    });
     const issued = createDemoContext({
       userId: 1,
       runId: firstRun.runId,
@@ -417,6 +434,17 @@ function assertLegacyContextMigration() {
     }).contextId, issued.contextId, '本地修改文件只绑定独立上传 SHA，不要求等于下载 artifact SHA');
 
     const previewDigest = `hmac-sha256:v1:audit:${crypto.createHash('sha256').update('preview-digest').digest('hex')}`;
+    invalidSha256Values.forEach((invalidSha256Value) => {
+      // 当前循环值必须由服务入口按原值拒绝，不能被静默修正。
+      assert.throws(() => bindDemoContextPreview({
+        token: issued.token,
+        userId: 1,
+        artifactKey: issued.artifactKey,
+        handlerKey: issued.handlerKey,
+        uploadFileSha256: invalidSha256Value,
+        previewDigest
+      }), (error) => error.details?.code === 'INVALID_DEMO_CONTEXT_DIGEST');
+    });
     bindDemoContextPreview({
       token: issued.token,
       userId: 1,

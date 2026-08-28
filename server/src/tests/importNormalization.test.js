@@ -33,12 +33,13 @@ assert.strictEqual(canonicalFieldName('energy_type'), 'energyType');
 assert.strictEqual(canonicalFieldName('energy_name'), 'energyType');
 assert.strictEqual(canonicalFieldName('能源类型编码'), 'energyType');
 assert.strictEqual(canonicalFieldName('能源类型名称'), 'energyType');
-assert.strictEqual(canonicalFieldName('organization_unit'), 'organization');
-assert.strictEqual(canonicalFieldName('meter_name'), 'meterCode');
+assert.strictEqual(canonicalFieldName('organization_unit'), null);
+assert.strictEqual(canonicalFieldName('用能单元编码'), 'organizationUnitCode');
+assert.strictEqual(canonicalFieldName('meter_name'), null);
 assert.strictEqual(canonicalFieldName('仪表编码'), 'meterCode');
 assert.strictEqual(canonicalFieldName('计量器具编码'), 'meterCode');
-assert.strictEqual(canonicalFieldName('data_time'), 'dataTime');
-assert.strictEqual(canonicalFieldName('设备名称'), 'meterCode');
+assert.strictEqual(canonicalFieldName('data_time'), null);
+assert.strictEqual(canonicalFieldName('设备名称'), null);
 
 assert.deepStrictEqual(mapRowFields({ 月份: '2026/1', 能源类型: '电力', 用量: '1,234.5', 单位: '度' }).mapped, {
   month: '2026/1',
@@ -132,9 +133,8 @@ const validRow = validateAndNormalizeRow({
   能源类型: '电力',
   用量: '10',
   单位: '度',
-  组织: '总部',
-  地点: 'A园区',
-  设备: '电表001',
+  用能单元编码: 'TEST-OU',
+  计量器具编码: '电表001',
   备注: '测试'
 }, 2, energyTypeIndex);
 assert.deepStrictEqual(validRow.errors, []);
@@ -149,27 +149,24 @@ const standardFieldRow = validateAndNormalizeRow({
   energy_name: '天然气',
   value: '1.2',
   unit: '万m³',
-  organization_unit: '动力车间',
-  meter_name: 'G-001',
-  data_time: '2026-02-01 08:00:00',
+  organization_unit_code: 'POWER-OU',
+  meter_code: 'G-001',
+  month: '2026-02-01 08:00:00',
   remark: '标准字段样例'
 }, 6, energyTypeIndex);
 assert.deepStrictEqual(standardFieldRow.errors, []);
 assert.strictEqual(standardFieldRow.record.normalizedMonth, '2026-02');
 assert.strictEqual(standardFieldRow.record.normalizedUnit, 'm3');
 assert.strictEqual(standardFieldRow.record.normalizedValue, 12000);
-assert.strictEqual(standardFieldRow.record.organization, '动力车间');
+assert.strictEqual(standardFieldRow.record.organizationUnitCode, 'POWER-OU');
 assert.strictEqual(standardFieldRow.record.meterCode, 'G-001');
 
 const duplicateKey = createDuplicateKey({
   energyTypeCode: 'electricity',
   normalizedMonth: '2026-01',
-  organization: '总部',
-  site: 'A园区',
-  department: '',
-  productionLine: '',
+  organizationUnitCode: 'TEST-OU',
   meterCode: '电表001',
-  businessDimension: ''
+  originalUnit: '度'
 });
 assert.strictEqual(validRow.record.duplicateKey, duplicateKey);
 
@@ -178,7 +175,7 @@ const photovoltaicCnRow = validateAndNormalizeRow({
   energy_type: '光伏',
   value: '1.5',
   unit: 'MWh',
-  organization_unit: '能源站',
+  organization_unit_code: 'ENERGY-STATION',
   meter_name: 'PV-001'
 }, 7, energyTypeIndex);
 assert.deepStrictEqual(photovoltaicCnRow.errors, []);
@@ -190,7 +187,8 @@ const photovoltaicCodeRow = validateAndNormalizeRow({
   period: '2026-04',
   energy_type: 'photovoltaic',
   value: '300',
-  unit: 'kWh'
+  unit: 'kWh',
+  organization_unit_code: 'PV-OU'
 }, 8, energyTypeIndex);
 assert.deepStrictEqual(photovoltaicCodeRow.errors, []);
 assert.strictEqual(photovoltaicCodeRow.record.energyTypeCode, 'photovoltaic');
@@ -201,7 +199,7 @@ const oilCnRow = validateAndNormalizeRow({
   energy_type: '油',
   value: '800',
   unit: 'kg',
-  organization_unit: '锅炉房'
+  organization_unit_code: 'BOILER-ROOM'
 }, 9, energyTypeIndex);
 assert.deepStrictEqual(oilCnRow.errors, []);
 assert.strictEqual(oilCnRow.record.energyTypeCode, 'oil');
@@ -212,7 +210,8 @@ const oilCodeRow = validateAndNormalizeRow({
   period: '2026-06',
   energy_type: 'oil',
   value: '2.5',
-  unit: 't'
+  unit: 't',
+  organization_unit_code: 'OIL-OU'
 }, 10, energyTypeIndex);
 assert.deepStrictEqual(oilCodeRow.errors, []);
 assert.strictEqual(oilCodeRow.record.energyTypeCode, 'oil');
@@ -222,7 +221,8 @@ const invalidOilUnitRow = validateAndNormalizeRow({
   period: '2026-07',
   energy_type: 'oil',
   value: '12',
-  unit: 'L'
+  unit: 'L',
+  organization_unit_code: 'OIL-OU'
 }, 11, energyTypeIndex);
 assert.strictEqual(invalidOilUnitRow.record, null);
 assert.strictEqual(invalidOilUnitRow.errors.length, 1);
@@ -232,7 +232,8 @@ const invalidRow = validateAndNormalizeRow({
   月份: '2026-99',
   能源类型: '未知能源',
   用量: 'abc',
-  单位: '吨'
+  单位: '吨',
+  用能单元编码: 'INVALID-OU'
 }, 3, energyTypeIndex);
 assert.strictEqual(invalidRow.record, null);
 assert.deepStrictEqual(invalidRow.errors.map((error) => error.errorCode).sort(), [
@@ -245,7 +246,8 @@ const unsupportedUnitRow = validateAndNormalizeRow({
   月份: '2026-02',
   能源类型: '天然气',
   用量: '20',
-  单位: 'kWh'
+  单位: 'kWh',
+  用能单元编码: 'GAS-OU'
 }, 4, energyTypeIndex);
 assert.strictEqual(unsupportedUnitRow.record, null);
 assert.strictEqual(unsupportedUnitRow.errors.length, 1);
@@ -254,7 +256,7 @@ assert.strictEqual(unsupportedUnitRow.errors[0].errorCode, 'UNSUPPORTED_UNIT');
 assert.strictEqual(unsupportedUnitRow.errors[0].rawValue, 'kWh');
 
 const missingRow = validateAndNormalizeRow({}, 5, energyTypeIndex);
-assert.strictEqual(missingRow.errors.length, 4);
+assert.strictEqual(missingRow.errors.length, 5);
 assert(missingRow.errors.every((error) => error.errorCode === 'REQUIRED_FIELD_MISSING'));
 
 const carbonTemplateMismatch = detectEnergyImportTemplateMismatch([

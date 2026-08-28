@@ -76,6 +76,42 @@ export function projectDynamicRouteContract(menu = {}) {
   };
 }
 
+// 校验服务端声明的业务目标只能是无查询、无片段的站内绝对页面路径。
+export function normalizeTrustedInternalRoutePath(value) {
+  if (typeof value !== 'string') return '';
+  const targetPath = value.trim();
+  const lowerPath = targetPath.toLowerCase();
+  if (!targetPath
+    || !targetPath.startsWith('/')
+    || targetPath.startsWith('//')
+    || lowerPath === '/api'
+    || lowerPath.startsWith('/api/')
+    || targetPath.includes('\\')
+    || targetPath.includes('?')
+    || targetPath.includes('#')
+    || /[\r\n\x00]/.test(targetPath)
+    || /^[a-z][a-z\d+.-]*:/i.test(targetPath)) return '';
+  return targetPath;
+}
+
+// 从当前账号已经注册的可信页面路由中解析服务端目标，不接受占位页、固定公共入口或未授权路径。
+export function resolveTrustedRegisteredRoute(value, routeRecords = []) {
+  const targetPath = normalizeTrustedInternalRoutePath(value);
+  if (!targetPath) return { ok: false, code: 'invalid-target-route', path: '' };
+  const route = (Array.isArray(routeRecords) ? routeRecords : []).find((record) => (
+    record?.path === targetPath
+    && record?.meta?.trustedInternalRoute === true
+    && record?.meta?.unavailable !== true
+  ));
+  if (!route?.name) return { ok: false, code: 'unregistered-target-route', path: targetPath };
+  return { ok: true, code: 'trusted-target-route', path: targetPath, location: { name: route.name } };
+}
+
+// 校验路由守卫处理后的最终命名路由仍是预期目标，重定向到登录页或其他页面均视为失败。
+export function isExpectedNamedRoute(currentRoute = {}, expectedLocation = {}) {
+  return Boolean(expectedLocation?.name) && currentRoute?.name === expectedLocation.name;
+}
+
 // 查找当前账号按菜单顺序获得的第一个授权业务路径，无可用菜单时返回空字符串。
 export function findFirstAuthorizedBusinessPath(menus = []) {
   const firstMenu = flattenMenus(menus).find((menu) => isBusinessRouteMenu(menu));

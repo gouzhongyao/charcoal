@@ -98,7 +98,7 @@ function getCounts() {
     const seedDb = openDatabase();
     try {
       const electricityId = seedDb.prepare("SELECT id FROM energy_types WHERE code = 'electricity' AND is_active = 1").get().id;
-      const energyRecordId = seedDb.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, organization, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-01', '2026-01', 'kWh', 1, 'kWh', 1, '发电审计单元', 'generation-audit-energy-boundary', 'active', datetime('now'), datetime('now'))").run(electricityId, importUnit.id).lastInsertRowid;
+      const energyRecordId = seedDb.prepare("INSERT INTO energy_records (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at) VALUES (?, ?, '2026-01', '2026-01', 'kWh', 1, 'kWh', 1, 'generation-audit-energy-boundary', 'active', datetime('now'), datetime('now'))").run(electricityId, importUnit.id).lastInsertRowid;
       seedDb.prepare("INSERT INTO carbon_emissions (energy_record_id, calculation_method, calculation_basis, activity_value, activity_unit, emission_unit, status, calculated_at, note) VALUES (?, 'seed', 'seed', 1, 'kWh', 'kgCO2e', 'factor_missing', datetime('now'), '发电审计边界种子')").run(energyRecordId);
     } finally {
       seedDb.close();

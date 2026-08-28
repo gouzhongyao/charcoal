@@ -32,8 +32,10 @@ const {
 const {
   CARBON_ACTIVITY_IMPORT_HEADERS,
   CARBON_ACTIVITY_IMPORT_RESOURCE_LIMITS,
+  CARBON_ACTIVITY_TEMPLATE_TYPE,
   CARBON_ACTIVITY_WORKSHEET_NAME
 } = require('../services/carbonActivityContracts');
+const { getTemplateDefinition, getTemplateXlsx } = require('../services/templateService');
 
 // 固定测试组织编码和活动行构建器。
 const TEST_ORGANIZATION_CODE = 'CA-IMPORT-OU';
@@ -236,10 +238,92 @@ async function run() {
 
   const validBuffer = buildWorkbookBuffer([buildActivityRow()]);
   assert.strictEqual(parseCarbonActivityWorkbook(validBuffer, 'valid.xlsx').length, 1);
+
+  // 中央独立碳活动模板仅在下载 XLSX 的用户可见边界补零秒，定义中的固定示例继续保持内部 T 分钟值。
+  const carbonActivityTemplateDefinition = getTemplateDefinition(CARBON_ACTIVITY_TEMPLATE_TYPE);
+  assert.deepStrictEqual(carbonActivityTemplateDefinition.userVisibleWallClockColumnIndexes, [6, 7]);
+  assert.strictEqual(carbonActivityTemplateDefinition.rows[0][6], '2026-01-01T00:00');
+  assert.strictEqual(carbonActivityTemplateDefinition.rows[0][7], '2026-02-01T00:00');
+  const carbonActivityTemplateDownload = getTemplateXlsx(CARBON_ACTIVITY_TEMPLATE_TYPE);
+  const carbonActivityTemplateWorkbook = XLSX.read(carbonActivityTemplateDownload.buffer, { type: 'buffer' });
+  const carbonActivityTemplateRows = XLSX.utils.sheet_to_json(
+    carbonActivityTemplateWorkbook.Sheets[CARBON_ACTIVITY_WORKSHEET_NAME],
+    { header: 1, raw: false, blankrows: false }
+  );
+  assert.strictEqual(carbonActivityTemplateRows[1][6], '2026-01-01 00:00:00');
+  assert.strictEqual(carbonActivityTemplateRows[1][7], '2026-02-01 00:00:00');
+  const carbonFactorTemplateDefinition = getTemplateDefinition('carbon-factors');
+  assert.strictEqual(carbonFactorTemplateDefinition.rows[0][7], 'https://example.com/electricity-factor');
+  assert.strictEqual(carbonFactorTemplateDefinition.rows[0][8], '2026-01-01', '纯日期模板字段不得被转换为完整日期时间。');
+  const carbonFactorTemplateWorkbook = XLSX.read(
+    getTemplateXlsx('carbon-factors').buffer,
+    { type: 'buffer' }
+  );
+  const carbonFactorTemplateRows = XLSX.utils.sheet_to_json(
+    carbonFactorTemplateWorkbook.Sheets['碳因子模板'],
+    { header: 1, raw: false, blankrows: false }
+  );
+  assert.strictEqual(carbonFactorTemplateRows[1][8], '2026-01-01');
+
   assert.throws(
     () => parseCarbonActivityWorkbook(validBuffer, 'valid.csv'),
     (error) => error?.details?.code === 'CARBON_ACTIVITY_IMPORT_XLSX_REQUIRED'
   );
+
+  // 新用户墙钟格式在导入边界归一化为内部分钟和 UTC 秒精度，历史 T 分钟格式继续兼容。
+  const visibleWallClockBuffer = buildWorkbookBuffer([buildActivityRow({
+    activityCode: 'CA-VISIBLE-WALL-CLOCK',
+    startWallClock: '2026-08-24 09:00:00',
+    endWallClock: '2026-08-24 10:00:00'
+  })]);
+  let visibleWallClockDb = openTestDatabase();
+  try {
+    const visiblePreview = buildCarbonActivityImportPreview({
+      db: visibleWallClockDb,
+      buffer: visibleWallClockBuffer,
+      originalFilename: 'visible-wall-clock.xlsx'
+    });
+    assert.strictEqual(visiblePreview.summary.wouldImport, 1);
+    assert.deepStrictEqual(visiblePreview.candidateRows[0].startWallClock, '2026-08-24T09:00');
+    assert.deepStrictEqual(visiblePreview.candidateRows[0].endWallClock, '2026-08-24T10:00');
+    assert.strictEqual(visiblePreview.candidateRows[0].startUtc, '2026-08-24T01:00:00Z');
+    assert.strictEqual(visiblePreview.candidateRows[0].endUtc, '2026-08-24T02:00:00Z');
+  } finally {
+    visibleWallClockDb.close();
+  }
+  const nonZeroWallClockBuffer = buildWorkbookBuffer([buildActivityRow({
+    activityCode: 'CA-NONZERO-WALL-CLOCK',
+    startWallClock: '2026-08-24 09:00:01'
+  })]);
+  let nonZeroWallClockDb = openTestDatabase();
+  try {
+    const nonZeroPreview = buildCarbonActivityImportPreview({
+      db: nonZeroWallClockDb,
+      buffer: nonZeroWallClockBuffer,
+      originalFilename: 'non-zero-wall-clock.xlsx'
+    });
+    assert.strictEqual(nonZeroPreview.summary.blocked, 1);
+    assert.strictEqual(nonZeroPreview.summary.wouldImport, 0);
+    assert(nonZeroPreview.auditIssues.some((issue) => issue.code === 'CARBON_ACTIVITY_WALL_CLOCK_SECOND_MUST_BE_ZERO'));
+  } finally {
+    nonZeroWallClockDb.close();
+  }
+  const invalidDateWallClockBuffer = buildWorkbookBuffer([buildActivityRow({
+    activityCode: 'CA-INVALID-DATE-WALL-CLOCK',
+    startWallClock: '2026-02-29 09:00:00'
+  })]);
+  let invalidDateWallClockDb = openTestDatabase();
+  try {
+    const invalidDatePreview = buildCarbonActivityImportPreview({
+      db: invalidDateWallClockDb,
+      buffer: invalidDateWallClockBuffer,
+      originalFilename: 'invalid-date-wall-clock.xlsx'
+    });
+    assert.strictEqual(invalidDatePreview.summary.blocked, 1);
+    assert(invalidDatePreview.auditIssues.some((issue) => issue.code === 'CARBON_ACTIVITY_WALL_CLOCK_INVALID'));
+  } finally {
+    invalidDateWallClockDb.close();
+  }
 
   const multipleSheetsBuffer = buildWorkbookBuffer([buildActivityRow()], (workbook) => {
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([['额外']]), '额外工作表');

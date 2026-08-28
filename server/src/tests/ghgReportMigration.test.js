@@ -179,7 +179,7 @@ try {
     db.close();
   }
 
-  // 空的非 canonical 旧骨架允许整体重建，且重复初始化保持幂等。
+  // 正式 canonical 库出现空的非 canonical N7 骨架或未知触发器时必须按 fingerprint fail-closed。
   db = openDatabase({ databasePath });
   try {
     db.exec('DELETE FROM ghg_reports');
@@ -194,18 +194,23 @@ try {
   } finally {
     db.close();
   }
-  initDatabase({ databasePath });
-  initDatabase({ databasePath });
+  assert.throws(
+    () => initDatabase({ databasePath }),
+    (error) => error?.code === 'SCHEMA_FINGERPRINT_MISMATCH'
+  );
   db = openDatabase({ databasePath });
   try {
-    EXPECTED_TABLES.forEach((tableName) => assert.strictEqual(ghgReportTableIsCanonical(db, tableName), true));
-    EXPECTED_INDEXES.forEach((indexName) => assert.strictEqual(sqliteObjectExists(db, 'index', indexName), true));
-    assert.strictEqual(sqliteObjectExists(db, 'trigger', 'trg_empty_ghg_report_cross_domain'), false,
-      '空非 canonical 骨架重建必须连带清除未知 N7 触发器。');
-    assert.deepStrictEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
+    assert.strictEqual(sqliteObjectExists(db, 'table', 'ghg_reports'), true);
+    assert.strictEqual(ghgReportTableIsCanonical(db, 'ghg_reports'), false);
+    EXPECTED_TABLES.slice(1).forEach((tableName) => assert.strictEqual(sqliteObjectExists(db, 'table', tableName), false));
+    assert.strictEqual(sqliteObjectExists(db, 'trigger', 'trg_empty_ghg_report_cross_domain'), true,
+      'fail-closed 初始化不得改写或删除未知旧结构。');
   } finally {
     db.close();
   }
+  // 恢复一份隔离 canonical 基线，供后续触发器和权限碰撞测试复制。
+  [databasePath, `${databasePath}-wal`, `${databasePath}-shm`].forEach((filePath) => fs.rmSync(filePath, { force: true }));
+  initDatabase({ databasePath });
 
   // 有业务数据的未知旧结构必须 fail-closed，禁止猜测列语义。
   const populatedPath = path.join(temporaryRoot, 'populated.sqlite');

@@ -25,7 +25,7 @@ const { runWithMaintenance } = require('../services/maintenanceState');
 const { toggleDemoRuntime } = require('../services/demoRuntimeService');
 const { parseEnergyAnalysisTemplateWorkbook } = require('../services/energyAnalysisTemplateService');
 
-// 十三类能源分析与配置模板的下载契约独立硬编码，避免从生产列表反向生成预期。
+// 十四类能源分析与配置模板的下载契约独立硬编码，避免从生产列表反向生成预期。
 const ENERGY_ANALYSIS_TEMPLATE_CONTRACTS = Object.freeze([
   Object.freeze({ id: 'energy-timeseries', permission: 'energy:analysis:timeseries:preview', baseFileName: '能耗时序数据导入模板', asciiBaseFileName: 'nenghao-shixu-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['能耗时序']) }),
   Object.freeze({ id: 'shift-definitions', permission: 'energy:analysis:config:import:preview', baseFileName: '班次定义导入模板', asciiBaseFileName: 'banci-dingyi-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['班次定义']) }),
@@ -37,6 +37,7 @@ const ENERGY_ANALYSIS_TEMPLATE_CONTRACTS = Object.freeze([
   Object.freeze({ id: 'energy-benchmark-definitions', permission: 'energy:benchmarks:import:preview', baseFileName: '能效对标定义导入模板', asciiBaseFileName: 'nengxiao-duibiao-dingyi-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['对标定义']) }),
   Object.freeze({ id: 'energy-benchmark-targets', permission: 'energy:benchmarks:import:preview', baseFileName: '能效对标目标导入模板', asciiBaseFileName: 'nengxiao-duibiao-mubiao-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['对标目标']) }),
   Object.freeze({ id: 'energy-flow-models', permission: 'energy:flows:import:preview', baseFileName: '能流模型导入模板', asciiBaseFileName: 'nengliu-moxing-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['能流模型']) }),
+  Object.freeze({ id: 'energy-flow-workbook', permission: 'energy:flows:import:preview', baseFileName: '完整能流工作簿模板', asciiBaseFileName: 'energy-flow-workbook-template', formats: Object.freeze(['xlsx']), sheetNames: Object.freeze(['模型', '设备资产与节点', '有向边', '期间流量', '余热事实', '损耗证据']) }),
   Object.freeze({ id: 'energy-balance-configs', permission: 'energy:balance:import:preview', baseFileName: '能效平衡配置导入模板', asciiBaseFileName: 'nengxiao-pingheng-peizhi-template', formats: Object.freeze(['xlsx']), sheetNames: Object.freeze(['平衡边界', '九角色项目']) }),
   Object.freeze({ id: 'energy-flow-nodes', permission: 'energy:flows:import:preview', baseFileName: '能流节点导入模板', asciiBaseFileName: 'nengliu-jiedian-template', formats: Object.freeze(['xlsx', 'csv']), sheetNames: Object.freeze(['能流节点']) }),
   Object.freeze({ id: 'energy-flow-edges', permission: 'energy:flows:import:preview', baseFileName: '能流边及显式边值导入模板', asciiBaseFileName: 'nengliu-bian-xianshi-bianzhi-template', formats: Object.freeze(['xlsx']), sheetNames: Object.freeze(['能流边', '显式边值']) })
@@ -54,6 +55,7 @@ const ENERGY_ANALYSIS_TEMPLATE_IMPORT_ROUTES = Object.freeze({
   'energy-benchmark-definitions': 'POST /api/energy-benchmarks/imports/definitions/preview -> POST /api/energy-benchmarks/imports/definitions/execute',
   'energy-benchmark-targets': 'POST /api/energy-benchmarks/imports/targets/preview -> POST /api/energy-benchmarks/imports/targets/execute',
   'energy-flow-models': 'POST /api/energy-flow-imports/models/preview -> POST /api/energy-flow-imports/models/execute',
+  'energy-flow-workbook': 'POST /api/energy-flow-imports/workbook/preview -> POST /api/energy-flow-imports/workbook/execute',
   'energy-flow-nodes': 'POST /api/energy-flow-imports/nodes/preview -> POST /api/energy-flow-imports/nodes/execute',
   'energy-flow-edges': 'POST /api/energy-flow-imports/bundle/preview -> POST /api/energy-flow-imports/bundle/execute',
   'energy-balance-configs': 'POST /api/energy-balance-imports/bundle/preview -> POST /api/energy-balance-imports/bundle/execute'
@@ -229,7 +231,7 @@ function assertSuccessfulTemplateDownload(response, contract, format, observedAs
   const parsed = parseEnergyAnalysisTemplateWorkbook(contract.id, response.body);
   assert.strictEqual(parsed.valid, true, `${contract.id}.xlsx 必须可由能源分析模板解析器读回。`);
   assert.deepStrictEqual(parsed.sheetNames, contract.sheetNames);
-  assert(parsed.sheets.every((sheet) => sheet.rows.length === 1));
+  assert(parsed.sheets.every((sheet) => sheet.rows.length >= 1), '每张模板工作表必须至少包含一行可解析样例。');
 }
 
 (async () => {
@@ -266,7 +268,7 @@ function assertSuccessfulTemplateDownload(response, contract, format, observedAs
     const deniedToken = await login(server, 'analysis-denied', 'Password123!');
     const allowedToken = await login(server, 'analysis-allowed', 'Password123!');
 
-    // 中央列表必须精确保留十五类基础模板，并正式提供十三类能源分析与配置模板及其格式元数据。
+    // 中央列表必须精确保留十五类基础模板，并正式提供十四类能源分析与配置模板及其格式元数据。
     const listResponse = await request(server, 'GET', '/api/templates');
     assert.strictEqual(listResponse.status, 200);
     const listedTemplates = listResponse.body.data;
@@ -361,15 +363,18 @@ function assertSuccessfulTemplateDownload(response, contract, format, observedAs
       });
     }
 
-    // 青岚园区 manifest 按当前账号权限过滤，并能下载精确多表演示文件。
+    // 天坤集团 manifest 按当前账号权限过滤，并能下载精确多表演示文件。
     const manifestResponse = await request(server, 'GET', '/api/templates/demo-park/manifest', undefined, allowedToken);
     assert.strictEqual(manifestResponse.status, 200);
     assert.strictEqual(manifestResponse.body.data.parkCode, 'QL-PARK');
     assert.strictEqual(manifestResponse.body.data.artifactCount, manifestResponse.body.data.artifacts.length);
     assert.deepStrictEqual(
       manifestResponse.body.data.artifacts.map((artifact) => artifact.templateType).sort(),
-      ENERGY_ANALYSIS_TEMPLATE_CONTRACTS.map((contract) => contract.id).sort(),
-      '仅领域 preview 权限账号应精确看到对应能源分析模板的演示条目。'
+      ENERGY_ANALYSIS_TEMPLATE_CONTRACTS
+        .filter((contract) => contract.id !== 'energy-flow-workbook')
+        .map((contract) => contract.id)
+        .sort(),
+      '仅领域 preview 权限账号应精确看到已注册演示条目的能源分析模板。'
     );
     assert(manifestResponse.body.data.artifacts.every((artifact) => requiredPermissions.includes(artifact.requiredPermission)));
     const demoTou = await request(server, 'GET', '/api/templates/demo-park/17-tou-schemes.xlsx', undefined, allowedToken);

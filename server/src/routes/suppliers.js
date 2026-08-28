@@ -5,6 +5,7 @@ const { openDatabase } = require('../db/database');
 const { authenticate } = require('../middleware/auth');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { requireWritable } = require('../middleware/maintenance');
+const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
 const { requirePermission } = require('../middleware/permission');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
 const { getImportAuditBatchDetail } = require('../services/importAuditService');
@@ -164,6 +165,7 @@ router.post(
   authenticate,
   requirePermission(SUPPLIER_PERMISSIONS.importPreview),
   requireWritable('suppliers:import-preview'),
+  rejectUnconnectedDemoContext,
   supplierPreviewHandler
 );
 
@@ -172,6 +174,7 @@ router.post(
   authenticate,
   requirePermission(SUPPLIER_PERMISSIONS.importExecute),
   requireWritable('suppliers:import-execute'),
+  rejectUnconnectedDemoContext,
   parseSupplierJsonBody,
   asyncHandler(async (req, res) => {
     const body = normalizeSupplierExecuteBody(req.body || {});

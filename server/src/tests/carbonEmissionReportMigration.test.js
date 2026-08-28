@@ -143,7 +143,7 @@ try {
     db.close();
   }
 
-  // 模拟空的非 canonical 旧骨架，重复初始化必须整体重建为 canonical 五表。
+  // 正式 canonical 库出现空的非 canonical 报告骨架时必须按 fingerprint fail-closed。
   db = openDatabase({ databasePath });
   try {
     db.exec('DELETE FROM carbon_emission_reports');
@@ -152,16 +152,21 @@ try {
   } finally {
     db.close();
   }
-  initDatabase({ databasePath });
-  initDatabase({ databasePath });
+  assert.throws(
+    () => initDatabase({ databasePath }),
+    (error) => error?.code === 'SCHEMA_FINGERPRINT_MISMATCH'
+  );
   db = openDatabase({ databasePath });
   try {
-    EXPECTED_TABLES.forEach((tableName) => assert.strictEqual(sqliteObjectExists(db, 'table', tableName), true));
-    EXPECTED_INDEXES.forEach((indexName) => assert.strictEqual(sqliteObjectExists(db, 'index', indexName), true));
-    assert.deepStrictEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
+    assert.strictEqual(sqliteObjectExists(db, 'table', 'carbon_emission_reports'), true);
+    assert.strictEqual(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'carbon_emission_reports'").get().sql.includes('legacy_payload'), true);
+    EXPECTED_TABLES.slice(1).forEach((tableName) => assert.strictEqual(sqliteObjectExists(db, 'table', tableName), false));
   } finally {
     db.close();
   }
+  // 恢复一份隔离 canonical 基线，供后续外部引用和权限碰撞测试复制。
+  [databasePath, `${databasePath}-wal`, `${databasePath}-shm`].forEach((filePath) => fs.rmSync(filePath, { force: true }));
+  initDatabase({ databasePath });
 
   // 非 canonical 骨架存在历史业务行时禁止猜测迁移。
   const populatedPath = path.join(temporaryRoot, 'populated.sqlite');

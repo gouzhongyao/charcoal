@@ -115,16 +115,15 @@ for (const contract of [
   ['energy-benchmark-targets', '21-benchmark-targets']
 ]) {
   assert.ok(apiSource.includes(`templateType: '${contract[0]}'`), `缺少空白模板 ${contract[0]}`);
-  assert.ok(apiSource.includes(`artifactKey: '${contract[1]}'`), `缺少青岚示例 ${contract[1]}`);
+  assert.ok(apiSource.includes(`artifactKey: '${contract[1]}'`), `缺少天坤集团示例 ${contract[1]}`);
 }
 assert.ok(apiSource.includes("import { download, query, request } from '@/api/http';"), '对标模板和示例必须复用共享 download');
 assert.ok(pageSource.includes('下载{{ currentImportTypeLabel }}空白模板'), '当前导入类型必须提供空白模板入口');
-assert.ok(pageSource.includes('下载{{ currentImportTypeLabel }}青岚园区示例'), '当前导入类型必须提供青岚园区示例入口');
+assert.doesNotMatch(pageSource, /downloadImportDemoExample|importDemoExampleLoading|天坤集团示例/, '对标业务页面不得继续分散提供演示下载入口');
 assert.ok(pageSource.includes('推荐顺序：先导入能源折标系数，再导入对标定义，最后导入对标目标'), '页面必须说明三类文件导入顺序');
 assert.ok(pageSource.includes('外部标准定义必须填写真实来源'), '页面必须保留外部标准真实来源边界');
 assert.ok(pageSource.includes('内部历史必须由服务端按明确参考期固化'), '页面必须保留内部历史固化边界');
-assert.ok(pageSource.includes('不会自动导入、计算或执行对标'), '模板和示例下载不得伪装自动导入或自动对标');
-assert.ok(pageSource.includes('青岚园区示例下载失败'), '示例下载失败必须复用现有消息反馈');
+assert.ok(pageSource.includes('下载模板不会自动导入、计算或执行对标'), '标准模板下载不得伪装自动导入或自动对标');
 assert.ok(apiSource.includes('getAllActiveEnergyBenchmarkDefinitions'), '缺少全部 active 定义入口');
 assert.ok(apiSource.includes('getAllActiveEnergyBenchmarkTargets'), '缺少全部 active 目标入口');
 assert.ok(apiSource.includes('getAllActiveEnergyBenchmarkProductionUnits'), '缺少全部 active 产能单元入口');

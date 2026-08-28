@@ -37,7 +37,6 @@
               </div>
               <el-space wrap>
                 <el-button @click="downloadEnergyBalanceImportTemplate">下载空白模板</el-button>
-                <el-button @click="downloadEnergyBalanceDemoParkExample">下载青岚示例</el-button>
               </el-space>
             </header>
             <el-alert
@@ -220,7 +219,7 @@
                           <el-table-column label="能源 / 单位" min-width="130"><template #default="{ row: evidence }">{{ evidence.energyTypeCode || '—' }} / {{ evidence.originalUnit || '—' }}</template></el-table-column>
                           <el-table-column label="实际值" min-width="100"><template #default="{ row: evidence }">{{ formatNumber(evidence.actualValue) }}</template></el-table-column>
                           <el-table-column label="覆盖率" min-width="100"><template #default="{ row: evidence }">{{ formatPercent(evidence.completenessRate) }}</template></el-table-column>
-                          <el-table-column label="数据范围" min-width="230"><template #default="{ row: evidence }">{{ evidence.startUtc || '—' }} 至 {{ evidence.endUtc || '—' }}</template></el-table-column>
+                          <el-table-column label="数据范围" min-width="230"><template #default="{ row: evidence }">{{ formatStrictUtcDateTimeDisplay(evidence.startUtc) }} 至 {{ formatStrictUtcDateTimeDisplay(evidence.endUtc) }}</template></el-table-column>
                         </el-table>
                       </div>
                     </template>
@@ -272,7 +271,7 @@
             <div><dt>组织范围</dt><dd>{{ boundaryDetail.organizationUnitName || '整体边界' }}</dd></div>
             <div><dt>来源 / 文号</dt><dd>{{ boundaryDetail.source }} / {{ boundaryDetail.documentNo || '无文号' }}</dd></div>
             <div><dt>版本 / 时区</dt><dd>{{ boundaryDetail.version }} / {{ boundaryDetail.sourceTimeZone }}</dd></div>
-            <div><dt>有效期</dt><dd>{{ boundaryDetail.effectiveStartUtc }} 至 {{ boundaryDetail.effectiveEndUtc }}</dd></div>
+            <div><dt>有效期</dt><dd>{{ formatStrictUtcDateTimeDisplay(boundaryDetail.effectiveStartUtc) }} 至 {{ formatStrictUtcDateTimeDisplay(boundaryDetail.effectiveEndUtc) }}</dd></div>
             <div><dt>发电边界</dt><dd>{{ boundaryDetail.generationBoundaryConfirmed ? '已人工确认' : '未确认；发电分面将冻结' }}</dd></div>
           </dl>
           <el-alert type="warning" :closable="false" show-icon title="发电记录不会自动抵扣能耗。generation 来源只能显式映射 self_generation 的 self_use_value_kwh，或 output 的 grid_export_value_kwh，并要求防重复计入键。" />
@@ -325,7 +324,7 @@
           <el-form-item label="平衡边界"><el-input :model-value="calculationBoundaryLabel" disabled /></el-form-item>
           <el-form-item label="来源时区"><el-input :model-value="calculationBoundary?.sourceTimeZone || '—'" disabled /></el-form-item>
           <el-form-item label="完整自然月统计期"><el-date-picker v-model="calculationForm.monthRange" type="monthrange" value-format="YYYY-MM" format="YYYY-MM" :editable="true" unlink-panels start-placeholder="开始月份" end-placeholder="结束月份" class="full-control" /></el-form-item>
-          <el-alert :type="calculationWindow.valid ? 'success' : 'warning'" :closable="false" show-icon :title="calculationWindow.valid ? `将提交 UTC 左闭右开窗口：${calculationWindow.startUtc} 至 ${calculationWindow.endUtc}` : calculationWindow.message" class="drawer-alert" />
+          <el-alert :type="calculationWindow.valid ? 'success' : 'warning'" :closable="false" show-icon :title="calculationWindow.valid ? `将提交 UTC 左闭右开窗口：${formatStrictUtcDateTimeDisplay(calculationWindow.startUtc)} 至 ${formatStrictUtcDateTimeDisplay(calculationWindow.endUtc)}` : calculationWindow.message" class="drawer-alert" />
           <template v-if="calculationExplicitItems.length">
             <h3 class="drawer-subtitle">人工显式值覆盖</h3>
             <p class="muted-text">仅 explicit_balance_value 项目可在本次运行覆盖默认值；留空时使用项目来源映射中的默认值。</p>
@@ -414,7 +413,6 @@ import {
   calculateEnergyBalanceSnapshots,
   createEnergyBalanceBoundary,
   createEnergyBalanceItem,
-  downloadEnergyBalanceDemoParkExample,
   downloadEnergyBalanceImportTemplate,
   executeEnergyBalanceBundleImport,
   getEnergyBalanceBoundaries,
@@ -460,6 +458,7 @@ import {
   validateSuggestionReview
 } from '@/utils/energyBalanceManagement';
 import { parseStrictUtcDateTime } from '@/utils/dateTimeFields';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 import { isIanaTimeZone } from '@/utils/ianaTimeZones';
 import { hasPermi } from '@/utils/permission';
 
@@ -704,7 +703,7 @@ function formatInteger(value) { return formatNumber(value, 0); }
 /** 格式化比例。 */
 function formatPercent(value) { return value === null || value === undefined || !Number.isFinite(Number(value)) ? '—' : `${formatNumber(Number(value) * 100, 1)}%`; }
 /** 格式化统计期。 */
-function formatRange(dataRange) { return dataRange ? `${dataRange.startUtc} 至 ${dataRange.endUtc}` : '—'; }
+function formatRange(dataRange) { return dataRange ? `${formatStrictUtcDateTimeDisplay(dataRange.startUtc)} 至 ${formatStrictUtcDateTimeDisplay(dataRange.endUtc)}` : '—'; }
 /** 返回摘要的短展示，完整摘要仍可通过筛选和接口追溯。 */
 function shortDigest(value) { return value ? `${String(value).slice(0, 12)}…${String(value).slice(-6)}` : '—'; }
 /** 返回组织选项标签。 */

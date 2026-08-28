@@ -31,12 +31,12 @@
       <template v-else>
         <el-table v-loading="loading" :data="rows" row-key="runCode" border empty-text="暂无独立核算运行">
           <el-table-column prop="runCode" label="运行编码" min-width="250" fixed="left" show-overflow-tooltip />
-          <el-table-column label="UTC 期间" min-width="250"><template #default="scope">{{ scope.row.startUtc }}<br />至 {{ scope.row.endUtc }}</template></el-table-column>
+          <el-table-column label="UTC 期间" min-width="250"><template #default="scope">{{ formatStrictUtcDateTimeDisplay(scope.row.startUtc) }}<br />至 {{ formatStrictUtcDateTimeDisplay(scope.row.endUtc) }}</template></el-table-column>
           <el-table-column prop="calculationMethod" label="方法" min-width="130" />
           <el-table-column label="活动 / 结果" width="120"><template #default="scope">{{ scope.row.activityCount }} / {{ scope.row.resultCount }}</template></el-table-column>
           <el-table-column label="已计算 / 缺因子" width="140"><template #default="scope">{{ scope.row.calculatedCount }} / {{ scope.row.factorMissingCount }}</template></el-table-column>
           <el-table-column label="按单位总量" min-width="200"><template #default="scope">{{ formatCarbonTotalsByUnit(scope.row.emissionTotals?.totals || []) }}</template></el-table-column>
-          <el-table-column prop="completedAt" label="完成时间（UTC）" min-width="190" />
+          <el-table-column label="完成时间（UTC）" min-width="190"><template #default="scope">{{ formatStrictUtcDateTimeDisplay(scope.row.completedAt) }}</template></el-table-column>
           <el-table-column label="操作" width="150" fixed="right">
             <template #default="scope"><el-button link type="primary" @click="openDetail(scope.row)">详情</el-button><el-button link type="success" @click="selectRun(scope.row)">查看结果</el-button></template>
           </el-table-column>
@@ -63,15 +63,15 @@
         <el-descriptions-item label="运行编码">{{ detailRun.runCode }}</el-descriptions-item>
         <el-descriptions-item label="来源类型">{{ detailRun.sourceType }}</el-descriptions-item>
         <el-descriptions-item label="状态 / 方法">{{ detailRun.status }} / {{ detailRun.calculationMethod }}</el-descriptions-item>
-        <el-descriptions-item label="UTC 期间">{{ detailRun.startUtc }} 至 {{ detailRun.endUtc }}</el-descriptions-item>
+        <el-descriptions-item label="UTC 期间">{{ formatStrictUtcDateTimeDisplay(detailRun.startUtc) }} 至 {{ formatStrictUtcDateTimeDisplay(detailRun.endUtc) }}</el-descriptions-item>
         <el-descriptions-item label="活动 / 结果">{{ detailRun.activityCount }} / {{ detailRun.resultCount }}</el-descriptions-item>
         <el-descriptions-item label="已计算 / 缺因子">{{ detailRun.calculatedCount }} / {{ detailRun.factorMissingCount }}</el-descriptions-item>
         <el-descriptions-item label="按排放单位总量">{{ formatCarbonTotalsByUnit(detailRun.emissionTotals?.totals || []) }}</el-descriptions-item>
         <el-descriptions-item label="快照版本">{{ detailRun.snapshotSchemaVersion }}</el-descriptions-item>
         <el-descriptions-item label="活动快照摘要"><span class="digest-text">{{ detailRun.activitySnapshotDigest }}</span></el-descriptions-item>
         <el-descriptions-item label="操作者">{{ actorLabel(detailRun.actorSnapshot) }}</el-descriptions-item>
-        <el-descriptions-item label="开始 / 完成">{{ detailRun.startedAt }} / {{ detailRun.completedAt }}</el-descriptions-item>
-        <el-descriptions-item label="创建时间">{{ detailRun.createdAt }}</el-descriptions-item>
+        <el-descriptions-item label="开始 / 完成">{{ formatStrictUtcDateTimeDisplay(detailRun.startedAt) }} / {{ formatStrictUtcDateTimeDisplay(detailRun.completedAt) }}</el-descriptions-item>
+        <el-descriptions-item label="创建时间">{{ formatStrictUtcDateTimeDisplay(detailRun.createdAt) }}</el-descriptions-item>
       </el-descriptions>
     </el-drawer>
   </section>
@@ -92,6 +92,7 @@ import {
   formatCarbonTotalsByUnit
 } from '@/utils/carbonSourceManagement';
 import { areStrictUtcInputsValid } from '@/utils/dateTimeFields';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 import { isLatestRequestGeneration, nextRequestGeneration } from '@/utils/requestGeneration';
 
 // 组件属性模块：页面壳按精确权限决定是否允许创建运行。

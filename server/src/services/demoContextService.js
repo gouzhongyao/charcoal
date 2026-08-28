@@ -50,13 +50,12 @@ function validateDemoContextToken(token) {
   return token;
 }
 
-/** 严格校验 SHA-256 十六进制摘要。 */
+/** 严格校验 canonical 64 位小写十六进制 SHA-256 摘要，禁止隐式归一化。 */
 function validateSha256(value, fieldName) {
-  const normalized = String(value || '').trim().toLowerCase();
-  if (!SHA256_HEX_PATTERN.test(normalized)) {
-    throw badRequest(`${fieldName} 必须为 SHA-256 十六进制摘要。`, { code: 'INVALID_DEMO_CONTEXT_DIGEST', fieldName });
+  if (typeof value !== 'string' || !SHA256_HEX_PATTERN.test(value)) {
+    throw badRequest(`${fieldName} 必须为 64 位小写十六进制 SHA-256 摘要。`, { code: 'INVALID_DEMO_CONTEXT_DIGEST', fieldName });
   }
-  return normalized;
+  return value;
 }
 
 /** 严格校验带域和版本的预演审计摘要，禁止归一化或截断。 */

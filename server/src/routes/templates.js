@@ -17,8 +17,11 @@ const {
   getDemoArtifactRegistration
 } = require('../services/demoArtifactRegistry');
 const { createDemoContext, revokeDemoContext, sha256Buffer } = require('../services/demoContextService');
-const { assertDemoRuntimeEnabled, getOrCreateActiveDemoDatasetRun } = require('../services/demoRunService');
-const { ensureDemoRuntimeEnabledForManagedDownload } = require('../services/demoRuntimeService');
+const {
+  assertDemoRuntimeEnabled,
+  getOrCreateActiveDemoDatasetRun,
+  readActiveDemoDatasetRunProjection
+} = require('../services/demoRunService');
 const { sendSuccess } = require('../utils/response');
 const { AppError, notFound } = require('../utils/errors');
 const { authenticate } = require('../middleware/auth');
@@ -111,7 +114,7 @@ function isStatelessDemoArtifact(registration) {
   return registration?.downloadLifecycle === DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.STATELESS_FORMAL_IMPORT;
 }
 
-/** 判断注册项是否需要惰性 runtime、active run 和一次性 context。 */
+/** 判断注册项是否需要在已开启 runtime 下复用 active run 并签发一次性 context。 */
 function isManagedDemoArtifact(registration) {
   return registration?.downloadLifecycle === DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME;
 }
@@ -156,6 +159,13 @@ function requireDemoParkArtifactPermission(req, res, next) {
         next(permissionError);
         return;
       }
+      try {
+        // 演示开关是独立业务边界，普通用户和超级管理员都必须先由显式 toggle 开启。
+        assertDemoRuntimeEnabled();
+      } catch (runtimeError) {
+        next(runtimeError);
+        return;
+      }
       if (isStatelessDemoArtifact(registration)) {
         next();
         return;
@@ -165,7 +175,7 @@ function requireDemoParkArtifactPermission(req, res, next) {
   });
 }
 
-/** 设置青岚示例文件的公共下载响应头，不包含任何运行期或 context 状态。 */
+/** 设置天坤集团示例文件的公共下载响应头，不包含任何运行期或 context 状态。 */
 function setDemoParkArtifactFileHeaders(res, result) {
   res.setHeader('Content-Type', result.mimeType);
   res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, result.asciiFileName));
@@ -173,18 +183,13 @@ function setDemoParkArtifactFileHeaders(res, result) {
   res.setHeader('X-Recommended-Format', 'xlsx');
 }
 
-/** 在同一 immediate 事务中完成 managed runtime、active run 与下载 context 准备。 */
+/** 在同一 immediate 事务中校验已开启 runtime，并准备 active run 与下载 context。 */
 function prepareManagedDemoArtifactDownload(req, result) {
   const db = openDatabase();
   try {
     return db.transaction(() => {
-      const runtime = ensureDemoRuntimeEnabledForManagedDownload({
-        actorUserId: req.user.id,
-        actorIp: req.ip,
-        artifactKey: result.artifact.artifactKey,
-        db
-      });
-      const run = getOrCreateActiveDemoDatasetRun({ actorUserId: req.user.id, db });
+      const runtime = assertDemoRuntimeEnabled({ db });
+      const run = getOrCreateActiveDemoDatasetRun({ actorUserId: req.user.id, actorIp: req.ip, db });
       const context = createDemoContext({
         userId: req.user.id,
         runId: run.runId,
@@ -281,15 +286,17 @@ router.get('/demo-park/manifest', authenticate, requirePermission('system:demo:d
     const artifacts = manifest.artifacts.filter((artifact) => (
       superAdmin || userPermissions.has(artifact.permissions.download)
     ));
-    const run = getOrCreateActiveDemoDatasetRun({ actorUserId: req.user.id });
+    // manifest 只读取当前 run 投影，旧 manifest 冲突不得阻断当前清单和 artifact 过滤结果。
+    const runProjection = readActiveDemoDatasetRunProjection();
     sendSuccess(res, {
       parkCode: 'QL-PARK',
-      parkName: '青岚智造园区',
+      parkName: '天坤集团',
       datasetId: manifest.datasetId,
       manifestVersion: manifest.manifestVersion,
       canonicalizationVersion: manifest.canonicalizationVersion,
       manifestDigest: manifest.manifestDigest,
-      run,
+      run: runProjection.activeRun,
+      activeRunCompatibility: runProjection.compatibility,
       codePrefix: manifest.codePrefix,
       sourceTimeZone: manifest.sourceTimeZone,
       artifactCount: artifacts.length,

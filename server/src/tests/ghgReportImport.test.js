@@ -245,12 +245,10 @@ function seedProtectedDomainFacts() {
       ).lastInsertRowid;
       const energyRecordId = db.prepare(`INSERT INTO energy_records
         (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit,
-         original_value, normalized_unit, normalized_value, organization, site, department,
-         production_line, meter_code, business_dimension, remark, duplicate_key, record_status,
+         original_value, normalized_unit, normalized_value, remark, duplicate_key, record_status,
          created_at, updated_at)
         VALUES (?, ?, '2026-01', '2026-01', 'kWh', 123.45, 'kWh', 123.45,
-          'N7跨领域保护组织', '保护园区', '保护部门', '保护产线', 'PROTECTED-METER',
-          '跨领域不变性', 'N7 不得修改该能耗依赖', 'ghg-protected-energy-record', 'active', ?, ?)`).run(
+          'N7 不得修改该能耗依赖', 'ghg-protected-energy-record', 'active', ?, ?)`).run(
         energyTypeId,
         organizationUnitId,
         now,

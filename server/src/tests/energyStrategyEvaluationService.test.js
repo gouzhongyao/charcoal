@@ -20,6 +20,8 @@ const {
   MAX_RULE_CODES,
   MAX_STRATEGY_RULES,
   SUPPORTED_FORMULA_VERSION,
+  buildEnergyStrategyExactScope,
+  getEnergyStrategyExactScopeMetadata,
   normalizeRuleCodes,
   parseEvidenceRequirements,
   previewEnergyStrategies,
@@ -27,6 +29,16 @@ const {
   stableStringify,
   updateStrategyRuleHitStatus
 } = require('../services/energyStrategyEvaluationService');
+const {
+  calculateDemoEntityIdentityDigest,
+  calculateDemoEntitySnapshotDigest,
+  _test: {
+    buildDemoEntityRegistrationContract,
+    getDemoOwnershipEntityHandler
+  }
+} = require('../services/demoOwnershipService');
+const { getOrCreateActiveDemoDatasetRun } = require('../services/demoRunService');
+const { toggleDemoRuntime } = require('../services/demoRuntimeService');
 
 // 策略测试统一使用上海来源时区。
 const SOURCE_TIME_ZONE = 'Asia/Shanghai';
@@ -130,6 +142,19 @@ function resetScenario(db) {
 }
 
 /**
+ * 创建隔离导入批次，供策略 exact scope provenance 测试使用。
+ * @param {object} db SQLite 连接。
+ * @param {string} importType 导入类型。
+ * @returns {number} 批次 ID。
+ */
+function createImportBatch(db, importType) {
+  return Number(db.prepare(
+    `INSERT INTO import_batches (import_type, original_filename, file_type, status)
+     VALUES (?, ?, 'csv', 'completed')`
+  ).run(importType, `${importType}-strategy-exact.csv`).lastInsertRowid);
+}
+
+/**
  * 创建时序事实写入函数。
  * @param {object} db SQLite 连接。
  * @param {object} ids 主数据 ID。
@@ -139,6 +164,8 @@ function createTimeseriesInserter(db, ids) {
   // 写入语句只生成 active 手工测试事实。
   const insert = db.prepare(
     `INSERT INTO energy_timeseries_records (
+       source_batch_id,
+       source_row_number,
        organization_unit_id,
        meter_device_id,
        energy_type_id,
@@ -153,7 +180,7 @@ function createTimeseriesInserter(db, ids) {
        source_reference,
        data_source,
        record_status
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'kWh', ?, 'kWh', ?, ?, 'manual', 'active')`
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'kWh', ?, 'kWh', ?, ?, 'manual', ?)`
   );
   // 来源序号保证默认引用唯一且可追溯。
   let sourceSequence = 0;
@@ -164,6 +191,12 @@ function createTimeseriesInserter(db, ids) {
       ? overrides.value
       : 10;
     return Number(insert.run(
+      Object.prototype.hasOwnProperty.call(overrides, 'sourceBatchId')
+        ? overrides.sourceBatchId
+        : null,
+      Object.prototype.hasOwnProperty.call(overrides, 'sourceRowNumber')
+        ? overrides.sourceRowNumber
+        : null,
       ids.organizationUnitId,
       ids.meterDeviceId,
       ids.electricityId,
@@ -173,7 +206,8 @@ function createTimeseriesInserter(db, ids) {
       overrides.granularityMinutes || 15,
       value,
       value,
-      overrides.sourceReference || `strategy-preview:test:${sourceSequence}`
+      overrides.sourceReference || `strategy-preview:test:${sourceSequence}`,
+      overrides.recordStatus || 'active'
     ).lastInsertRowid);
   };
 }
@@ -184,16 +218,20 @@ function createTimeseriesInserter(db, ids) {
  * @param {number[]} values 每个十五分钟区间能源量。
  * @returns {number[]} 写入事实 ID。
  */
-function insertQuarterHourSeries(insertTimeseries, values) {
+function insertQuarterHourSeries(insertTimeseries, values, overrides = {}) {
   return values.map((value, index) => {
     // 区间边界由固定窗口开始时间按十五分钟递增。
     const startMs = Date.parse(WINDOW_START_UTC) + index * 15 * 60 * 1000;
     return insertTimeseries({
+      ...overrides,
+      sourceRowNumber: Object.prototype.hasOwnProperty.call(overrides, 'sourceRowNumber')
+        ? overrides.sourceRowNumber + index
+        : overrides.sourceRowNumber,
       startUtc: new Date(startMs).toISOString(),
       endUtc: new Date(startMs + 15 * 60 * 1000).toISOString(),
       granularityMinutes: 15,
       value,
-      sourceReference: `strategy-preview:quarter:${index + 1}`
+      sourceReference: overrides.sourceReference || `strategy-preview:quarter:${index + 1}`
     });
   });
 }
@@ -207,6 +245,8 @@ function createRuleInserter(db) {
   // 写入字段精确对应 strategy_rules 当前 schema。
   const insert = db.prepare(
     `INSERT INTO strategy_rules (
+       source_batch_id,
+       source_row_number,
        rule_code,
        rule_name,
        rule_version,
@@ -227,6 +267,8 @@ function createRuleInserter(db) {
        source_timezone,
        status
      ) VALUES (
+       @sourceBatchId,
+       @sourceRowNumber,
        @ruleCode,
        @ruleName,
        @ruleVersion,
@@ -267,6 +309,12 @@ function createRuleInserter(db) {
     // 当前规则编码允许测试显式覆盖。
     const ruleCode = overrides.ruleCode || `STRATEGY_RULE_${ruleSequence}`;
     return Number(insert.run({
+      sourceBatchId: Object.prototype.hasOwnProperty.call(overrides, 'sourceBatchId')
+        ? overrides.sourceBatchId
+        : null,
+      sourceRowNumber: Object.prototype.hasOwnProperty.call(overrides, 'sourceRowNumber')
+        ? overrides.sourceRowNumber
+        : null,
       ruleCode,
       ruleName: overrides.ruleName || `策略规则 ${ruleSequence}`,
       ruleVersion: overrides.ruleVersion || `strategy-rule-${ruleSequence}:v1`,
@@ -315,6 +363,44 @@ function getEvaluation(result, ruleCode) {
   const evaluation = result.evaluations.find((item) => item.ruleCode === ruleCode);
   assert(evaluation, `缺少规则评价 ${ruleCode}。`);
   return evaluation;
+}
+
+/**
+ * 为隔离测试中的策略命中写入固定 derived ownership。
+ * @param {object} db SQLite 连接。
+ * @param {object} runRecord 当前演示数据集运行。
+ * @param {number} hitId 策略命中 ID。
+ * @returns {object} 登记行和初始 projection。
+ */
+function insertDerivedStrategyHitOwnership(db, runRecord, hitId) {
+  // 固定 handler 是命中快照和摘要的唯一来源。
+  const handler = getDemoOwnershipEntityHandler('strategy_rule_hit');
+  const projection = handler.readProjection(db, hitId);
+  assert(projection, `缺少策略命中 ${hitId} 的 ownership projection。`);
+  const identityDigest = calculateDemoEntityIdentityDigest('strategy_rule_hit', String(hitId));
+  const snapshotDigest = calculateDemoEntitySnapshotDigest(
+    'strategy_rule_hit',
+    String(hitId),
+    projection
+  );
+  const registryId = Number(db.prepare(
+    `INSERT INTO demo_data_registry
+       (run_id, artifact_key, entity_type, entity_pk, ownership_kind, identity_digest,
+        snapshot_digest, source_batch_id, source_row_number, registered_by)
+     VALUES (?, '18-strategy-rules', 'strategy_rule_hit', ?, 'derived', ?, ?, NULL, NULL, ?)`
+  ).run(
+    runRecord.runId,
+    String(hitId),
+    identityDigest,
+    snapshotDigest,
+    auditActorUserId
+  ).lastInsertRowid);
+  return {
+    registryId,
+    identityDigest,
+    snapshotDigest,
+    projection
+  };
 }
 
 /**
@@ -1256,6 +1342,234 @@ function testAtomicOperationAuditRollback(db, ids, insertTimeseries, insertRule)
 }
 
 /**
+ * 验证 derived 策略命中人工复核刷新和调用方 SAVEPOINT 回滚边界。
+ * @param {object} db SQLite 连接。
+ * @param {object} ids 主数据 ID。
+ * @param {Function} insertTimeseries 时序写入函数。
+ * @param {Function} insertRule 规则写入函数。
+ */
+function testDerivedOwnershipReviewRefresh(db, ids, insertTimeseries, insertRule) {
+  resetScenario(db);
+  // 运行期和数据集 run 只用于满足 derived registry 的真实外键，不接入 post-action。
+  toggleDemoRuntime({
+    enabled: true,
+    actorUserId: auditActorUserId,
+    actorIp: '127.0.0.1'
+  });
+  const runRecord = getOrCreateActiveDemoDatasetRun({
+    actorUserId: auditActorUserId,
+    actorIp: '127.0.0.1'
+  });
+  insertQuarterHourSeries(insertTimeseries, [10, 20, 30, 40]);
+  [
+    'DERIVED_REVIEW_SUCCESS',
+    'DERIVED_REVIEW_AUDIT_FAILURE',
+    'DERIVED_REVIEW_REFRESH_FAILURE',
+    'FORMAL_REVIEW_NO_OWNERSHIP'
+  ].forEach((ruleCode) => insertRule({ ruleCode }));
+  const evaluated = runEnergyStrategyEvaluation(
+    createInput(ids.meterDeviceId),
+    createWriteOptions(db)
+  );
+  const hitByRuleCode = new Map(evaluated.hits.map((hit) => [hit.ruleCode, hit]));
+  const successHit = hitByRuleCode.get('DERIVED_REVIEW_SUCCESS');
+  const auditFailureHit = hitByRuleCode.get('DERIVED_REVIEW_AUDIT_FAILURE');
+  const refreshFailureHit = hitByRuleCode.get('DERIVED_REVIEW_REFRESH_FAILURE');
+  const formalHit = hitByRuleCode.get('FORMAL_REVIEW_NO_OWNERSHIP');
+  [successHit, auditFailureHit, refreshFailureHit, formalHit].forEach((hit) => {
+    assert(hit, '正式策略执行必须为每条测试规则生成命中。');
+  });
+
+  // 固定旧时间消除同毫秒执行的不确定性，确保 review updated_at 刷新可被稳定断言。
+  const oldHitTime = '2026-01-01T00:00:00.000Z';
+  [successHit.id, auditFailureHit.id, refreshFailureHit.id].forEach((hitId) => {
+    db.prepare('UPDATE strategy_rule_hits SET created_at = ?, updated_at = ? WHERE id = ?')
+      .run(oldHitTime, oldHitTime, hitId);
+  });
+  const successOwnership = insertDerivedStrategyHitOwnership(db, runRecord, successHit.id);
+  const auditFailureOwnership = insertDerivedStrategyHitOwnership(db, runRecord, auditFailureHit.id);
+  const refreshFailureOwnership = insertDerivedStrategyHitOwnership(db, runRecord, refreshFailureHit.id);
+  const derivedRegistryCount = db.prepare(
+    "SELECT COUNT(*) AS total FROM demo_data_registry WHERE entity_type = 'strategy_rule_hit' AND cleaned_at IS NULL"
+  ).get().total;
+
+  // 正式命中没有 active ownership 时只更新业务状态，不得隐式新增 registry。
+  const formalReviewed = updateStrategyRuleHitStatus(formalHit.id, {
+    manualStatus: 'accepted',
+    reviewNote: '正式命中保持无 ownership。'
+  }, createWriteOptions(db));
+  assert.strictEqual(formalReviewed.manualStatus, 'accepted');
+  assert.strictEqual(
+    db.prepare(
+      "SELECT COUNT(*) AS total FROM demo_data_registry WHERE entity_type = 'strategy_rule_hit' AND cleaned_at IS NULL"
+    ).get().total,
+    derivedRegistryCount,
+    '无 ownership 命中人工复核不得新增 registry。'
+  );
+  assert.strictEqual(
+    db.prepare(
+      "SELECT COUNT(*) AS total FROM demo_data_registry WHERE entity_type = 'strategy_rule_hit' AND entity_pk = ?"
+    ).get(String(formalHit.id)).total,
+    0
+  );
+
+  // active derived ownership 必须在同一 review 事务中刷新为当前固定 projection 摘要。
+  const successRegisteredAt = db.prepare(
+    'SELECT registered_at AS registeredAt FROM demo_data_registry WHERE registry_id = ?'
+  ).get(successOwnership.registryId).registeredAt;
+  const successReviewed = updateStrategyRuleHitStatus(successHit.id, {
+    manualStatus: 'accepted',
+    reviewNote: 'derived snapshot 已随人工复核刷新。'
+  }, createWriteOptions(db));
+  const successProjection = getDemoOwnershipEntityHandler('strategy_rule_hit')
+    .readProjection(db, successHit.id);
+  const expectedSuccessDigest = calculateDemoEntitySnapshotDigest(
+    'strategy_rule_hit',
+    String(successHit.id),
+    successProjection
+  );
+  const refreshedSuccessRegistry = db.prepare(
+    `SELECT registry_id AS registryId, identity_digest AS identityDigest,
+            snapshot_digest AS snapshotDigest, registered_by AS registeredBy,
+            registered_at AS registeredAt, source_batch_id AS sourceBatchId,
+            source_row_number AS sourceRowNumber
+       FROM demo_data_registry WHERE registry_id = ?`
+  ).get(successOwnership.registryId);
+  assert.strictEqual(successReviewed.updatedAt, successProjection.updated_at);
+  assert.notStrictEqual(successReviewed.updatedAt, oldHitTime, '人工复核必须刷新命中 updated_at。');
+  assert.strictEqual(refreshedSuccessRegistry.snapshotDigest, expectedSuccessDigest);
+  assert.notStrictEqual(refreshedSuccessRegistry.snapshotDigest, successOwnership.snapshotDigest);
+  assert.strictEqual(refreshedSuccessRegistry.identityDigest, successOwnership.identityDigest);
+  assert.strictEqual(refreshedSuccessRegistry.registeredBy, auditActorUserId);
+  assert.strictEqual(refreshedSuccessRegistry.registeredAt, successRegisteredAt);
+  assert.strictEqual(refreshedSuccessRegistry.sourceBatchId, null);
+  assert.strictEqual(refreshedSuccessRegistry.sourceRowNumber, null);
+
+  // 审计位于 refresh 之后；审计故障必须由私有 SAVEPOINT 同时回滚 hit 和 registry。
+  const auditFailureProjectionBefore = getDemoOwnershipEntityHandler('strategy_rule_hit')
+    .readProjection(db, auditFailureHit.id);
+  const auditFailureRegistryBefore = db.prepare(
+    'SELECT snapshot_digest AS snapshotDigest FROM demo_data_registry WHERE registry_id = ?'
+  ).get(auditFailureOwnership.registryId);
+  const auditCountBeforeFailure = db.prepare(
+    "SELECT COUNT(*) AS total FROM sys_operation_logs WHERE operation = 'energy.strategy.hit.review'"
+  ).get().total;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare(
+      `INSERT INTO organization_units
+         (unit_code, unit_name, unit_path, unit_type, status)
+       VALUES ('DERIVED-REVIEW-AUDIT-SENTINEL', '派生复核审计哨兵', '/派生复核审计哨兵', 'workshop', 'active')`
+    ).run();
+    assert.throws(() => updateStrategyRuleHitStatus(auditFailureHit.id, {
+      manualStatus: 'accepted',
+      reviewNote: '该 derived refresh 必须随审计故障回滚。'
+    }, createWriteOptions(db, {
+      auditWriter() {
+        throw new Error('injected derived review audit failure');
+      }
+    })), /injected derived review audit failure/);
+    assert.strictEqual(db.inTransaction, true, '审计故障后调用方事务必须继续保持 active。');
+    assert.deepStrictEqual(
+      getDemoOwnershipEntityHandler('strategy_rule_hit').readProjection(db, auditFailureHit.id),
+      auditFailureProjectionBefore,
+      '审计故障必须回滚命中状态、复核字段和 updated_at。'
+    );
+    assert.deepStrictEqual(
+      db.prepare('SELECT snapshot_digest AS snapshotDigest FROM demo_data_registry WHERE registry_id = ?')
+        .get(auditFailureOwnership.registryId),
+      auditFailureRegistryBefore,
+      '审计故障必须回滚 derived registry snapshot digest。'
+    );
+    db.prepare(
+      `INSERT INTO organization_units
+         (unit_code, unit_name, unit_path, unit_type, status)
+       VALUES ('DERIVED-REVIEW-AUDIT-CONTINUE', '派生复核审计继续哨兵', '/派生复核审计继续哨兵', 'workshop', 'active')`
+    ).run();
+  } finally {
+    if (db.inTransaction) db.exec('COMMIT');
+  }
+  assert.strictEqual(
+    db.prepare(
+      "SELECT COUNT(*) AS total FROM organization_units WHERE unit_code IN ('DERIVED-REVIEW-AUDIT-SENTINEL', 'DERIVED-REVIEW-AUDIT-CONTINUE')"
+    ).get().total,
+    2,
+    'review 私有 SAVEPOINT 不得回滚调用方自身写入。'
+  );
+  assert.strictEqual(
+    db.prepare(
+      "SELECT COUNT(*) AS total FROM sys_operation_logs WHERE operation = 'energy.strategy.hit.review'"
+    ).get().total,
+    auditCountBeforeFailure
+  );
+
+  // 注入 registry CAS 更新故障，验证 refresh 失败同样只回滚本次 review SAVEPOINT。
+  const refreshFailureProjectionBefore = getDemoOwnershipEntityHandler('strategy_rule_hit')
+    .readProjection(db, refreshFailureHit.id);
+  const refreshFailureRegistryBefore = db.prepare(
+    'SELECT snapshot_digest AS snapshotDigest FROM demo_data_registry WHERE registry_id = ?'
+  ).get(refreshFailureOwnership.registryId);
+  db.exec(`CREATE TRIGGER block_derived_strategy_hit_refresh
+    BEFORE UPDATE OF snapshot_digest ON demo_data_registry
+    WHEN OLD.registry_id = ${refreshFailureOwnership.registryId}
+      AND NEW.snapshot_digest <> OLD.snapshot_digest
+    BEGIN
+      SELECT RAISE(ABORT, 'injected derived registry refresh failure');
+    END`);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare(
+      `INSERT INTO organization_units
+         (unit_code, unit_name, unit_path, unit_type, status)
+       VALUES ('DERIVED-REVIEW-REFRESH-SENTINEL', '派生复核刷新哨兵', '/派生复核刷新哨兵', 'workshop', 'active')`
+    ).run();
+    assert.throws(() => updateStrategyRuleHitStatus(refreshFailureHit.id, {
+      manualStatus: 'rejected',
+      reviewNote: '该 review 必须随 registry 刷新故障回滚。'
+    }, createWriteOptions(db)), /injected derived registry refresh failure/);
+    assert.strictEqual(db.inTransaction, true, 'refresh 故障后调用方事务必须继续保持 active。');
+    assert.deepStrictEqual(
+      getDemoOwnershipEntityHandler('strategy_rule_hit').readProjection(db, refreshFailureHit.id),
+      refreshFailureProjectionBefore,
+      'refresh 故障必须回滚命中状态、复核字段和 updated_at。'
+    );
+    assert.deepStrictEqual(
+      db.prepare('SELECT snapshot_digest AS snapshotDigest FROM demo_data_registry WHERE registry_id = ?')
+        .get(refreshFailureOwnership.registryId),
+      refreshFailureRegistryBefore,
+      'refresh 故障不得改变 derived registry snapshot digest。'
+    );
+    db.prepare(
+      `INSERT INTO organization_units
+         (unit_code, unit_name, unit_path, unit_type, status)
+       VALUES ('DERIVED-REVIEW-REFRESH-CONTINUE', '派生复核刷新继续哨兵', '/派生复核刷新继续哨兵', 'workshop', 'active')`
+    ).run();
+  } finally {
+    if (db.inTransaction) db.exec('COMMIT');
+    db.exec('DROP TRIGGER IF EXISTS block_derived_strategy_hit_refresh');
+  }
+  assert.strictEqual(
+    db.prepare(
+      "SELECT COUNT(*) AS total FROM organization_units WHERE unit_code IN ('DERIVED-REVIEW-REFRESH-SENTINEL', 'DERIVED-REVIEW-REFRESH-CONTINUE')"
+    ).get().total,
+    2
+  );
+  assert.strictEqual(
+    db.prepare(
+      "SELECT COUNT(*) AS total FROM sys_operation_logs WHERE operation = 'energy.strategy.hit.review'"
+    ).get().total,
+    auditCountBeforeFailure,
+    'refresh 失败发生在审计前，不得留下 review 操作日志。'
+  );
+
+  // 清除仅由本测试创建的逻辑 ownership 后再删除业务行，避免污染后续场景。
+  db.prepare(
+    "DELETE FROM demo_data_registry WHERE entity_type = 'strategy_rule_hit' AND entity_pk IN (?, ?, ?)"
+  ).run(String(successHit.id), String(auditFailureHit.id), String(refreshFailureHit.id));
+  resetScenario(db);
+}
+
+/**
  * 验证策略业务写入口拒绝缺失或非法操作者。
  * @param {object} db SQLite 连接。
  * @param {object} ids 主数据 ID。
@@ -1277,6 +1591,507 @@ function testAuditActorRequired(db, ids) {
     0,
     '非法操作者不得产生策略评价运行。'
   );
+}
+
+/**
+ * 验证策略评价服务端私有 exact scope、正式运行隔离、漂移和公共脱敏边界。
+ * @param {object} db SQLite 连接。
+ * @param {object} ids 主数据 ID。
+ * @param {Function} insertTimeseries 时序写入函数。
+ * @param {Function} insertRule 规则写入函数。
+ */
+function testServerPrivateExactScope(db, ids, insertTimeseries, insertRule) {
+  resetScenario(db);
+  const timeseriesBatchId = createImportBatch(db, 'energy_timeseries');
+  const otherTimeseriesBatchId = createImportBatch(db, 'energy_timeseries');
+  const strategyRuleBatchId = createImportBatch(db, 'strategy_rule');
+  const otherStrategyRuleBatchId = createImportBatch(db, 'strategy_rule');
+  const exactTimeseriesIds = insertQuarterHourSeries(insertTimeseries, [10, 20, 30, 40], {
+    sourceBatchId: timeseriesBatchId,
+    sourceRowNumber: 1,
+    sourceReference: 'formal-sentinel-timeseries'
+  });
+  insertQuarterHourSeries(insertTimeseries, [100, 100, 100, 100], {
+    sourceBatchId: otherTimeseriesBatchId,
+    sourceRowNumber: 1,
+    sourceReference: 'other-demo-run-timeseries'
+  });
+  const exactRuleIds = [
+    insertRule({
+      sourceBatchId: strategyRuleBatchId,
+      sourceRowNumber: 1,
+      ruleCode: 'FORMAL_SENTINEL_LOAD_RATE',
+      thresholdValue: 60
+    }),
+    insertRule({
+      sourceBatchId: strategyRuleBatchId,
+      sourceRowNumber: 2,
+      ruleCode: 'FORMAL_SENTINEL_PEAK',
+      metricCode: 'peak_interval_energy',
+      thresholdOperator: 'gte',
+      thresholdValue: 40,
+      thresholdUnit: 'kWh/15min'
+    })
+  ];
+  const sameBatchExtraRuleId = insertRule({
+    sourceBatchId: strategyRuleBatchId,
+    sourceRowNumber: 3,
+    ruleCode: 'SAME_BATCH_EXTRA_RULE'
+  });
+  const otherRunRuleId = insertRule({
+    sourceBatchId: otherStrategyRuleBatchId,
+    sourceRowNumber: 1,
+    ruleCode: 'OTHER_DEMO_RUN_RULE'
+  });
+  const exactScope = buildEnergyStrategyExactScope(db, {
+    timeseriesRecordIds: exactTimeseriesIds,
+    timeseriesSourceBatchId: timeseriesBatchId,
+    strategyRuleIds: exactRuleIds,
+    strategyRuleSourceBatchId: strategyRuleBatchId
+  });
+  // 恰好五十条规则必须通过 exact normalizer 和真实参数化查询。
+  const boundaryStrategyRuleIds = [
+    ...exactRuleIds,
+    ...Array.from({ length: MAX_STRATEGY_RULES - exactRuleIds.length }, (_value, index) => (
+      insertRule({
+        sourceBatchId: strategyRuleBatchId,
+        sourceRowNumber: 4 + index,
+        ruleCode: `BOUNDARY_RULE_${String(index + 1).padStart(2, '0')}`
+      })
+    ))
+  ];
+  const boundaryStrategyScope = buildEnergyStrategyExactScope(db, {
+    timeseriesRecordIds: exactTimeseriesIds,
+    timeseriesSourceBatchId: timeseriesBatchId,
+    strategyRuleIds: boundaryStrategyRuleIds,
+    strategyRuleSourceBatchId: strategyRuleBatchId
+  });
+  assert.strictEqual(boundaryStrategyScope.strategyRules.strategyRuleIds.length, MAX_STRATEGY_RULES);
+  assert.strictEqual(
+    boundaryStrategyScope.strategyRules.expectedStrategyRuleSnapshots.length,
+    MAX_STRATEGY_RULES
+  );
+  const boundaryPreview = previewEnergyStrategies(createInput(ids.meterDeviceId), {
+    db,
+    exactScope: boundaryStrategyScope
+  });
+  assert.strictEqual(boundaryPreview.ruleSelection.selectedRuleCount, MAX_STRATEGY_RULES);
+  // 超过五十条必须在 exact normalization 阶段稳定拒绝，不能退化为 SQL 或集合错误。
+  assertBadRequestCode(
+    () => buildEnergyStrategyExactScope(db, {
+      timeseriesRecordIds: exactTimeseriesIds,
+      timeseriesSourceBatchId: timeseriesBatchId,
+      strategyRuleIds: [...boundaryStrategyRuleIds, 999999999],
+      strategyRuleSourceBatchId: strategyRuleBatchId
+    }),
+    'STRATEGY_RULE_LIMIT_EXCEEDED'
+  );
+  const oversizedNormalizedScope = JSON.parse(JSON.stringify(boundaryStrategyScope));
+  oversizedNormalizedScope.strategyRules.strategyRuleIds.push(999999999);
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId), {
+      db,
+      exactScope: oversizedNormalizedScope
+    }),
+    'STRATEGY_RULE_LIMIT_EXCEEDED'
+  );
+  // 私有 expected snapshots 必须与 ownership 固定 projection 摘要完全兼容。
+  [
+    {
+      entityType: 'energy_timeseries',
+      entityIds: exactTimeseriesIds,
+      snapshots: exactScope.timeseries.expectedTimeseriesSnapshots
+    },
+    {
+      entityType: 'strategy_rule',
+      entityIds: exactRuleIds,
+      snapshots: exactScope.strategyRules.expectedStrategyRuleSnapshots
+    }
+  ].forEach(({ entityType, entityIds, snapshots }) => {
+    const handler = getDemoOwnershipEntityHandler(entityType);
+    entityIds.forEach((entityId) => {
+      const registration = buildDemoEntityRegistrationContract({
+        entityType,
+        entityPk: String(entityId),
+        row: handler.readProjection(db, entityId)
+      });
+      const expectedSnapshot = snapshots.find((snapshot) => snapshot.id === entityId);
+      assert(expectedSnapshot);
+      assert.strictEqual(expectedSnapshot.identityDigest, registration.identityDigest);
+      assert.strictEqual(expectedSnapshot.snapshotDigest, registration.snapshotDigest);
+    });
+  });
+  // builder 必须先执行 ownership 固定 projection，不能接受领域 schema 之外的不兼容策略规则。
+  [
+    {
+      ruleCode: 'OWNERSHIP_BAD_METRIC',
+      metricCode: 'unsupported_metric'
+    },
+    {
+      ruleCode: 'OWNERSHIP_BAD_FORMULA',
+      formulaVersion: 'unsupported-formula:v1'
+    },
+    {
+      ruleCode: 'OWNERSHIP_BAD_EVIDENCE',
+      evidenceRequirementsJson: JSON.stringify({ unknown: true })
+    },
+    {
+      ruleCode: 'OWNERSHIP_BAD_THRESHOLD_UNIT',
+      thresholdUnit: ' '
+    }
+  ].forEach((overrides) => {
+    const incompatibleRuleId = insertRule({
+      sourceBatchId: strategyRuleBatchId,
+      sourceRowNumber: 10,
+      ...overrides
+    });
+    assertBadRequestCode(
+      () => buildEnergyStrategyExactScope(db, {
+        timeseriesRecordIds: exactTimeseriesIds,
+        timeseriesSourceBatchId: timeseriesBatchId,
+        strategyRuleIds: [incompatibleRuleId],
+        strategyRuleSourceBatchId: strategyRuleBatchId
+      }),
+      'ENERGY_STRATEGY_EXACT_SCOPE_OWNERSHIP_INCOMPATIBLE'
+    );
+    db.prepare('DELETE FROM strategy_rules WHERE id = ?').run(incompatibleRuleId);
+  });
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId, { ruleCodes: [] }), {
+      db,
+      exactRequired: true
+    }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_REQUIRED'
+  );
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId, { ruleCodes: [] }), {
+      db,
+      exactRequired: true,
+      exactScope: JSON.parse(JSON.stringify(exactScope))
+    }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  const preview = previewEnergyStrategies(createInput(ids.meterDeviceId, {
+    ruleCodes: [],
+    recordIds: [999999],
+    sourceBatchId: otherTimeseriesBatchId,
+    registry: { connected: true },
+    context: { private: true },
+    digest: 'client-must-be-ignored'
+  }), { db, exactRequired: true, exactScope });
+  assert.strictEqual(preview.ruleSelection.selectedRuleCount, 2);
+  assert.deepStrictEqual(
+    preview.evaluations.map((evaluation) => evaluation.ruleCode).sort(),
+    ['FORMAL_SENTINEL_LOAD_RATE', 'FORMAL_SENTINEL_PEAK']
+  );
+  assert.strictEqual(preview.dataSummary.recordCount, 4);
+  assert.strictEqual(preview.dataSummary.metrics.totalEnergy, 100);
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,
+    0,
+    'exact preview 不得写 strategy_evaluation_runs。'
+  );
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total,
+    0,
+    'exact preview 不得写 strategy_rule_hits。'
+  );
+  const metadata = getEnergyStrategyExactScopeMetadata(preview, { db });
+  assert(metadata);
+  assert.deepStrictEqual(metadata.timeseries.recordIds, exactTimeseriesIds);
+  assert.deepStrictEqual(metadata.strategyRules.recordIds, exactRuleIds);
+  const publicJson = JSON.stringify(preview);
+  [
+    'sourceBatchId',
+    'sourceRowNumber',
+    'strategyRuleScopeDigest',
+    'timeseriesScopeDigest',
+    'expectedStrategyRuleSnapshots',
+    'expectedTimeseriesSnapshots',
+    'registry',
+    'context',
+    'handler',
+    'SELECT '
+  ].forEach((privateToken) => {
+    assert.strictEqual(publicJson.includes(privateToken), false, `公共策略预演泄露 ${privateToken}`);
+  });
+
+  // 调用方事务必须保持所有权，exact preview 不得提交或回滚。
+  db.exec('BEGIN DEFERRED');
+  try {
+    const callerTransactionPreview = previewEnergyStrategies(
+      createInput(ids.meterDeviceId),
+      { db, exactScope }
+    );
+    assert.strictEqual(callerTransactionPreview.meta.reusedCallerTransaction, true);
+    assert.strictEqual(db.inTransaction, true);
+  } finally {
+    db.exec('ROLLBACK');
+  }
+
+  const emptyRuleScope = JSON.parse(JSON.stringify(exactScope));
+  emptyRuleScope.strategyRules.strategyRuleIds = [];
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId, { ruleCodes: [] }), {
+      db,
+      exactScope: emptyRuleScope
+    }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_IDS_REQUIRED'
+  );
+  const duplicateRuleScope = JSON.parse(JSON.stringify(exactScope));
+  duplicateRuleScope.strategyRules.strategyRuleIds.push(exactRuleIds[0]);
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId), {
+      db,
+      exactScope: duplicateRuleScope
+    }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_ID_DUPLICATE'
+  );
+  const missingBatchFieldScope = JSON.parse(JSON.stringify(exactScope));
+  delete missingBatchFieldScope.strategyRules.strategyRuleSourceBatchId;
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId), {
+      db,
+      exactScope: missingBatchFieldScope
+    }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_SOURCE_BATCH_REQUIRED'
+  );
+  const missingBatchScope = JSON.parse(JSON.stringify(exactScope));
+  missingBatchScope.strategyRules.strategyRuleSourceBatchId = 999999999;
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId), {
+      db,
+      exactScope: missingBatchScope
+    }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  const crossBatchScope = JSON.parse(JSON.stringify(exactScope));
+  crossBatchScope.strategyRules.strategyRuleIds.push(otherRunRuleId);
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId), {
+      db,
+      exactScope: crossBatchScope
+    }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  const extraRuleScope = JSON.parse(JSON.stringify(exactScope));
+  extraRuleScope.strategyRules.strategyRuleIds.push(sameBatchExtraRuleId);
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId), {
+      db,
+      exactScope: extraRuleScope
+    }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  const ruleDigestDriftScope = JSON.parse(JSON.stringify(exactScope));
+  ruleDigestDriftScope.strategyRules.strategyRuleScopeDigest = '0'.repeat(64);
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId), {
+      db,
+      exactScope: ruleDigestDriftScope
+    }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  const timeseriesDigestDriftScope = JSON.parse(JSON.stringify(exactScope));
+  timeseriesDigestDriftScope.timeseries.timeseriesScopeDigest = '0'.repeat(64);
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId), {
+      db,
+      exactScope: timeseriesDigestDriftScope
+    }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+
+  // active 规则漂移必须因 SQL 基础校验与 expected IDs 不一致而阻断。
+  db.prepare("UPDATE strategy_rules SET status = 'inactive' WHERE id = ?").run(exactRuleIds[0]);
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId), { db, exactScope }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_RECORD_SET_MISMATCH'
+  );
+  db.prepare("UPDATE strategy_rules SET status = 'active' WHERE id = ?").run(exactRuleIds[0]);
+  const refreshedExactScope = buildEnergyStrategyExactScope(db, {
+    timeseriesRecordIds: exactTimeseriesIds,
+    timeseriesSourceBatchId: timeseriesBatchId,
+    strategyRuleIds: exactRuleIds,
+    strategyRuleSourceBatchId: strategyRuleBatchId
+  });
+  const beforeMissingExecuteRunCount = db.prepare(
+    'SELECT COUNT(*) AS total FROM strategy_evaluation_runs'
+  ).get().total;
+  const beforeMissingExecuteHitCount = db.prepare(
+    'SELECT COUNT(*) AS total FROM strategy_rule_hits'
+  ).get().total;
+  // exact-required execute 丢失私有 scope 时必须在任何业务写入前稳定失败。
+  assertBadRequestCode(
+    () => runEnergyStrategyEvaluation(
+      createInput(ids.meterDeviceId, { ruleCodes: [] }),
+      createWriteOptions(db, { exactRequired: true })
+    ),
+    'ENERGY_STRATEGY_EXACT_SCOPE_REQUIRED'
+  );
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,
+    beforeMissingExecuteRunCount
+  );
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total,
+    beforeMissingExecuteHitCount
+  );
+
+  // caller-owned BEGIN IMMEDIATE 中的 exact ownership 错误不得留下 running 或命中记录。
+  const beforeOwnershipFailureRunCount = db.prepare(
+    'SELECT COUNT(*) AS total FROM strategy_evaluation_runs'
+  ).get().total;
+  const beforeOwnershipFailureHitCount = db.prepare(
+    'SELECT COUNT(*) AS total FROM strategy_rule_hits'
+  ).get().total;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare(
+      `INSERT INTO organization_units
+         (unit_code, unit_name, unit_path, unit_type, status)
+       VALUES ('CALLER-EXACT-OWNERSHIP-SENTINEL', '调用方 ownership 哨兵', '/调用方 ownership 哨兵', 'workshop', 'active')`
+    ).run();
+    db.prepare("UPDATE strategy_rules SET metric_code = 'unsupported_metric' WHERE id = ?")
+      .run(exactRuleIds[0]);
+    assertBadRequestCode(
+      () => runEnergyStrategyEvaluation(
+        createInput(ids.meterDeviceId, { ruleCodes: [] }),
+        createWriteOptions(db, { exactScope: refreshedExactScope })
+      ),
+      'ENERGY_STRATEGY_EXACT_SCOPE_OWNERSHIP_INCOMPATIBLE'
+    );
+    assert.strictEqual(db.inTransaction, true);
+    db.prepare("UPDATE strategy_rules SET metric_code = 'load_rate' WHERE id = ?").run(exactRuleIds[0]);
+  } finally {
+    if (db.inTransaction) db.exec('COMMIT');
+  }
+  assert.strictEqual(
+    db.prepare("SELECT COUNT(*) AS total FROM organization_units WHERE unit_code = 'CALLER-EXACT-OWNERSHIP-SENTINEL'").get().total,
+    1
+  );
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,
+    beforeOwnershipFailureRunCount
+  );
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total,
+    beforeOwnershipFailureHitCount
+  );
+
+  // exact digest 漂移同样必须在调用方提交后保持无业务残留，并保留调用方哨兵写入。
+  const beforeDigestFailureRunCount = db.prepare(
+    'SELECT COUNT(*) AS total FROM strategy_evaluation_runs'
+  ).get().total;
+  const beforeDigestFailureHitCount = db.prepare(
+    'SELECT COUNT(*) AS total FROM strategy_rule_hits'
+  ).get().total;
+  const staleExactScope = JSON.parse(JSON.stringify(refreshedExactScope));
+  staleExactScope.timeseries.timeseriesScopeDigest = '0'.repeat(64);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare(
+      `INSERT INTO organization_units
+         (unit_code, unit_name, unit_path, unit_type, status)
+       VALUES ('CALLER-EXACT-DIGEST-SENTINEL', '调用方 digest 哨兵', '/调用方 digest 哨兵', 'workshop', 'active')`
+    ).run();
+    assertBadRequestCode(
+      () => runEnergyStrategyEvaluation(
+        createInput(ids.meterDeviceId, { ruleCodes: [] }),
+        createWriteOptions(db, { exactScope: staleExactScope })
+      ),
+      'ENERGY_STRATEGY_EXACT_SCOPE_CAPABILITY_REQUIRED'
+    );
+    assert.strictEqual(db.inTransaction, true);
+  } finally {
+    if (db.inTransaction) db.exec('COMMIT');
+  }
+  assert.strictEqual(
+    db.prepare("SELECT COUNT(*) AS total FROM organization_units WHERE unit_code = 'CALLER-EXACT-DIGEST-SENTINEL'").get().total,
+    1
+  );
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,
+    beforeDigestFailureRunCount
+  );
+  assert.strictEqual(
+    db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total,
+    beforeDigestFailureHitCount
+  );
+
+  // 审计失败发生在 run/hit 写入之后，私有 SAVEPOINT 必须只回滚本次业务写入。
+  const beforeAuditFailureRunCount = db.prepare(
+    'SELECT COUNT(*) AS total FROM strategy_evaluation_runs'
+  ).get().total;
+  const beforeAuditFailureHitCount = db.prepare(
+    'SELECT COUNT(*) AS total FROM strategy_rule_hits'
+  ).get().total;
+  const beforeAuditFailureLogCount = db.prepare(
+    'SELECT COUNT(*) AS total FROM sys_operation_logs'
+  ).get().total;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare(
+      `INSERT INTO organization_units
+         (unit_code, unit_name, unit_path, unit_type, status)
+       VALUES ('CALLER-EXACT-AUDIT-SENTINEL', '调用方 audit 哨兵', '/调用方 audit 哨兵', 'workshop', 'active')`
+    ).run();
+    assert.throws(
+      () => runEnergyStrategyEvaluation(
+        createInput(ids.meterDeviceId, { ruleCodes: [] }),
+        createWriteOptions(db, {
+          exactRequired: true,
+          exactScope: refreshedExactScope,
+          auditWriter() {
+            throw new Error('injected caller-owned exact audit failure');
+          }
+        })
+      ),
+      /injected caller-owned exact audit failure/
+    );
+    assert.strictEqual(db.inTransaction, true);
+    assert.strictEqual(
+      db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,
+      beforeAuditFailureRunCount,
+      '私有 SAVEPOINT 必须回滚本次新增 run。'
+    );
+    assert.strictEqual(
+      db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total,
+      beforeAuditFailureHitCount,
+      '私有 SAVEPOINT 必须回滚本次新增 hit。'
+    );
+    assert.strictEqual(
+      db.prepare('SELECT COUNT(*) AS total FROM sys_operation_logs').get().total,
+      beforeAuditFailureLogCount,
+      '私有 SAVEPOINT 必须避免留下本次 audit。'
+    );
+  } finally {
+    if (db.inTransaction) db.exec('COMMIT');
+  }
+  assert.strictEqual(
+    db.prepare("SELECT COUNT(*) AS total FROM organization_units WHERE unit_code = 'CALLER-EXACT-AUDIT-SENTINEL'").get().total,
+    1
+  );
+
+  // 正式执行继续使用服务端 actor，并只持久化 exact 规则命中。
+  const executed = runEnergyStrategyEvaluation(
+    createInput(ids.meterDeviceId, { ruleCodes: [] }),
+    createWriteOptions(db, { exactRequired: true, exactScope: refreshedExactScope })
+  );
+  assert.strictEqual(executed.hits.length, 2);
+  assert.strictEqual(executed.meta.reusedCallerTransaction, false);
+  assert.strictEqual(db.inTransaction, false, 'exact 正式执行必须提交服务自建写事务。');
+  assert.deepStrictEqual(
+    executed.hits.map((hit) => hit.ruleCode).sort(),
+    ['FORMAL_SENTINEL_LOAD_RATE', 'FORMAL_SENTINEL_PEAK']
+  );
+  const executeJson = JSON.stringify(executed);
+  assert.strictEqual(executeJson.includes('sourceBatchId'), false);
+  assert.strictEqual(executeJson.includes('strategyRuleScopeDigest'), false);
+  assert.strictEqual(executeJson.includes('timeseriesScopeDigest'), false);
+  assert.strictEqual(executeJson.includes('registry'), false);
+  assert.strictEqual(executeJson.includes('context'), false);
+  resetScenario(db);
 }
 
 /**
@@ -1339,10 +2154,12 @@ try {
   testEvaluationDigestBinding(db, ids, insertTimeseries, insertRule);
   testNonFiniteEvaluationDigestEncoding(db, ids, insertTimeseries, insertRule);
   testAutomationAndSavingGates(db, ids, insertTimeseries, insertRule);
+  testServerPrivateExactScope(db, ids, insertTimeseries, insertRule);
   testConsistentReadSnapshot(db, ids, insertTimeseries, insertRule);
   testInjectionAndDatabaseOwnership(db, ids, insertTimeseries, insertRule);
   testPersistentEvaluationAndManualStatus(db, ids, insertTimeseries, insertRule);
   testAtomicOperationAuditRollback(db, ids, insertTimeseries, insertRule);
+  testDerivedOwnershipReviewRefresh(db, ids, insertTimeseries, insertRule);
 
   assert.strictEqual(
     db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,

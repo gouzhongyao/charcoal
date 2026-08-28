@@ -411,6 +411,12 @@ function grantPermissions(userId, permissionCodes) {
     assert.strictEqual(detail.status, 200);
     assertNoCarbonEmissionReportInternalFields(detail.body);
     assert.strictEqual(detail.body.data.report.reportCode, 'CER-API-001');
+    const reportCreatedAt = detail.body.data.report.createdAt;
+    assert.match(reportCreatedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/,
+      '碳排放报告详情 API 必须继续返回严格 UTC 技术值。');
+    const reportCreatedAtUserVisible = reportCreatedAt.replace(/\.\d{3}Z$/, 'Z').replace('T', ' ').replace(/Z$/, '');
+    assert.strictEqual(detail.body.data.report.periodStart, '2026-01-01', '报告开始日期必须继续保持 YYYY-MM-DD。');
+    assert.strictEqual(detail.body.data.report.periodEnd, '2026-12-31', '报告结束日期必须继续保持 YYYY-MM-DD。');
     assert.strictEqual(detail.body.data.items.length, 2);
     const traced = await request(server, 'GET', `/api/carbon/emission-reports/batches/${preview.body.data.batchId}`, undefined, viewToken);
     assert.strictEqual(traced.status, 200);
@@ -437,6 +443,10 @@ function grantPermissions(userId, permissionCodes) {
     const exportedWorkbook = XLSX.read(exported.buffer, { type: 'buffer' });
     assert.deepStrictEqual(exportedWorkbook.SheetNames, CARBON_EMISSION_REPORT_SHEETS.map((sheet) => sheet.name));
     assert.strictEqual(exportedWorkbook.Sheets['报告信息'].B2.v, "'=API报告名称");
+    assert.strictEqual(exportedWorkbook.Sheets['报告信息'].L2.v, reportCreatedAtUserVisible,
+      '碳排放报告导出创建时间必须使用用户可见空格秒格式。');
+    assert.strictEqual(exportedWorkbook.Sheets['报告信息'].D2.v, '2026-01-01');
+    assert.strictEqual(exportedWorkbook.Sheets['报告信息'].E2.v, '2026-12-31');
     assert.strictEqual(exportedWorkbook.Sheets['报告项目'].L2.v, "'=项目备注");
     assert.strictEqual(exportedWorkbook.Sheets['证据说明'].B2.v, "'+燃气证据");
     assert.strictEqual(exportedWorkbook.Sheets['证据说明'].E2.v, "'@证据备注");

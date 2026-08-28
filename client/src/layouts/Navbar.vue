@@ -72,18 +72,33 @@ async function onCommand(command) {
 </script>
 <style scoped>
 .navbar {
+  position: sticky;
+  top: 0;
+  z-index: 15;
+  flex: 0 0 64px;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   height: 64px;
   display: flex;
   align-items: center;
   gap: 14px;
   padding: 0 22px;
+  overflow-x: hidden;
   background: #fff;
   border-bottom: 1px solid #dce9fb;
 }
+.navbar :deep(.el-breadcrumb) {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
 .nav-right {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 18px;
+  min-width: 0;
   margin-left: auto;
 }
 .api-base {

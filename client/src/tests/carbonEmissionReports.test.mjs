@@ -94,7 +94,7 @@ const reportHeader = {
   id: 7,
   reportCode: 'RPT-2028-001',
   reportName: '2028 年度碳排放报告',
-  reportOrganization: '青岚园区',
+  reportOrganization: '天坤集团',
   periodStart: '2028-01-01',
   periodEnd: '2028-12-31',
   templateId: 'carbon-emission-report',

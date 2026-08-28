@@ -20,6 +20,7 @@ const {
   createEnergyAnalysisSingleBatchPreview,
   executeEnergyAnalysisSingleBatchImport
 } = require('./energyAnalysisSingleBatchImportService');
+const { createDemoOwnershipInsertWitness } = require('./demoOwnershipService');
 const { allocateBenchmarkCompatibilityVersion } = require('./energyBenchmarkService');
 
 // 三类导入固定绑定已冻结模板，调用方不能替换 operation、recordKind 或 importType。
@@ -40,6 +41,24 @@ const TEMPLATE_SHEET_NAMES = Object.freeze({
   [ENERGY_BENCHMARK_DEFINITION_TEMPLATE_TYPE]: '对标定义',
   [ENERGY_BENCHMARK_TARGET_TEMPLATE_TYPE]: '对标目标'
 });
+
+/** 将已通过领域校验的 UTC 时间规范化为 ownership projection 要求的毫秒精度。 */
+function normalizeOwnershipUtcMilliseconds(value) {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : value;
+}
+
+/**
+ * 将合法严格 UTC Z 文本规范为可比较的 ISO 毫秒形式。
+ * 非字符串、缺失、非法日期和带偏移量文本均返回 null，避免放宽导入校验或把异常历史值视为 exact。
+ * @param {*} value 待比较的有效期值。
+ * @returns {string|null} 规范 ISO 时间或 null。
+ */
+function canonicalizeStrictUtcForExactComparison(value) {
+  if (typeof value !== 'string' || !isStrictUtcIso(value)) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
 
 /**
  * 判断导入值是否为空白。
@@ -346,37 +365,32 @@ function markInputPairConflict(left, right, code, messagePrefix) {
  * @returns {boolean} 是否完全相同。
  */
 function isExactConversionFactor(left, right) {
-  return stableSerialize({
-    factorCode: left.factorCode,
-    energyTypeId: Number(left.energyTypeId),
-    sourceUnit: normalizeText(left.sourceUnit).toLocaleLowerCase('en-US'),
-    factorValue: Number(left.factorValue),
-    targetUnit: left.targetUnit,
-    displayUnit: left.displayUnit,
-    displayDivisor: Number(left.displayDivisor),
-    source: left.source,
-    documentNo: left.documentNo,
-    version: left.version,
-    effectiveStartUtc: left.effectiveStartUtc,
-    effectiveEndUtc: left.effectiveEndUtc,
-    sourceTimeZone: left.sourceTimeZone,
-    status: left.status
-  }) === stableSerialize({
-    factorCode: right.factorCode,
-    energyTypeId: Number(right.energyTypeId),
-    sourceUnit: normalizeText(right.sourceUnit).toLocaleLowerCase('en-US'),
-    factorValue: Number(right.factorValue),
-    targetUnit: right.targetUnit,
-    displayUnit: right.displayUnit,
-    displayDivisor: Number(right.displayDivisor),
-    source: right.source,
-    documentNo: right.documentNo,
-    version: right.version,
-    effectiveStartUtc: right.effectiveStartUtc,
-    effectiveEndUtc: right.effectiveEndUtc,
-    sourceTimeZone: right.sourceTimeZone,
-    status: right.status
+  const leftEffectiveStartUtc = canonicalizeStrictUtcForExactComparison(left.effectiveStartUtc);
+  const leftEffectiveEndUtc = canonicalizeStrictUtcForExactComparison(left.effectiveEndUtc);
+  const rightEffectiveStartUtc = canonicalizeStrictUtcForExactComparison(right.effectiveStartUtc);
+  const rightEffectiveEndUtc = canonicalizeStrictUtcForExactComparison(right.effectiveEndUtc);
+  // 有效期字段必须先通过严格 UTC 校验；异常历史值不得仅因文本相同而被判定为 exact。
+  if ([leftEffectiveStartUtc, leftEffectiveEndUtc, rightEffectiveStartUtc, rightEffectiveEndUtc]
+    .some((value) => value === null)) return false;
+
+  const project = (value, effectiveStartUtc, effectiveEndUtc) => ({
+    factorCode: value.factorCode,
+    energyTypeId: Number(value.energyTypeId),
+    sourceUnit: normalizeText(value.sourceUnit).toLocaleLowerCase('en-US'),
+    factorValue: Number(value.factorValue),
+    targetUnit: value.targetUnit,
+    displayUnit: value.displayUnit,
+    displayDivisor: Number(value.displayDivisor),
+    source: value.source,
+    documentNo: value.documentNo,
+    version: value.version,
+    effectiveStartUtc,
+    effectiveEndUtc,
+    sourceTimeZone: value.sourceTimeZone,
+    status: value.status
   });
+  return stableSerialize(project(left, leftEffectiveStartUtc, leftEffectiveEndUtc))
+    === stableSerialize(project(right, rightEffectiveStartUtc, rightEffectiveEndUtc));
 }
 
 /**
@@ -526,17 +540,61 @@ function buildEnergyConversionFactorImportPreview(input) {
  * @returns {object} 插入结果。
  */
 function insertEnergyConversionFactorCandidates(input) {
-  const statement = input.db.prepare(`INSERT INTO energy_conversion_factors (
+  const insertSql = `INSERT INTO energy_conversion_factors (
     source_batch_id, source_row_number, factor_code, energy_type_id, source_unit, factor_value,
     target_unit, display_unit, display_divisor, source, document_no, version,
     effective_start_utc, effective_end_utc, source_timezone, status
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  return insertCandidates(input, statement, (candidate) => [
-    input.batchId, candidate.sourceRowNumber, candidate.factorCode, candidate.energyTypeId,
-    candidate.sourceUnit, candidate.factorValue, candidate.targetUnit, candidate.displayUnit,
-    candidate.displayDivisor, candidate.source, candidate.documentNo, candidate.version,
-    candidate.effectiveStartUtc, candidate.effectiveEndUtc, candidate.sourceTimeZone, candidate.status
-  ]);
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  if (!input.transactionScope) {
+    const statement = input.db.prepare(insertSql);
+    return insertCandidates(input, statement, (candidate) => [
+      input.batchId, candidate.sourceRowNumber, candidate.factorCode, candidate.energyTypeId,
+      candidate.sourceUnit, candidate.factorValue, candidate.targetUnit, candidate.displayUnit,
+      candidate.displayDivisor, candidate.source, candidate.documentNo, candidate.version,
+      candidate.effectiveStartUtc, candidate.effectiveEndUtc, candidate.sourceTimeZone, candidate.status
+    ]);
+  }
+  const importedIds = [];
+  const importedItems = [];
+  input.candidateRows.forEach((candidate, index) => {
+    if (typeof input.options.beforeInsertCandidate === 'function') {
+      input.options.beforeInsertCandidate({ candidate, index, db: input.db });
+    }
+    const insertParams = [
+      input.batchId, candidate.sourceRowNumber, candidate.factorCode, candidate.energyTypeId,
+      candidate.sourceUnit, candidate.factorValue, candidate.targetUnit, candidate.displayUnit,
+      candidate.displayDivisor, candidate.source, candidate.documentNo, candidate.version,
+      normalizeOwnershipUtcMilliseconds(candidate.effectiveStartUtc),
+      normalizeOwnershipUtcMilliseconds(candidate.effectiveEndUtc),
+      candidate.sourceTimeZone, candidate.status
+    ];
+    const rowWitness = createDemoOwnershipInsertWitness({
+      transactionScope: input.transactionScope,
+      entityType: 'energy_conversion_factor',
+      insertParams,
+      insertSql,
+      sourceBatchId: input.batchId,
+      sourceRowNumber: candidate.sourceRowNumber
+    });
+    const importedId = Number(rowWitness.lastInsertRowid);
+    importedIds.push(importedId);
+    importedItems.push({
+      id: importedId,
+      candidateRowId: candidate.candidateRowId,
+      sourceRowNumber: candidate.sourceRowNumber,
+      rowWitness
+    });
+    if (typeof input.options.afterInsertCandidate === 'function') {
+      input.options.afterInsertCandidate({
+        candidate,
+        index,
+        importedId,
+        db: input.db,
+        rowWitness
+      });
+    }
+  });
+  return { imported: importedIds.length, importedIds, importedItems };
 }
 
 /**
@@ -960,7 +1018,13 @@ function insertCandidates(input, statement, buildParameters) {
 const ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR = Object.freeze({
   templateType: ENERGY_CONVERSION_FACTOR_TEMPLATE_TYPE,
   buildPreview: buildEnergyConversionFactorImportPreview,
-  insertCandidates: insertEnergyConversionFactorCandidates
+  insertCandidates: insertEnergyConversionFactorCandidates,
+  demoOwnership: Object.freeze({
+    artifactKey: '19-conversion-factors',
+    entityType: 'energy_conversion_factor',
+    batchRole: 'primary',
+    expectedImportType: 'energy_conversion_factor'
+  })
 });
 // 对标定义描述器使用 core 已冻结的 definitions 模板 operation/recordKind 绑定。
 const ENERGY_BENCHMARK_DEFINITION_IMPORT_DESCRIPTOR = Object.freeze({
@@ -1017,6 +1081,7 @@ module.exports = {
   buildEnergyBenchmarkDefinitionImportPreview,
   buildEnergyBenchmarkTargetImportPreview,
   buildEnergyConversionFactorImportPreview,
+  isExactConversionFactor,
   executeEnergyBenchmarkDefinitionImport,
   executeEnergyBenchmarkTargetImport,
   executeEnergyConversionFactorImport,

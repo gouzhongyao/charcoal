@@ -159,10 +159,8 @@ function seedAccountingFacts() {
       .run(organizationUnitId, energyTypeId, crypto.createHash('sha256').update('accounting-http-act').digest('hex'));
     const insertEnergyRecord = db.prepare(`INSERT INTO energy_records
       (energy_type_id, organization_unit_id, original_month, normalized_month, original_unit,
-       original_value, normalized_unit, normalized_value, organization, site, department,
-       duplicate_key, record_status)
-      VALUES (?, ?, '2026-08', '2026-08', 'unit', 8, 'unit', 8, '=旧能耗组织',
-       '+旧能耗厂区', '@旧能耗部门', ?, 'active')`);
+       original_value, normalized_unit, normalized_value, remark, duplicate_key, record_status)
+      VALUES (?, ?, '2026-08', '2026-08', 'unit', 8, 'unit', 8, '@旧能耗备注', ?, 'active')`);
     const energyRecordId = Number(insertEnergyRecord
       .run(energyTypeId, organizationUnitId, 'accounting-http-energy-record-kg').lastInsertRowid);
     const secondEnergyRecordId = Number(insertEnergyRecord
@@ -263,6 +261,12 @@ function assertPublicActorWithoutIp(run) {
 /** 将 CSV 内容拆成非空行，便于验证标题和业务行来源值。 */
 function parseNonEmptyCsvLines(buffer) {
   return buffer.toString('utf8').replace(/^﻿/, '').split(/\r?\n/).filter(Boolean);
+}
+
+/** 将测试读取到的内部严格 UTC 值投影为预期用户可见格式。 */
+function formatExpectedUserVisibleUtc(value) {
+  assert.match(String(value), /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/);
+  return String(value).replace(/\.\d{3}Z$/, 'Z').replace('T', ' ').replace(/Z$/, '');
 }
 
 (async () => {
@@ -458,6 +462,11 @@ function parseNonEmptyCsvLines(buffer) {
     assert.strictEqual(defaultIndependent.body.data.sourceType, 'independent_activity');
     assert.strictEqual(defaultIndependent.body.data.run.runCode, secondRunCode);
     assert.strictEqual(defaultIndependent.body.data.pagination.total, 1);
+    const independentApiRow = defaultIndependent.body.data.rows[0];
+    assert.strictEqual(independentApiRow.activityStartWallClock, '2026-08-24T08:00', '核算结果 API 墙钟必须继续使用内部 T 分钟合同。');
+    assert.strictEqual(independentApiRow.activityEndWallClock, '2026-08-24T09:00');
+    assert.strictEqual(independentApiRow.activityStartUtc, '2026-08-24T00:00:00Z', '核算结果 API UTC 必须继续使用严格 T/Z 合同。');
+    assert.match(independentApiRow.createdAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/);
     const historicalIndependent = await requestJson(
       server,
       'GET',
@@ -480,6 +489,10 @@ function parseNonEmptyCsvLines(buffer) {
     );
     assert.strictEqual(energyResults.status, 200);
     assert.strictEqual(energyResults.body.data.pagination.total, 2);
+    const energyApiRow = energyResults.body.data.rows[0];
+    assert.strictEqual(energyApiRow.normalizedMonth, '2026-08', '旧能耗核算 API 月份必须继续保持 YYYY-MM。');
+    assert.match(energyApiRow.calculatedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/,
+      '旧能耗核算 API 必须继续返回严格 UTC 技术值。');
     const allWithOnePermission = await requestJson(
       server, 'GET', '/api/carbon/accounting/results?sourceType=all', undefined, activityViewToken
     );
@@ -514,6 +527,12 @@ function parseNonEmptyCsvLines(buffer) {
     assert(independentCsv.includes("'@独立活动类别"), 'CSV 必须防护 @ 公式前缀。');
     assert(independentCsv.includes("'=独立活动组织"), 'CSV 必须防护 = 公式前缀。');
     assert(independentCsv.includes("'+HTTP因子来源"), 'CSV 必须防护 + 公式前缀。');
+    assert(independentCsv.includes('2026-08-24 08:00:00'), '独立核算 CSV 墙钟必须使用空格零秒格式。');
+    assert(independentCsv.includes('2026-08-24 00:00:00'), '独立核算 CSV UTC 必须不偏移地使用空格秒格式。');
+    assert(independentCsv.includes(formatExpectedUserVisibleUtc(independentApiRow.createdAt)),
+      '独立核算 CSV 核算时间必须使用用户可见空格秒格式。');
+    assert(!independentCsv.includes('2026-08-24T08:00'), '独立核算 CSV 不得泄漏内部墙钟 T 分钟值。');
+    assert(!independentCsv.includes('2026-08-24T00:00:00Z'), '独立核算 CSV 不得泄漏内部 UTC T/Z 值。');
     const independentCsvLines = parseNonEmptyCsvLines(filteredExport.buffer);
     assert(independentCsvLines[0].startsWith('"来源类型"'));
     assert(independentCsvLines[1].startsWith('"independent_activity"'));
@@ -528,6 +547,15 @@ function parseNonEmptyCsvLines(buffer) {
     });
     assert.strictEqual(independentOnlyRows[0][0], '来源类型');
     assert.strictEqual(independentOnlyRows[1][0], 'independent_activity');
+    const independentHeaders = independentOnlyRows[0];
+    assert.strictEqual(independentOnlyRows[1][independentHeaders.indexOf('活动开始墙钟')], '2026-08-24 08:00:00');
+    assert.strictEqual(independentOnlyRows[1][independentHeaders.indexOf('活动结束墙钟')], '2026-08-24 09:00:00');
+    assert.strictEqual(independentOnlyRows[1][independentHeaders.indexOf('活动开始UTC')], '2026-08-24 00:00:00');
+    assert.strictEqual(independentOnlyRows[1][independentHeaders.indexOf('活动结束UTC')], '2026-08-24 01:00:00');
+    assert.strictEqual(independentOnlyRows[1][independentHeaders.indexOf('核算时间')],
+      formatExpectedUserVisibleUtc(independentApiRow.createdAt));
+    assert.strictEqual(independentOnlyRows[1][independentHeaders.indexOf('因子年份')], '2026',
+      '因子年份不得被转换为日期时间。');
 
     const energyStatistics = await requestJson(
       server, 'GET', '/api/carbon/accounting/statistics?sourceType=energy_record', undefined, energyViewToken
@@ -549,8 +577,13 @@ function parseNonEmptyCsvLines(buffer) {
     );
     assert.strictEqual(energyCsvExport.status, 200);
     const energyCsvLines = parseNonEmptyCsvLines(energyCsvExport.buffer);
+    const energyCsvText = energyCsvExport.buffer.toString('utf8');
     assert(energyCsvLines[0].startsWith('"来源类型"'));
     assert(energyCsvLines.slice(1).every((line) => line.startsWith('"energy_record"')));
+    assert(energyCsvText.includes('2026-08'), '旧能耗核算 CSV 月份必须继续保持 YYYY-MM。');
+    assert(energyCsvText.includes(formatExpectedUserVisibleUtc(energyApiRow.calculatedAt)),
+      '旧能耗核算 CSV 核算时间必须使用用户可见空格秒格式。');
+    assert(!energyCsvText.includes(energyApiRow.calculatedAt), '旧能耗核算 CSV 不得泄漏内部 T/Z 时间。');
     const energyXlsxExport = await requestJson(
       server, 'GET', '/api/carbon/accounting/export?sourceType=energy_record&format=xlsx', undefined, energyExportToken
     );
@@ -562,6 +595,10 @@ function parseNonEmptyCsvLines(buffer) {
     });
     assert.strictEqual(energyOnlyRows[0][0], '来源类型');
     assert(energyOnlyRows.slice(1).every((row) => row[0] === 'energy_record'));
+    const energyHeaders = energyOnlyRows[0];
+    assert.strictEqual(energyOnlyRows[1][energyHeaders.indexOf('月份')], '2026-08');
+    assert.strictEqual(energyOnlyRows[1][energyHeaders.indexOf('核算时间')],
+      formatExpectedUserVisibleUtc(energyApiRow.calculatedAt));
 
     assert.strictEqual((await requestJson(
       server, 'GET', '/api/carbon/accounting/export?sourceType=energy_record&format=csv', undefined, activityExportToken

@@ -63,7 +63,7 @@ http.interceptors.response.use((response) => {
       const keys = [];
       for (let index = 0; index < sessionStorage.length; index += 1) {
         const key = sessionStorage.key(index);
-        if (key?.startsWith('charcoal.demoContext.v1:')) keys.push(key);
+        if (key?.startsWith('charcoal.demoContext.v2:')) keys.push(key);
       }
       keys.forEach((key) => sessionStorage.removeItem(key));
     } catch { /* sessionStorage 可能不可用 */ }

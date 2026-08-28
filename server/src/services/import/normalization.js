@@ -5,18 +5,13 @@ const FIELD_ALIASES = {
   energyType: ['能源类型', '能源类型编码', '能源类型名称', '能源种类', '能源编码', '能源名称', '能源', '名称', '类型', 'energytype', 'energy_type', 'energyname', 'energy_name', 'energy', 'fueltype', 'fuel', 'type', 'name'],
   value: ['用量', '能耗值', '消耗量', '消费量', '数值', '数据值', 'value', 'usage', 'amount', 'consumption', 'quantity'],
   unit: ['单位', '计量单位', 'unit', 'uom'],
-  organization: ['组织', '组织/公司', '公司', '企业', '机构', '用能单元', '组织单元', '部门/车间', 'organization', 'organisation', 'organizationunit', 'organization_unit', 'company', 'org'],
-  site: ['地点', '位置', '场所', '站点', '厂区', '厂站', 'location', 'site', 'place'],
-  department: ['部门', '车间', '工序', '科室', 'department', 'dept', 'workshop', 'process'],
-  productionLine: ['产线', '生产线', 'line', 'productionline', 'production_line'],
-  meterCode: ['设备', '设备名称', '表计', '表计名称', '表计编号', '仪表', '仪表名称', '仪表编号', '仪表编码', '计量器具编码', '计量点', 'meter', 'metername', 'meter_name', 'metercode', 'meter_code', 'equipment', 'equipmentname', 'device'],
-  dataTime: ['数据时间', '采集时间', '记录时间', '发生时间', 'data_time', 'datatime', 'record_time', 'recordtime', 'timestamp'],
-  businessDimension: ['业务维度', '维度', '业务', 'businessdimension', 'business_dimension', 'dimension'],
-  remark: ['备注', '说明', 'note', 'remark', 'comments', 'comment']
+  organizationUnitCode: ['用能单元编码', '组织单元编码', '组织编码', 'organizationUnitCode', 'organization_unit_code', 'unitCode', 'unit_code'],
+  meterCode: ['计量器具编码', '仪表编码', '表计编号', 'meterCode', 'meter_code', 'meterDeviceCode', 'meter_device_code'],
+  remark: ['备注', '说明', 'remark']
 };
 
-const REQUIRED_FIELDS = ['month', 'energyType', 'value', 'unit'];
-const ENERGY_IMPORT_TEMPLATE_KEY_FIELDS = ['month', 'value'];
+const REQUIRED_FIELDS = ['month', 'energyType', 'value', 'unit', 'organizationUnitCode'];
+const ENERGY_IMPORT_TEMPLATE_KEY_FIELDS = ['month', 'value', 'organizationUnitCode'];
 const TEMPLATE_TYPE_MISMATCH_CODE = 'TEMPLATE_TYPE_MISMATCH';
 const TEMPLATE_TYPE_MISMATCH_REASON = '模板类型不匹配：当前入口只支持能耗数据导入，请使用能耗数据导入模板；碳因子模板仅用于维护参考/字段整理，不支持批量上传。';
 const CARBON_FACTOR_HEADER_FEATURES = {
@@ -312,12 +307,9 @@ function createDuplicateKey(record) {
   const parts = {
     energyTypeCode: record.energyTypeCode,
     normalizedMonth: record.normalizedMonth,
-    organization: normalizeString(record.organization) || '',
-    site: normalizeString(record.site) || '',
-    department: normalizeString(record.department) || '',
-    productionLine: normalizeString(record.productionLine) || '',
+    organizationUnitCode: normalizeString(record.organizationUnitCode) || '',
     meterCode: normalizeString(record.meterCode) || '',
-    businessDimension: normalizeString(record.businessDimension) || ''
+    originalUnit: normalizeString(record.originalUnit) || ''
   };
 
   return crypto.createHash('sha256').update(JSON.stringify(parts)).digest('hex');
@@ -337,19 +329,17 @@ function createValidationError(rowNumber, fieldName, rawValue, errorCode, errorR
 function validateAndNormalizeRow(row, rowNumber, energyTypeIndex) {
   const { mapped, fieldMapping } = mapRowFields(row);
   const errors = [];
-  const monthSourceValue = !isBlank(mapped.month) ? mapped.month : mapped.dataTime;
-  const monthSourceField = !isBlank(mapped.month) ? 'month' : 'dataTime';
+  const monthSourceValue = mapped.month;
 
   REQUIRED_FIELDS.forEach((field) => {
-    const requiredValue = field === 'month' ? monthSourceValue : mapped[field];
-    if (isBlank(requiredValue)) {
-      errors.push(createValidationError(rowNumber, field, requiredValue, 'REQUIRED_FIELD_MISSING', `必填字段 ${field} 为空或未映射`));
+    if (isBlank(mapped[field])) {
+      errors.push(createValidationError(rowNumber, field, mapped[field], 'REQUIRED_FIELD_MISSING', `必填字段 ${field} 为空或未映射`));
     }
   });
 
   const normalizedMonth = normalizeMonth(monthSourceValue);
   if (!isBlank(monthSourceValue) && !normalizedMonth) {
-    errors.push(createValidationError(rowNumber, monthSourceField, monthSourceValue, 'INVALID_MONTH', '月份/数据时间格式不合法，需可标准化为 YYYY-MM'));
+    errors.push(createValidationError(rowNumber, 'month', monthSourceValue, 'INVALID_MONTH', '月份格式不合法，需可标准化为 YYYY-MM'));
   }
 
   const originalValue = normalizeNumber(mapped.value);
@@ -384,12 +374,8 @@ function validateAndNormalizeRow(row, rowNumber, energyTypeIndex) {
     originalValue,
     normalizedUnit: normalizedUnitValue.normalizedUnit,
     normalizedValue: normalizedUnitValue.normalizedValue,
-    organization: normalizeString(mapped.organization),
-    site: normalizeString(mapped.site),
-    department: normalizeString(mapped.department),
-    productionLine: normalizeString(mapped.productionLine),
+    organizationUnitCode: normalizeString(mapped.organizationUnitCode),
     meterCode: normalizeString(mapped.meterCode),
-    businessDimension: normalizeString(mapped.businessDimension),
     remark: normalizeString(mapped.remark)
   };
   record.duplicateKey = createDuplicateKey(record);

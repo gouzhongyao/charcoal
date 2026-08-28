@@ -3,6 +3,7 @@
 const XLSX = require('xlsx');
 const { openDatabase } = require('../db/database');
 const { badRequest, notFound } = require('../utils/errors');
+const { formatStrictUtcForUser } = require('../utils/userVisibleDateTime');
 const {
   buildCarbonEmissionReportCodeKey,
   normalizeCarbonEmissionReportDate,
@@ -345,7 +346,7 @@ function exportCarbonEmissionReport(reportIdValue) {
     ['报告编码', '报告名称', '报告组织', '报告开始日期', '报告结束日期', '模板标识', '模板版本', '备注', '来源批次ID', '来源行号', '创建者', '创建时间'], [[
       report.reportCode, report.reportName, report.reportOrganization, report.periodStart, report.periodEnd,
       report.templateId, report.templateVersion, report.note, report.sourceBatchId, report.sourceRowNumber,
-      report.createdByName, report.createdAt
+      report.createdByName, formatStrictUtcForUser(report.createdAt)
     ]]);
   appendCarbonEmissionReportWorksheet(workbook, '组织与核算边界',
     ['边界类型', '边界名称', '边界说明', '来源行号'], boundaries.map((row) => [

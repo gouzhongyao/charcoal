@@ -439,6 +439,34 @@ function insertCollidingModel(modelCode) {
     assert(archiveSummary.totalUncompressedBytes > 0);
     assert.strictEqual(buildDomainPreview('FLOW-DOMAIN').summary.wouldImport, 1);
 
+    // 新用户墙钟格式在完整能流领域预演边界归一化为内部分钟合同，来源时区转换仍产生同一 UTC 结果。
+    const visibleWallClockPreview = buildDomainPreview('FLOW-VISIBLE-WALL-CLOCK', {
+      mutateRows(rows) {
+        rows.models[0][7] = '2026-01-01 00:00:00';
+        rows.models[0][8] = '2027-01-01 00:00:00';
+        rows.records[0][8] = '2026-07-01 09:00:00';
+        rows.records[0][9] = '2026-07-01 10:00:00';
+        rows.lossEvidence[1][10] = '2026-07-01 01:00:00';
+        rows.lossEvidence[1][11] = '2026-07-01 02:00:00';
+      }
+    });
+    assert.strictEqual(
+      visibleWallClockPreview.summary.wouldImport,
+      1,
+      JSON.stringify(visibleWallClockPreview.issues)
+    );
+    assert.strictEqual(visibleWallClockPreview.candidateRows[0].model.startWallClock, '2026-01-01T00:00');
+    assert.strictEqual(visibleWallClockPreview.candidateRows[0].model.endWallClock, '2027-01-01T00:00');
+    assert.strictEqual(visibleWallClockPreview.candidateRows[0].records[0].startWallClock, '2026-07-01T09:00');
+    assert.strictEqual(visibleWallClockPreview.candidateRows[0].records[0].startUtc, '2026-07-01T01:00:00Z');
+    assert.strictEqual(visibleWallClockPreview.candidateRows[0].lossEvidence[0].startWallClock, '2026-07-01T01:00');
+    const nonZeroWallClockPreview = buildDomainPreview('FLOW-NONZERO-WALL-CLOCK', {
+      mutateRows(rows) { rows.records[0][8] = '2026-07-01 09:00:01'; }
+    });
+    assert.strictEqual(nonZeroWallClockPreview.summary.wouldImport, 0);
+    assert.strictEqual(nonZeroWallClockPreview.summary.blocked, 1);
+    assert(issueCodes(nonZeroWallClockPreview).has('ENERGY_FLOW_WORKBOOK_WALL_CLOCK_SECOND_MUST_BE_ZERO'));
+
     // ZIP/OOXML 门禁必须覆盖 ZIP64、分卷、加密、路径、重复、压缩、CRC 和 descriptor。
     const zip64Locator = Buffer.alloc(20);
     zip64Locator.writeUInt32LE(0x07064b50, 0);

@@ -44,7 +44,7 @@
                   <el-table-column prop="objectName" label="对象名称" min-width="150"><template #default="{ row }"><el-input v-model.trim="row.objectName" :disabled="analysisDefinition.scopeType === 'organization'" :placeholder="analysisDefinition.scopeType === 'organization' ? '由组织主数据带出' : '对象名称'" /></template></el-table-column>
                   <el-table-column prop="objectLevel" label="对象层级" min-width="120"><template #default="{ row }"><el-input :model-value="ENERGY_BENCHMARK_ORGANIZATION_LEVEL_LABELS[row.objectLevel] || row.objectLevel || '待解析'" disabled /></template></el-table-column>
                   <el-table-column prop="actualValue" label="实际值" min-width="130"><template #default="{ row }"><el-input-number v-model="row.actualValue" :controls="false" class="full-control" /></template></el-table-column>
-                  <el-table-column label="上下文" min-width="250"><template #default="{ row }"><span class="context-summary">{{ row.metricCode }} · {{ row.unit }} · {{ row.periodType }}<br>{{ row.periodStartUtc || '未填开始时间' }} → {{ row.periodEndUtc || '未填结束时间' }}</span></template></el-table-column>
+                  <el-table-column label="上下文" min-width="250"><template #default="{ row }"><span class="context-summary">{{ row.metricCode }} · {{ row.unit }} · {{ row.periodType }}<br>{{ formatStrictUtcDateTimeDisplay(row.periodStartUtc, '未填开始时间') }} → {{ formatStrictUtcDateTimeDisplay(row.periodEndUtc, '未填结束时间') }}</span></template></el-table-column>
                   <el-table-column label="操作" width="150" fixed="right"><template #default="{ row, $index }"><el-button link type="primary" @click="openActualContext(row, $index)">编辑上下文</el-button><el-button link type="danger" :disabled="actualRows.length <= 1" @click="removeActualRow($index)">移除</el-button></template></el-table-column>
                 </el-table>
               </template>
@@ -156,7 +156,7 @@
                 <el-table-column prop="benchmarkDefinitionId" label="定义 ID" width="90" />
                 <el-table-column label="目标 / 边界" min-width="150"><template #default="{ row }">{{ targetValueLabel(row, definitionById(row.benchmarkDefinitionId)) }}</template></el-table-column>
                 <el-table-column label="固化" width="90"><template #default="{ row }"><el-tag :type="row.isFrozen ? 'warning' : 'info'" effect="light">{{ row.isFrozen ? '锁 固化' : '普通' }}</el-tag></template></el-table-column>
-                <el-table-column label="参考期" min-width="240"><template #default="{ row }">{{ row.referenceStartUtc ? `${row.referenceStartUtc} → ${row.referenceEndUtc}` : '—' }}</template></el-table-column>
+                <el-table-column label="参考期" min-width="240"><template #default="{ row }">{{ row.referenceStartUtc ? `${formatStrictUtcDateTimeDisplay(row.referenceStartUtc)} → ${formatStrictUtcDateTimeDisplay(row.referenceEndUtc)}` : '—' }}</template></el-table-column>
                 <el-table-column label="状态" width="90"><template #default="{ row }"><StatusTag :status="row.status" /></template></el-table-column>
                 <el-table-column label="操作" min-width="160" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openTargetDetail(row)">详情</el-button><el-button v-if="canManage && !row.isFrozen" link type="primary" :disabled="writeDisabled" @click="openAdjustTarget(row)">调整</el-button><el-button v-if="canManage" link :type="row.status === 'active' ? 'warning' : 'success'" :disabled="writeDisabled" @click="confirmTargetStatus(row)">{{ row.status === 'active' ? '停用' : '启用' }}</el-button></template></el-table-column>
               </el-table>
@@ -171,10 +171,10 @@
             <header class="section-heading"><div><h2>折标系数、定义与目标导入</h2><p>预演是执行的前置能力；执行需要同时具备 preview 与 execute 权限。页面只提交服务端持久化批次、固定确认文本和确认标志。</p></div></header>
             <el-alert v-if="!hasImportExecutePermission" type="info" :closable="false" show-icon title="当前账号可以预演；进入执行确认还需要 energy:benchmarks:import:execute 权限。" />
             <el-alert type="warning" :closable="false" show-icon title="导入只接受真实企业文件。对标定义模板不允许导入内部历史基准；内部历史必须由服务端按明确参考期固化。" />
-            <el-alert type="info" :closable="false" show-icon title="推荐顺序：先导入能源折标系数，再导入对标定义，最后导入对标目标。外部标准定义必须填写真实来源；下载模板或示例不会自动导入、计算或执行对标。" />
+            <el-alert type="info" :closable="false" show-icon title="推荐顺序：先导入能源折标系数，再导入对标定义，最后导入对标目标。外部标准定义必须填写真实来源；下载模板不会自动导入、计算或执行对标。" />
             <el-form label-position="top" class="import-form">
               <el-form-item label="导入类型"><el-radio-group v-model="importType" :disabled="importPreviewLoading"><el-radio-button v-for="item in ENERGY_BENCHMARK_IMPORT_TYPES" :key="item.value" :label="item.value">{{ item.label }}</el-radio-button></el-radio-group></el-form-item>
-              <el-form-item label="当前类型文件"><div class="action-row"><el-button :loading="importTemplateLoading" @click="downloadImportTemplate">下载{{ currentImportTypeLabel }}空白模板</el-button><el-button :loading="importDemoExampleLoading" @click="downloadImportDemoExample">下载{{ currentImportTypeLabel }}青岚园区示例</el-button></div></el-form-item>
+              <el-form-item label="当前类型文件"><div class="action-row"><el-button :loading="importTemplateLoading" @click="downloadImportTemplate">下载{{ currentImportTypeLabel }}空白模板</el-button></div></el-form-item>
               <el-form-item label="选择文件"><el-upload :auto-upload="false" :limit="1" accept=".xlsx,.csv" :disabled="!canImportPreview || writeDisabled" :on-change="selectImportFile" :on-remove="clearImportFile"><el-button :disabled="!canImportPreview || writeDisabled">选择 .xlsx 或 .csv</el-button><template #tip><div class="el-upload__tip">服务端会校验冻结中文模板、字段、重复、有效期和范围主数据。</div></template></el-upload></el-form-item>
               <el-button v-if="canImportPreview" type="primary" :loading="importPreviewLoading" :disabled="!importFile || writeDisabled" @click="previewImport">开始预演</el-button>
             </el-form>
@@ -303,7 +303,6 @@ import {
   createEnergyBenchmarkDefinition,
   createEnergyBenchmarkInternalHistory,
   createEnergyBenchmarkTarget,
-  downloadEnergyBenchmarkDemoParkExample,
   downloadEnergyBenchmarkImportTemplate,
   evaluateEnergyBenchmark,
   executeEnergyBenchmarkImport,
@@ -377,6 +376,7 @@ import {
   validateEnergyBenchmarkScopeSelection
 } from '@/utils/energyBenchmarkManagement';
 import { hasPermi } from '@/utils/permission';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 
 defineOptions({ name: 'EnergyBenchmarksIndex' });
 
@@ -594,7 +594,6 @@ const importType = ref('conversion-factors');
 const importFile = ref(null);
 const importPreview = ref(null);
 const importTemplateLoading = ref(false);
-const importDemoExampleLoading = ref(false);
 const importPreviewLoading = ref(false);
 const importError = ref('');
 const importExecuteOpen = ref(false);
@@ -1276,12 +1275,10 @@ async function openTargetDetail(row) {
   detailData.value = result.value.data || null;
 }
 /** 构造详情描述项。 */
-function buildDetailDescriptions(data, kind) { if (!data) return []; if (kind === 'definition') return [{ label: '编码', value: data.benchmarkCode }, { label: '名称', value: data.benchmarkName }, { label: '类型', value: ENERGY_BENCHMARK_TYPE_LABELS[data.benchmarkType] || data.benchmarkType }, { label: '指标', value: `${data.metricCode} / ${data.unit}` }, { label: '方向', value: ENERGY_BENCHMARK_DIRECTION_LABELS[data.direction] || data.direction }, { label: '周期', value: data.periodType }, { label: '范围', value: `${ENERGY_BENCHMARK_SCOPE_LABELS[data.scopeType] || data.scopeType} / ${data.scopeReference}` }, { label: '来源', value: data.source }, { label: '有效期', value: `${data.effectiveStartUtc} → ${data.effectiveEndUtc}` }, { label: '状态', value: data.status }]; return [{ label: '目标 ID', value: data.id }, { label: '定义', value: `${data.definition?.benchmarkName || data.benchmarkDefinitionId}${data.definition?.benchmarkCode ? ` · ${data.definition.benchmarkCode}` : ''}` }, { label: '目标 / 边界', value: targetValueLabel(data, data.definition) }, { label: '状态', value: data.status }, { label: '是否固化', value: data.isFrozen ? '是' : '否' }, { label: '是否自动刷新', value: data.autoRefresh ? '是' : '否' }, { label: '参考期', value: data.referenceStartUtc ? `${data.referenceStartUtc} → ${data.referenceEndUtc}` : '—' }, { label: '固化值', value: formatEnergyBenchmarkNumber(data.frozenValue) }, { label: '样本数', value: formatInteger(data.sampleCount) }, { label: '来源数据摘要', value: data.sourceDataDigest || '—' }, { label: '固化时间', value: data.frozenAt || '—' }]; }
+function buildDetailDescriptions(data, kind) { if (!data) return []; if (kind === 'definition') return [{ label: '编码', value: data.benchmarkCode }, { label: '名称', value: data.benchmarkName }, { label: '类型', value: ENERGY_BENCHMARK_TYPE_LABELS[data.benchmarkType] || data.benchmarkType }, { label: '指标', value: `${data.metricCode} / ${data.unit}` }, { label: '方向', value: ENERGY_BENCHMARK_DIRECTION_LABELS[data.direction] || data.direction }, { label: '周期', value: data.periodType }, { label: '范围', value: `${ENERGY_BENCHMARK_SCOPE_LABELS[data.scopeType] || data.scopeType} / ${data.scopeReference}` }, { label: '来源', value: data.source }, { label: '有效期', value: `${formatStrictUtcDateTimeDisplay(data.effectiveStartUtc)} → ${formatStrictUtcDateTimeDisplay(data.effectiveEndUtc)}` }, { label: '状态', value: data.status }]; return [{ label: '目标 ID', value: data.id }, { label: '定义', value: `${data.definition?.benchmarkName || data.benchmarkDefinitionId}${data.definition?.benchmarkCode ? ` · ${data.definition.benchmarkCode}` : ''}` }, { label: '目标 / 边界', value: targetValueLabel(data, data.definition) }, { label: '状态', value: data.status }, { label: '是否固化', value: data.isFrozen ? '是' : '否' }, { label: '是否自动刷新', value: data.autoRefresh ? '是' : '否' }, { label: '参考期', value: data.referenceStartUtc ? `${formatStrictUtcDateTimeDisplay(data.referenceStartUtc)} → ${formatStrictUtcDateTimeDisplay(data.referenceEndUtc)}` : '—' }, { label: '固化值', value: formatEnergyBenchmarkNumber(data.frozenValue) }, { label: '样本数', value: formatInteger(data.sampleCount) }, { label: '来源数据摘要', value: data.sourceDataDigest || '—' }, { label: '固化时间', value: formatStrictUtcDateTimeDisplay(data.frozenAt) }]; }
 
 /** 下载当前类型空白 XLSX 模板，不自动进入预演。 */
 async function downloadImportTemplate() { importTemplateLoading.value = true; const result = await safe(() => downloadEnergyBenchmarkImportTemplate(importType.value)); importTemplateLoading.value = false; if (!result.ok) ElMessage.error(`能效对标模板下载失败：${writeErrorText(result, '下载模板')}`); }
-/** 下载当前类型青岚园区 XLSX 示例，不自动导入或执行对标。 */
-async function downloadImportDemoExample() { importDemoExampleLoading.value = true; const result = await safe(() => downloadEnergyBenchmarkDemoParkExample(importType.value)); importDemoExampleLoading.value = false; if (!result.ok) ElMessage.error(`青岚园区示例下载失败：${writeErrorText(result, '下载示例')}`); }
 
 /** 保存用户选择的导入文件并清空旧预演。 */
 function selectImportFile(file) { latestRequestGuard.invalidate('import-preview'); latestRequestGuard.invalidate('import-execute'); importPreviewLoading.value = false; importExecuteLoading.value = false; importFile.value = file.raw || null; importPreview.value = null; importError.value = ''; }

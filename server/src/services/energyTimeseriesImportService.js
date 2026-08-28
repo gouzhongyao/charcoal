@@ -19,6 +19,7 @@ const {
   createEnergyAnalysisSingleBatchPreview,
   executeEnergyAnalysisSingleBatchImport
 } = require('./energyAnalysisSingleBatchImportService');
+const { createDemoOwnershipInsertWitness } = require('./demoOwnershipService');
 
 // 时序能耗领域固定绑定冻结模板，不允许调用方切换到其他能源分析类型。
 const ENERGY_TIMESERIES_TEMPLATE_TYPE = 'energy-timeseries';
@@ -579,12 +580,12 @@ function buildEnergyTimeseriesImportPreview(input) {
 
 /**
  * 在调用方 SQLite 事务内插入已复核的时序候选事实。
+ * managed 路径使用私有事务 row witness，正式路径保持既有 prepare/run 写入。
  * @param {object} input 数据库、批次和候选上下文。
  * @returns {{imported:number,importedIds:number[],importedItems:object[]}} 插入结果。
  */
 function insertEnergyTimeseriesCandidates(input) {
-  const insertRecord = input.db.prepare(
-    `INSERT INTO energy_timeseries_records (
+  const insertSql = `INSERT INTO energy_timeseries_records (
        source_batch_id,
        source_row_number,
        organization_unit_id,
@@ -601,15 +602,15 @@ function insertEnergyTimeseriesCandidates(input) {
        source_reference,
        data_source,
        record_status
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
-  );
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`;
+  const insertRecord = input.transactionScope ? null : input.db.prepare(insertSql);
   const importedIds = [];
   const importedItems = [];
   input.candidateRows.forEach((candidate, index) => {
     if (typeof input.options.beforeInsertCandidate === 'function') {
       input.options.beforeInsertCandidate({ candidate, index, db: input.db });
     }
-    const result = insertRecord.run(
+    const insertParams = [
       input.batchId,
       candidate.sourceRowNumber,
       candidate.organizationUnitId,
@@ -625,16 +626,34 @@ function insertEnergyTimeseriesCandidates(input) {
       candidate.normalizedValue,
       candidate.sourceReference,
       candidate.dataSource
-    );
+    ];
+    const rowWitness = input.transactionScope
+      ? createDemoOwnershipInsertWitness({
+          transactionScope: input.transactionScope,
+          entityType: 'energy_timeseries',
+          insertParams,
+          insertSql,
+          sourceBatchId: input.batchId,
+          sourceRowNumber: candidate.sourceRowNumber
+        })
+      : null;
+    const result = rowWitness || insertRecord.run(...insertParams);
     const importedId = Number(result.lastInsertRowid);
     importedIds.push(importedId);
     importedItems.push({
       id: importedId,
       candidateRowId: candidate.candidateRowId,
-      sourceRowNumber: candidate.sourceRowNumber
+      sourceRowNumber: candidate.sourceRowNumber,
+      ...(rowWitness ? { rowWitness } : {})
     });
     if (typeof input.options.afterInsertCandidate === 'function') {
-      input.options.afterInsertCandidate({ candidate, index, importedId, db: input.db });
+      input.options.afterInsertCandidate({
+        candidate,
+        index,
+        importedId,
+        ...(rowWitness ? { rowWitness } : {}),
+        db: input.db
+      });
     }
   });
   return { imported: importedIds.length, importedIds, importedItems };
@@ -644,7 +663,13 @@ function insertEnergyTimeseriesCandidates(input) {
 const ENERGY_TIMESERIES_IMPORT_DESCRIPTOR = Object.freeze({
   templateType: ENERGY_TIMESERIES_TEMPLATE_TYPE,
   buildPreview: buildEnergyTimeseriesImportPreview,
-  insertCandidates: insertEnergyTimeseriesCandidates
+  insertCandidates: insertEnergyTimeseriesCandidates,
+  demoOwnership: Object.freeze({
+    artifactKey: '15-energy-timeseries',
+    batchRole: 'primary',
+    entityType: 'energy_timeseries',
+    expectedImportType: 'energy_timeseries'
+  })
 });
 
 /**

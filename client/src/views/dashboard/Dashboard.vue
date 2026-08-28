@@ -14,7 +14,6 @@
       @retry-budget="retryBudgetPanel"
       @retry-meter="loadMeterSnapshot"
       @retry-import="loadImportSnapshot"
-      @navigate="goToModule"
     />
     <StandardDashboardView
       v-else
@@ -46,17 +45,24 @@ import { ledgerApi } from '@/api/ledger';
 import { useAppStore } from '@/stores/app';
 import { ENERGY_TYPE_COLORS } from '@/utils/energyStatistics';
 import { hasPermi } from '@/utils/permission';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 import {
   DASHBOARD_PANEL_STATUS,
+  attachSeriesComparisonRows,
+  buildDashboardBaselineRange,
   buildDashboardYearRange,
   buildEnergyTrendSeries,
   calculateZeroSafePercentage,
   createDashboardPanelState,
+  filterDashboardRowsByMonthRange,
+  formatDashboardMeasurement,
+  formatDashboardPercentage,
   groupEnergyRowsByUnit,
   isLatestDashboardRequest,
   projectBudgetWarningStatus,
   projectCarbonDashboardStats,
   projectDashboardSceneState,
+  projectSeriesChange,
   resolveDashboardSummaryDomainState,
   settleDashboardPanelSuccess
 } from '@/utils/dashboardCockpit';
@@ -117,6 +123,8 @@ const importPanel = ref(createDashboardPanelState());
 const yearOptions = computed(() => Array.from({ length: 8 }, (_, index) => currentYear - index));
 /** 当前年度标准化月份范围。 */
 const selectedRange = computed(() => buildDashboardYearRange(selectedYear.value, currentYear));
+/** 只供一月跨年环比使用的上一年十二月请求范围。 */
+const baselineRange = computed(() => buildDashboardBaselineRange(selectedRange.value));
 /** 驾驶舱基础查看权限。 */
 const canView = computed(() => hasPermi('dashboard:view'));
 /** 能耗记录或统计领域查看权限。 */
@@ -143,6 +151,8 @@ const annualLoading = computed(() => [energyPanel.value, carbonPanel.value, budg
 const energySeries = computed(() => energyPanel.value.data?.series || []);
 /** 当前选中的单一能源趋势序列。 */
 const selectedEnergySeries = computed(() => energySeries.value.find((series) => series.key === selectedEnergySeriesKey.value) || energySeries.value[0] || null);
+/** 当前能源序列最近两个真实月份的变化投影。 */
+const energyTrendChange = computed(() => projectSeriesChange(selectedEnergySeries.value));
 /** 能源结构的单位安全分组。 */
 const energyUnitGroups = computed(() => energyPanel.value.data?.unitGroups || []);
 /** 当前能源趋势和结构共用的单位。 */
@@ -166,6 +176,8 @@ const carbonUnitGroups = computed(() => carbonProjection.value.unitGroups || [])
 const selectedCarbonTotal = computed(() => carbonUnitGroups.value.find((group) => group.unit === selectedCarbonUnit.value)?.totalValue ?? null);
 /** 当前排放单位对应的单轴年度碳排趋势。 */
 const selectedCarbonSeries = computed(() => (carbonProjection.value.trendSeries || []).find((series) => series.normalizedUnit === selectedCarbonUnit.value) || null);
+/** 当前碳排序列最近两个真实月份的变化投影。 */
+const carbonTrendChange = computed(() => projectSeriesChange(selectedCarbonSeries.value));
 /** 当前碳排单位下按能源类型的真实已核算结构行。 */
 const carbonStructureRows = computed(() => buildStructureRows(
   (carbonPanel.value.data?.stats?.byEnergyType || []).filter((row) => row.emissionUnit === selectedCarbonUnit.value && Number(row.calculatedCount || 0) > 0),
@@ -185,6 +197,63 @@ const sceneState = computed(() => projectDashboardSceneState([
   meterPanel.value,
   importPanel.value
 ]));
+/** 将真实趋势变化投影为园区场景可读的变化说明，不为单点或缺月数据补造环比。 */
+function sceneChangeDetail(change, unit, kind = 'energy') {
+  if (!change || change.status !== 'available') return '当前没有可比较的月份数据';
+  if (change.comparisonStatus === 'missing-previous-month') {
+    return `${change.latestMonth}，上月无数据（自然上月 ${change.previousMonth}）`;
+  }
+  if (change.comparisonStatus === 'single' || change.direction === 'single') return `${change.latestMonth}，暂无上月对比`;
+  if (change.direction === 'flat') return `${change.latestMonth}，与上月持平`;
+  const direction = change.direction === 'up' ? '较上月上升' : '较上月下降';
+  const amount = `${formatDashboardMeasurement(Math.abs(change.delta), {
+    kind,
+    maximumFractionDigits: kind === 'carbon' ? 8 : 2
+  })}${unit ? ` ${unit}` : ''}`;
+  const rate = change.rate === null
+    ? '上月为 0，百分比不可用'
+    : formatDashboardPercentage(Math.abs(change.rate));
+  return `${change.latestMonth}，${direction} ${amount}（${rate}）`;
+}
+/** 将预算最高风险级别转换为摘要中文标签。 */
+function sceneBudgetRiskLabel(level) {
+  return ({ unit_mismatch: '单位不一致', exceeded: '超预算', missing_budget: '缺预算', nearing: '接近预算', normal: '正常' })[level] || '未知';
+}
+/** 仅从已成功面板提取真实数量、最新月份和环比变化供园区示意展示。 */
+const sceneSignals = computed(() => {
+  const signals = [];
+  if (energyPanel.value.status === DASHBOARD_PANEL_STATUS.SUCCESS && selectedEnergySeries.value && energyTrendChange.value.status === 'available') {
+    signals.push({
+      key: 'energy-trend', label: '最新能源用量', value: energyTrendChange.value.latestValue,
+      unit: selectedEnergySeries.value.normalizedUnit, detail: sceneChangeDetail(energyTrendChange.value, selectedEnergySeries.value.normalizedUnit), tone: 'energy'
+    });
+  }
+  if (carbonPanel.value.status === DASHBOARD_PANEL_STATUS.SUCCESS && selectedCarbonSeries.value && carbonTrendChange.value.status === 'available') {
+    signals.push({
+      key: 'carbon-trend', label: '最新已核算碳排', value: carbonTrendChange.value.latestValue,
+      unit: selectedCarbonSeries.value.normalizedUnit, detail: sceneChangeDetail(carbonTrendChange.value, selectedCarbonSeries.value.normalizedUnit, 'carbon'), tone: 'carbon'
+    });
+  }
+  if (budgetPanel.value.status === DASHBOARD_PANEL_STATUS.SUCCESS) {
+    signals.push({
+      key: 'budget-risk', label: '预算预警项', value: budgetProjection.value.warningCount,
+      unit: '项', detail: budgetProjection.value.warningCount ? `最高级别：${sceneBudgetRiskLabel(budgetProjection.value.highestLevel)}` : '当前年度未触发预警', tone: budgetProjection.value.warningCount ? 'warning' : 'good'
+    });
+  }
+  if (meterPanel.value.status === DASHBOARD_PANEL_STATUS.SUCCESS) {
+    signals.push({
+      key: 'meter-ledger', label: '计量器具台账', value: meterPanel.value.data?.total,
+      unit: '台', detail: `启用 ${meterPanel.value.data?.active ?? '—'}，停用 ${meterPanel.value.data?.inactive ?? '—'}`, tone: 'ledger'
+    });
+  }
+  if (importPanel.value.status === DASHBOARD_PANEL_STATUS.SUCCESS) {
+    signals.push({
+      key: 'import-activity', label: '导入累计批次', value: importPanel.value.data?.imports?.batchCount,
+      unit: '批', detail: `最新活动 ${formatDateTime(importPanel.value.data?.imports?.latestBatchAt)}`, tone: 'import'
+    });
+  }
+  return signals;
+});
 /** 两套独立视图共享的只读投影模型。 */
 const viewModel = computed(() => ({
   selectedYear: selectedYear.value,
@@ -201,6 +270,8 @@ const viewModel = computed(() => ({
   energySeries: energySeries.value,
   selectedEnergySeriesKey: selectedEnergySeriesKey.value,
   selectedEnergySeries: selectedEnergySeries.value,
+  energyTrendChange: energyTrendChange.value,
+  energyTrendColor: energyColor(selectedEnergySeries.value?.energyTypeCode),
   energyUnitGroups: energyUnitGroups.value,
   selectedEnergyUnit: selectedEnergyUnit.value,
   selectedEnergyUnitGroup: selectedEnergyUnitGroup.value,
@@ -211,6 +282,7 @@ const viewModel = computed(() => ({
   selectedCarbonUnit: selectedCarbonUnit.value,
   selectedCarbonTotal: selectedCarbonTotal.value,
   selectedCarbonSeries: selectedCarbonSeries.value,
+  carbonTrendChange: carbonTrendChange.value,
   carbonStructureRows: carbonStructureRows.value,
   carbonTrendColor: CARBON_TREND_COLOR,
   budgetProjection: budgetProjection.value,
@@ -218,7 +290,8 @@ const viewModel = computed(() => ({
   meterInactivePercentage: meterInactivePercentage.value,
   quickLinks: quickLinks.value,
   unconnectedCapabilities: UNCONNECTED_CAPABILITIES,
-  sceneState: sceneState.value
+  sceneState: sceneState.value,
+  sceneSignals: sceneSignals.value
 }));
 
 /** 返回项目既有能源类型固定颜色。 */
@@ -280,6 +353,11 @@ function formatInteger(value) {
   return formatNumber(value, 0);
 }
 
+/** 格式化导入摘要最新活动时间。 */
+function formatDateTime(value) {
+  return formatStrictUtcDateTimeDisplay(value, '尚未成功更新');
+}
+
 /** 更新最近成功响应时间。 */
 function touchLastUpdated() {
   lastUpdated.value = new Date().toISOString();
@@ -298,9 +376,12 @@ async function loadEnergyPanel(version = requestVersion.value) {
   }
   energyPanel.value = createDashboardPanelState(DASHBOARD_PANEL_STATUS.LOADING);
   const params = { normalizedMonthStart: selectedRange.value.normalizedMonthStart, normalizedMonthEnd: selectedRange.value.normalizedMonthEnd };
+  const trendParams = baselineRange.value
+    ? { ...params, normalizedMonthStart: baselineRange.value.normalizedMonthStart }
+    : params;
   const [summaryResult, trendResult, breakdownResult] = await Promise.all([
     safeRequest(() => getDashboardSummary(params)),
-    safeRequest(() => getDashboardEnergyTrend(params)),
+    safeRequest(() => getDashboardEnergyTrend(trendParams)),
     safeRequest(() => getDashboardEnergyBreakdown(params))
   ]);
   if (!isLatestDashboardRequest(version, requestVersion.value)) return;
@@ -323,10 +404,18 @@ async function loadEnergyPanel(version = requestVersion.value) {
     energyPanel.value = createDashboardPanelState(DASHBOARD_PANEL_STATUS.ERROR, null, requestError(failedResult));
     return;
   }
-  const trendRows = trendResult.value.data || [];
-  const breakdownRows = breakdownResult.value.data || [];
-  const totals = Array.isArray(summary.energy?.totals) ? summary.energy.totals : breakdownRows;
-  const series = buildEnergyTrendSeries(trendRows);
+  const trendRows = filterDashboardRowsByMonthRange(trendResult.value.data || [], selectedRange.value);
+  const baselineTrendRows = baselineRange.value
+    ? filterDashboardRowsByMonthRange(trendResult.value.data || [], baselineRange.value)
+    : [];
+  const breakdownRows = filterDashboardRowsByMonthRange(breakdownResult.value.data || [], selectedRange.value);
+  const totals = filterDashboardRowsByMonthRange(
+    Array.isArray(summary.energy?.totals) ? summary.energy.totals : breakdownRows,
+    selectedRange.value
+  );
+  const currentSeries = buildEnergyTrendSeries(trendRows);
+  const baselineSeries = buildEnergyTrendSeries(baselineTrendRows);
+  const series = attachSeriesComparisonRows(currentSeries, baselineSeries);
   const unitGroups = groupEnergyRowsByUnit(totals);
   energyPanel.value = settleDashboardPanelSuccess({ summary, series, unitGroups }, summaryDomainState.status === DASHBOARD_PANEL_STATUS.EMPTY);
   if (series.length && !series.some((item) => item.key === selectedEnergySeriesKey.value)) selectedEnergySeriesKey.value = series[0].key;
@@ -341,14 +430,30 @@ async function loadCarbonPanel(version = requestVersion.value) {
   }
   carbonPanel.value = createDashboardPanelState(DASHBOARD_PANEL_STATUS.LOADING);
   const params = { normalizedMonthStart: selectedRange.value.normalizedMonthStart, normalizedMonthEnd: selectedRange.value.normalizedMonthEnd };
-  const result = await safeRequest(() => getCarbonEmissionStats(params));
+  const [result, baselineResult] = await Promise.all([
+    safeRequest(() => getCarbonEmissionStats(params)),
+    safeRequest(() => getCarbonEmissionStats(baselineRange.value || params))
+  ]);
   if (!isLatestDashboardRequest(version, requestVersion.value)) return;
   if (!result.ok) {
     carbonPanel.value = createDashboardPanelState(DASHBOARD_PANEL_STATUS.ERROR, null, requestError(result));
     return;
   }
-  const stats = result.value.data || {};
-  const projection = projectCarbonDashboardStats(stats);
+  const stats = {
+    ...(result.value.data || {}),
+    byMonth: filterDashboardRowsByMonthRange(result.value.data?.byMonth || [], selectedRange.value)
+  };
+  const baselineData = baselineResult.ok ? (baselineResult.value.data || {}) : {};
+  const baselineStats = {
+    ...baselineData,
+    byMonth: filterDashboardRowsByMonthRange(baselineData.byMonth || [], baselineRange.value || {})
+  };
+  const currentProjection = projectCarbonDashboardStats(stats);
+  const baselineProjection = projectCarbonDashboardStats(baselineStats);
+  const projection = {
+    ...currentProjection,
+    trendSeries: attachSeriesComparisonRows(currentProjection.trendSeries, baselineProjection.trendSeries)
+  };
   carbonPanel.value = settleDashboardPanelSuccess({ stats, projection }, Number(stats.totalRecords || 0) === 0);
   if (projection.unitGroups.length && !projection.unitGroups.some((group) => group.unit === selectedCarbonUnit.value)) selectedCarbonUnit.value = projection.unitGroups[0].unit;
   if (!projection.unitGroups.length) selectedCarbonUnit.value = '';
@@ -481,22 +586,33 @@ function handleFullscreenChange() {
   fullscreenActive.value = Boolean(document.fullscreenElement);
   if (fullscreenActive.value) {
     fullscreenWasEntered.value = true;
+    applyImmersiveDocumentClass(true);
     return;
   }
   if (fullscreenWasEntered.value && appStore.immersiveMode) appStore.setImmersiveMode(false);
   fullscreenWasEntered.value = false;
+  if (!appStore.immersiveMode) applyImmersiveDocumentClass(false);
+}
+
+/** 同步沉浸模式全局节点 class，避免离开页面后普通页面继续锁定滚动。 */
+function applyImmersiveDocumentClass(enabled) {
+  [document.documentElement, document.body, document.getElementById('app')].filter(Boolean).forEach((node) => {
+    node.classList.toggle('immersive-mode', enabled);
+  });
 }
 
 /** 响应 Escape，清理被拒绝全屏后仍保留的纯沉浸模式。 */
 function handleEscape(event) {
   if (event.key !== 'Escape' || !appStore.immersiveMode) return;
   appStore.setImmersiveMode(false);
+  applyImmersiveDocumentClass(false);
   if (document.fullscreenElement && document.exitFullscreen) void document.exitFullscreen();
 }
 
 /** 在用户手势内进入沉浸模式并请求浏览器全屏。 */
 async function enterImmersiveMode() {
   appStore.setImmersiveMode(true);
+  applyImmersiveDocumentClass(true);
   const requestFullscreen = cockpitRoot.value?.requestFullscreen;
   if (typeof requestFullscreen !== 'function') {
     ElMessage.warning('当前浏览器不支持全屏，已保留沉浸模式。');
@@ -512,6 +628,7 @@ async function enterImmersiveMode() {
 /** 退出浏览器全屏并关闭沉浸模式。 */
 async function exitImmersiveMode() {
   appStore.setImmersiveMode(false);
+  applyImmersiveDocumentClass(false);
   fullscreenWasEntered.value = false;
   if (!document.fullscreenElement || !document.exitFullscreen) return;
   try {
@@ -530,6 +647,7 @@ function toggleImmersiveMode() {
 /** 离开驾驶舱时清理沉浸模式和浏览器全屏。 */
 function cleanupImmersiveMode() {
   appStore.setImmersiveMode(false);
+  applyImmersiveDocumentClass(false);
   fullscreenWasEntered.value = false;
   if (document.fullscreenElement && document.exitFullscreen) void document.exitFullscreen();
 }
@@ -558,5 +676,5 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.dashboard-controller{min-width:0;max-width:100%;overflow-x:hidden}.dashboard-controller:fullscreen{overflow-y:auto;background:#020b18}
+.dashboard-controller{min-width:0;max-width:100%;overflow-x:hidden}.dashboard-controller[data-display-mode="immersive"],.dashboard-controller:fullscreen{width:100%;height:100dvh;min-height:0;overflow:hidden;background:#020b18}
 </style>

@@ -6,14 +6,14 @@
       <el-alert v-if="pageError" type="error" :closable="false" show-icon :title="pageError" class="panel-alert" />
       <section class="page-card import-actions">
         <div><h2>能耗数据导入</h2><p>支持 .xlsx、.xls、.csv；上传后立即由服务端校验、标准化并记录批次审计。</p></div>
-        <div class="action-row"><el-button v-if="canTemplate" :loading="templateLoading" @click="downloadTemplate">下载模板</el-button><el-button v-if="canDemoExample" :loading="demoExampleLoading" @click="downloadDemoExample">下载青岚园区示例</el-button><el-button v-if="canCreate" type="primary" @click="openUpload">上传能耗表格</el-button><el-alert v-if="!canCreate" type="info" :closable="false" show-icon title="当前账号没有创建导入批次的权限；仍可在获得查看权限时核对既有批次。" /></div>
+        <div class="action-row"><el-button v-if="canTemplate" :loading="templateLoading" @click="downloadTemplate">下载模板</el-button><el-button v-if="canCreate" type="primary" @click="openUpload">上传能耗表格</el-button><el-alert v-if="!canCreate" type="info" :closable="false" show-icon title="当前账号没有创建导入批次的权限；仍可在获得查看权限时核对既有批次。" /></div>
       </section>
 
       <article class="page-card">
         <header class="chart-heading"><div><h2>导入批次</h2><span>批次、错误和原文件均以服务端审计记录为准。</span></div></header>
         <el-form inline class="filter-row"><el-form-item label="类型"><el-select v-model="draftFilters.importType" clearable placeholder="全部类型"><el-option v-for="item in importTypes" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item><el-form-item label="状态"><el-select v-model="draftFilters.status" clearable placeholder="全部状态"><el-option v-for="status in batchStatuses" :key="status" :label="status" :value="status" /></el-select></el-form-item><el-form-item label="文件类型"><el-select v-model="draftFilters.fileType" clearable placeholder="全部"><el-option label="xlsx" value="xlsx" /><el-option label="xls" value="xls" /><el-option label="csv" value="csv" /></el-select></el-form-item><el-form-item><el-button :loading="loading" type="primary" @click="applyFilters">查询</el-button><el-button @click="resetFilters">重置</el-button></el-form-item></el-form>
         <PageState v-if="listError" :error="listError" @retry="loadBatches" />
-        <template v-else><el-table :data="batches" v-loading="loading" stripe><el-table-column prop="id" label="批次" width="80" /><el-table-column prop="importTypeLabel" label="导入类型" min-width="130" /><el-table-column prop="displayFilename" label="原始文件" min-width="185" show-overflow-tooltip /><el-table-column prop="status" label="状态" min-width="150" /><el-table-column label="结果" min-width="170"><template #default="{ row }">成功 {{ number(row.successCount) }} / 失败 {{ number(row.failureCount) }} / 跳过 {{ number(row.skippedCount) }}</template></el-table-column><el-table-column prop="createdAt" label="创建时间" min-width="160" /><el-table-column label="操作" width="220" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openDetail(row)">详情</el-button><el-button v-if="canDownloadBatch(row)" link @click="downloadSource(row)">原文件</el-button><el-tooltip v-if="canDelete && !canDeleteBatch(row)" content="此批次由领域专用生命周期维护，通用导入删除已禁用以保护追溯链路。"><el-button link disabled>不可通用删除</el-button></el-tooltip><el-button v-else-if="canDelete" link type="danger" @click="confirmDelete(row)">删除批次</el-button></template></el-table-column></el-table><div class="pagination"><el-pagination v-model:current-page="page" v-model:page-size="pageSize" layout="total, sizes, prev, pager, next" :page-sizes="[20,50,100]" :total="pagination.total || 0" @current-change="loadBatches" @size-change="changePageSize" /></div></template>
+        <template v-else><el-table :data="batches" v-loading="loading" stripe><el-table-column prop="id" label="批次" width="80" /><el-table-column prop="importTypeLabel" label="导入类型" min-width="130" /><el-table-column prop="displayFilename" label="原始文件" min-width="185" show-overflow-tooltip /><el-table-column prop="status" label="状态" min-width="150" /><el-table-column label="结果" min-width="170"><template #default="{ row }">成功 {{ number(row.successCount) }} / 失败 {{ number(row.failureCount) }} / 跳过 {{ number(row.skippedCount) }}</template></el-table-column><el-table-column label="创建时间" min-width="160"><template #default="{ row }">{{ formatStrictUtcDateTimeDisplay(row.createdAt) }}</template></el-table-column><el-table-column label="操作" width="220" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openDetail(row)">详情</el-button><el-button v-if="canDownloadBatch(row)" link @click="downloadSource(row)">原文件</el-button><el-tooltip v-if="canDelete && !canDeleteBatch(row)" content="此批次由领域专用生命周期维护，通用导入删除已禁用以保护追溯链路。"><el-button link disabled>不可通用删除</el-button></el-tooltip><el-button v-else-if="canDelete" link type="danger" @click="confirmDelete(row)">删除批次</el-button></template></el-table-column></el-table><div class="pagination"><el-pagination v-model:current-page="page" v-model:page-size="pageSize" layout="total, sizes, prev, pager, next" :page-sizes="[20,50,100]" :total="pagination.total || 0" @current-change="loadBatches" @size-change="changePageSize" /></div></template>
       </article>
 
       <el-dialog v-model="uploadOpen" title="上传能耗数据并建立批次" width="760px" destroy-on-close>
@@ -37,7 +37,7 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 import ManagementPage from '@/components/ManagementPage.vue';
 import HelpIcon from '@/components/HelpIcon.vue';
 import PageState from '@/components/PageState.vue';
-import { createImportBatch, deleteImportBatch, downloadImportBatchFile, downloadImportTemplate, downloadMonthlyEnergyDemoParkExample, getImportBatchDetail, getImportBatchErrors, getImportBatches, getImportContract } from '@/api/imports';
+import { createImportBatch, deleteImportBatch, downloadImportBatchFile, downloadImportTemplate, getImportBatchDetail, getImportBatchErrors, getImportBatches, getImportContract } from '@/api/imports';
 import {
   availableImportBatchTypeOptions,
   buildImportBatchDeleteConfirmation,
@@ -49,15 +49,16 @@ import {
   filterVisibleImportBatches
 } from '@/utils/specialModules';
 import { hasPermi } from '@/utils/permission';
+import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 
 // 导入契约、批次和详情状态。
 const emptyFilters = () => ({ importType: '', status: '', fileType: '', createdAtStart: '', createdAtEnd: '' });
-const contract = ref({}); const draftFilters = ref(emptyFilters()); const appliedFilters = ref(emptyFilters()); const batches = ref([]); const pagination = ref({ total: 0 }); const page = ref(1); const pageSize = ref(20); const loading = ref(false); const listError = ref(''); const pageError = ref(''); const templateLoading = ref(false); const demoExampleLoading = ref(false);
+const contract = ref({}); const draftFilters = ref(emptyFilters()); const appliedFilters = ref(emptyFilters()); const batches = ref([]); const pagination = ref({ total: 0 }); const page = ref(1); const pageSize = ref(20); const loading = ref(false); const listError = ref(''); const pageError = ref(''); const templateLoading = ref(false);
 const uploadOpen = ref(false); const uploadFile = ref(null); const fieldMapping = ref({}); const uploading = ref(false); const uploadError = ref('');
 const detailOpen = ref(false); const detail = ref(null); const detailLoading = ref(false); const detailError = ref(''); const errors = ref([]); const errorsLoading = ref(false); const errorPage = ref(1); const errorPagination = ref({ total: 0 });
 const safe = async (task) => { try { return { ok: true, value: await task() }; } catch (error) { return { ok: false, error }; } };
 const errorText = (result) => result?.error?.message || '接口请求失败。';
-const canView = computed(() => hasPermi('imports:view')); const canCreate = computed(() => hasPermi('imports:create')); const canDelete = computed(() => hasPermi('imports:delete')); const canDownload = computed(() => hasPermi('imports:download')); const canViewCarbonEmissionReports = computed(() => hasPermi('carbon:emission-reports:view')); const canExportCarbonEmissionReports = computed(() => hasPermi('carbon:emission-reports:export')); const canViewGhgReports = computed(() => hasPermi('carbon:ghg-reports:view')); const canExportGhgReports = computed(() => hasPermi('carbon:ghg-reports:export')); const canTemplate = computed(() => hasPermi('imports:view')); const canDemoExample = computed(() => hasPermi('imports:view'));
+const canView = computed(() => hasPermi('imports:view')); const canCreate = computed(() => hasPermi('imports:create')); const canDelete = computed(() => hasPermi('imports:delete')); const canDownload = computed(() => hasPermi('imports:download')); const canViewCarbonEmissionReports = computed(() => hasPermi('carbon:emission-reports:view')); const canExportCarbonEmissionReports = computed(() => hasPermi('carbon:emission-reports:export')); const canViewGhgReports = computed(() => hasPermi('carbon:ghg-reports:view')); const canExportGhgReports = computed(() => hasPermi('carbon:ghg-reports:export')); const canTemplate = computed(() => hasPermi('imports:view'));
 const supportedFileTypes = computed(() => contract.value.supportedFileTypes || []); const maxUploadFileSize = computed(() => contract.value.maxUploadFileSize || ''); const batchStatuses = computed(() => contract.value.batchStatuses || []); const importTypes = computed(() => availableImportBatchTypeOptions(canViewCarbonEmissionReports.value, canViewGhgReports.value)); const mappingFields = computed(() => [...(contract.value.requiredFields || []), ...(contract.value.optionalFields || [])]);
 
 /** 格式化导入计数。 */
@@ -78,8 +79,6 @@ function resetFilters() { draftFilters.value = emptyFilters(); appliedFilters.va
 function changePageSize() { page.value = 1; loadBatches(); }
 /** 下载服务端模板。 */
 async function downloadTemplate() { templateLoading.value = true; const result = await safe(() => downloadImportTemplate()); templateLoading.value = false; if (!result.ok) ElMessage.error(`模板下载失败：${errorText(result)}`); }
-/** 下载月度能耗与预测历史青岚园区示例，不自动创建导入批次。 */
-async function downloadDemoExample() { demoExampleLoading.value = true; const result = await safe(downloadMonthlyEnergyDemoParkExample); demoExampleLoading.value = false; if (!result.ok) ElMessage.error(`青岚园区示例下载失败：${errorText(result)}`); }
 /** 打开受控上传对话框。 */
 function openUpload() { uploadFile.value = null; fieldMapping.value = {}; uploadError.value = ''; uploadOpen.value = true; }
 /** 保存用户选择的上传文件。 */

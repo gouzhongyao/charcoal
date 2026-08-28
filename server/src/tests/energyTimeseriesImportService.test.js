@@ -21,6 +21,7 @@ const { createBackup, validateBackupFile } = require('../services/backupService'
 const { getImportAuditBatchDetail } = require('../services/importAuditService');
 const { listImportBatches } = require('../services/importService');
 const {
+  ENERGY_TIMESERIES_IMPORT_DESCRIPTOR,
   executeEnergyTimeseriesImport,
   previewEnergyTimeseriesImport
 } = require('../services/energyTimeseriesImportService');
@@ -620,6 +621,12 @@ async function testRollbackBoundaries(db, baseOptions) {
     db = openDatabase();
     seedMasterData(db);
     const baseOptions = { db, uploadsDir: process.env.UPLOADS_DIR, createBackup: createBackupStub() };
+    assert.deepStrictEqual(ENERGY_TIMESERIES_IMPORT_DESCRIPTOR.demoOwnership, {
+      artifactKey: '15-energy-timeseries',
+      batchRole: 'primary',
+      entityType: 'energy_timeseries',
+      expectedImportType: 'energy_timeseries'
+    }, 'artifact 15 descriptor 必须固定绑定 artifact、batch role、实体类型和导入类型。');
 
     await testPreviewAndExecute(db, baseOptions);
     await testLockedBackupEpoch(db, baseOptions);

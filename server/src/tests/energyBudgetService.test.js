@@ -38,6 +38,13 @@ const EXPECTED_ENERGY_BUDGET_TEMPLATE_HEADERS = Object.freeze([
   '预算月份', '能源类型编码', '组织范围', '预算值', '单位', '备注', '状态'
 ]);
 
+// 重建隔离测试库，验证旧结构被拒绝后可以按正式 canonical schema 重新开始。
+function resetIsolatedDatabase() {
+  [process.env.SQLITE_PATH, `${process.env.SQLITE_PATH}-wal`, `${process.env.SQLITE_PATH}-shm`]
+    .forEach((filePath) => fs.rmSync(filePath, { force: true }));
+  initDatabase();
+}
+
 function seedBaseData() {
   const db = openDatabase();
   try {
@@ -47,14 +54,14 @@ function seedBaseData() {
     const workshopUnitId = db.prepare("INSERT INTO organization_units (unit_code, unit_name, unit_path, unit_type, status, created_at, updated_at) VALUES ('BUD-WS', '预算车间', '预算总厂/预算车间', 'workshop', 'active', datetime('now'), datetime('now'))").run().lastInsertRowid;
     const otherUnitId = db.prepare("INSERT INTO organization_units (unit_code, unit_name, unit_path, unit_type, status, created_at, updated_at) VALUES ('BUD-OTHER', '其它车间', '预算总厂/其它车间', 'workshop', 'active', datetime('now'), datetime('now'))").run().lastInsertRowid;
     const insertEnergy = db.prepare(`INSERT INTO energy_records (
-      energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value,
-      organization, site, department, duplicate_key, record_status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`);
-    insertEnergy.run(electricityId, workshopUnitId, '2026-08', '2026-08', 'kWh', 40, 'kWh', 40, '预算总厂', 'A园区', '预算车间', 'budget-electricity-1', 'active');
-    insertEnergy.run(electricityId, workshopUnitId, '2026-08', '2026-08', 'kWh', 30, 'kWh', 30, '预算总厂', 'A园区', '预算车间', 'budget-electricity-2', 'active');
-    insertEnergy.run(electricityId, workshopUnitId, '2026-08', '2026-08', 'kWh', 999, 'kWh', 999, '预算总厂', 'A园区', '预算车间', 'budget-electricity-void', 'void');
-    insertEnergy.run(electricityId, otherUnitId, '2026-08', '2026-08', 'kWh', 20, 'kWh', 20, '其它总厂', 'B园区', '其它车间', 'budget-electricity-other', 'active');
-    insertEnergy.run(heatId, rootUnitId, '2026-08', '2026-08', 'MJ', 300, 'MJ', 300, '预算总厂', 'A园区', '动力部', 'budget-heat-1', 'active');
+      energy_type_id, organization_unit_id, original_month, normalized_month, original_unit,
+      original_value, normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`);
+    insertEnergy.run(electricityId, workshopUnitId, '2026-08', '2026-08', 'kWh', 40, 'kWh', 40, 'budget-electricity-1', 'active');
+    insertEnergy.run(electricityId, workshopUnitId, '2026-08', '2026-08', 'kWh', 30, 'kWh', 30, 'budget-electricity-2', 'active');
+    insertEnergy.run(electricityId, workshopUnitId, '2026-08', '2026-08', 'kWh', 999, 'kWh', 999, 'budget-electricity-void', 'void');
+    insertEnergy.run(electricityId, otherUnitId, '2026-08', '2026-08', 'kWh', 20, 'kWh', 20, 'budget-electricity-other', 'active');
+    insertEnergy.run(heatId, rootUnitId, '2026-08', '2026-08', 'MJ', 300, 'MJ', 300, 'budget-heat-1', 'active');
     return { electricityId, heatId, rootUnitId, workshopUnitId, otherUnitId };
   } finally {
     db.close();
@@ -66,9 +73,9 @@ function insertComparisonEnergyRecord(input) {
   const db = openDatabase();
   try {
     db.prepare(`INSERT INTO energy_records (
-      energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value,
-      organization, site, department, duplicate_key, record_status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`)
+      energy_type_id, organization_unit_id, original_month, normalized_month, original_unit,
+      original_value, normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`)
       .run(
         input.energyTypeId,
         input.organizationUnitId,
@@ -78,9 +85,6 @@ function insertComparisonEnergyRecord(input) {
         input.value,
         input.unit,
         input.value,
-        input.organization,
-        input.site,
-        input.department,
         input.duplicateKey,
         input.recordStatus || 'active'
       );
@@ -150,17 +154,21 @@ try {
     legacyDb.close();
   }
 
+  assert.throws(
+    () => initDatabase(),
+    (error) => error.code === 'SCHEMA_FINGERPRINT_MISMATCH',
+    '正式 canonical 初始化必须拒绝被替换为旧结构的 energy_budgets，而不是自动补列迁移。'
+  );
+  resetIsolatedDatabase();
   initDatabase();
-  initDatabase();
-  const upgradedBudgetDb = openDatabase();
+  const canonicalBudgetDb = openDatabase();
   try {
-    const upgradedColumns = upgradedBudgetDb.prepare('PRAGMA table_info(energy_budgets)').all().map((column) => column.name);
-    assert(upgradedColumns.includes('source_batch_id'), '旧 energy_budgets 应先补 source_batch_id 再创建对应索引。');
-    assert(upgradedColumns.includes('source_row_number'), '旧 energy_budgets 应兼容补 source_row_number。');
-    assert.strictEqual(upgradedBudgetDb.prepare("SELECT COUNT(*) AS total FROM energy_budgets WHERE remark = '迁移保留'").get().total, 1, '旧预算数据应在启动迁移后保留。');
-    assert.strictEqual(upgradedBudgetDb.prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'index' AND name = 'idx_energy_budgets_batch'").get().total, 1, '补列后应创建 source_batch_id 索引。');
+    const canonicalColumns = canonicalBudgetDb.prepare('PRAGMA table_info(energy_budgets)').all().map((column) => column.name);
+    assert(canonicalColumns.includes('source_batch_id'));
+    assert(canonicalColumns.includes('source_row_number'));
+    assert.strictEqual(canonicalBudgetDb.prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'index' AND name = 'idx_energy_budgets_batch'").get().total, 1);
   } finally {
-    upgradedBudgetDb.close();
+    canonicalBudgetDb.close();
   }
 
   const ids = seedBaseData();
@@ -389,9 +397,6 @@ try {
     periodMonth: '2034-01',
     unit: 'kWh',
     value: 30,
-    organization: '预算总厂',
-    site: 'A园区',
-    department: '预算车间',
     duplicateKey: 'budget-scope-workshop'
   });
   insertComparisonEnergyRecord({
@@ -400,9 +405,6 @@ try {
     periodMonth: '2034-01',
     unit: 'kWh',
     value: 70,
-    organization: '其它总厂',
-    site: 'B园区',
-    department: '其它车间',
     duplicateKey: 'budget-scope-other'
   });
   const isolatedScopeComparison = getEnergyBudgetExecutionComparison({ periodMonth: '2034-01', energyTypeCode: 'electricity', organizationScope: '预算车间' });
@@ -415,10 +417,10 @@ try {
   const zeroActualDb = openDatabase();
   try {
     zeroActualDb.prepare(`INSERT INTO energy_records (
-      energy_type_id, organization_unit_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value,
-      organization, site, department, duplicate_key, record_status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`)
-      .run(ids.electricityId, ids.workshopUnitId, '2026-11', '2026-11', 'kWh', 10, 'kWh', 10, '预算总厂', 'A园区', '预算车间', 'budget-zero-actual', 'active');
+      energy_type_id, organization_unit_id, original_month, normalized_month, original_unit,
+      original_value, normalized_unit, normalized_value, duplicate_key, record_status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`)
+      .run(ids.electricityId, ids.workshopUnitId, '2026-11', '2026-11', 'kWh', 10, 'kWh', 10, 'budget-zero-actual', 'active');
   } finally {
     zeroActualDb.close();
   }

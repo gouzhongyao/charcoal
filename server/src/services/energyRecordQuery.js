@@ -6,18 +6,17 @@ const STATISTICS_MAX_PAGE_SIZE = 1000;
 const MONTH_PATTERN = /^(\d{4})-(0[1-9]|1[0-2])$/;
 
 const DIMENSION_COLUMNS = Object.freeze({
-  organization: 'er.organization',
-  site: 'er.site',
-  department: 'er.department'
+  organizationUnit: 'ou.unit_path',
+  meterDevice: 'md.meter_code'
 });
 
 const DETAIL_SORT_COLUMNS = Object.freeze({
   normalizedMonth: 'er.normalized_month',
   energyTypeCode: 'et.code',
   normalizedValue: 'er.normalized_value',
-  organization: 'er.organization',
-  site: 'er.site',
-  department: 'er.department',
+  organizationUnitCode: 'ou.unit_code',
+  organizationUnitPath: 'ou.unit_path',
+  meterCode: 'md.meter_code',
   sourceBatchId: 'er.source_batch_id',
   createdAt: 'er.created_at'
 });
@@ -120,10 +119,8 @@ function normalizeEnergyRecordFilters(query = {}) {
     normalizedMonthStart,
     normalizedMonthEnd,
     energyTypeCode: normalizeText(query.energyTypeCode),
-    organization: normalizeText(query.organization),
+    organizationUnitCode: normalizeText(query.organizationUnitCode),
     keyword: normalizeText(firstDefined(query, ['keyword', 'search'])),
-    site: normalizeText(query.site),
-    department: normalizeText(query.department),
     organizationUnitId: normalizePositiveInteger(firstDefined(query, ['organizationUnitId', 'organization_unit_id', 'orgId']), 'organizationUnitId'),
     meterDeviceId: normalizePositiveInteger(firstDefined(query, ['meterDeviceId', 'meter_device_id', 'meterId']), 'meterDeviceId'),
     sourceBatchId: normalizePositiveInteger(query.sourceBatchId, 'sourceBatchId')
@@ -146,37 +143,23 @@ function buildEnergyRecordWhere(filters = {}) {
     where.push('et.code = @energyTypeCode');
     params.energyTypeCode = filters.energyTypeCode;
   }
-  if (filters.organization) {
-    where.push('er.organization = @organization');
-    params.organization = filters.organization;
+  if (filters.organizationUnitCode) {
+    where.push('ou.unit_code = @organizationUnitCode');
+    params.organizationUnitCode = filters.organizationUnitCode;
   }
   if (filters.keyword) {
     where.push(`(
       et.code LIKE @keyword ESCAPE '\\'
       OR et.name LIKE @keyword ESCAPE '\\'
-      OR er.organization LIKE @keyword ESCAPE '\\'
-      OR er.site LIKE @keyword ESCAPE '\\'
-      OR er.department LIKE @keyword ESCAPE '\\'
-      OR er.production_line LIKE @keyword ESCAPE '\\'
-      OR er.meter_code LIKE @keyword ESCAPE '\\'
-      OR er.business_dimension LIKE @keyword ESCAPE '\\'
-      OR er.remark LIKE @keyword ESCAPE '\\'
       OR ou.unit_code LIKE @keyword ESCAPE '\\'
       OR ou.unit_name LIKE @keyword ESCAPE '\\'
       OR ou.unit_path LIKE @keyword ESCAPE '\\'
       OR md.meter_code LIKE @keyword ESCAPE '\\'
       OR md.meter_name LIKE @keyword ESCAPE '\\'
       OR md.install_location LIKE @keyword ESCAPE '\\'
+      OR er.remark LIKE @keyword ESCAPE '\\'
     )`);
     params.keyword = `%${filters.keyword.replace(/[\\%_]/g, '\\$&')}%`;
-  }
-  if (filters.site) {
-    where.push('er.site = @site');
-    params.site = filters.site;
-  }
-  if (filters.department) {
-    where.push('er.department = @department');
-    params.department = filters.department;
   }
   if (filters.organizationUnitId) {
     where.push('er.organization_unit_id = @organizationUnitId');
@@ -225,9 +208,9 @@ function normalizeDetailSort(query = {}) {
 }
 
 function normalizeDimension(value) {
-  const dimension = normalizeText(value) || 'organization';
+  const dimension = normalizeText(value) || 'organizationUnit';
   if (!Object.prototype.hasOwnProperty.call(DIMENSION_COLUMNS, dimension)) {
-    throw badRequest('dimension 仅支持 organization、site、department。', {
+    throw badRequest('dimension 仅支持 organizationUnit、meterDevice。', {
       code: 'UNSUPPORTED_DIMENSION',
       dimension,
       allowedDimensions: Object.keys(DIMENSION_COLUMNS)

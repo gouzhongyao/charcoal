@@ -134,10 +134,9 @@ assert.match(importsApiSource, /import \{ buildImportOriginalFileFallbackName \}
 assert.match(importsApiSource, /buildImportOriginalFileFallbackName\(batchId, response\.headers\?\.\['content-type'\]\)/);
 assert.match(importsApiSource, /`能耗数据导入模板\.\$\{safeExtension\}`/);
 assert.match(importsApiSource, /\/templates\/demo-park\/07-monthly-energy\.xlsx/);
-assert.match(importCenterSource, /v-if="canDemoExample"[\s\S]*?>下载青岚园区示例<\/el-button>/);
-assert.match(importCenterSource, /hasPermi\('imports:view'\)[\s\S]*?canDemoExample/);
-assert.match(importCenterSource, /downloadMonthlyEnergyDemoParkExample/);
-assert.match(importCenterSource, /青岚园区示例下载失败/);
+assert.doesNotMatch(importCenterSource, /canDemoExample|demoExampleLoading|downloadMonthlyEnergyDemoParkExample|天坤集团示例/);
+assert.match(importCenterSource, /下载模板/);
+assert.match(importCenterSource, /上传能耗表格/);
 assert.doesNotMatch(importsApiSource, /`import-batch-\$\{batchId\}`/);
 assert.match(legacyMainSource, /'导入模板\.xlsx'/);
 assert.match(legacyMainSource, /'历史能耗台账回填预演审计预案\.xlsx'/);

@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('assert');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -16,8 +17,19 @@ process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 process.env.ENERGY_ANALYSIS_IMPORT_HMAC_SECRET = 'energy-benchmark-import-test-secret';
 
 const { initDatabase, openDatabase } = require('../db/database');
+const { createDemoContext } = require('../services/demoContextService');
+const {
+  calculateDemoEntityIdentityDigest,
+  calculateDemoEntitySnapshotDigest,
+  DEMO_OWNERSHIP_ENTITY_HANDLERS
+} = require('../services/demoOwnershipService');
+const { getOrCreateActiveDemoDatasetRun } = require('../services/demoRunService');
+const { toggleDemoRuntime } = require('../services/demoRuntimeService');
 const { getImportAuditBatchDetail } = require('../services/importAuditService');
-const { createEnergyAnalysisSingleBatchPreview } = require('../services/energyAnalysisSingleBatchImportService');
+const {
+  createEnergyAnalysisSingleBatchPreview,
+  executeEnergyAnalysisSingleBatchImport
+} = require('../services/energyAnalysisSingleBatchImportService');
 const { getEnergyAnalysisTemplateDefinition } = require('../services/energyAnalysisTemplateService');
 const {
   ENERGY_BENCHMARK_DEFINITION_IMPORT_DESCRIPTOR,
@@ -26,6 +38,7 @@ const {
   executeEnergyBenchmarkDefinitionImport,
   executeEnergyBenchmarkTargetImport,
   executeEnergyConversionFactorImport,
+  isExactConversionFactor,
   previewEnergyBenchmarkDefinitionImport,
   previewEnergyBenchmarkTargetImport,
   previewEnergyConversionFactorImport
@@ -51,6 +64,93 @@ const TARGET_HEADERS = Object.freeze([
 const LEGACY_TARGET_HEADERS = Object.freeze([
   '对标编码', '对标定义版本', ...TARGET_HEADERS.slice(1, -1), '目标版本', '状态'
 ]);
+// artifact 19 专项测试只使用静态 registry 绑定，不允许测试调用方替换实体、角色或导入类型。
+const ARTIFACT_19_KEY = '19-conversion-factors';
+const ARTIFACT_19_HANDLER_KEY = 'energy-conversion-factors-import';
+const ARTIFACT_19_FILE_SHA256 = 'f'.repeat(64);
+// managed ownership 公共响应允许返回的固定摘要字段。
+const MANAGED_OWNERSHIP_PUBLIC_FIELDS = Object.freeze([
+  'applied',
+  'mode',
+  'noInsertedRecords',
+  'registrationCount',
+  'insertedCount',
+  'idempotentCount',
+  'skippedCount',
+  'relationCount'
+]);
+// ownership 公共投影递归禁止出现的内部字段。
+const FORBIDDEN_OWNERSHIP_PUBLIC_FIELDS = new Set([
+  'context',
+  'contextId',
+  'runId',
+  'datasetId',
+  'manifestVersion',
+  'manifestDigest',
+  'batchBindings',
+  'registrations',
+  'relations',
+  'registryId',
+  'identityDigest',
+  'snapshotDigest',
+  'sourceBatchId',
+  'sourceRowNumber',
+  'rowWitness',
+  'transactionScope',
+  'facade',
+  'handler',
+  'sql',
+  'modulePath'
+]);
+
+/** 递归断言 ownership 公共投影不包含内部字段。 */
+function assertNoManagedOwnershipInternalFields(value, label, currentPath = 'ownership') {
+  if (!value || typeof value !== 'object') return;
+  Object.entries(value).forEach(([key, nestedValue]) => {
+    assert.strictEqual(FORBIDDEN_OWNERSHIP_PUBLIC_FIELDS.has(key), false,
+      `${label} ${currentPath}.${key} 不得进入公共 execute 投影。`);
+    assertNoManagedOwnershipInternalFields(nestedValue, label, `${currentPath}.${key}`);
+  });
+}
+
+/** 断言 managed ownership 仅返回固定安全摘要。 */
+function assertManagedOwnershipPublicProjection(ownership, label) {
+  assert(ownership && typeof ownership === 'object' && !Array.isArray(ownership),
+    `${label} execute 必须返回 ownership 公共摘要。`);
+  assert.deepStrictEqual(Object.keys(ownership).sort(), [...MANAGED_OWNERSHIP_PUBLIC_FIELDS].sort(),
+    `${label} ownership 只能包含固定公共摘要字段。`);
+  assertNoManagedOwnershipInternalFields(ownership, label);
+  assert.strictEqual(typeof ownership.applied, 'boolean');
+  assert.strictEqual(ownership.mode, 'demo');
+  assert.strictEqual(typeof ownership.noInsertedRecords, 'boolean');
+  ['registrationCount', 'insertedCount', 'idempotentCount', 'skippedCount', 'relationCount'].forEach((field) => {
+    assert(Number.isSafeInteger(ownership[field]) && ownership[field] >= 0,
+      `${label} ownership.${field} 必须是非负安全整数。`);
+  });
+}
+
+/** 断言 artifact 19 execute 顶层合法导入合同保持不变。 */
+function assertArtifact19ExecuteTopLevelContract(result, preview, label) {
+  assert.strictEqual(result.batchId, preview.batchId, `${label} 必须保留 batchId。`);
+  assert.strictEqual(result.previewSignature, preview.previewSignature, `${label} 必须保留 previewSignature。`);
+  assert.strictEqual(result.previewAuditDigest, preview.previewAuditDigest, `${label} 必须保留 previewAuditDigest。`);
+  assert.deepStrictEqual(result.previewAudit, preview.previewAudit, `${label} 必须保留 previewAudit。`);
+  assert.deepStrictEqual(result.candidateRows, preview.candidateRows, `${label} 必须保留 candidateRows。`);
+  assert.deepStrictEqual(result.candidateRowIds, preview.candidateRowIds, `${label} 必须保留 candidateRowIds。`);
+  assert.strictEqual(result.expectedWouldImport, preview.expectedWouldImport, `${label} 必须保留 expectedWouldImport。`);
+  assert.strictEqual(result.importedIds.length, result.imported, `${label} importedIds 数量必须匹配 imported。`);
+  assert.strictEqual(result.importedItems.length, result.imported, `${label} importedItems 数量必须匹配 imported。`);
+  assert(result.importedItems.every((item) => Number.isSafeInteger(Number(item.sourceRowNumber))
+    && Number(item.sourceRowNumber) > 0), `${label} 顶层 importedItems.sourceRowNumber 必须继续保留。`);
+}
+
+/** 统计与 artifact 19 ownership 端点相关的真实 relation 数量。 */
+function countArtifact19Relations(db) {
+  return Number(db.prepare(`SELECT COUNT(*) AS total FROM demo_data_relations relation
+    JOIN demo_data_registry source ON source.registry_id = relation.from_registry_id
+    JOIN demo_data_registry target ON target.registry_id = relation.to_registry_id
+    WHERE source.artifact_key = ? OR target.artifact_key = ?`).get(ARTIFACT_19_KEY, ARTIFACT_19_KEY).total);
+}
 
 /** 创建合法折标系数行。 */
 function createFactorRow(overrides = {}) {
@@ -178,6 +278,16 @@ function testDescriptorBindings() {
   assert.strictEqual(Object.isFrozen(ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR), true);
   assert.strictEqual(Object.isFrozen(ENERGY_BENCHMARK_DEFINITION_IMPORT_DESCRIPTOR), true);
   assert.strictEqual(Object.isFrozen(ENERGY_BENCHMARK_TARGET_IMPORT_DESCRIPTOR), true);
+  assert.deepStrictEqual(ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR.demoOwnership, {
+    artifactKey: '19-conversion-factors',
+    entityType: 'energy_conversion_factor',
+    batchRole: 'primary',
+    expectedImportType: 'energy_conversion_factor'
+  });
+  assert.strictEqual(Object.isFrozen(ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR.demoOwnership), true);
+  assert.strictEqual(ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR.demoOwnership.entityType, 'energy_conversion_factor');
+  assert.strictEqual(ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR.demoOwnership.batchRole, 'primary');
+  assert.strictEqual(ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR.demoOwnership.expectedImportType, 'energy_conversion_factor');
 
   const definitionTemplate = getEnergyAnalysisTemplateDefinition('energy-benchmark-definitions');
   const targetTemplate = getEnergyAnalysisTemplateDefinition('energy-benchmark-targets');
@@ -262,6 +372,10 @@ async function testPreviewExecuteAndTraceability(db, options) {
   assert.strictEqual(factorPreview.operation, 'energy-conversion-factor-import');
   const factorResult = await executeEnergyConversionFactorImport(createExecuteBody(factorPreview), options);
   assert.strictEqual(factorResult.imported, 1);
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(factorResult, 'ownership'), false,
+    '正式无 context 响应不得新增 ownership 字段。');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM demo_data_registry WHERE source_batch_id = ?')
+    .get(factorPreview.batchId).total, 0, '正式无 context 导入不得登记 demo ownership。');
   const factor = db.prepare('SELECT source_batch_id AS batchId, source_row_number AS rowNumber FROM energy_conversion_factors').get();
   assert.deepStrictEqual(factor, { batchId: factorPreview.batchId, rowNumber: 4 });
   const factorAudit = getImportAuditBatchDetail(factorPreview.batchId, { db });
@@ -335,6 +449,49 @@ async function testPreviewExecuteAndTraceability(db, options) {
   await executeEnergyBenchmarkTargetImport(createExecuteBody(higherPreview), options);
 }
 
+/** 创建用于直接验证折标系数 exact 语义的规范事实。 */
+function createExactConversionFactor(overrides = {}) {
+  return {
+    factorCode: 'EXACT-FACTOR', energyTypeId: 1, sourceUnit: 'kWh', factorValue: 0.1229,
+    targetUnit: 'kgce', displayUnit: 'tce', displayDivisor: 1000, source: '测试来源', documentNo: 'DOC-EXACT',
+    version: 'exact-factor:v1', effectiveStartUtc: '2030-01-01T00:00:00Z',
+    effectiveEndUtc: '2031-01-01T00:00:00Z', sourceTimeZone: 'Asia/Shanghai', status: 'active', ...overrides
+  };
+}
+
+/** 验证折标系数有效期 canonicalization 及非法值 fail-closed 语义。 */
+function testConversionFactorExactComparison() {
+  const base = createExactConversionFactor();
+  assert.strictEqual(isExactConversionFactor(
+    { ...base, effectiveStartUtc: '2030-01-01T00:00:00Z', effectiveEndUtc: '2031-01-01T00:00:00Z' },
+    { ...base, effectiveStartUtc: '2030-01-01T00:00:00.000Z', effectiveEndUtc: '2031-01-01T00:00:00.000Z' }
+  ), true, 'Z 与 .000Z 必须视为同一 instant。');
+  assert.strictEqual(isExactConversionFactor(
+    { ...base, effectiveStartUtc: '2030-01-01T00:00:00.123Z', effectiveEndUtc: '2031-01-01T00:00:00.123Z' },
+    { ...base, effectiveStartUtc: '2030-01-01T00:00:00.123Z', effectiveEndUtc: '2031-01-01T00:00:00.123Z' }
+  ), true, '非零毫秒必须保留并能稳定比较。');
+  assert.strictEqual(isExactConversionFactor(
+    { ...base, effectiveStartUtc: '2030-01-01T00:00:00.123Z' },
+    { ...base, effectiveStartUtc: '2030-01-01T00:00:00.124Z' }
+  ), false, '不同非零毫秒 instant 不得视为 exact。');
+  assert.strictEqual(isExactConversionFactor(
+    { ...base, effectiveStartUtc: '2030-01-01T00:00:00Z' },
+    { ...base, effectiveStartUtc: '2030-01-01T00:00:01Z' }
+  ), false, '不同 instant 不得视为 exact。');
+  assert.strictEqual(isExactConversionFactor(
+    { ...base, effectiveStartUtc: 'not-a-date' },
+    { ...base, effectiveStartUtc: 'not-a-date' }
+  ), false, '非法日期即使文本相同也不得视为 exact。');
+  assert.strictEqual(isExactConversionFactor(
+    { ...base, effectiveStartUtc: '2030-01-01T00:00:00+08:00' },
+    { ...base, effectiveStartUtc: '2030-01-01T00:00:00+08:00' }
+  ), false, '带时区偏移文本不得绕过严格 UTC exact 校验。');
+  assert.strictEqual(isExactConversionFactor(
+    { ...base, effectiveStartUtc: null },
+    { ...base, effectiveStartUtc: null }
+  ), false, '缺失有效期不得被静默视为 exact。');
+}
+
 /** 验证折标正数、能源、有效期、文件/数据库重叠与重复 skip。 */
 async function testConversionFactorRules(db, options) {
   const invalidFile = writeCsvUpload('factor-invalid.csv', FACTOR_HEADERS, [
@@ -378,6 +535,37 @@ async function testConversionFactorRules(db, options) {
   assert(duplicate.auditIssues.some((issue) => issue.code === 'DUPLICATE_CONVERSION_FACTOR_SKIPPED'));
 
   const energyTypeId = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
+  db.prepare(`INSERT INTO energy_conversion_factors
+    (factor_code, energy_type_id, source_unit, factor_value, target_unit, display_unit, display_divisor,
+     source, document_no, version, effective_start_utc, effective_end_utc, source_timezone, status)
+    VALUES ('UTC-CANONICAL-DUP', ?, 'utc-canonical-duplicate', 0.1229, 'kgce', 'tce', 1000,
+      '企业能源折标制度', 'Q/EA-2026', 'utc-canonical-duplicate:v1',
+      '2031-01-01T00:00:00.000Z', '2032-01-01T00:00:00.000Z', 'Asia/Shanghai', 'inactive')`).run(energyTypeId);
+  const canonicalDuplicate = previewEnergyConversionFactorImport(writeCsvUpload(
+    'factor-db-canonical-duplicate.csv', FACTOR_HEADERS, [createFactorRow({
+      系数编码: 'UTC-CANONICAL-DUP', 源单位: 'utc-canonical-duplicate', 版本: 'utc-canonical-duplicate:v1',
+      '生效开始时间（UTC）': '2031-01-01T00:00:00Z', '生效结束时间（UTC）': '2032-01-01T00:00:00Z',
+      状态: 'inactive'
+    })]
+  ), options);
+  assert.strictEqual(canonicalDuplicate.summary.wouldImport, 0);
+  assert.strictEqual(canonicalDuplicate.summary.skipped, 1, '数据库 .000Z 与模板 Z 必须走 duplicate skip。');
+  assert.strictEqual(canonicalDuplicate.summary.blocked, 0);
+  assert(canonicalDuplicate.auditIssues.some((issue) => issue.code === 'DUPLICATE_CONVERSION_FACTOR_SKIPPED'));
+  assert(!canonicalDuplicate.auditIssues.some((issue) => issue.code === 'CONVERSION_FACTOR_UNIQUE_KEY_CONFLICT'));
+
+  const changedInstantConflict = previewEnergyConversionFactorImport(writeCsvUpload(
+    'factor-db-changed-instant-conflict.csv', FACTOR_HEADERS, [createFactorRow({
+      系数编码: 'UTC-CANONICAL-DUP', 源单位: 'utc-canonical-duplicate', 版本: 'utc-canonical-duplicate:v1',
+      '生效开始时间（UTC）': '2031-01-01T00:00:00Z', '生效结束时间（UTC）': '2032-01-01T00:00:01Z',
+      状态: 'inactive'
+    })]
+  ), options);
+  assert.strictEqual(changedInstantConflict.summary.skipped, 0);
+  assert.strictEqual(changedInstantConflict.summary.blocked, 1, '不同 instant 必须保持非 exact 并触发唯一键冲突。');
+  assert(changedInstantConflict.auditIssues.some((issue) => issue.code === 'CONVERSION_FACTOR_UNIQUE_KEY_CONFLICT'));
+  assert(!changedInstantConflict.auditIssues.some((issue) => issue.code === 'DUPLICATE_CONVERSION_FACTOR_SKIPPED'));
+
   const insertExisting = db.prepare(`INSERT INTO energy_conversion_factors
     (factor_code, energy_type_id, source_unit, factor_value, source, document_no, version,
      effective_start_utc, effective_end_utc, source_timezone, status)
@@ -812,6 +1000,456 @@ async function testDescriptorIsolation(db, options) {
   assert.strictEqual(oldError.details.code, 'ENERGY_ANALYSIS_IMPORT_TEMPLATE_UNSUPPORTED');
 }
 
+/** 验证 artifact 19 demo ownership 的真实登记、备份失败回滚和业务失败回滚边界。 */
+async function testArtifact19DemoOwnershipBoundaries(db, baseOptions) {
+  const admin = db.prepare(`SELECT u.id FROM sys_users AS u
+    JOIN sys_user_roles AS ur ON ur.user_id = u.id
+    JOIN sys_roles AS role ON role.id = ur.role_id
+    WHERE u.status = 'active' AND role.status = 'active' AND role.role_code = 'super_admin'
+    ORDER BY u.id LIMIT 1`).get();
+  assert(admin, 'artifact 19 专项测试需要隔离库内置管理员。');
+  const actorUserId = Number(admin.id);
+  toggleDemoRuntime({ enabled: true, actorUserId, actorIp: '127.0.0.1' });
+  const run = getOrCreateActiveDemoDatasetRun({ actorUserId, actorIp: '127.0.0.1' });
+  const demoOptions = () => ({
+    token: createDemoContext({
+      db,
+      userId: actorUserId,
+      runId: run.runId,
+      artifactKey: ARTIFACT_19_KEY,
+      handlerKey: ARTIFACT_19_HANDLER_KEY,
+      artifactFileSha256: ARTIFACT_19_FILE_SHA256
+    }).token,
+    userId: actorUserId,
+    artifactKey: ARTIFACT_19_KEY,
+    handlerKey: ARTIFACT_19_HANDLER_KEY
+  });
+  const executeDemoCase = async (label, row, executeOptions = {}) => {
+    const file = writeCsvUpload(`artifact-19-${label}.csv`, FACTOR_HEADERS, [row]);
+    const context = demoOptions();
+    const preview = previewEnergyConversionFactorImport(file, { ...baseOptions, demoContext: context });
+    assert.strictEqual(preview.expectedWouldImport, 1, `${label} preview 必须产生一个候选。`);
+    const result = await executeEnergyConversionFactorImport(createExecuteBody(preview), {
+      ...baseOptions,
+      ...executeOptions,
+      demoContext: context
+    });
+    return { context, preview, result };
+  };
+
+  const valid = await executeDemoCase('valid', createFactorRow({
+    系数编码: 'DEMO-OWNERSHIP-VALID', 源单位: 'demo-valid-unit', 版本: 'demo-valid:v1'
+  }));
+  assertArtifact19ExecuteTopLevelContract(valid.result, valid.preview, 'artifact 19 正常 execute');
+  assertManagedOwnershipPublicProjection(valid.result.ownership, 'artifact 19 正常 execute');
+  assert.strictEqual(valid.result.ownership.applied, true);
+  assert.strictEqual(valid.result.ownership.noInsertedRecords, false);
+  assert.strictEqual(valid.result.ownership.insertedCount, 1);
+  assert.strictEqual(valid.result.ownership.registrationCount, 1);
+  assert.strictEqual(valid.result.ownership.idempotentCount, 0);
+  assert.strictEqual(valid.result.ownership.skippedCount, 0);
+  assert.strictEqual(valid.result.ownership.relationCount, 0);
+  const validAudit = getImportAuditBatchDetail(valid.preview.batchId, { db, includeIssues: false });
+  assert.strictEqual(validAudit.auditPhase, 'execute');
+  assert.strictEqual(validAudit.executeResult.executed, true);
+  assertManagedOwnershipPublicProjection(validAudit.executeResult.ownership, 'artifact 19 正常 execute 审计');
+  assert.deepStrictEqual(validAudit.executeResult.ownership, valid.result.ownership,
+    'artifact 19 正常 execute 的持久化审计必须使用同一 ownership 公共投影。');
+  assert.strictEqual(countArtifact19Relations(db), 0,
+    'artifact 19 正常 execute 没有真实 relation 语义，不得写 demo_data_relations。');
+  const validRegistry = db.prepare(`SELECT entity_pk AS entityPk, ownership_kind AS ownershipKind,
+      identity_digest AS identityDigest, snapshot_digest AS snapshotDigest,
+      source_batch_id AS sourceBatchId, source_row_number AS sourceRowNumber, registered_by AS registeredBy
+    FROM demo_data_registry WHERE source_batch_id = ?`).get(valid.preview.batchId);
+  assert(validRegistry, '合法 artifact 19 execute 必须生成 registry。');
+  assert.strictEqual(validRegistry.ownershipKind, 'imported');
+  assert.strictEqual(Number(validRegistry.registeredBy), actorUserId);
+  assert.strictEqual(Number(validRegistry.sourceBatchId), valid.preview.batchId);
+  assert.strictEqual(Number(validRegistry.sourceRowNumber), valid.preview.candidateRows[0].sourceRowNumber);
+  assert.strictEqual(validRegistry.identityDigest,
+    calculateDemoEntityIdentityDigest('energy_conversion_factor', validRegistry.entityPk));
+  const validProjection = db.prepare(`SELECT id, source_batch_id, source_row_number, factor_code, energy_type_id,
+      source_unit, factor_value, target_unit, display_unit, display_divisor, source, document_no, version,
+      effective_start_utc, effective_end_utc, source_timezone, status, created_at, updated_at
+    FROM energy_conversion_factors WHERE id = ?`).get(Number(validRegistry.entityPk));
+  assert.strictEqual(validRegistry.snapshotDigest,
+    calculateDemoEntitySnapshotDigest('energy_conversion_factor', validRegistry.entityPk, validProjection));
+  assert.deepStrictEqual(DEMO_OWNERSHIP_ENTITY_HANDLERS.energy_conversion_factor.projectionFields.includes('id'), true);
+
+  const formalDuplicateFile = writeCsvUpload('artifact-19-formal-duplicate.csv', FACTOR_HEADERS, [createFactorRow()]);
+  const formalDuplicateContext = demoOptions();
+  const formalDuplicatePreview = previewEnergyConversionFactorImport(formalDuplicateFile, {
+    ...baseOptions,
+    demoContext: formalDuplicateContext
+  });
+  assert.strictEqual(formalDuplicatePreview.expectedWouldImport, 0);
+  assert.strictEqual(formalDuplicatePreview.summary.skipped, 1);
+  const formalDuplicateRelationsBefore = countArtifact19Relations(db);
+  const formalDuplicateResult = await executeEnergyConversionFactorImport(createExecuteBody(formalDuplicatePreview), {
+    ...baseOptions,
+    demoContext: formalDuplicateContext
+  });
+  assert.strictEqual(formalDuplicateResult.writesBusinessRecords, false);
+  assertArtifact19ExecuteTopLevelContract(formalDuplicateResult, formalDuplicatePreview, 'artifact 19 正式重复 all-skipped');
+  assertManagedOwnershipPublicProjection(formalDuplicateResult.ownership, 'artifact 19 正式重复 all-skipped');
+  assert.strictEqual(formalDuplicateResult.ownership.applied, true);
+  assert.strictEqual(formalDuplicateResult.ownership.noInsertedRecords, true);
+  assert.strictEqual(formalDuplicateResult.ownership.registrationCount, 0);
+  assert.strictEqual(formalDuplicateResult.ownership.insertedCount, 0);
+  assert.strictEqual(formalDuplicateResult.ownership.idempotentCount, 0);
+  assert.strictEqual(formalDuplicateResult.ownership.skippedCount, 1);
+  assert.strictEqual(formalDuplicateResult.ownership.relationCount, 0);
+  const formalDuplicateAudit = getImportAuditBatchDetail(formalDuplicatePreview.batchId, { db, includeIssues: false });
+  assert.strictEqual(formalDuplicateAudit.auditPhase, 'execute');
+  assert.strictEqual(formalDuplicateAudit.executeResult.executed, true);
+  assertManagedOwnershipPublicProjection(formalDuplicateAudit.executeResult.ownership,
+    'artifact 19 正式重复 all-skipped 审计');
+  assert.deepStrictEqual(formalDuplicateAudit.executeResult.ownership, formalDuplicateResult.ownership,
+    'artifact 19 正式重复 all-skipped 的持久化审计必须使用同一 ownership 公共投影。');
+  assert.strictEqual(formalDuplicateRelationsBefore, 0,
+    'artifact 19 正式重复 all-skipped 前不得存在领域 relation。');
+  assert.strictEqual(countArtifact19Relations(db), formalDuplicateRelationsBefore,
+    'artifact 19 正式重复 all-skipped 不得新增或丢失 demo_data_relations。');
+  const formalFactor = db.prepare("SELECT id FROM energy_conversion_factors WHERE factor_code = 'ELEC-KGCE-2026' ORDER BY id LIMIT 1").get();
+  assert(formalFactor, '正式折标系数必须存在。');
+  assert.strictEqual(db.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+    WHERE entity_type = 'energy_conversion_factor' AND entity_pk = ?`).get(String(formalFactor.id)).total, 0,
+  'duplicate skipped 不得接管正式业务行。');
+
+  const sameRunDuplicateRow = createFactorRow({
+    系数编码: validProjection.factor_code,
+    能源类型编码: 'electricity',
+    源单位: validProjection.source_unit,
+    折标系数值: validProjection.factor_value,
+    目标单位: validProjection.target_unit,
+    展示单位: validProjection.display_unit,
+    展示除数: validProjection.display_divisor,
+    来源: validProjection.source,
+    文号: validProjection.document_no,
+    版本: validProjection.version,
+    '生效开始时间（UTC）': validProjection.effective_start_utc,
+    '生效结束时间（UTC）': validProjection.effective_end_utc,
+    来源时区: validProjection.source_timezone,
+    状态: validProjection.status
+  });
+  const sameRunFile = writeCsvUpload('artifact-19-same-run-duplicate.csv', FACTOR_HEADERS, [sameRunDuplicateRow]);
+  const sameRunContext = demoOptions();
+  const sameRunPreview = previewEnergyConversionFactorImport(sameRunFile, { ...baseOptions, demoContext: sameRunContext });
+  assert.strictEqual(sameRunPreview.expectedWouldImport, 0);
+  assert.strictEqual(sameRunPreview.summary.skipped, 1, 'ownership projection 的 .000Z 与模板 Z 必须形成 artifact 19 all-skipped。');
+  assert.strictEqual(sameRunPreview.summary.blocked, 0);
+  assert(sameRunPreview.auditIssues.some((issue) => issue.code === 'DUPLICATE_CONVERSION_FACTOR_SKIPPED'));
+  const sameRunResult = await executeEnergyConversionFactorImport(createExecuteBody(sameRunPreview), {
+    ...baseOptions,
+    demoContext: sameRunContext
+  });
+  assert.strictEqual(sameRunResult.ownership.noInsertedRecords, true);
+  assert.strictEqual(sameRunResult.ownership.registrationCount, 0);
+  assert.strictEqual(sameRunResult.ownership.skippedCount, 1);
+  assert.strictEqual(db.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+    WHERE entity_type = 'energy_conversion_factor' AND entity_pk = ?`).get(validRegistry.entityPk).total, 1,
+  '同 run 重复导入必须保持单一 registry，不得重复登记。');
+
+  const bindingFile = writeCsvUpload('artifact-19-binding-mismatch.csv', FACTOR_HEADERS, [createFactorRow({
+    系数编码: 'DEMO-OWNERSHIP-BINDING-FAIL', 源单位: 'demo-binding-fail-unit', 版本: 'demo-binding-fail:v1'
+  })]);
+  const bindingContext = demoOptions();
+  const bindingPreview = previewEnergyConversionFactorImport(bindingFile, { ...baseOptions, demoContext: bindingContext });
+  let bindingBackupCalls = 0;
+  const bindingCases = [
+    {
+      label: 'artifact',
+      descriptor: { ...ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR, demoOwnership: {
+        ...ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR.demoOwnership, artifactKey: '18-energy-benchmark-definitions'
+      } },
+      demoContext: bindingContext,
+      expectedCode: 'ENERGY_ANALYSIS_IMPORT_DEMO_OWNERSHIP_BINDING_MISMATCH'
+    },
+    {
+      label: 'handler',
+      descriptor: ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR,
+      demoContext: { ...bindingContext, handlerKey: 'energy-benchmark-definitions-import' },
+      expectedCode: 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED'
+    },
+    {
+      label: 'batch role',
+      descriptor: { ...ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR, demoOwnership: {
+        ...ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR.demoOwnership, batchRole: 'secondary'
+      } },
+      demoContext: bindingContext,
+      expectedCode: 'ENERGY_ANALYSIS_IMPORT_DEMO_OWNERSHIP_BINDING_MISMATCH'
+    },
+    {
+      label: 'entity',
+      descriptor: { ...ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR, demoOwnership: {
+        ...ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR.demoOwnership, entityType: 'energy_record'
+      } },
+      demoContext: bindingContext,
+      expectedCode: 'ENERGY_ANALYSIS_IMPORT_DEMO_OWNERSHIP_BINDING_MISMATCH'
+    },
+    {
+      label: 'expected import type',
+      descriptor: { ...ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR, demoOwnership: {
+        ...ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR.demoOwnership, expectedImportType: 'energy_record'
+      } },
+      demoContext: bindingContext,
+      expectedCode: 'ENERGY_ANALYSIS_IMPORT_DEMO_OWNERSHIP_BINDING_MISMATCH'
+    }
+  ];
+  for (const bindingCase of bindingCases) {
+    const bindingError = await captureError(() => executeEnergyAnalysisSingleBatchImport(
+      createExecuteBody(bindingPreview),
+      bindingCase.descriptor,
+      {
+        ...baseOptions,
+        demoContext: bindingCase.demoContext,
+        createBackup: async (input) => {
+          bindingBackupCalls += 1;
+          return createBackupStub()(input);
+        }
+      }
+    ));
+    assert.strictEqual(bindingError.details.code, bindingCase.expectedCode, `${bindingCase.label} mismatch 必须 fail-closed。`);
+  }
+  assert.strictEqual(bindingBackupCalls, 0, 'artifact/handler/role/entity/import type 描述器失配不得进入备份。');
+  assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code = 'DEMO-OWNERSHIP-BINDING-FAIL'").get().total, 0);
+  const bindingTokenHash = crypto.createHash('sha256').update(bindingContext.token, 'utf8').digest('hex');
+  assert.strictEqual(db.prepare('SELECT status FROM demo_import_contexts WHERE token_hash = ?').get(bindingTokenHash).status, 'previewed');
+
+  const provenanceDescriptor = {
+    ...ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR,
+    insertCandidates(input) {
+      const insertion = ENERGY_CONVERSION_FACTOR_IMPORT_DESCRIPTOR.insertCandidates(input);
+      return {
+        ...insertion,
+        importedItems: insertion.importedItems.map((item) => ({
+          ...item,
+          sourceRowNumber: item.sourceRowNumber + 1
+        }))
+      };
+    }
+  };
+  const provenanceError = await captureError(() => executeEnergyAnalysisSingleBatchImport(
+    createExecuteBody(bindingPreview),
+    provenanceDescriptor,
+    { ...baseOptions, demoContext: bindingContext }
+  ));
+  assert.strictEqual(provenanceError.details.code, 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED');
+  assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code = 'DEMO-OWNERSHIP-BINDING-FAIL'").get().total, 0,
+    'source provenance mismatch 必须回滚真实声明式 INSERT。');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM demo_data_registry WHERE source_batch_id = ?').get(bindingPreview.batchId).total, 0);
+  assert.strictEqual(db.prepare('SELECT status FROM demo_import_contexts WHERE token_hash = ?').get(bindingTokenHash).status, 'previewed');
+
+  const invalidContextFile = writeCsvUpload('artifact-19-invalid-context.csv', FACTOR_HEADERS, [createFactorRow({
+    系数编码: 'DEMO-OWNERSHIP-CONTEXT-INVALID', 源单位: 'demo-context-invalid-unit', 版本: 'demo-context-invalid:v1'
+  })]);
+  const invalidContext = demoOptions();
+  const invalidContextPreview = previewEnergyConversionFactorImport(invalidContextFile, {
+    ...baseOptions,
+    demoContext: invalidContext
+  });
+  const invalidToken = `${invalidContext.token[0] === 'A' ? 'B' : 'A'}${invalidContext.token.slice(1)}`;
+  const invalidContextError = await captureError(() => executeEnergyConversionFactorImport(createExecuteBody(invalidContextPreview), {
+    ...baseOptions,
+    demoContext: { ...invalidContext, token: invalidToken }
+  }));
+  assert.strictEqual(invalidContextError.details.code, 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED');
+  assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code = 'DEMO-OWNERSHIP-CONTEXT-INVALID'").get().total, 0);
+  assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM demo_data_registry WHERE source_batch_id = ?').get(invalidContextPreview.batchId).total, 0);
+  const invalidContextTokenHash = crypto.createHash('sha256').update(invalidContext.token, 'utf8').digest('hex');
+  assert.strictEqual(db.prepare('SELECT status FROM demo_import_contexts WHERE token_hash = ?').get(invalidContextTokenHash).status, 'previewed');
+
+  const importTypeFile = writeCsvUpload('artifact-19-import-type-mismatch.csv', FACTOR_HEADERS, [createFactorRow({
+    系数编码: 'DEMO-OWNERSHIP-IMPORT-TYPE-FAIL', 源单位: 'demo-import-type-fail-unit', 版本: 'demo-import-type-fail:v1'
+  })]);
+  const importTypeContext = demoOptions();
+  const importTypePreview = previewEnergyConversionFactorImport(importTypeFile, { ...baseOptions, demoContext: importTypeContext });
+  db.prepare("UPDATE import_batches SET import_type = 'energy_benchmark' WHERE id = ?").run(importTypePreview.batchId);
+  const importTypeError = await captureError(() => executeEnergyConversionFactorImport(createExecuteBody(importTypePreview), {
+    ...baseOptions,
+    demoContext: importTypeContext
+  }));
+  db.prepare("UPDATE import_batches SET import_type = 'energy_conversion_factor' WHERE id = ?").run(importTypePreview.batchId);
+  assert.strictEqual(importTypeError.details.code, 'ENERGY_ANALYSIS_IMPORT_BATCH_IMPORT_TYPE_MISMATCH');
+  assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code = 'DEMO-OWNERSHIP-IMPORT-TYPE-FAIL'").get().total, 0);
+  const importTypeTokenHash = crypto.createHash('sha256').update(importTypeContext.token, 'utf8').digest('hex');
+  assert.strictEqual(db.prepare('SELECT status FROM demo_import_contexts WHERE token_hash = ?').get(importTypeTokenHash).status, 'previewed');
+
+  const batchRoleFile = writeCsvUpload('artifact-19-batch-role-mismatch.csv', FACTOR_HEADERS, [createFactorRow({
+    系数编码: 'DEMO-OWNERSHIP-BATCH-ROLE-FAIL', 源单位: 'demo-batch-role-fail-unit', 版本: 'demo-batch-role-fail:v1'
+  })]);
+  const batchRoleContext = demoOptions();
+  const batchRolePreview = previewEnergyConversionFactorImport(batchRoleFile, { ...baseOptions, demoContext: batchRoleContext });
+  const batchRoleTokenHash = crypto.createHash('sha256').update(batchRoleContext.token, 'utf8').digest('hex');
+  const batchRoleContextRow = db.prepare('SELECT context_id AS contextId FROM demo_import_contexts WHERE token_hash = ?').get(batchRoleTokenHash);
+  db.prepare("UPDATE demo_run_import_batches SET batch_role = 'secondary' WHERE context_id = ?").run(batchRoleContextRow.contextId);
+  const batchRoleError = await captureError(() => executeEnergyConversionFactorImport(createExecuteBody(batchRolePreview), {
+    ...baseOptions,
+    demoContext: batchRoleContext
+  }));
+  db.prepare("UPDATE demo_run_import_batches SET batch_role = 'primary' WHERE context_id = ?").run(batchRoleContextRow.contextId);
+  assert.strictEqual(batchRoleError.details.code, 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED');
+  assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code = 'DEMO-OWNERSHIP-BATCH-ROLE-FAIL'").get().total, 0);
+  assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM demo_data_registry WHERE source_batch_id = ?').get(batchRolePreview.batchId).total, 0);
+  assert.strictEqual(db.prepare('SELECT status FROM demo_import_contexts WHERE token_hash = ?').get(batchRoleTokenHash).status, 'previewed');
+
+  const registrarFailureFile = writeCsvUpload('artifact-19-registry-failure.csv', FACTOR_HEADERS, [createFactorRow({
+    系数编码: 'DEMO-OWNERSHIP-REGISTRY-FAIL', 源单位: 'demo-registry-fail-unit', 版本: 'demo-registry-fail:v1'
+  })]);
+  const registrarFailureContext = demoOptions();
+  const registrarFailurePreview = previewEnergyConversionFactorImport(registrarFailureFile, {
+    ...baseOptions,
+    demoContext: registrarFailureContext
+  });
+  const predictedConflictPk = Number(db.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS nextId FROM energy_conversion_factors').get().nextId);
+  db.prepare(`INSERT INTO demo_data_registry
+    (run_id, artifact_key, entity_type, entity_pk, ownership_kind, identity_digest, snapshot_digest, registered_by)
+    VALUES (?, ?, 'energy_conversion_factor', ?, 'imported', ?, ?, ?)`).run(
+    run.runId,
+    ARTIFACT_19_KEY,
+    String(predictedConflictPk),
+    'd'.repeat(64),
+    'e'.repeat(64),
+    actorUserId
+  );
+  const registryFailureBefore = {
+    factors: Number(db.prepare('SELECT COUNT(*) AS total FROM energy_conversion_factors').get().total),
+    registry: Number(db.prepare('SELECT COUNT(*) AS total FROM demo_data_registry').get().total)
+  };
+  const registrarFailureError = await captureError(() => executeEnergyConversionFactorImport(createExecuteBody(registrarFailurePreview), {
+    ...baseOptions,
+    demoContext: registrarFailureContext
+  }));
+  assert.strictEqual(registrarFailureError.details.code, 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED');
+  assert.strictEqual(Number(db.prepare('SELECT COUNT(*) AS total FROM energy_conversion_factors').get().total), registryFailureBefore.factors,
+    'registrar 写入失败必须回滚业务行。');
+  assert.strictEqual(Number(db.prepare('SELECT COUNT(*) AS total FROM demo_data_registry').get().total), registryFailureBefore.registry,
+    'registrar 写入失败必须回滚新 registry/link 写入。');
+  const registrarFailureTokenHash = crypto.createHash('sha256').update(registrarFailureContext.token, 'utf8').digest('hex');
+  assert.strictEqual(db.prepare('SELECT status FROM demo_import_contexts WHERE token_hash = ?').get(registrarFailureTokenHash).status, 'previewed',
+    'registrar 写入失败后 context 必须保持 previewed。');
+  db.prepare('DELETE FROM demo_data_registry WHERE run_id = ? AND entity_pk = ?').run(run.runId, String(predictedConflictPk));
+
+  const auditFailureFile = writeCsvUpload('artifact-19-audit-failure.csv', FACTOR_HEADERS, [createFactorRow({
+    系数编码: 'DEMO-OWNERSHIP-AUDIT-FAIL', 源单位: 'demo-audit-fail-unit', 版本: 'demo-audit-fail:v1'
+  })]);
+  const auditFailureContext = demoOptions();
+  const auditFailurePreview = previewEnergyConversionFactorImport(auditFailureFile, {
+    ...baseOptions,
+    demoContext: auditFailureContext
+  });
+  const auditBackupMarker = path.join(process.env.BACKUPS_DIR, 'artifact-19-audit-failure.sqlite');
+  db.exec(`CREATE TRIGGER test_artifact_19_audit_failure
+    BEFORE UPDATE ON import_batches
+    FOR EACH ROW WHEN OLD.id = ${auditFailurePreview.batchId} AND NEW.audit_phase = 'execute'
+    BEGIN SELECT RAISE(ABORT, 'test artifact 19 audit failure'); END`);
+  let auditFailureError;
+  try {
+    auditFailureError = await captureError(() => executeEnergyConversionFactorImport(createExecuteBody(auditFailurePreview), {
+      ...baseOptions,
+      demoContext: auditFailureContext,
+      createBackup: async ({ reason }) => {
+        fs.writeFileSync(auditBackupMarker, Buffer.from('committed snapshot marker'));
+        return { backupName: path.basename(auditBackupMarker), reason, sizeBytes: 25, sha256: 'a'.repeat(64), method: 'test-stub' };
+      }
+    }));
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS test_artifact_19_audit_failure');
+  }
+  assert.strictEqual(auditFailureError.details.code, 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED');
+  assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code = 'DEMO-OWNERSHIP-AUDIT-FAIL'").get().total, 0,
+    'execute audit 失败必须回滚业务行。');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM demo_data_registry WHERE source_batch_id = ?').get(auditFailurePreview.batchId).total, 0,
+    'execute audit 失败必须回滚 registry。');
+  const auditFailureTokenHash = crypto.createHash('sha256').update(auditFailureContext.token, 'utf8').digest('hex');
+  assert.strictEqual(db.prepare('SELECT status FROM demo_import_contexts WHERE token_hash = ?').get(auditFailureTokenHash).status, 'previewed');
+  const auditFailureBatch = getImportAuditBatchDetail(auditFailurePreview.batchId, { db });
+  assert.strictEqual(auditFailureBatch.auditPhase, 'preview', '成功 execute audit 必须随事务回滚。');
+  assert.notStrictEqual(auditFailureBatch.executeResult?.executed, true);
+  assert.strictEqual(fs.existsSync(auditBackupMarker), true,
+    '业务事务回滚不得宣称删除已经成功创建的备份文件。');
+
+  const contextFailureFile = writeCsvUpload('artifact-19-context-cas-failure.csv', FACTOR_HEADERS, [createFactorRow({
+    系数编码: 'DEMO-OWNERSHIP-CONTEXT-FAIL', 源单位: 'demo-context-fail-unit', 版本: 'demo-context-fail:v1'
+  })]);
+  const contextFailureContext = demoOptions();
+  const contextFailurePreview = previewEnergyConversionFactorImport(contextFailureFile, {
+    ...baseOptions,
+    demoContext: contextFailureContext
+  });
+  db.exec(`CREATE TRIGGER test_artifact_19_context_failure
+    BEFORE UPDATE ON demo_import_contexts
+    FOR EACH ROW WHEN NEW.status = 'executed'
+    BEGIN SELECT RAISE(ABORT, 'test artifact 19 context failure'); END`);
+  let contextFailureError;
+  try {
+    contextFailureError = await captureError(() => executeEnergyConversionFactorImport(createExecuteBody(contextFailurePreview), {
+      ...baseOptions,
+      demoContext: contextFailureContext
+    }));
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS test_artifact_19_context_failure');
+  }
+  assert.strictEqual(contextFailureError.details.code, 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED');
+  assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code = 'DEMO-OWNERSHIP-CONTEXT-FAIL'").get().total, 0,
+    'context CAS 失败必须回滚业务行。');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM demo_data_registry WHERE source_batch_id = ?').get(contextFailurePreview.batchId).total, 0,
+    'context CAS 失败必须回滚 registry。');
+  const contextFailureTokenHash = crypto.createHash('sha256').update(contextFailureContext.token, 'utf8').digest('hex');
+  assert.strictEqual(db.prepare('SELECT status FROM demo_import_contexts WHERE token_hash = ?').get(contextFailureTokenHash).status, 'previewed');
+  const contextFailureAudit = getImportAuditBatchDetail(contextFailurePreview.batchId, { db });
+  assert.notStrictEqual(contextFailureAudit.executeResult?.executed, true, 'context CAS 失败不得残留成功 execute audit。');
+
+  const failureBefore = {
+    factors: Number(db.prepare('SELECT COUNT(*) AS total FROM energy_conversion_factors').get().total),
+    registry: Number(db.prepare('SELECT COUNT(*) AS total FROM demo_data_registry').get().total)
+  };
+  const failureFile = writeCsvUpload('artifact-19-registrar-failure.csv', FACTOR_HEADERS, [createFactorRow({
+    系数编码: 'DEMO-OWNERSHIP-REGISTRAR-FAIL', 源单位: 'demo-registrar-fail-unit', 版本: 'demo-registrar-fail:v1'
+  })]);
+  const failureContext = demoOptions();
+  const failurePreview = previewEnergyConversionFactorImport(failureFile, { ...baseOptions, demoContext: failureContext });
+  const failureError = await captureError(() => executeEnergyConversionFactorImport(createExecuteBody(failurePreview), {
+    ...baseOptions,
+    demoContext: failureContext,
+    afterInsertCandidate: () => {
+      const error = new Error('registrar failure injection');
+      error.details = { code: 'TEST_REGISTRAR_FAILURE' };
+      throw error;
+    }
+  }));
+  assert.strictEqual(failureError.details.code, 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED');
+  assert.strictEqual(Number(db.prepare('SELECT COUNT(*) AS total FROM energy_conversion_factors').get().total), failureBefore.factors,
+    'ownership registrar 前的业务失败必须回滚业务行。');
+  assert.strictEqual(Number(db.prepare('SELECT COUNT(*) AS total FROM demo_data_registry').get().total), failureBefore.registry,
+    'ownership registrar 前的业务失败必须回滚 registry。');
+  const failureTokenHash = crypto.createHash('sha256').update(failureContext.token, 'utf8').digest('hex');
+  const failureContextRow = db.prepare(`SELECT context_id AS contextId, status FROM demo_import_contexts
+    WHERE token_hash = ?`).get(failureTokenHash);
+  assert.strictEqual(failureContextRow.status, 'previewed', '业务事务失败后 context 必须保持 previewed。');
+  assert.strictEqual(getImportAuditBatchDetail(failurePreview.batchId, { db }).status, 'failed',
+    '业务事务失败后只能记录失败审计，不得伪造成功 execute 审计。');
+
+  const backupFile = writeCsvUpload('artifact-19-backup-failure.csv', FACTOR_HEADERS, [createFactorRow({
+    系数编码: 'DEMO-OWNERSHIP-BACKUP-FAIL', 源单位: 'demo-backup-fail-unit', 版本: 'demo-backup-fail:v1'
+  })]);
+  const backupContext = demoOptions();
+  const backupPreview = previewEnergyConversionFactorImport(backupFile, { ...baseOptions, demoContext: backupContext });
+  const backupError = await captureError(() => executeEnergyConversionFactorImport(createExecuteBody(backupPreview), {
+    ...baseOptions,
+    demoContext: backupContext,
+    createBackup: async () => {
+      const error = new Error('backup failure injection');
+      error.details = { code: 'TEST_BACKUP_FAILURE' };
+      throw error;
+    }
+  }));
+  assert.strictEqual(backupError.details.code, 'ENERGY_ANALYSIS_IMPORT_BACKUP_FAILED');
+  assert.strictEqual(Number(db.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code IN ('DEMO-OWNERSHIP-BACKUP-FAIL', 'DEMO-OWNERSHIP-REGISTRAR-FAIL')").get().total), 0);
+  assert.strictEqual(Number(db.prepare("SELECT COUNT(*) AS total FROM demo_data_registry WHERE entity_type = 'energy_conversion_factor' AND entity_pk NOT IN (SELECT CAST(? AS TEXT))").get(validRegistry.entityPk).total), 0,
+    'artifact 19 失败用例不得留下新的 ownership。');
+}
+
 /** 验证备份失败零写和事务中途失败完整回滚。 */
 async function testRollbackBoundaries(db, baseOptions) {
   const missingFile = writeCsvUpload('trusted-file-missing.csv', FACTOR_HEADERS, [createFactorRow({
@@ -868,6 +1506,7 @@ async function testRollbackBoundaries(db, baseOptions) {
     testDescriptorBindings();
     testCsvHeaderSafety(options);
     await testPreviewExecuteAndTraceability(db, options);
+    testConversionFactorExactComparison();
     await testConversionFactorRules(db, options);
     await testLegacyBenchmarkHeaders(db, options);
     await testCompatibilityVersionFallbackAndPreviewStability(db, options);
@@ -877,6 +1516,7 @@ async function testRollbackBoundaries(db, baseOptions) {
     await testPersistedDescriptorBinding(db, options);
     await testDescriptorIsolation(db, options);
     await testRollbackBoundaries(db, options);
+    await testArtifact19DemoOwnershipBoundaries(db, options);
 
     assert.deepStrictEqual(db.pragma('foreign_key_check'), [], 'PRAGMA foreign_key_check 必须为空。');
     console.log('energy benchmark import service tests passed');

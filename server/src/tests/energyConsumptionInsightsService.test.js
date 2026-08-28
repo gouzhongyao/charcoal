@@ -201,9 +201,8 @@ function insertEnergyRecord(db, ids, month, value, unit, suffix) {
     `INSERT INTO energy_records (
        energy_type_id, organization_unit_id, meter_device_id,
        original_month, normalized_month, original_unit, original_value,
-       normalized_unit, normalized_value, organization, meter_code,
-       duplicate_key, record_status
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '消费洞察测试单元', 'INSIGHT-METER-001', ?, 'active')`
+       normalized_unit, normalized_value, duplicate_key, record_status
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
   ).run(
     ids.electricityId,
     ids.organizationUnitId,
