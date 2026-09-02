@@ -32,6 +32,7 @@ const {
   exportCarbonActivities,
   listCarbonActivities
 } = require('../services/carbonActivityService');
+const { toggleDemoRuntime } = require('../services/demoRuntimeService');
 
 // 路由测试固定组织与能源类型信息。
 const TEST_ORGANIZATION_CODE = 'CA-API-OU';
@@ -226,7 +227,17 @@ function grantPermissions(userId, permissionCodes) {
     const ordinaryToken = login({ username: 'carbonordinary', password: 'CarbonOrdinary123!' }).token;
     const viewToken = login({ username: 'carbonviewer', password: 'CarbonViewer123!' }).token;
     const previewToken = login({ username: 'carbonpreviewer', password: 'CarbonPreviewer123!' }).token;
-    const adminToken = login({ username: 'admin', password: process.env.CHARCOAL_ADMIN_PASSWORD }).token;
+    // 管理员完整会话同时提供真实 Bearer token 和隔离 demo runtime 审计操作者。
+    const adminSession = login({
+      username: 'admin',
+      password: process.env.CHARCOAL_ADMIN_PASSWORD
+    });
+    const adminToken = adminSession.token;
+    toggleDemoRuntime({
+      enabled: true,
+      actorUserId: adminSession.user.id,
+      actorIp: '127.0.0.1'
+    });
 
     const app = express();
     // 活动路由必须位于全局 JSON 解析器之前，验证自己的 64 KiB 限制和上传链。
@@ -246,7 +257,7 @@ function grantPermissions(userId, permissionCodes) {
     assert.strictEqual((await requestMultipart(server, '/api/carbon/activities/imports/preview', importFile, ordinaryToken)).status, 403);
     assert.strictEqual((await request(server, 'GET', '/api/carbon/activities', undefined, previewToken)).status, 403);
 
-    // 未接入 demo context 必须在 Multer 落盘前 fail-closed。
+    // managed demo context 的未知 token 必须在 Multer 落盘前 fail-closed。
     const uploadsBeforeDemoReject = fs.existsSync(process.env.UPLOADS_DIR)
       ? fs.readdirSync(process.env.UPLOADS_DIR).sort()
       : [];
@@ -258,7 +269,7 @@ function grantPermissions(userId, permissionCodes) {
       { 'X-Demo-Context': 'z'.repeat(43) }
     );
     assert.strictEqual(demoRejected.status, 409);
-    assert.strictEqual(demoRejected.body.error.code, 'DEMO_CONTEXT_CAPABILITY_NOT_CONNECTED');
+    assert.strictEqual(demoRejected.body.error.code, 'DEMO_CONTEXT_NOT_FOUND');
     const uploadsAfterDemoReject = fs.existsSync(process.env.UPLOADS_DIR)
       ? fs.readdirSync(process.env.UPLOADS_DIR).sort()
       : [];
@@ -305,8 +316,12 @@ function grantPermissions(userId, permissionCodes) {
       requireBackup: true,
       acknowledgeSkippedRisks: true
     }, adminToken, { 'X-Demo-Context': 'y'.repeat(43) });
-    assert.strictEqual(demoExecuteRejected.status, 409);
-    assert.strictEqual(demoExecuteRejected.body.error.code, 'DEMO_CONTEXT_CAPABILITY_NOT_CONNECTED');
+    assert.strictEqual(demoExecuteRejected.status, 400);
+    assert.strictEqual(demoExecuteRejected.body.error.code, 'BAD_REQUEST');
+    assert.strictEqual(
+      demoExecuteRejected.body.error.details.code,
+      'DEMO_CONTEXT_NOT_FOUND'
+    );
 
     const executed = await request(server, 'POST', '/api/carbon/activities/imports/execute', {
       batchId: preview.body.data.batchId,

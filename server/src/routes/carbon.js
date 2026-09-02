@@ -4,7 +4,7 @@ const { authenticate } = require('../middleware/auth');
 const { requireAnyPermission, requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
-const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
+const { demoContextPreflight } = require('../middleware/demoContext');
 const {
   buildCarbonEmissionStats,
   calculateCarbonEmissions,
@@ -35,6 +35,22 @@ function buildContentDisposition(fileName, fallbackName) {
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
+/** 构造碳因子服务审计操作者。 */
+function getCarbonFactorActor(req) {
+  return { userId: req.user?.id || null, ip: req.ip || null };
+}
+
+/** 构造只含路由固定身份的碳因子 managed demo context 参数。 */
+function getCarbonFactorDemoContext(req) {
+  if (!req.demoContext) return null;
+  return {
+    token: req.demoContext.token,
+    userId: req.user.id,
+    artifactKey: req.demoContext.artifactKey,
+    handlerKey: req.demoContext.handlerKey
+  };
+}
+
 router.get('/contract', authenticate, requireCarbonContractView, (req, res) => {
   sendSuccess(res, getCarbonManagementContract(), { meta: { contractOnly: false } });
 });
@@ -48,27 +64,57 @@ router.get('/factors/export', authenticate, requirePermission('carbon:factors:ex
   res.status(200).send(result.body);
 }));
 
-router.post('/factors/import/preview', authenticate, requirePermission('carbon:factor:import'), requireWritable('carbon:factor-import-preview'), rejectUnconnectedDemoContext, (req, res, next) => {
-  uploadImportFile(req, res, (uploadError) => {
-    const normalizedUploadError = normalizeUploadError(uploadError);
-    if (normalizedUploadError) {
-      cleanupUploadedImportFile(req.file);
-      next(normalizedUploadError);
-      return;
-    }
-    Promise.resolve()
-      .then(() => createCarbonFactorImportPreviewFromUpload(req.file))
-      .then((preview) => sendSuccess(res, preview))
-      .catch((error) => {
+router.post(
+  '/factors/import/preview',
+  authenticate,
+  requirePermission('carbon:factor:import'),
+  requireWritable('carbon:factor-import-preview'),
+  demoContextPreflight({
+    artifactKey: '11-carbon-factors',
+    handlerKey: 'carbon-factors-import',
+    phase: 'preview',
+    allowFormal: true
+  }),
+  (req, res, next) => {
+    uploadImportFile(req, res, (uploadError) => {
+      const normalizedUploadError = normalizeUploadError(uploadError);
+      if (normalizedUploadError) {
         cleanupUploadedImportFile(req.file);
-        next(error);
-      });
-  });
-});
+        next(normalizedUploadError);
+        return;
+      }
+      Promise.resolve()
+        .then(() => createCarbonFactorImportPreviewFromUpload(req.file, {
+          actor: getCarbonFactorActor(req),
+          demoContext: getCarbonFactorDemoContext(req)
+        }))
+        .then((preview) => sendSuccess(res, preview))
+        .catch((error) => {
+          cleanupUploadedImportFile(req.file);
+          next(error);
+        });
+    });
+  }
+);
 
-router.post('/factors/import/execute', authenticate, requirePermission('carbon:factor:import'), requireWritable('carbon:factor-import-execute'), rejectUnconnectedDemoContext, asyncHandler(async (req, res) => {
-  sendSuccess(res, await executeCarbonFactorImport(req.body || {}));
-}));
+router.post(
+  '/factors/import/execute',
+  authenticate,
+  requirePermission('carbon:factor:import'),
+  requireWritable('carbon:factor-import-execute'),
+  demoContextPreflight({
+    artifactKey: '11-carbon-factors',
+    handlerKey: 'carbon-factors-import',
+    phase: 'execute',
+    allowFormal: true
+  }),
+  asyncHandler(async (req, res) => {
+    sendSuccess(res, await executeCarbonFactorImport(req.body || {}, {
+      actor: getCarbonFactorActor(req),
+      demoContext: getCarbonFactorDemoContext(req)
+    }));
+  })
+);
 
 router.get('/factors/:factorId', authenticate, requireCarbonFactorsView, asyncHandler(async (req, res) => {
   sendSuccess(res, getCarbonFactor(req.params.factorId));

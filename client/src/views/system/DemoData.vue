@@ -4,7 +4,7 @@
       <HelpIcon label="查看演示数据治理说明" content="标准模板和演示目录均来自服务端。演示文件、标签页 context、导入 ownership 与清理只服务于当前 run；页面不会复制 registry，也不会在进入页面时自动创建 run。" />
     </template>
     <template #actions>
-      <el-button v-if="canSeeStatusRefresh" :loading="statusLoading" :disabled="!canRefreshStatus" @click="loadInitialState">刷新状态</el-button>
+      <el-button v-if="canSeeStatusAction" :loading="statusLoading" :disabled="!canRefreshStatus" @click="refreshStatusProjection">{{ canSeeStatusRecovery ? '重试读取状态' : '刷新状态' }}</el-button>
       <el-button v-if="canSeeToggle" :loading="toggleLoading" :disabled="!canToggle" :type="runtime.enabled ? 'warning' : 'primary'" @click="changeRuntime(!runtime.enabled)">{{ runtime.enabled ? '关闭演示运行期' : '开启演示运行期' }}</el-button>
     </template>
 
@@ -60,6 +60,8 @@
       <el-alert v-else-if="!allowedAction('catalog')" type="warning" :closable="false" show-icon title="当前账号缺少演示 catalog 权限，已隐藏目录读取操作。" />
       <el-alert v-if="runtime.enabled && capability('activeRun') && !allowedAction('run')" type="info" :closable="false" show-icon title="当前账号缺少 active run 准备权限，已隐藏 run 操作。" />
       <el-alert v-else-if="runtime.enabled && !capability('activeRun')" type="warning" :closable="false" show-icon title="服务端未启用 active run 能力，页面不会创建 run。" />
+      <el-alert v-if="activeRunCleanupBlocked" type="warning" :closable="false" show-icon title="当前 active run 正在 cleaning 或处于不可换代阻断状态；显式准备与 managed 下载已临时禁用，请稍后重试。" />
+      <el-alert v-else-if="activeRunCompatibility?.state === 'manifest-turnover-pending'" type="info" :closable="false" show-icon title="当前 active run 与 manifest 不一致；显式准备 run 或下载 managed artifact 时，后端会自动换代并保留旧 run 治理证据。" />
       <el-alert v-if="runError" type="error" :closable="false" show-icon :title="runError" />
       <PageState v-if="catalogError" :error="catalogError" @retry="loadCatalog" />
       <template v-if="catalog">
@@ -69,7 +71,7 @@
           <div><dt>manifest digest</dt><dd class="digest-text">{{ displayValue(catalog.manifestDigest) }}</dd></div>
           <div><dt>active run</dt><dd>{{ displayValue(activeRunProjection.runId || activeRunProjection.id) }}</dd></div>
           <div><dt>run 状态</dt><dd>{{ displayValue(activeRunProjection.status) }}</dd></div>
-          <div><dt>manifest 状态</dt><dd>{{ displayValue(activeRunCompatibility?.manifestCompatible === false || activeRunProjection.manifestCompatible === false ? '不兼容' : activeRunCompatibility?.code || activeRunProjection.conflictCode || '一致或未知') }}</dd></div>
+          <div><dt>manifest 状态</dt><dd>{{ displayValue(activeRunCompatibility?.state || activeRunCompatibility?.code || activeRunProjection.conflictCode || '一致或未知') }}</dd></div>
           <div><dt>来源时区</dt><dd>{{ displayValue(catalog.sourceTimeZone) }}</dd></div>
         </dl>
         <div class="table-scroll" role="region" aria-label="演示 catalog 横向滚动区域">
@@ -88,6 +90,13 @@
       </template>
       <PageState v-else-if="!catalogLoading && !catalogError" description="尚未加载演示目录；进入页面不会自动创建 run。" />
     </article>
+
+    <DemoPostActionPanel
+      :runtime="runtime"
+      :active-run="activeRun"
+      :active-run-compatibility="activeRunCompatibility"
+      @succeeded="handlePostActionSucceeded"
+    />
 
     <article class="page-card">
       <header class="section-heading"><div><h2>ownership 进度</h2><p>只读汇总来自当前 active run 的服务端响应；ownership 登记和清理能力分别按 capability 与 allowedAction 判断。</p></div><el-button v-if="canLoadOwnership" :loading="ownershipLoading" @click="loadOwnership">刷新进度</el-button></header>
@@ -155,19 +164,28 @@ import ManagementPage from '@/components/ManagementPage.vue';
 import PageState from '@/components/PageState.vue';
 import StatCard from '@/components/StatCard.vue';
 import StatusTag from '@/components/StatusTag.vue';
+import DemoPostActionPanel from '@/views/system/components/DemoPostActionPanel.vue';
 import {
+  canDownloadDemoCatalogArtifact,
+  canStartDemoCleanupAction,
   clearDemoContexts,
   clearDemoContextIfTokenMatches,
   downloadDemoCatalogArtifact,
   downloadDemoStandardTemplate,
   executeDemoCleanup,
+  formatDemoRunTurnoverSuccessMessage,
   getDemoCatalog,
   getDemoCleanupRun,
   prepareDemoRun,
   getDemoOwnershipSummary,
   getDemoStatus,
   getDemoTemplateCatalog,
+  isDemoCleanupInProgressBlocked,
+  isLatestDemoCleanupResultRequest,
+  isLatestDemoRequest,
+  isLatestDemoRunRequest,
   previewDemoCleanup,
+  readDemoRunTurnover,
   toggleDemoRuntime
 } from '@/api/demoData';
 import { isExpectedNamedRoute, resolveTrustedRegisteredRoute } from '@/utils/navigationRoutes';
@@ -217,6 +235,24 @@ const ownershipError = ref('');
 const cleanupError = ref('');
 /** 初始状态加载标记。 */
 const statusLoading = ref(false);
+/** status 投影异常或读取失败后的本地恢复标记；不复制服务端权限。 */
+const statusRecoveryRequired = ref(false);
+/** status 请求递增序号，旧响应不得覆盖新状态。 */
+const statusRequestSequence = ref(0);
+/** 最近一次会控制刷新按钮 loading 的 status 请求序号。 */
+const statusLoadingRequestSequence = ref(0);
+/** 显式 prepare 返回的待核对 run 身份；status 成功前不向子组件暴露可写运行环境。 */
+const preparedRunId = ref('');
+/** ownership 请求递增序号，响应必须同时匹配当前 run。 */
+const ownershipRequestSequence = ref(0);
+/** cleanup preview 请求递增序号，响应必须同时匹配当前 run。 */
+const cleanupPreviewRequestSequence = ref(0);
+/** cleanup execute 本地请求序号，用于独立维护提交 loading 与 active run 身份。 */
+const cleanupExecuteRequestSequence = ref(0);
+/** cleanup 状态查询本地请求序号，用于独立维护查询 loading。 */
+const cleanupStatusRequestSequence = ref(0);
+/** cleanup preview、execute、状态查询和治理清空共享的结果 generation，最新动作唯一拥有落地资格。 */
+const cleanupResultGeneration = ref(0);
 /** 模板目录加载标记。 */
 const templateLoading = ref(false);
 /** 运行期开关提交标记。 */
@@ -265,12 +301,16 @@ const enabledCapabilityCount = computed(() => capabilityRows.value.filter((item)
 const activeRunProjection = computed(() => activeRun.value || {});
 /** 当前是否存在可用 active run 身份。 */
 const hasActiveRun = computed(() => Boolean(activeRunProjection.value.runId || activeRunProjection.value.id));
-/** 当前 run 是否被服务端只读兼容性投影明确标记为不可写。 */
+/** 当前 active run 是否处于 cleaning 或兼容旧版 state 的明确阻断期。 */
+const activeRunCleanupBlocked = computed(() => hasActiveRun.value && isDemoCleanupInProgressBlocked({
+  activeRunStatus: activeRunProjection.value.status,
+  activeRunCompatibility: activeRunCompatibility.value
+}));
+/** 当前 run 是否缺少 cleanup 所需的当前 manifest 兼容与明确写资格。 */
 const activeRunManifestBlocked = computed(() => hasActiveRun.value && (
-  activeRunCompatibility.value?.writeEligible === false
-  || activeRunCompatibility.value?.manifestCompatible === false
-  || activeRunProjection.value.manifestCompatible === false
-  || Boolean(activeRunProjection.value.conflictCode)
+  activeRunCompatibility.value?.writeEligible !== true
+  || activeRunCompatibility.value?.manifestCompatible !== true
+  || activeRunCleanupBlocked.value
 ));
 /** 按服务端顺序展示 artifact。 */
 const artifacts = computed(() => [...(catalog.value?.artifacts || [])].sort((left, right) => Number(left.order || 0) - Number(right.order || 0)));
@@ -315,10 +355,20 @@ const cleanupResultAlert = computed(() => {
   }
   return { type: 'info', title: '服务端已返回清理状态；请核对详细响应。' };
 });
-/** 当前账号是否看到状态刷新操作。 */
+/** 三类 cleanup 动作是否均处于空闲状态，动作门禁必须互斥。 */
+const cleanupActionsIdle = computed(() => canStartDemoCleanupAction({
+  previewLoading: cleanupPreviewLoading.value,
+  executeLoading: cleanupExecuteLoading.value,
+  statusLoading: cleanupStatusLoading.value
+}));
+/** 当前可信服务端投影是否允许显示常规状态刷新操作。 */
 const canSeeStatusRefresh = computed(() => capability('status') && runtime.value.available);
-/** 当前账号是否可刷新状态。 */
-const canRefreshStatus = computed(() => canSeeStatusRefresh.value && !statusLoading.value);
+/** fail-closed 后是否必须保留只读 status 恢复入口；只依赖本地恢复标记。 */
+const canSeeStatusRecovery = computed(() => statusRecoveryRequired.value);
+/** 状态操作在正常投影或本地恢复态任一成立时可见。 */
+const canSeeStatusAction = computed(() => canSeeStatusRefresh.value || canSeeStatusRecovery.value);
+/** 当前账号是否可发起只读 status 请求；恢复态不从已清空的权限投影推断权限。 */
+const canRefreshStatus = computed(() => canSeeStatusAction.value && !statusLoading.value);
 /** 当前账号是否看到运行期开关操作。 */
 const canSeeToggle = computed(() => capability('toggle') && allowedAction('toggle') && runtime.value.available);
 /** 当前账号是否可操作运行期开关。 */
@@ -329,14 +379,19 @@ const canSeeLoadCatalog = computed(() => runtime.value.available && capability('
 const canLoadCatalog = computed(() => canSeeLoadCatalog.value && runtime.value.enabled && !catalogLoading.value);
 /** 当前账号是否看到 active run 准备操作。 */
 const canSeePrepareRun = computed(() => runtime.value.available && capability('activeRun') && allowedAction('run'));
-/** 是否允许显式准备 active run。 */
-const canPrepareRun = computed(() => canSeePrepareRun.value && runtime.value.enabled && !runLoading.value);
+/** 是否允许显式准备 active run；cleaning 阻断期间等待服务端可重试状态恢复。 */
+const canPrepareRun = computed(() => canSeePrepareRun.value
+  && runtime.value.enabled
+  && !activeRunCleanupBlocked.value
+  && !runLoading.value);
 /** 是否展示 catalog 中的下载操作。 */
 const canSeeCatalogActions = computed(() => capability('download') && allowedAction('download') && runtime.value.available && runtime.value.enabled);
 /** 是否允许进入 catalog 声明的当前账号可信路由。 */
 const canNavigateArtifact = computed(() => capability('catalog') && allowedAction('catalog') && runtime.value.available && runtime.value.enabled);
-/** 是否存在可供 ownership 查询的当前 run。 */
-const canLoadOwnership = computed(() => Boolean(capability('ownershipSummary') && allowedAction('ownershipSummary') && runtime.value.available && runtime.value.enabled && hasActiveRun.value && !ownershipLoading.value));
+/** ownership 读取的稳定门禁，不因已有请求在途而关闭成功后的补刷资格。 */
+const canReadOwnership = computed(() => Boolean(capability('ownershipSummary') && allowedAction('ownershipSummary') && runtime.value.available && runtime.value.enabled && hasActiveRun.value));
+/** 是否存在可供 ownership 查询的当前 run；按钮 loading 期间仅隐藏重复点击。 */
+const canLoadOwnership = computed(() => canReadOwnership.value && !ownershipLoading.value);
 /** 是否允许请求 cleanup 预演；不依赖 ownershipRegistration 或 cleanupExecute。 */
 const canPreviewCleanup = computed(() => Boolean(capability('cleanupPreview')
   && allowedAction('cleanupPreview')
@@ -344,8 +399,7 @@ const canPreviewCleanup = computed(() => Boolean(capability('cleanupPreview')
   && runtime.value.enabled
   && hasActiveRun.value
   && !activeRunManifestBlocked.value
-  && !cleanupPreviewLoading.value
-  && !cleanupExecuteLoading.value));
+  && cleanupActionsIdle.value));
 /** 是否展示 cleanup execute 表单。 */
 const canSeeCleanupExecute = computed(() => capability('ownershipRegistration') && capability('cleanupExecute') && allowedAction('cleanupExecute') && runtime.value.available && runtime.value.enabled);
 /** 是否展示 cleanup run 只读状态查询；只依赖服务端状态查询能力和当前用户授权。 */
@@ -353,7 +407,7 @@ const canSeeCleanupStatus = computed(() => capability('cleanupRunStatus') && all
 /** 是否允许按独立 cleanup run ID 查询状态，不依赖 runtime enabled 或当前 cleanup 预演。 */
 const canQueryCleanupStatus = computed(() => Boolean(canSeeCleanupStatus.value
   && cleanupRunIdInput.value.trim()
-  && !cleanupStatusLoading.value));
+  && cleanupActionsIdle.value));
 /** 当前预演使用的固定确认文本，优先采用预演响应并允许状态合同作为显示回退。 */
 const cleanupExpectedConfirmation = computed(() => String(cleanupPreview.value?.confirmationText || confirmationTexts.value?.cleanup || '').trim());
 /** 是否允许执行 cleanup，包含 capability、真实授权、运行态、可执行预演和防重复提交约束。 */
@@ -367,14 +421,13 @@ const canExecuteCleanup = computed(() => Boolean(canSeeCleanupExecute.value
   && cleanupExecuteRequestId.value
   && cleanupExpectedConfirmation.value
   && cleanupConfirmation.value === cleanupExpectedConfirmation.value
-  && !cleanupExecuteLoading.value
-  && !cleanupPreviewLoading.value));
+  && cleanupActionsIdle.value));
 
 /** 安全捕获异步请求。 */
 async function safeRequest(task) { try { return { ok: true, value: await task() }; } catch (error) { return { ok: false, error }; } }
 /** 提取统一 API 错误文本。 */
 function errorText(result) { return result?.error?.apiError?.message || result?.error?.message || '接口请求失败。'; }
-/** 提取统一 API 错误代码，便于明确展示 manifest 等冲突。 */
+/** 提取统一 API 错误代码，保留通用接口错误格式。 */
 function errorCode(result) { return String(result?.error?.apiError?.code || '').trim(); }
 /** 判断服务端是否明确启用指定能力。 */
 function capability(key) { return capabilities.value?.[key] === true; }
@@ -395,14 +448,25 @@ function formattedJson(value) { return JSON.stringify(value, null, 2); }
 function summaryNumber(source, keys) { for (const key of keys) { const value = source?.[key]; if (Array.isArray(value)) return value.length; const number = Number(value); if (Number.isFinite(number)) return number; } return 0; }
 /** 生成 cleanup 幂等请求标识。 */
 function createClientRequestId() { if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID(); return `demo-${Date.now()}-${Math.random().toString(16).slice(2)}`; }
-/** 按 capability、allowedAction、运行态和 catalog 生命周期判断 artifact 下载是否可用。 */
+/** 读取当前 active run 的稳定身份。 */
+function currentActiveRunId() { return String(activeRunProjection.value.runId || activeRunProjection.value.id || '').trim(); }
+/** 开始新的 status 请求，失效旧响应并释放旧刷新按钮 loading。 */
+function beginStatusRequest() { statusRequestSequence.value += 1; statusLoading.value = false; return statusRequestSequence.value; }
+/** 开始 cleanup 结果动作；preview、execute、query 中最后发起的动作唯一拥有结果落地资格。 */
+function beginCleanupResultAction() { cleanupResultGeneration.value += 1; return cleanupResultGeneration.value; }
+/** 按 capability、allowedAction、运行态和服务端换代投影判断 artifact 下载是否可用。 */
 function canDownloadArtifact(artifact) {
-  const lifecycle = String(artifact?.downloadLifecycle || '').trim();
-  if (!capability('download')) return false;
-  if (!canSeeCatalogActions.value || !runtime.value.enabled) return false;
-  if (lifecycle === 'stateless-formal-import') return true;
-  if (!hasActiveRun.value || activeRunManifestBlocked.value) return false;
-  return lifecycle === 'managed-context-auto-runtime' && capability('contextIssue');
+  return canDownloadDemoCatalogArtifact({
+    artifact,
+    downloadCapable: capability('download'),
+    downloadAllowed: allowedAction('download'),
+    runtimeAvailable: runtime.value.available,
+    runtimeEnabled: runtime.value.enabled,
+    contextIssueCapable: capability('contextIssue'),
+    hasActiveRun: hasActiveRun.value,
+    activeRunStatus: activeRunProjection.value.status,
+    activeRunCompatibility: activeRunCompatibility.value
+  });
 }
 /** 从服务端 artifact 中读取 targetRoute，并要求当前账号已注册真实页面路由。 */
 function targetRouteContract(artifact) {
@@ -419,42 +483,270 @@ function targetRouteError(artifact, contract = targetRouteContract(artifact)) {
   if (contract.code === 'invalid-target-route') return `artifact ${artifactKey} 合同无效：服务端未声明合法 targetRoute。`;
   return `artifact ${artifactKey} 合同无效：targetRoute 未注册为当前账号可用的真实页面。`;
 }
-/** 应用服务端 status 响应，并只接受 status 的 activeRun 只读投影。 */
-function applyStatus(response) {
-  const data = response?.data || {};
-  runtime.value = data.runtime || { available: false, enabled: false, runtimeEpoch: null, revision: null };
-  capabilities.value = data.capabilities && typeof data.capabilities === 'object' ? data.capabilities : {};
-  allowedActions.value = data.allowedActions && typeof data.allowedActions === 'object' ? data.allowedActions : {};
-  confirmationTexts.value = data.confirmationTexts && typeof data.confirmationTexts === 'object' ? data.confirmationTexts : {};
-  activeRun.value = data.activeRun && typeof data.activeRun === 'object' ? data.activeRun : null;
-  activeRunCompatibility.value = data.activeRunCompatibility && typeof data.activeRunCompatibility === 'object'
-    ? data.activeRunCompatibility : null;
+/** 服务端 status 必须声明的稳定 capability 字段；未知新增字段仍允许透传。 */
+const requiredDemoStatusCapabilityKeys = Object.freeze([
+  'status', 'toggle', 'catalog', 'activeRun', 'download', 'contextIssue',
+  'contextReassociate', 'centralPreviewExecuteContext', 'ownershipSummary',
+  'ownershipRegistration', 'cleanupPreview', 'cleanupExecute', 'cleanupRunStatus', 'postActionRegistry',
+  'postActionPreview', 'postActionExecute', 'postActionRunStatus'
+]);
+/** 服务端 status 必须声明的 canonical RBAC 动作字段；别名只用于页面兼容消费。 */
+const requiredDemoStatusAllowedActionKeys = Object.freeze([
+  'toggleRuntime', 'loadCatalog', 'prepareRun', 'downloadArtifacts',
+  'reassociateContext', 'readOwnershipSummary', 'previewCleanup',
+  'executeCleanup', 'readCleanupRunStatus'
+]);
+/** 服务端 status 对 active run 使用的 canonical Dataset 身份；不复制动作列表，仅绑定领域数据集。 */
+const canonicalDemoDatasetId = 'qinglan-park-v1';
+/** 服务端 active run 查询允许公开到 status 的生命周期集合；未知状态必须拒绝。 */
+const validDemoActiveRunStatuses = Object.freeze(['active', 'completed', 'cleanup_pending', 'cleaning']);
+/** 服务端 status 必须返回的固定确认文本字段；不能由空容器伪造完整投影。 */
+const requiredDemoStatusConfirmationKeys = Object.freeze(['legacyClaim', 'cleanup']);
+
+/** 判断 status 子对象是否为非数组普通记录。 */
+function isDemoStatusRecord(value) {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
-/** 应用显式 POST run 成功结果，不从 catalog 推断 active run。 */
+/** 判断 status 字段是否为非空文本。 */
+function isDemoStatusText(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+/** 判断 status 字段是否为可接受的可空文本。 */
+function isDemoStatusNullableText(value) {
+  return value === null || isDemoStatusText(value);
+}
+/** 判断布尔 map 是否包含服务端必要字段且没有非布尔值污染。 */
+function isDemoStatusBooleanMap(value, requiredKeys) {
+  return isDemoStatusRecord(value)
+    && requiredKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    && Object.values(value).every((item) => typeof item === 'boolean');
+}
+/** 校验 runtime 的可用性与 epoch/revision generation，允许服务端规范 fail-closed 快照。 */
+function isDemoStatusRuntime(value) {
+  if (!isDemoStatusRecord(value)
+    || !['available', 'enabled', 'runtimeEpoch', 'revision'].every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    || typeof value.available !== 'boolean'
+    || typeof value.enabled !== 'boolean') return false;
+  const validGeneration = (generation) => generation === null
+    || (typeof generation === 'number' && Number.isSafeInteger(generation) && generation >= 1);
+  if (!validGeneration(value.runtimeEpoch) || !validGeneration(value.revision)) return false;
+  if (!value.available) return value.enabled === false && value.runtimeEpoch === null && value.revision === null;
+  return value.runtimeEpoch !== null && value.revision !== null;
+}
+/** 校验 active run 身份与服务端稳定字段，禁止空对象、未知状态或错误 Dataset 的伪 run。 */
+function isDemoStatusActiveRun(value) {
+  if (value === null) return true;
+  return isDemoStatusRecord(value)
+    && ['runId', 'datasetId', 'manifestVersion', 'manifestDigest', 'status'].every((key) => isDemoStatusText(value[key]))
+    && value.datasetId === canonicalDemoDatasetId
+    && validDemoActiveRunStatuses.includes(value.status)
+    && (value.id === undefined || isDemoStatusText(value.id));
+}
+/** 校验 active run compatibility 的完整状态机；无 active run 只允许服务端 missing/unavailable 快照。 */
+function isDemoStatusCompatibility(value, activeRunValue) {
+  const hasActiveRun = activeRunValue !== null;
+  if (value === null) return false;
+  if (!isDemoStatusRecord(value)
+    || ![
+      'readable', 'readOnly', 'writeEligible', 'turnoverEligible', 'retryable',
+      'state', 'code', 'manifestCompatible', 'historical', 'active',
+      'expectedManifestVersion', 'expectedManifestDigest',
+      'actualManifestVersion', 'actualManifestDigest'
+    ].every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    || !['readable', 'readOnly', 'writeEligible', 'turnoverEligible', 'retryable', 'manifestCompatible', 'historical', 'active']
+      .every((key) => typeof value[key] === 'boolean')
+    || value.readOnly !== true
+    || !isDemoStatusText(value.state)
+    || !isDemoStatusText(value.code)
+    || !isDemoStatusNullableText(value.expectedManifestVersion)
+    || !isDemoStatusNullableText(value.expectedManifestDigest)
+    || !isDemoStatusNullableText(value.actualManifestVersion)
+    || !isDemoStatusNullableText(value.actualManifestDigest)) return false;
+  if (!hasActiveRun) {
+    const isMissingProjection = value.state === 'missing'
+      && value.code === 'DEMO_RUN_NOT_FOUND'
+      && isDemoStatusText(value.expectedManifestVersion)
+      && isDemoStatusText(value.expectedManifestDigest);
+    const isUnavailableProjection = value.state === 'unavailable'
+      && value.code === 'DEMO_ACTIVE_RUN_PROJECTION_UNAVAILABLE'
+      && value.expectedManifestVersion === null
+      && value.expectedManifestDigest === null;
+    return value.readable === false
+      && value.writeEligible === false
+      && value.turnoverEligible === false
+      && value.retryable === false
+      && value.manifestCompatible === false
+      && value.historical === false
+      && value.active === false
+      && value.actualManifestVersion === null
+      && value.actualManifestDigest === null
+      && (isMissingProjection || isUnavailableProjection);
+  }
+  if (!isDemoStatusActiveRun(activeRunValue)) return false;
+  const expectedManifestComplete = isDemoStatusText(value.expectedManifestVersion)
+    && isDemoStatusText(value.expectedManifestDigest);
+  const actualManifestMatchesRun = value.actualManifestVersion === activeRunValue.manifestVersion
+    && value.actualManifestDigest === activeRunValue.manifestDigest;
+  const manifestIdentityMatches = value.expectedManifestVersion === activeRunValue.manifestVersion
+    && value.expectedManifestDigest === activeRunValue.manifestDigest;
+  const commonActiveProjection = value.readable === true
+    && value.historical === false
+    && value.active === true
+    && expectedManifestComplete
+    && actualManifestMatchesRun
+    && value.manifestCompatible === manifestIdentityMatches;
+  if (!commonActiveProjection) return false;
+  if (activeRunValue.status === 'cleaning') {
+    return value.writeEligible === false
+      && value.turnoverEligible === false
+      && value.retryable === true
+      && value.state === 'cleanup-in-progress-blocked'
+      && value.code === 'DEMO_RUN_CLEANUP_IN_PROGRESS';
+  }
+  const manifestTurnoverPending = value.manifestCompatible === false;
+  return value.writeEligible === !manifestTurnoverPending
+    && value.turnoverEligible === manifestTurnoverPending
+    && value.retryable === false
+    && value.state === (manifestTurnoverPending ? 'manifest-turnover-pending' : 'active')
+    && value.code === (manifestTurnoverPending
+      ? 'DEMO_RUN_MANIFEST_TURNOVER_PENDING'
+      : 'DEMO_RUN_ACTIVE');
+}
+
+/** 将 status 响应投影为完整、可原子应用的运行期状态；嵌套字段缺失或语义无效时拒绝 DTO。 */
+function readStatusProjection(response) {
+  const data = response?.data;
+  if (!isDemoStatusRecord(data)
+    || !isDemoStatusRuntime(data.runtime)
+    || !isDemoStatusBooleanMap(data.capabilities, requiredDemoStatusCapabilityKeys)
+    || !isDemoStatusBooleanMap(data.allowedActions, requiredDemoStatusAllowedActionKeys)
+    || !isDemoStatusRecord(data.confirmationTexts)
+    || !requiredDemoStatusConfirmationKeys.every((key) => isDemoStatusText(data.confirmationTexts[key]))
+    || !Object.values(data.confirmationTexts).every((item) => isDemoStatusText(item))
+    || !Object.prototype.hasOwnProperty.call(data, 'activeRun')
+    || !Object.prototype.hasOwnProperty.call(data, 'activeRunCompatibility')
+    || !isDemoStatusActiveRun(data.activeRun)
+    || !isDemoStatusCompatibility(data.activeRunCompatibility, data.activeRun)) return null;
+  return {
+    runtime: data.runtime,
+    capabilities: data.capabilities,
+    allowedActions: data.allowedActions,
+    confirmationTexts: data.confirmationTexts,
+    activeRun: data.activeRun,
+    activeRunCompatibility: data.activeRunCompatibility
+  };
+}
+
+/** 清空 status、run 与 compatibility，等待下一份可信 status 投影。 */
+function failClosedStatusProjection() {
+  statusRecoveryRequired.value = true;
+  clearRunGovernanceProjection();
+  runtime.value = { available: false, enabled: false, runtimeEpoch: null, revision: null };
+  capabilities.value = {};
+  allowedActions.value = {};
+  confirmationTexts.value = {};
+  activeRun.value = null;
+  activeRunCompatibility.value = null;
+  return false;
+}
+
+/** 应用服务端 status 响应；run 身份改变时先使旧治理投影与请求失效。 */
+function applyStatus(response, expectedRunId = '') {
+  const projection = readStatusProjection(response);
+  const nextActiveRun = projection?.activeRun || null;
+  const nextRunId = String(nextActiveRun?.runId || nextActiveRun?.id || '').trim();
+  const normalizedExpectedRunId = String(expectedRunId || '').trim();
+  if (!projection || (normalizedExpectedRunId && nextRunId !== normalizedExpectedRunId)) return failClosedStatusProjection();
+  statusRecoveryRequired.value = false;
+  const previousRunId = currentActiveRunId();
+  if (previousRunId !== nextRunId) clearRunGovernanceProjection();
+  // 所有字段先完成合同校验，再一次性替换页面状态，避免 partial status 污染后置动作入口。
+  runtime.value = projection.runtime;
+  capabilities.value = projection.capabilities;
+  allowedActions.value = projection.allowedActions;
+  confirmationTexts.value = projection.confirmationTexts;
+  activeRun.value = nextActiveRun;
+  activeRunCompatibility.value = projection.activeRunCompatibility;
+  return true;
+}
+
+/** 应用显式 POST run 成功结果：只捕获待核对身份并立即 fail-closed，不消费不完整 compatibility。 */
 function applyRun(response) {
+  beginStatusRequest();
   const data = response?.data;
   const nextRun = data?.activeRun || data?.run || data;
-  activeRun.value = nextRun && typeof nextRun === 'object' && (nextRun.runId || nextRun.id) ? nextRun : null;
-  const compatibility = data?.activeRunCompatibility || data?.compatibility || nextRun?.compatibility;
-  activeRunCompatibility.value = compatibility && typeof compatibility === 'object'
-    ? compatibility : (activeRun.value ? { manifestCompatible: true, writeEligible: true } : null);
+  preparedRunId.value = nextRun && typeof nextRun === 'object'
+    ? String(nextRun.runId || nextRun.id || '').trim() : '';
+  failClosedStatusProjection();
 }
-/** 加载状态和模板目录；不请求 catalog 或准备 active run。 */
-async function loadInitialState() {
-  statusLoading.value = true;
-  pageError.value = '';
-  const result = await safeRequest(getDemoStatus);
-  statusLoading.value = false;
-  if (result.ok) {
-    applyStatus(result.value);
-  } else {
-    runtime.value = { available: false, enabled: false, runtimeEpoch: null, revision: null };
-    capabilities.value = {};
-    allowedActions.value = {};
+/** 清空只属于旧 active run 的 ownership 与 cleanup 页面投影，可保留刚完成的 cleanup 结果。 */
+function clearRunGovernanceProjection(options = {}) {
+  ownershipRequestSequence.value += 1;
+  cleanupPreviewRequestSequence.value += 1;
+  cleanupExecuteRequestSequence.value += 1;
+  cleanupStatusRequestSequence.value += 1;
+  beginCleanupResultAction();
+  ownershipLoading.value = false;
+  cleanupPreviewLoading.value = false;
+  cleanupExecuteLoading.value = false;
+  cleanupStatusLoading.value = false;
+  ownership.value = null;
+  cleanupPreview.value = null;
+  if (options.preserveCleanupResult !== true) cleanupResult.value = null;
+  cleanupConfirmation.value = '';
+  cleanupExecuteRequestId.value = '';
+  ownershipError.value = '';
+  cleanupError.value = '';
+}
+/** managed artifact 下载后刷新 status；自动换代时先清空旧 run 治理投影。 */
+async function refreshStatusAfterManagedDownload(downloadResult) {
+  const turnover = downloadResult?.turnover || readDemoRunTurnover(downloadResult);
+  if (turnover?.performed === true) {
     activeRun.value = null;
     activeRunCompatibility.value = null;
-    pageError.value = `演示运行期状态读取失败：${errorText(result)}`;
+    clearRunGovernanceProjection();
   }
+  const statusRequestId = beginStatusRequest();
+  const statusResult = await safeRequest(getDemoStatus);
+  if (isLatestDemoRequest(statusRequestId, statusRequestSequence.value)) {
+    if (statusResult.ok) {
+      pageError.value = applyStatus(statusResult.value)
+        ? ''
+        : 'managed artifact 已下载，但最新 status 投影无效，页面已 fail-closed。';
+    } else {
+      failClosedStatusProjection();
+      pageError.value = `managed artifact 已下载，但最新状态读取失败：${errorText(statusResult)}`;
+    }
+  }
+  if (turnover?.performed === true) {
+    ElMessage.success(formatDemoRunTurnoverSuccessMessage(turnover, 'managed artifact 下载已自动换代 active run'));
+  }
+}
+/** 只读取 status 并恢复完整投影；不请求模板、catalog、prepare 或任何写接口。 */
+async function refreshStatusProjection() {
+  const statusRequestId = beginStatusRequest();
+  statusLoadingRequestSequence.value = statusRequestId;
+  statusLoading.value = true;
+  const result = await safeRequest(getDemoStatus);
+  if (statusLoadingRequestSequence.value === statusRequestId) statusLoading.value = false;
+  if (!isLatestDemoRequest(statusRequestId, statusRequestSequence.value)) return false;
+  preparedRunId.value = '';
+  if (result.ok) {
+    if (applyStatus(result.value)) {
+      pageError.value = '';
+      runError.value = '';
+      return true;
+    }
+    pageError.value = '演示运行期 status 投影无效，页面保持 fail-closed；请重试读取状态。';
+    return false;
+  }
+  failClosedStatusProjection();
+  pageError.value = `演示运行期状态读取失败，页面保持 fail-closed；请重试：${errorText(result)}`;
+  return false;
+}
+/** 加载状态和模板目录；两类只读请求保持独立，不请求 catalog 或准备 active run。 */
+async function loadInitialState() {
+  await refreshStatusProjection();
   await loadTemplateCatalog();
 }
 /** 加载服务端标准模板目录。 */
@@ -469,22 +761,23 @@ async function changeRuntime(enabled) {
   const result = await safeRequest(() => toggleDemoRuntime(enabled));
   toggleLoading.value = false;
   if (!result.ok) { ElMessage.error(`演示运行期切换失败：${errorText(result)}`); return; }
-  const statusResult = await safeRequest(getDemoStatus);
-  if (statusResult.ok) applyStatus(statusResult.value);
-  else {
-    applyStatus(result.value);
-    pageError.value = `运行期已切换，但最新权限状态读取失败：${errorText(statusResult)}`;
-  }
   if (!enabled) {
     catalog.value = null;
     activeRun.value = null;
     activeRunCompatibility.value = null;
-    ownership.value = null;
-    cleanupPreview.value = null;
-    cleanupResult.value = null;
-    cleanupConfirmation.value = '';
-    cleanupExecuteRequestId.value = '';
+    clearRunGovernanceProjection();
     clearDemoContexts();
+  }
+  const statusRequestId = beginStatusRequest();
+  const statusResult = await safeRequest(getDemoStatus);
+  if (isLatestDemoRequest(statusRequestId, statusRequestSequence.value)) {
+    preparedRunId.value = '';
+    if (statusResult.ok) {
+      if (!applyStatus(statusResult.value)) pageError.value = '运行期已切换，但最新 status 投影无效，页面已 fail-closed。';
+    } else {
+      failClosedStatusProjection();
+      pageError.value = `运行期已切换，但最新权限状态读取失败：${errorText(statusResult)}`;
+    }
   }
   ElMessage.success(`演示运行期已${enabled ? '开启' : '关闭'}。`);
 }
@@ -501,7 +794,7 @@ async function loadCatalog() {
   }
   catalog.value = result.value?.data || null;
 }
-/** 显式 POST 准备 active run；409 manifest 冲突时保留已加载 catalog。 */
+/** 显式 POST 创建、复用或自动换代 active run；失败时保留已加载 catalog。 */
 async function prepareRun() {
   if (!canPrepareRun.value) return;
   runLoading.value = true;
@@ -513,16 +806,39 @@ async function prepareRun() {
     runError.value = code ? `active run 准备失败（${code}）：${errorText(result)}` : `active run 准备失败：${errorText(result)}`;
     return;
   }
+  const turnover = readDemoRunTurnover(result.value);
+  if (turnover.performed === true) clearDemoContexts();
   applyRun(result.value);
-  if (!hasActiveRun.value) {
+  clearRunGovernanceProjection();
+  if (!preparedRunId.value) {
     runError.value = '服务端未返回有效 active run，页面保持 fail-closed。';
     return;
   }
-  ownership.value = null;
-  cleanupPreview.value = null;
-  cleanupResult.value = null;
-  cleanupConfirmation.value = '';
-  cleanupExecuteRequestId.value = '';
+  // POST run 可能缺少 compatibility 或产生新的 runtime epoch/revision；必须以最新 status 原子同步完整投影。
+  const statusRequestId = beginStatusRequest();
+  statusLoadingRequestSequence.value = statusRequestId;
+  statusLoading.value = true;
+  const statusResult = await safeRequest(getDemoStatus);
+  if (statusLoadingRequestSequence.value === statusRequestId) statusLoading.value = false;
+  if (!isLatestDemoRequest(statusRequestId, statusRequestSequence.value)) {
+    preparedRunId.value = '';
+    return;
+  }
+  if (!statusResult.ok) {
+    preparedRunId.value = '';
+    failClosedStatusProjection();
+    runError.value = `active run 已准备，但最新 status 读取失败，页面保持 fail-closed：${errorText(statusResult)}`;
+    return;
+  }
+  if (!applyStatus(statusResult.value, preparedRunId.value)) {
+    preparedRunId.value = '';
+    runError.value = 'active run 已准备，但最新 status 未返回匹配的完整运行期投影，页面保持 fail-closed。';
+    return;
+  }
+  preparedRunId.value = '';
+  if (turnover.performed === true) {
+    ElMessage.success(formatDemoRunTurnoverSuccessMessage(turnover, 'active run 自动换代成功'));
+  }
   if (canLoadOwnership.value) await loadOwnership();
 }
 /** 下载服务端标准模板目录项。 */
@@ -539,7 +855,13 @@ async function downloadArtifact(artifact, mode = 'download') {
   artifactDownloadMode.value = mode;
   try {
     const result = await safeRequest(() => downloadDemoCatalogArtifact(artifact, format));
-    if (!result.ok) ElMessage.error(`演示 artifact 下载失败：${errorText(result)}`);
+    if (!result.ok) {
+      ElMessage.error(`演示 artifact 下载失败：${errorText(result)}`);
+      return result;
+    }
+    if (artifact.downloadLifecycle === 'managed-context-auto-runtime') {
+      await refreshStatusAfterManagedDownload(result.value);
+    }
     return result;
   } finally {
     artifactDownloadKey.value = '';
@@ -605,21 +927,41 @@ async function navigateToArtifact(artifact) {
     ElMessage.error(`artifact ${artifact?.artifactKey || 'unknown-artifact'} 导航失败：${error?.message || '当前目标页面不可用。'}`);
   }
 }
-/** 加载当前 run ownership 汇总。 */
-async function loadOwnership() {
-  const runId = activeRunProjection.value.runId || activeRunProjection.value.id;
-  if (!canLoadOwnership.value || !runId) return;
+/** 后置动作成功只刷新同一 active run 的 ownership 汇总，不清理或重建 run。 */
+async function handlePostActionSucceeded(payload = {}) {
+  const payloadRunId = String(payload?.runId || '').trim();
+  const ownershipRefreshAllowed = canReadOwnership.value
+    && (canLoadOwnership.value || ownershipLoading.value);
+  if (payloadRunId === currentActiveRunId() && ownershipRefreshAllowed) {
+    // succeeded 发生在旧 ownership 请求在途时，后发请求必须使旧响应失效，不能静默跳过刷新。
+    if (ownershipLoading.value) await loadOwnership({ supersede: true });
+    else await loadOwnership();
+  }
+}
+/** 加载当前 run ownership 汇总；成功补刷可显式替代同 run 的旧在途请求。 */
+async function loadOwnership(options = {}) {
+  const runId = currentActiveRunId();
+  if (!canReadOwnership.value || !runId
+    || (ownershipLoading.value && options.supersede !== true)) return;
+  ownershipRequestSequence.value += 1;
+  const requestId = ownershipRequestSequence.value;
   ownershipLoading.value = true;
   ownershipError.value = '';
   const result = await safeRequest(() => getDemoOwnershipSummary(runId));
+  const requestCurrent = isLatestDemoRunRequest(requestId, ownershipRequestSequence.value, runId, currentActiveRunId());
+  if (!requestCurrent) return;
   ownershipLoading.value = false;
+  if (!canReadOwnership.value) return;
   if (result.ok) ownership.value = result.value?.data || {};
   else { ownership.value = null; ownershipError.value = errorText(result); }
 }
 /** 创建只针对当前 run 的 cleanup 预演；blocked 响应也作为有效结果展示。 */
 async function previewCleanup() {
-  const runId = activeRunProjection.value.runId || activeRunProjection.value.id;
+  const runId = currentActiveRunId();
   if (!canPreviewCleanup.value || !runId) return;
+  cleanupPreviewRequestSequence.value += 1;
+  const requestId = cleanupPreviewRequestSequence.value;
+  const resultGeneration = beginCleanupResultAction();
   cleanupPreviewLoading.value = true;
   cleanupError.value = '';
   cleanupResult.value = null;
@@ -628,7 +970,9 @@ async function previewCleanup() {
   const clientRequestId = createClientRequestId();
   cleanupExecuteRequestId.value = clientRequestId;
   const result = await safeRequest(() => previewDemoCleanup(runId, clientRequestId));
-  cleanupPreviewLoading.value = false;
+  const previewResponseCurrent = isLatestDemoRunRequest(requestId, cleanupPreviewRequestSequence.value, runId, currentActiveRunId());
+  if (previewResponseCurrent) cleanupPreviewLoading.value = false;
+  if (!previewResponseCurrent || !isLatestDemoRequest(resultGeneration, cleanupResultGeneration.value)) return;
   if (!result.ok) {
     cleanupExecuteRequestId.value = '';
     cleanupError.value = errorText(result);
@@ -640,6 +984,7 @@ async function previewCleanup() {
 /** 执行当前 cleanup 预演，提交期间防止重复请求。 */
 async function executeCleanup() {
   if (!canExecuteCleanup.value) return;
+  const runId = currentActiveRunId();
   const preview = cleanupPreview.value;
   const cleanupRunId = String(preview.cleanupRunId || preview.id || '').trim();
   const clientRequestId = cleanupExecuteRequestId.value;
@@ -648,30 +993,45 @@ async function executeCleanup() {
     await ElMessageBox.confirm('只清理当前演示 run 的 ownership 数据。请再次确认已经核对候选、blocker、digest、watermark 和过期时间。', '确认精确清理', { type: 'error', confirmButtonText: '执行当前 run 清理', cancelButtonText: '取消' });
   } catch { return; }
   if (!canExecuteCleanup.value || cleanupExecuteLoading.value || clientRequestId !== cleanupExecuteRequestId.value) return;
+  cleanupExecuteRequestSequence.value += 1;
+  const requestId = cleanupExecuteRequestSequence.value;
+  const resultGeneration = beginCleanupResultAction();
   cleanupExecuteLoading.value = true;
   cleanupError.value = '';
+  cleanupResult.value = null;
   const result = await safeRequest(() => executeDemoCleanup({ cleanupRunId, clientRequestId, previewDigest: preview.previewDigest, confirmationText }));
-  cleanupExecuteLoading.value = false;
+  const executeResponseCurrent = isLatestDemoRunRequest(requestId, cleanupExecuteRequestSequence.value, runId, currentActiveRunId());
+  if (executeResponseCurrent) cleanupExecuteLoading.value = false;
+  if (!executeResponseCurrent || !isLatestDemoRequest(resultGeneration, cleanupResultGeneration.value)) return;
   if (!result.ok) { cleanupError.value = errorText(result); return; }
   cleanupResult.value = result.value?.data || {};
   clearDemoContexts();
   catalog.value = null;
   activeRun.value = null;
-  ownership.value = null;
-  cleanupPreview.value = null;
-  cleanupConfirmation.value = '';
-  cleanupExecuteRequestId.value = '';
+  activeRunCompatibility.value = null;
+  clearRunGovernanceProjection({ preserveCleanupResult: true });
   await loadInitialState();
 }
 /** 查询指定 cleanup run 的服务端状态，blocked/executable 均按服务端结果展示。 */
 async function loadCleanupStatus(cleanupRunId) {
   const normalizedCleanupRunId = String(cleanupRunId || '').trim();
   if (!canSeeCleanupStatus.value || !normalizedCleanupRunId || cleanupStatusLoading.value) return;
+  cleanupStatusRequestSequence.value += 1;
+  const requestId = cleanupStatusRequestSequence.value;
+  const resultGeneration = beginCleanupResultAction();
   cleanupRunIdInput.value = normalizedCleanupRunId;
   cleanupStatusLoading.value = true;
   cleanupError.value = '';
+  cleanupResult.value = null;
   const result = await safeRequest(() => getDemoCleanupRun(normalizedCleanupRunId));
-  cleanupStatusLoading.value = false;
+  const statusResponseCurrent = isLatestDemoRequest(requestId, cleanupStatusRequestSequence.value);
+  if (statusResponseCurrent) cleanupStatusLoading.value = false;
+  if (!statusResponseCurrent || !isLatestDemoCleanupResultRequest(
+    resultGeneration,
+    cleanupResultGeneration.value,
+    normalizedCleanupRunId,
+    cleanupRunIdInput.value
+  )) return;
   if (result.ok) cleanupResult.value = result.value?.data || {};
   else cleanupError.value = errorText(result);
 }

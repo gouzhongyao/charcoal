@@ -5,14 +5,16 @@ const { AppError, badRequest } = require('../utils/errors');
 const backupService = require('./backupService');
 const {
   bindDemoContextPreviewInTransaction,
-  markDemoContextExecutedInTransaction
+  markDemoContextExecutedInTransaction,
+  validateDemoContextTerminalReplay
 } = require('./demoContextService');
 const { requireDemoArtifactHandler } = require('./demoArtifactRegistry');
 const {
   markDemoContextExecutedWithOwnershipTransaction,
   registerImportedDemoOwnershipInTransaction,
   runWithDemoOwnershipTransactionAsync,
-  updateDemoExecuteAuditInOwnershipTransaction
+  updateDemoExecuteAuditInOwnershipTransaction,
+  validateDemoContextWithOwnershipTransaction
 } = require('./demoOwnershipService');
 const {
   createPreviewAuditBatch,
@@ -516,6 +518,9 @@ function isSafeEnergyAnalysisErrorCode(value) {
     && (code.startsWith('ENERGY_ANALYSIS_')
       || code.startsWith('ENERGY_TIMESERIES_')
       || code.startsWith('CARBON_ACTIVITY_')
+      || code.startsWith('DEMO_CONTEXT_')
+      || code.startsWith('DEMO_OWNERSHIP_')
+      || code.startsWith('DEMO_CARBON_ACTIVITY_')
       || code.startsWith('CARBON_EMISSION_REPORT_')
       || code.startsWith('GHG_REPORT_'));
 }
@@ -548,17 +553,28 @@ function getSafeExecuteErrorMessage(code, domainName = '能源分析') {
 /**
  * 根据安全领域码构造对外错误；授权类保持 4xx，备份和事务基础设施故障使用 5xx。
  * @param {string} code 稳定领域错误码。
+ * @param {string} domainName 领域中文名称。
+ * @param {{causeCode?:string}} options 可选安全内部原因码。
  * @returns {Error} 带安全消息和合适 HTTP 状态的错误。
  */
-function createSafeExecuteError(code, domainName = '能源分析') {
+function createSafeExecuteError(code, domainName = '能源分析', options = {}) {
   const message = getSafeExecuteErrorMessage(code, domainName);
+  // 只允许附带已经进入稳定白名单的内部原因码，不透传原始 SQLite 或异常文本。
+  const causeCode = isSafeEnergyAnalysisErrorCode(options.causeCode)
+    && options.causeCode !== code
+    ? options.causeCode
+    : null;
+  const details = {
+    code,
+    ...(causeCode ? { causeCode } : {})
+  };
   if (code === 'ENERGY_ANALYSIS_IMPORT_BACKUP_FAILED') {
-    return new AppError(code, message, { statusCode: 503, details: { code } });
+    return new AppError(code, message, { statusCode: 503, details });
   }
   if (code === 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED') {
-    return new AppError(code, message, { statusCode: 500, details: { code } });
+    return new AppError(code, message, { statusCode: 500, details });
   }
-  return badRequest(message, { code });
+  return badRequest(message, details);
 }
 
 /**
@@ -568,15 +584,20 @@ function createSafeExecuteError(code, domainName = '能源分析') {
  * @returns {Error} 安全领域错误。
  */
 function normalizeSafeExecuteError(error, stage = 'preflight', domainName = '能源分析') {
-  const detailCode = error?.details?.code;
-  if (isSafeEnergyAnalysisErrorCode(detailCode)) {
-    return createSafeExecuteError(detailCode, domainName);
-  }
+  const detailCode = error?.details?.code || error?.code;
   const stageCode = stage === 'backup'
     ? 'ENERGY_ANALYSIS_IMPORT_BACKUP_FAILED'
     : (stage === 'lock' || stage === 'write'
       ? 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED'
       : 'ENERGY_ANALYSIS_IMPORT_SOURCE_OR_BATCH_INVALID');
+  // ownership registry/link 属于公共单批次事务内部实现，外部保持稳定事务错误码并仅保留安全原因码。
+  if ((stage === 'lock' || stage === 'write')
+    && String(detailCode || '').startsWith('DEMO_OWNERSHIP_')) {
+    return createSafeExecuteError(stageCode, domainName, { causeCode: detailCode });
+  }
+  if (isSafeEnergyAnalysisErrorCode(detailCode)) {
+    return createSafeExecuteError(detailCode, domainName);
+  }
   return createSafeExecuteError(stageCode, domainName);
 }
 
@@ -641,12 +662,21 @@ function requireSingleBatchDemoOwnershipBinding(descriptor, demoContext) {
   }
   const artifact = requireDemoArtifactHandler(demoContext.artifactKey, demoContext.handlerKey);
   const batchRole = artifact.batchRoles.length === 1 ? artifact.batchRoles[0] : null;
+  // expected import type 必须来自描述器关联的固定模板，不能由描述器副本单独改写。
+  const template = getEnergyAnalysisImportTemplate(descriptor.templateType);
+  const templateImportType = Array.isArray(template.importTypes)
+    && template.importTypes.length === 1
+    ? template.importTypes[0]
+    : null;
   if (artifact.artifactKey !== ownershipBinding.artifactKey
     || artifact.templateType !== descriptor.templateType
     || !batchRole
     || batchRole.role !== ownershipBinding.batchRole
     || batchRole.entityType !== ownershipBinding.entityType
-    || ownershipBinding.expectedImportType !== ownershipBinding.entityType) {
+    || typeof ownershipBinding.expectedImportType !== 'string'
+    || ownershipBinding.expectedImportType.trim() !== ownershipBinding.expectedImportType
+    || !ownershipBinding.expectedImportType
+    || ownershipBinding.expectedImportType !== templateImportType) {
     throw badRequest('当前演示 artifact 与单批次导入描述器不匹配。', {
       code: 'ENERGY_ANALYSIS_IMPORT_DEMO_OWNERSHIP_BINDING_MISMATCH'
     });
@@ -772,6 +802,12 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
     if (!descriptor || typeof descriptor.buildPreview !== 'function' || typeof descriptor.insertCandidates !== 'function') {
       throw badRequest('单批次导入缺少领域重算或写入构建器。', { code: 'ENERGY_ANALYSIS_IMPORT_EXECUTE_BUILDER_REQUIRED' });
     }
+    if (options.demoContext && options.actor?.userId !== undefined
+      && options.actor.userId !== options.demoContext.userId) {
+      throw badRequest('导入 actor 与 managed context 用户不一致。', {
+        code: 'ENERGY_ANALYSIS_IMPORT_ACTOR_MISMATCH'
+      });
+    }
     const batchId = normalizeBatchId(body.batchId);
     const template = getEnergyAnalysisImportTemplate(descriptor.templateType);
     const databaseContext = openServiceDatabase(options);
@@ -791,6 +827,41 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
         throw badRequest('当前原文件 SHA-256 与 preview 批次不一致。', {
           code: 'ENERGY_ANALYSIS_IMPORT_CURRENT_FILE_SHA256_MISMATCH'
         });
+      }
+      if (options.demoContext && descriptor.demoOwnership
+        && batch.auditPhase === 'execute'
+        && ['completed', 'completed_with_errors'].includes(batch.status)) {
+        const ownershipBinding = requireSingleBatchDemoOwnershipBinding(descriptor, options.demoContext);
+        if (batch.importType !== ownershipBinding.expectedImportType
+          || body.confirmText !== template.confirmText
+          || body.requireBackup !== true
+          || body.acknowledgeSkippedRisks !== true) {
+          throw badRequest('演示终态回放请求与已执行批次合同不一致。', {
+            code: 'ENERGY_ANALYSIS_IMPORT_TERMINAL_REPLAY_MISMATCH'
+          });
+        }
+        const replay = validateDemoContextTerminalReplay({
+          db: databaseContext.db,
+          token: options.demoContext.token,
+          userId: options.demoContext.userId,
+          artifactKey: options.demoContext.artifactKey,
+          handlerKey: options.demoContext.handlerKey,
+          uploadFileSha256: safeFile.fileSha256,
+          previewDigest: batch.previewAuditDigest,
+          batchBindings: [{
+            batchId,
+            batchRole: ownershipBinding.batchRole.role,
+            importType: ownershipBinding.expectedImportType
+          }]
+        });
+        const replayBatch = replay.batches[0];
+        return {
+          ...replayBatch.executeResult,
+          persistsImportBatch: true,
+          batchId,
+          auditBatch: replayBatch.auditBatch,
+          terminalReplay: true
+        };
       }
       const recomputedDomainPreview = descriptor.buildPreview({
         db: databaseContext.db,
@@ -900,6 +971,17 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
           });
           const latestAuthorization = authorizePersistedBatchExecute(body, latestBatch, latestPreview, safeFile.buffer, secret);
           requireExecuteAuthorization(latestAuthorization);
+          validateDemoContextWithOwnershipTransaction({
+            transactionScope,
+            demoContext: {
+              token: options.demoContext.token,
+              userId: options.demoContext.userId,
+              artifactKey: options.demoContext.artifactKey,
+              handlerKey: options.demoContext.handlerKey
+            },
+            uploadFileSha256: safeFile.fileSha256,
+            previewDigest: latestPreview.previewAuditDigest
+          });
 
           failureStage = 'backup';
           // 私有 ownership 事务自锁内重算起持有 RESERVED 锁；在线备份读取锁前已提交快照。
@@ -916,7 +998,11 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
             batchId,
             candidateRows: latestPreview.candidateRows,
             preview: latestPreview,
-            options
+            options: {
+              ...options,
+              demoUploadFileSha256: safeFile.fileSha256,
+              demoPreviewDigest: latestPreview.previewAuditDigest
+            }
           });
           const ownership = registerSingleBatchDemoOwnershipInTransaction({
             transactionScope,
@@ -1059,7 +1145,11 @@ async function executeEnergyAnalysisSingleBatchImport(body = {}, descriptor, opt
     }
   } catch (error) {
     const safeError = normalizeSafeExecuteError(error, failureStage, descriptor?.domainName);
-    if (trustedFailureAuditBatchId !== null) {
+    // 显式声明 rollback-only 的 managed artifact 禁止事务外失败审计破坏可重试 preview。
+    const rollbackOnlyManagedFailure = Boolean(
+      options.demoContext && descriptor?.demoOwnership?.failureAuditPolicy === 'rollback-only'
+    );
+    if (trustedFailureAuditBatchId !== null && !rollbackOnlyManagedFailure) {
       markEnergyAnalysisSingleBatchFailure(trustedFailureAuditBatchId, descriptor || {}, safeError, options, backup);
     }
     throw safeError;

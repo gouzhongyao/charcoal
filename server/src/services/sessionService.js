@@ -79,7 +79,8 @@ function requireSession(token) {
 }
 
 function sanitizeAuditDetail(value) {
-  if (!value || typeof value !== 'object') return value || null;
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object') return value;
   const blocked = new Set(['password', 'passwordhash', 'currentpassword', 'newpassword', 'token', 'authorization']);
   if (Array.isArray(value)) return value.map(sanitizeAuditDetail);
   return Object.entries(value).reduce((result, [key, item]) => {
@@ -88,14 +89,16 @@ function sanitizeAuditDetail(value) {
   }, {});
 }
 
-function recordOperation({ userId = null, operation, targetType = null, targetId = null, detail = null, ip = null } = {}) {
-  const db = openDatabase();
+/** 在独立连接或调用者持有的 SQLite 事务中写入统一操作日志。 */
+function recordOperation({ userId = null, operation, targetType = null, targetId = null, detail = null, ip = null, db: providedDb = null } = {}) {
+  const ownedDb = !providedDb;
+  const db = providedDb || openDatabase();
   try {
     db.prepare(`INSERT INTO sys_operation_logs (user_id, operation, target_type, target_id, detail_json, ip, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .run(userId, operation, targetType, targetId === null ? null : String(targetId), JSON.stringify(sanitizeAuditDetail(detail)), ip, now());
   } finally {
-    db.close();
+    if (ownedDb) db.close();
   }
 }
 

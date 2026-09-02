@@ -1,7 +1,33 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { normalizeTrustedInternalRoutePath, resolveTrustedRegisteredRoute } from '../utils/navigationRoutes.js';
+
+// 直接复用服务端冻结的 manifest 与 registry，避免客户端测试复制 artifact 数量、key 或顺序。
+const require = createRequire(import.meta.url);
+// 复用项目现有 AxiosHeaders，验证真实客户端下载响应头容器。
+const { AxiosHeaders } = require('axios');
+const {
+  DEMO_DATASET_ID,
+  DEMO_MANIFEST_VERSION,
+  DEMO_PARK_ARTIFACTS,
+  getDemoParkManifestDigest,
+  validateDemoParkManifest
+} = require('../../../server/src/services/demoParkDatasetService.js');
+const {
+  ACTIVE_IDENTITY_RUN_STATUSES,
+  _test: demoRunTestContract
+} = require('../../../server/src/services/demoRunService.js');
+const { _test: demoDataRouteTestContract } = require('../../../server/src/routes/demoData.js');
+const {
+  DEMO_ARTIFACT_REGISTRY,
+  validateDemoArtifactRegistry
+} = require('../../../server/src/services/demoArtifactRegistry.js');
+const {
+  getDemoCapabilities,
+  getDemoConfirmationTexts
+} = require('../../../server/src/services/demoRuntimeService.js');
 
 // 集中页、共享 API、服务端事实源和保留正式能力的业务页源码模块。
 const sourceUrls = Object.freeze({
@@ -29,9 +55,11 @@ const sourceUrls = Object.freeze({
 // 读取全部静态契约文件并按稳定名称建立索引。
 const sourceEntries = await Promise.all(Object.entries(sourceUrls).map(async ([name, url]) => [name, await readFile(url, 'utf8')]));
 const sources = Object.freeze(Object.fromEntries(sourceEntries));
-// 从服务端源码提取真实 artifactKey，仅验证集中页没有复制条目，不执行可能正处于迁移中的服务端初始化。
-const serverArtifactKeys = [...sources.serverDemoRegistry.matchAll(/artifactKey: '([^']+)'/g)].map((match) => match[1]);
-const uniqueServerArtifactKeys = [...new Set(serverArtifactKeys)];
+// 从服务端冻结事实源读取 manifest/registry 身份与顺序，集中页只消费目录响应而不复制条目。
+const serverManifestArtifactKeys = DEMO_PARK_ARTIFACTS.map((artifact) => artifact.artifactKey);
+const serverManifestArtifactOrders = DEMO_PARK_ARTIFACTS.map((artifact) => artifact.order);
+const serverRegistryArtifactKeys = DEMO_ARTIFACT_REGISTRY.map((artifact) => artifact.artifactKey);
+const registeredArtifactCount = serverRegistryArtifactKeys.length;
 
 // 分散业务 API 的托管下载必须复用既有正式契约，并把 artifact/handler identity 传给共享下载函数。
 assert.match(sources.energyAnalysisApi, /const contract = analysisDemoArtifact\(artifactKey\);[\s\S]*?undefined,[\s\S]*?contract\s*\n\s*\)/, '能源分析下载必须传入正式 artifact/handler 契约。');
@@ -39,9 +67,30 @@ assert.match(sources.energyBenchmarksApi, /const config = energyBenchmarkImportD
 assert.match(sources.energyBalancesApi, /undefined,[\s\S]*?ENERGY_BALANCE_DEMO_IMPORT\s*\n\s*\)/, '能效平衡下载必须传入正式 artifact/handler 契约。');
 assert.match(sources.energyFlowsApi, /const contract = energyFlowDemoArtifact\(artifactKey\);[\s\S]*?undefined,[\s\S]*?contract\s*\n\s*\)/, '能流下载必须传入正式 artifact/handler 契约。');
 
-// 服务端 registry 仍是唯一条目事实源，前端集中页不得复制 25 项映射。
-assert.strictEqual(uniqueServerArtifactKeys.length, 25, '服务端演示 manifest 必须声明 25 个唯一 artifactKey。');
-for (const artifactKey of uniqueServerArtifactKeys) {
+// 服务端 manifest 与 registry 必须共同声明当前 29 项唯一 key，并保持连续 order 与相同顺序。
+assert.strictEqual(validateDemoParkManifest(), true, '服务端演示 manifest 自校验必须通过。');
+assert.strictEqual(validateDemoArtifactRegistry(), true, '服务端演示 registry 自校验必须通过。');
+assert.strictEqual(
+  new Set(serverManifestArtifactKeys).size,
+  serverManifestArtifactKeys.length,
+  '服务端演示 manifest 的 artifactKey 必须唯一。'
+);
+assert.strictEqual(
+  new Set(serverRegistryArtifactKeys).size,
+  registeredArtifactCount,
+  '服务端演示 registry 的 artifactKey 必须唯一。'
+);
+assert.deepStrictEqual(
+  serverManifestArtifactKeys,
+  serverRegistryArtifactKeys,
+  `服务端演示 manifest 必须与 registry 的 ${registeredArtifactCount} 项 key 和顺序完全一致。`
+);
+assert.deepStrictEqual(
+  serverManifestArtifactOrders,
+  Array.from({ length: registeredArtifactCount }, (_item, index) => index + 1),
+  `服务端演示 manifest 的 ${registeredArtifactCount} 项 order 必须从 1 连续递增。`
+);
+for (const artifactKey of serverManifestArtifactKeys) {
   assert.strictEqual(sources.demoDataPage.includes(artifactKey), false, `集中页不得硬编码 registry 条目 ${artifactKey}。`);
 }
 assert.match(sources.demoDataPage, /const artifacts = computed\(\(\) => \[\.\.\.\(catalog\.value\?\.artifacts \|\| \[\]\)\]/, '集中页必须直接渲染服务端 catalog artifacts。');
@@ -60,8 +109,11 @@ const initialStateEnd = sources.demoDataPage.indexOf('/** 加载服务端标准�
 const initialStateBlock = sources.demoDataPage.slice(initialStateStart, initialStateEnd);
 assert.notStrictEqual(initialStateStart, -1, '集中页必须定义初始状态加载方法。');
 assert.match(sources.demoDataPage, /onMounted\(loadInitialState\)/);
-assert.match(initialStateBlock, /getDemoStatus/);
+assert.match(initialStateBlock, /refreshStatusProjection/);
 assert.match(initialStateBlock, /loadTemplateCatalog/);
+const refreshStatusProjectionBlock = sources.demoDataPage.match(/async function refreshStatusProjection\(\) \{([\s\S]*?)\n\}/)?.[1] || '';
+assert.match(refreshStatusProjectionBlock, /getDemoStatus/);
+assert.doesNotMatch(refreshStatusProjectionBlock, /getDemoCatalog|prepareDemoRun|ensureDemoRun|loadTemplateCatalog|loadOwnership/, 'status 恢复只能读取 status，不得触发其它请求。');
 assert.doesNotMatch(initialStateBlock, /getDemoCatalog|prepareDemoRun|ensureDemoRun/, '页面挂载不得读取 catalog 或创建、复用 active run。');
 assert.match(sources.demoDataPage, /catalog 读取与 active run 准备是两个独立动作；进入页面不会自动创建 run/);
 
@@ -74,7 +126,7 @@ assert.match(sources.demoDataPage, /const runError = ref\(''\)/);
 assert.match(sources.demoDataPage, /const activeRun = ref\(null\)/, 'activeRun 必须是独立状态。');
 assert.doesNotMatch(sources.demoDataPage, /activeRun = computed\(\(\) => catalog\.value\?\.run/, 'activeRun 不得从 catalog.run 唯一派生。');
 const loadCatalogStart = sources.demoDataPage.indexOf('async function loadCatalog()');
-const loadCatalogEnd = sources.demoDataPage.indexOf('/** 显式 POST 准备 active run', loadCatalogStart);
+const loadCatalogEnd = sources.demoDataPage.indexOf('/** 显式 POST 创建、复用或自动换代 active run', loadCatalogStart);
 const loadCatalogBlock = sources.demoDataPage.slice(loadCatalogStart, loadCatalogEnd);
 assert.match(loadCatalogBlock, /getDemoCatalog/);
 assert.doesNotMatch(loadCatalogBlock, /prepareDemoRun|applyRun|activeRun\.value/, 'catalog 读取不得准备或推断 active run。');
@@ -82,8 +134,21 @@ const prepareRunStart = sources.demoDataPage.indexOf('async function prepareRun(
 const prepareRunEnd = sources.demoDataPage.indexOf('/** 下载服务端标准模板目录项。 \*/', prepareRunStart);
 const prepareRunBlock = sources.demoDataPage.slice(prepareRunStart, prepareRunEnd);
 assert.match(prepareRunBlock, /safeRequest\(prepareDemoRun\)/);
+assert.match(prepareRunBlock, /const turnover = readDemoRunTurnover\(result\.value\)/, '显式 prepare 成功后必须读取服务端 turnover 元数据。');
 assert.match(prepareRunBlock, /applyRun\(result\.value\)/);
-assert.doesNotMatch(prepareRunBlock, /catalog\.value = null/, 'POST run 发生 409 等失败时必须保留已加载 catalog。');
+assert.match(prepareRunBlock, /turnover\.performed === true\) clearDemoContexts\(\)/, '显式 prepare 自动换代必须清理全部旧标签页 context。');
+assert.match(prepareRunBlock, /turnover\.performed === true[\s\S]*?formatDemoRunTurnoverSuccessMessage/, '显式 prepare 自动换代后必须展示非阻塞成功提示。');
+assert.doesNotMatch(prepareRunBlock, /catalog\.value = null/, 'POST run 失败时必须保留已加载 catalog。');
+const canPrepareRunStart = sources.demoDataPage.indexOf('const canPrepareRun = computed');
+const canPrepareRunEnd = sources.demoDataPage.indexOf('/** 是否展示 catalog 中的下载操作。 */', canPrepareRunStart);
+const canPrepareRunBlock = sources.demoDataPage.slice(canPrepareRunStart, canPrepareRunEnd);
+assert.match(canPrepareRunBlock, /!activeRunCleanupBlocked\.value/, 'cleaning 阻断期间必须禁用显式 prepare，避免重复触发 409。');
+assert.match(sources.demoDataPage, /activeRunCleanupBlocked[\s\S]*?显式准备与 managed 下载已临时禁用，请稍后重试/, '页面必须提示 cleaning 阻断期间稍后重试。');
+assert.doesNotMatch(sources.demoDataPage, /DEMO_ACTIVE_RUN_MANIFEST_CONFLICT|必须保留并人工处置|manifest 不一致必须人工处置/, '页面不得保留普通 manifest mismatch 的人工处置特判或文案。');
+assert.match(sources.demoDataPage, /active run 自动换代成功/, '页面必须为显式 prepare 自动换代提供成功提示。');
+const turnoverMessageContract = sources.demoDataApi.match(/export function formatDemoRunTurnoverSuccessMessage\([\s\S]*?\n\}/)?.[0] || '';
+assert.match(turnoverMessageContract, /oldManifestVersion[\s\S]*?newManifestVersion/, '换代提示必须包含旧、新 manifest version。');
+assert.doesNotMatch(turnoverMessageContract, /manifestDigest|digest/i, '换代成功提示不得输出过长 manifest digest。');
 
 // 标准模板目录必须来自服务端 /templates，下载路径经过站内路径规范化。
 assert.match(sources.demoDataApi, /url: '\/templates', method: 'get'/);
@@ -98,6 +163,32 @@ assert.match(sources.demoDataApi, /throw new Error\('服务端未声明受支持
 assert.match(sources.demoDataApi, /const DEMO_CONTEXT_STORAGE_PREFIX = 'charcoal\.demoContext\.v2'/, '新编码 context 必须使用独立 v2 prefix。');
 assert.doesNotMatch(sources.demoDataApi, /charcoal\.demoContext\.v1/, '生产 demoData API 不得读取或清理旧 v1 context。');
 assert.match(sources.demoDataApi, /downloadManagedDemoArtifact\(config, fallbackName, storage, expectedIdentity\)/, '托管下载必须要求调用方传入预期身份。');
+for (const headerName of ['x-demo-run-id', 'x-demo-run-reused', 'x-demo-run-auto-superseded', 'x-demo-run-superseded-from', 'x-demo-runtime-epoch']) {
+  assert.match(sources.demoDataApi, new RegExp(headerName), `托管下载必须读取稳定响应头 ${headerName}。`);
+}
+assert.match(sources.demoDataApi, /const turnover = readDemoRunTurnover\(result\);[\s\S]*?clearDemoContextsForRun\(turnover\.oldRunId, contextStorage\)[\s\S]*?demoContextStored: replacement\.ok, turnover, clearedPredecessorContextCount/, '共享下载 helper 必须保存 successor context，并按 predecessor run 定向清理旧 context。');
+assert.doesNotMatch(sources.demoDataPage.match(/async function refreshStatusAfterManagedDownload\([\s\S]*?\n\}/)?.[0] || '', /clearDemoContexts\(\)/, 'managed 下载后不得无条件清理全部 context。');
+assert.match(sources.demoDataPage, /artifact\.downloadLifecycle === 'managed-context-auto-runtime'[\s\S]*?refreshStatusAfterManagedDownload\(result\.value\)/, 'managed 下载成功后必须刷新 status。');
+const refreshManagedStatusBlock = sources.demoDataPage.match(/async function refreshStatusAfterManagedDownload\(downloadResult\) \{([\s\S]*?)\n\}/)?.[1] || '';
+assert.match(refreshManagedStatusBlock, /turnover\?\.performed === true[\s\S]*?clearRunGovernanceProjection\(\)/, 'managed 自动换代后必须清空旧 ownership 与 cleanup 投影。');
+assert.match(refreshManagedStatusBlock, /beginStatusRequest\(\)[\s\S]*?safeRequest\(getDemoStatus\)[\s\S]*?isLatestDemoRequest[\s\S]*?applyStatus/, 'managed status 刷新必须拒绝乱序旧响应。');
+assert.ok(sources.demoDataPage.includes("function applyStatus(response, expectedRunId = '')"), 'status 应支持 prepare 后的 expected runId 守卫。');
+const applyStatusStart = sources.demoDataPage.indexOf("function applyStatus(response, expectedRunId = '')");
+const applyStatusEnd = sources.demoDataPage.indexOf('/** 应用显式 POST run 成功结果', applyStatusStart);
+const applyStatusBlock = sources.demoDataPage.slice(applyStatusStart, applyStatusEnd);
+assert.match(applyStatusBlock, /readStatusProjection\(response\)/, 'status 必须先验证完整投影再落地。');
+assert.match(applyStatusBlock, /expectedRunId/, 'prepare 后 status 必须核对 expected runId。');
+assert.match(applyStatusBlock, /previousRunId !== nextRunId\) clearRunGovernanceProjection\(\)/, 'status 返回的 run ID 改变时必须清空旧治理投影。');
+const ownershipRequestBlock = sources.demoDataPage.match(/async function loadOwnership\(options = \{\}\) \{([\s\S]*?)\n\}/)?.[1] || '';
+assert.match(ownershipRequestBlock, /isLatestDemoRunRequest\(requestId, ownershipRequestSequence\.value, runId, currentActiveRunId\(\)\)/, 'ownership 响应落地前必须核对请求序号和当前 run ID。');
+assert.match(sources.demoDataPage, /isLatestDemoRunRequest\(requestId, cleanupPreviewRequestSequence\.value, runId, currentActiveRunId\(\)\)/, 'cleanup preview 响应必须核对请求序号和当前 run ID。');
+assert.match(sources.demoDataPage, /isLatestDemoRunRequest\(requestId, cleanupExecuteRequestSequence\.value, runId, currentActiveRunId\(\)\)/, 'cleanup execute 响应必须核对请求序号和当前 run ID。');
+const cleanupExecuteBlock = sources.demoDataPage.match(/async function executeCleanup\(\) \{([\s\S]*?)\n\}/)?.[1] || '';
+assert.match(cleanupExecuteBlock, /const resultGeneration = beginCleanupResultAction\(\)[\s\S]*?isLatestDemoRequest\(resultGeneration, cleanupResultGeneration\.value\)/, 'cleanup execute 必须使用共享 generation 拒绝跨类型旧响应。');
+const cleanupStatusBlock = sources.demoDataPage.match(/async function loadCleanupStatus\(cleanupRunId\) \{([\s\S]*?)\n\}/)?.[1] || '';
+assert.match(cleanupStatusBlock, /const resultGeneration = beginCleanupResultAction\(\)[\s\S]*?isLatestDemoCleanupResultRequest\([\s\S]*?normalizedCleanupRunId,[\s\S]*?cleanupRunIdInput\.value/, 'cleanup status 查询必须同时核对共享 generation、请求 cleanupRunId 与当前输入身份。');
+const clearGovernanceBlock = sources.demoDataPage.match(/function clearRunGovernanceProjection\(options = \{\}\) \{([\s\S]*?)\n\}/)?.[1] || '';
+assert.match(clearGovernanceBlock, /cleanupStatusRequestSequence\.value \+= 1[\s\S]*?beginCleanupResultAction\(\)/, '治理投影清空必须使旧 cleanup query 和共享结果响应失效。');
 assert.match(sources.demoDataApi, /托管演示下载缺少预期的 artifactKey 或 handlerKey/, '缺少预期身份必须明确失败。');
 assert.doesNotMatch(sources.demoDataApi, /captureDemoContextStorage|storeDemoContextIfStorageUnchanged|expectedIdentity = null/, '托管下载不得保留无身份 fallback。');
 assert.match(sources.demoDataPage, /downloadDemoCatalogArtifact\(artifact, format\)/);
@@ -115,10 +206,11 @@ assert.match(sources.demoDataPage, /targetRoute 未注册为当前账号可用�
 assert.doesNotMatch(sources.demoDataPage, /window\.open|target="_blank"|location\.href/, '下载后的目标导航不得打开新标签页或把 context 放入 URL。');
 assert.match(sources.demoDataPage, /const canSeeCatalogActions = computed\(\(\) => capability\('download'\) && allowedAction\('download'\)/, 'artifact 下载必须组合 capability 与 allowedAction。');
 const canDownloadArtifactBlock = sources.demoDataPage.match(/function canDownloadArtifact\(artifact\) \{([\s\S]*?)\n\}/)?.[1] || '';
-assert.match(canDownloadArtifactBlock, /if \(!canSeeCatalogActions\.value \|\| !runtime\.value\.enabled\) return false;/, 'artifact 下载必须组合真实授权和运行态。');
-assert.ok(canDownloadArtifactBlock.indexOf("lifecycle === 'stateless-formal-import'") < canDownloadArtifactBlock.indexOf('!hasActiveRun.value'), 'stateless 正式下载必须在 active run 门禁之前放行。');
-assert.match(canDownloadArtifactBlock, /if \(!hasActiveRun\.value \|\| activeRunManifestBlocked\.value\) return false;/, '只有 managed lifecycle 必须要求有效且兼容的 active run。');
-assert.match(canDownloadArtifactBlock, /managed-context-auto-runtime' && capability\('contextIssue'\)/, '托管下载必须在服务端 context 签发能力明确启用时开放。');
+assert.match(canDownloadArtifactBlock, /canDownloadDemoCatalogArtifact\(\{/, '页面下载门禁必须复用可执行的纯逻辑合同。');
+for (const field of ['downloadCapable', 'downloadAllowed', 'runtimeAvailable', 'runtimeEnabled', 'contextIssueCapable', 'hasActiveRun', 'activeRunStatus', 'activeRunCompatibility']) {
+  assert.match(canDownloadArtifactBlock, new RegExp(`${field}:`), `页面下载门禁必须传入 ${field}。`);
+}
+assert.doesNotMatch(canDownloadArtifactBlock, /activeRunManifestBlocked/, 'managed 下载不得复用 cleanup 的 manifest 写入门禁。');
 const downloadAndNavigateButton = sources.demoDataPage.match(/<el-button(?=[^>]*@click="downloadArtifactAndNavigate\(row\)")[^>]*>/)?.[0] || '';
 const downloadOnlyButton = sources.demoDataPage.match(/<el-button(?=[^>]*@click="downloadArtifactOnly\(row\)")[^>]*>/)?.[0] || '';
 assert.match(downloadAndNavigateButton, /:disabled="!canDownloadArtifact\(row\) \|\| !targetRoute\(row\) \|\| Boolean\(artifactDownloadKey\)"/, '下载并前往必须在下载前把无效 targetRoute 标记为不可用。');
@@ -165,13 +257,15 @@ for (const canonicalAction of ['toggleRuntime', 'loadCatalog', 'prepareRun', 'do
   assert.match(sources.demoDataPage, new RegExp(canonicalAction), `allowedActions 必须消费 canonical 字段 ${canonicalAction}。`);
 }
 assert.match(sources.demoDataPage, /ownershipSummary: 'ownership 汇总'/);
-assert.match(sources.demoDataPage, /const canLoadOwnership = computed\(\(\) => Boolean\(capability\('ownershipSummary'\) && allowedAction\('ownershipSummary'\)/, 'ownership 汇总必须同时由 capability 和 allowedAction 门控。');
-const canLoadOwnershipStart = sources.demoDataPage.indexOf('const canLoadOwnership = computed');
-const canLoadOwnershipEnd = sources.demoDataPage.indexOf('/** 是否允许请求 cleanup 预演', canLoadOwnershipStart);
-const canLoadOwnershipBlock = sources.demoDataPage.slice(canLoadOwnershipStart, canLoadOwnershipEnd);
-assert.doesNotMatch(canLoadOwnershipBlock, /activeRunManifestBlocked/, 'manifest-conflict run 的 ownership 只读汇总不得被前端冲突写入门禁阻断。');
-assert.match(canLoadOwnershipBlock, /runtime\.value\.enabled[\s\S]*?hasActiveRun\.value/, 'ownership 汇总仍需运行期和 active run 只读前置条件。');
-assert.match(sources.demoDataPage, /if \(!canLoadOwnership\.value \|\| !runId\) return/, 'ownership 汇总请求必须按真实授权门控。');
+assert.match(sources.demoDataPage, /const canReadOwnership = computed\(\(\) => Boolean\(capability\('ownershipSummary'\) && allowedAction\('ownershipSummary'\)/, 'ownership 汇总必须同时由 capability 和 allowedAction 门控。');
+const canReadOwnershipStart = sources.demoDataPage.indexOf('const canReadOwnership = computed');
+const canReadOwnershipEnd = sources.demoDataPage.indexOf('/** 是否允许请求 cleanup 预演', canReadOwnershipStart);
+const canReadOwnershipBlock = sources.demoDataPage.slice(canReadOwnershipStart, canReadOwnershipEnd);
+assert.doesNotMatch(canReadOwnershipBlock, /activeRunManifestBlocked/, 'manifest-conflict run 的 ownership 只读汇总不得被前端冲突写入门禁阻断。');
+assert.match(canReadOwnershipBlock, /runtime\.value\.enabled[\s\S]*?hasActiveRun\.value/, 'ownership 汇总仍需运行期和 active run 只读前置条件。');
+assert.match(canReadOwnershipBlock, /const canLoadOwnership = computed\(\(\) => canReadOwnership\.value && !ownershipLoading\.value\)/, '按钮门禁必须独立阻止重复点击。');
+assert.match(ownershipRequestBlock, /!canReadOwnership\.value \|\| !runId/, 'ownership 汇总请求必须按稳定授权门禁。');
+assert.match(ownershipRequestBlock, /ownershipLoading\.value && options\.supersede !== true/, 'ownership 汇总在途替换必须由显式 supersede 控制。');
 for (const field of ['totalCount', 'activeCount', 'cleanedCount', 'cleanupCandidateCount', 'cleanupBlockerCount', 'blockers']) {
   assert.match(sources.demoDataPage, new RegExp(`summaryNumber\\(ownership, \\['${field}'\\]\\)`), `ownership 汇总必须适配 ${field}。`);
 }
@@ -183,9 +277,26 @@ const canPreviewCleanupStart = sources.demoDataPage.indexOf('const canPreviewCle
 const canPreviewCleanupEnd = sources.demoDataPage.indexOf('/** 是否展示 cleanup execute 表单。 */', canPreviewCleanupStart);
 const canPreviewCleanupBlock = sources.demoDataPage.slice(canPreviewCleanupStart, canPreviewCleanupEnd);
 assert.doesNotMatch(canPreviewCleanupBlock, /capability\('(ownershipRegistration|cleanupExecute)'\)/, 'cleanup preview 不得依赖 ownershipRegistration 或 cleanupExecute capability。');
-assert.match(canPreviewCleanupBlock, /!activeRunManifestBlocked\.value/, 'manifest-conflict run 的 cleanup preview 写入入口必须继续关闭。');
+assert.match(canPreviewCleanupBlock, /!activeRunManifestBlocked\.value/, '不兼容或不可写 run 的 cleanup preview 写入入口必须继续关闭。');
+assert.match(canPreviewCleanupBlock, /cleanupActionsIdle\.value/, 'query 或 execute loading 时 cleanup preview 必须禁用。');
+const cleanupActionsIdleBlock = sources.demoDataPage.match(/const cleanupActionsIdle = computed\(\(\) => canStartDemoCleanupAction\(\{([\s\S]*?)\n\}\)\);/)?.[1] || '';
+for (const loadingField of ['cleanupPreviewLoading.value', 'cleanupExecuteLoading.value', 'cleanupStatusLoading.value']) {
+  assert.match(cleanupActionsIdleBlock, new RegExp(loadingField.replace('.', '\\.')), `cleanup 互斥门禁必须包含 ${loadingField}。`);
+}
+const cleanupRunEligibilityBlock = sources.demoDataPage.match(/const activeRunManifestBlocked = computed\(\(\) => hasActiveRun\.value && \(([\s\S]*?)\n\)\);/)?.[1] || '';
+assert.match(cleanupRunEligibilityBlock, /writeEligible !== true/, 'cleanup 必须要求服务端明确 writeEligible=true。');
+assert.match(cleanupRunEligibilityBlock, /manifestCompatible !== true/, 'cleanup 必须要求服务端明确 manifestCompatible=true。');
+assert.match(cleanupRunEligibilityBlock, /activeRunCleanupBlocked\.value/, 'cleaning 与 cleanup-in-progress-blocked 必须继续关闭 cleanup。');
+const activeRunCleanupBlockedBlock = sources.demoDataPage.match(/const activeRunCleanupBlocked = computed\(\(\) => hasActiveRun\.value && isDemoCleanupInProgressBlocked\(\{([\s\S]*?)\n\}\)\);/)?.[1] || '';
+assert.match(activeRunCleanupBlockedBlock, /activeRunStatus: activeRunProjection\.value\.status/, 'cleaning 阻断判断必须消费 active run status。');
+assert.match(activeRunCleanupBlockedBlock, /activeRunCompatibility: activeRunCompatibility\.value/, 'cleaning 阻断判断必须消费服务端 compatibility state。');
+assert.match(sources.demoDataApi, /cleanup-in-progress-blocked/, '客户端必须识别服务端统一 cleaning state。');
 assert.match(sources.demoDataPage, /const canSeeCleanupExecute = computed\(\(\) => capability\('ownershipRegistration'\) && capability\('cleanupExecute'\) && allowedAction\('cleanupExecute'\)/);
-assert.match(sources.demoDataPage, /canSeeCleanupExecute\.value[\s\S]*?!activeRunManifestBlocked\.value[\s\S]*?cleanupPreview\.value\?\.executable === true/, 'manifest-conflict run 的 cleanup execute 门禁不得放宽。');
+assert.match(sources.demoDataPage, /canSeeCleanupExecute\.value[\s\S]*?!activeRunManifestBlocked\.value[\s\S]*?cleanupPreview\.value\?\.executable === true/, '不兼容或不可写 run 的 cleanup execute 门禁不得放宽。');
+const canExecuteCleanupStart = sources.demoDataPage.indexOf('const canExecuteCleanup = computed');
+const canExecuteCleanupEnd = sources.demoDataPage.indexOf('/** 安全捕获异步请求。 */', canExecuteCleanupStart);
+const canExecuteCleanupBlock = sources.demoDataPage.slice(canExecuteCleanupStart, canExecuteCleanupEnd);
+assert.match(canExecuteCleanupBlock, /cleanupActionsIdle\.value/, 'preview 或 status query loading 时 cleanup execute 必须禁用。');
 assert.match(sources.demoDataPage, /cleanupBlockers = computed/);
 assert.match(sources.demoDataPage, /清理预演 blocker/);
 const cleanupResultAlertBlock = sources.demoDataPage.match(/const cleanupResultAlert = computed\(\(\) => \{([\s\S]*?)\n\}\);/)?.[1] || '';
@@ -213,6 +324,10 @@ assert.match(sources.demoDataPage, /<el-form v-if="canSeeCleanupStatus"[\s\S]*?v
 assert.match(sources.demoDataPage, /const canSeeCleanupStatus = computed\(\(\) => capability\('cleanupRunStatus'\) && allowedAction\('readCleanupRunStatus'\)\);/, 'cleanup 状态查询只读门禁只依赖 capability 和 canonical allowedAction。');
 assert.doesNotMatch(sources.demoDataPage, /allowedAction\('cleanupRunStatus'\)/, 'cleanup 状态查询不得接受非 canonical allowedAction 别名。');
 assert.match(sources.demoDataPage, /const canQueryCleanupStatus = computed\(\(\) => Boolean\([\s\S]*?cleanupRunIdInput\.value\.trim\(\)/, 'cleanup 状态查询必须要求用户提供 cleanupRunId。');
+const canQueryCleanupStatusStart = sources.demoDataPage.indexOf('const canQueryCleanupStatus = computed');
+const canQueryCleanupStatusEnd = sources.demoDataPage.indexOf('/** 当前预演使用的固定确认文本', canQueryCleanupStatusStart);
+const canQueryCleanupStatusBlock = sources.demoDataPage.slice(canQueryCleanupStatusStart, canQueryCleanupStatusEnd);
+assert.match(canQueryCleanupStatusBlock, /cleanupActionsIdle\.value/, 'preview 或 execute loading 时 cleanup status query 必须禁用。');
 const canSeeCleanupStatusStart = sources.demoDataPage.indexOf('const canSeeCleanupStatus = computed');
 const canSeeCleanupStatusEnd = sources.demoDataPage.indexOf('/** 当前预演使用的固定确认文本', canSeeCleanupStatusStart);
 assert.doesNotMatch(sources.demoDataPage.slice(canSeeCleanupStatusStart, canSeeCleanupStatusEnd), /runtime\.value\.(enabled|available)/, 'runtime 关闭或不可用时仍必须允许有权限用户查询 cleanup 状态。');
@@ -224,7 +339,7 @@ assert.match(sources.demoDataPage, /const clientRequestId = cleanupExecuteReques
 assert.match(sources.demoDataPage, /clientRequestId,[\s\S]*?previewDigest: preview\.previewDigest,[\s\S]*?confirmationText/);
 assert.doesNotMatch(sources.demoDataPage, /clientRequestId: createClientRequestId\(\), previewDigest/, '同一 cleanup 预演的执行失败重试不得生成新的幂等 ID。');
 assert.match(sources.demoDataPage, /if \(!canExecuteCleanup\.value \|\| cleanupExecuteLoading\.value \|\| clientRequestId !== cleanupExecuteRequestId\.value\) return/);
-assert.match(sources.demoDataPage, /clearDemoContexts\(\);[\s\S]*?catalog\.value = null;[\s\S]*?activeRun\.value = null;[\s\S]*?ownership\.value = null;[\s\S]*?cleanupPreview\.value = null/);
+assert.match(cleanupExecuteBlock, /cleanupResult\.value = result\.value\?\.data \|\| \{\};[\s\S]*?clearDemoContexts\(\);[\s\S]*?catalog\.value = null;[\s\S]*?activeRun\.value = null;[\s\S]*?clearRunGovernanceProjection\(\{ preserveCleanupResult: true \}\);[\s\S]*?await loadInitialState\(\)/, 'cleanup execute 成功后必须完成 context 清理、治理清空和状态刷新。');
 assert.match(sources.demoDataPage, /v-if="canPreviewCleanup"/);
 assert.match(sources.demoDataPage, /v-if="canSeeCleanupExecute"/);
 assert.match(sources.demoDataPage, /v-else-if="!allowedAction\('cleanupPreview'\)"/);
@@ -262,6 +377,365 @@ const demoDataModuleSource = sources.demoDataApi.replace(
 const demoDataModuleUrl = `data:text/javascript;base64,${Buffer.from(demoDataModuleSource).toString('base64')}`;
 const demoDataModule = await import(demoDataModuleUrl);
 
+// managed 下载只依赖下载授权、运行期、contextIssue 与明确换代 blocker，不要求预先存在兼容 active run。
+const managedDownloadAvailability = Object.freeze({
+  artifact: { downloadLifecycle: 'managed-context-auto-runtime' },
+  downloadCapable: true,
+  downloadAllowed: true,
+  runtimeAvailable: true,
+  runtimeEnabled: true,
+  contextIssueCapable: true
+});
+assert.equal(demoDataModule.canDownloadDemoCatalogArtifact({
+  ...managedDownloadAvailability,
+  hasActiveRun: false,
+  activeRunCompatibility: { state: 'missing', turnoverEligible: false, writeEligible: false, manifestCompatible: false }
+}), true, '没有 active run 时 managed 下载必须允许后端创建 run。');
+assert.equal(demoDataModule.canDownloadDemoCatalogArtifact({
+  ...managedDownloadAvailability,
+  hasActiveRun: true,
+  activeRunStatus: 'active',
+  activeRunCompatibility: {
+    state: 'manifest-turnover-pending',
+    turnoverEligible: true,
+    writeEligible: false,
+    manifestCompatible: false
+  }
+}), true, '普通 manifest mismatch 必须允许 managed 下载触发后端换代。');
+assert.equal(demoDataModule.canDownloadDemoCatalogArtifact({
+  ...managedDownloadAvailability,
+  hasActiveRun: true,
+  activeRunStatus: 'active',
+  activeRunCompatibility: {
+    state: 'active',
+    turnoverEligible: false,
+    writeEligible: true,
+    manifestCompatible: true
+  }
+}), true, '正常 compatible active run 不得因 turnoverEligible=false 被禁用。');
+assert.equal(demoDataModule.canDownloadDemoCatalogArtifact({
+  ...managedDownloadAvailability,
+  hasActiveRun: true,
+  activeRunStatus: 'active',
+  activeRunCompatibility: { state: 'unknown-future-state' }
+}), false, '未知 active run 投影字段必须 fail-closed。');
+assert.equal(demoDataModule.canDownloadDemoCatalogArtifact({
+  ...managedDownloadAvailability,
+  hasActiveRun: true,
+  activeRunStatus: 'active',
+  activeRunCompatibility: { state: 'cleanup-in-progress-blocked', retryable: true, turnoverEligible: false }
+}), false, 'cleanup-in-progress-blocked 必须禁用 managed 下载。');
+assert.equal(demoDataModule.canDownloadDemoCatalogArtifact({
+  ...managedDownloadAvailability,
+  hasActiveRun: true,
+  activeRunStatus: 'cleaning',
+  activeRunCompatibility: { state: 'manifest-turnover-pending', retryable: true, turnoverEligible: true }
+}), false, 'active run status=cleaning 时即使换代投影可重试也必须禁用 managed 下载。');
+assert.equal(demoDataModule.canDownloadDemoCatalogArtifact({
+  ...managedDownloadAvailability,
+  hasActiveRun: true,
+  activeRunStatus: 'active',
+  activeRunCompatibility: { state: 'manifest-turnover-blocked', turnoverEligible: true }
+}), false, '兼容旧后端的 manifest-turnover-blocked 仍必须禁用 managed 下载。');
+assert.equal(demoDataModule.isDemoCleanupInProgressBlocked({
+  activeRunStatus: 'active',
+  activeRunCompatibility: { state: 'cleanup-in-progress-blocked', retryable: true }
+}), true, '统一 cleaning state 必须被页面 prepare、warning 和 cleanup 门禁共同识别。');
+assert.equal(demoDataModule.isDemoCleanupInProgressBlocked({
+  activeRunStatus: 'cleaning',
+  activeRunCompatibility: { state: 'manifest-turnover-pending', retryable: true }
+}), true, 'run status=cleaning 必须保持阻断。');
+assert.equal(demoDataModule.isDemoCleanupInProgressBlocked({
+  activeRunStatus: 'active',
+  activeRunCompatibility: { state: 'manifest-turnover-pending', retryable: true }
+}), false, '普通可重试 manifest turnover pending 不得误判为 cleaning 阻断。');
+assert.equal(demoDataModule.canDownloadDemoCatalogArtifact({
+  ...managedDownloadAvailability,
+  hasActiveRun: true,
+  activeRunStatus: 'active',
+  activeRunCompatibility: { state: 'manifest-turnover-pending', turnoverEligible: false }
+}), false, 'turnoverEligible=false 必须 fail-closed。');
+assert.equal(demoDataModule.canDownloadDemoCatalogArtifact({ ...managedDownloadAvailability, contextIssueCapable: false }), false, '缺少 contextIssue 能力必须禁用 managed 下载。');
+assert.equal(demoDataModule.canDownloadDemoCatalogArtifact({ ...managedDownloadAvailability, runtimeEnabled: false }), false, '运行期关闭时必须禁用 managed 下载。');
+assert.equal(demoDataModule.canDownloadDemoCatalogArtifact({ ...managedDownloadAvailability, downloadAllowed: false }), false, '缺少下载授权时必须禁用 managed 下载。');
+
+// 请求序号和 run 身份守卫必须拒绝乱序 status/ownership 响应。
+assert.equal(demoDataModule.isLatestDemoRequest(1, 2), false, '较旧 status 响应不得覆盖较新请求。');
+assert.equal(demoDataModule.isLatestDemoRequest(2, 2), true, '当前最新 status 响应可以落地。');
+assert.equal(demoDataModule.isLatestDemoRunRequest(1, 2, 'run-1', 'run-1'), false, '较旧 ownership 响应不得落地。');
+assert.equal(demoDataModule.isLatestDemoRunRequest(2, 2, 'run-1', 'run-2'), false, '旧 run ownership 响应不得落到 successor。');
+assert.equal(demoDataModule.isLatestDemoRunRequest(2, 2, 'run-2', 'run-2'), true, '最新且 run 身份一致的 ownership 响应可以落地。');
+let committedStatusRunId = '';
+if (demoDataModule.isLatestDemoRequest(2, 2)) committedStatusRunId = 'run-new';
+if (demoDataModule.isLatestDemoRequest(1, 2)) committedStatusRunId = 'run-old';
+assert.equal(committedStatusRunId, 'run-new', '乱序完成的旧 status 响应不得覆盖新 run。');
+let committedOwnershipRunId = '';
+if (demoDataModule.isLatestDemoRunRequest(1, 2, 'run-old', 'run-new')) committedOwnershipRunId = 'run-old';
+if (demoDataModule.isLatestDemoRunRequest(2, 2, 'run-new', 'run-new')) committedOwnershipRunId = 'run-new';
+assert.equal(committedOwnershipRunId, 'run-new', '旧 run ownership 响应不得污染 successor 投影。');
+
+// RF-P1-004：本地恢复门禁不依赖已清空投影，且只有最新可信 status 成功才能关闭。
+let statusRecoveryRequired = true;
+const trustedStatusProjectionAvailable = false;
+assert.equal(trustedStatusProjectionAvailable || statusRecoveryRequired, true, 'fail-closed 后即使服务端投影为空也必须保留恢复入口。');
+if (demoDataModule.isLatestDemoRequest(1, 2)) statusRecoveryRequired = false;
+assert.equal(statusRecoveryRequired, true, '旧 generation 的恢复成功响应不得关闭恢复入口。');
+if (demoDataModule.isLatestDemoRequest(2, 2)) statusRecoveryRequired = true;
+assert.equal(statusRecoveryRequired, true, '最新 status 读取失败或投影无效时必须保留恢复入口。');
+if (demoDataModule.isLatestDemoRequest(3, 3)) statusRecoveryRequired = false;
+assert.equal(statusRecoveryRequired, false, '只有最新完整 status 成功应用后才能关闭恢复入口。');
+
+// RF-P1-005：执行页面源码中的纯 status projection 校验，覆盖 malformed DTO 与合法 null 组合。
+const statusProjectionStart = sources.demoDataPage.indexOf('/** 服务端 status 必须声明的稳定 capability 字段');
+const statusProjectionEnd = sources.demoDataPage.indexOf('/** 清空 status、run 与 compatibility', statusProjectionStart);
+const statusProjectionSource = sources.demoDataPage.slice(statusProjectionStart, statusProjectionEnd);
+assert.notStrictEqual(statusProjectionStart, -1, 'DemoData 必须包含 status 嵌套投影校验实现。');
+const readStatusProjection = new Function(`${statusProjectionSource}; return readStatusProjection;`)();
+const validStatusRuntime = { available: true, enabled: true, runtimeEpoch: 7, revision: 11 };
+const validStatusCapabilities = getDemoCapabilities();
+const validStatusAllowedActions = Object.fromEntries([
+  'toggleRuntime', 'loadCatalog', 'prepareRun', 'downloadArtifacts',
+  'reassociateContext', 'readOwnershipSummary', 'previewCleanup',
+  'executeCleanup', 'readCleanupRunStatus'
+].map((key) => [key, true]));
+const validStatusConfirmationTexts = getDemoConfirmationTexts();
+const validStatusActiveRun = {
+  runId: 'run-status-1',
+  datasetId: DEMO_DATASET_ID,
+  manifestVersion: DEMO_MANIFEST_VERSION,
+  manifestDigest: getDemoParkManifestDigest(),
+  status: 'active'
+};
+const validStatusCompatibility = demoRunTestContract.getDemoDatasetRunReadCompatibility(validStatusActiveRun);
+const validStatusResponse = {
+  data: {
+    runtime: validStatusRuntime,
+    capabilities: validStatusCapabilities,
+    allowedActions: validStatusAllowedActions,
+    confirmationTexts: validStatusConfirmationTexts,
+    activeRun: validStatusActiveRun,
+    activeRunCompatibility: validStatusCompatibility
+  }
+};
+assert.ok(readStatusProjection(validStatusResponse), '完整真实 status DTO 必须被接受。');
+const validNoRunCompatibility = demoRunTestContract.getDemoDatasetRunReadCompatibility(null);
+assert.ok(readStatusProjection({ data: { ...validStatusResponse.data, activeRun: null, activeRunCompatibility: validNoRunCompatibility } }), '无 active run 的真实 missing compatibility 组合必须被接受。');
+const unavailableStatusProjection = demoDataRouteTestContract.buildUnavailableActiveRunProjection();
+assert.ok(readStatusProjection({
+  data: {
+    ...validStatusResponse.data,
+    runtime: { available: false, enabled: false, runtimeEpoch: null, revision: null },
+    activeRun: unavailableStatusProjection.activeRun,
+    activeRunCompatibility: unavailableStatusProjection.compatibility
+  }
+}), '服务端规范 fail-closed runtime 与 unavailable compatibility 组合必须被接受。');
+for (const status of ACTIVE_IDENTITY_RUN_STATUSES) {
+  const statusRun = { ...validStatusActiveRun, runId: `run-status-${status}`, status };
+  assert.ok(readStatusProjection({
+    data: { ...validStatusResponse.data, activeRun: statusRun, activeRunCompatibility: demoRunTestContract.getDemoDatasetRunReadCompatibility(statusRun) }
+  }), `服务端允许的 active run status=${status} 合同必须被接受。`);
+}
+assert.ok(readStatusProjection({
+  data: {
+    ...validStatusResponse.data,
+    runtime: { available: false, enabled: false, runtimeEpoch: null, revision: null }
+  }
+}), 'runtime unavailable 与真实 active run 可以同时出现在独立读取的 public status 中。');
+const turnoverRun = {
+  ...validStatusActiveRun,
+  runId: 'run-status-turnover',
+  manifestVersion: 'legacy-manifest',
+  manifestDigest: 'b'.repeat(64),
+  status: 'active'
+};
+assert.ok(readStatusProjection({
+  data: {
+    ...validStatusResponse.data,
+    activeRun: turnoverRun,
+    activeRunCompatibility: demoRunTestContract.getDemoDatasetRunReadCompatibility(turnoverRun)
+  }
+}), '服务端 manifest-turnover-pending compatibility 必须被接受。');
+const malformedStatusResponses = [
+  { label: 'runtime 空对象', response: { data: { ...validStatusResponse.data, runtime: {} } } },
+  { label: 'runtime 缺 available', response: { data: { ...validStatusResponse.data, runtime: { enabled: true, runtimeEpoch: 7, revision: 11 } } } },
+  { label: 'runtime 缺 epoch', response: { data: { ...validStatusResponse.data, runtime: { available: true, enabled: true, revision: 11 } } } },
+  { label: 'runtime 可用但 epoch 无效', response: { data: { ...validStatusResponse.data, runtime: { ...validStatusRuntime, runtimeEpoch: null } } } },
+  { label: 'capabilities 空对象', response: { data: { ...validStatusResponse.data, capabilities: {} } } },
+  { label: 'capability 缺 status', response: { data: { ...validStatusResponse.data, capabilities: Object.fromEntries(Object.entries(validStatusCapabilities).filter(([key]) => key !== 'status')) } } },
+  { label: 'capability 非布尔', response: { data: { ...validStatusResponse.data, capabilities: { ...validStatusCapabilities, status: 'true' } } } },
+  { label: 'allowedActions 空对象', response: { data: { ...validStatusResponse.data, allowedActions: {} } } },
+  { label: 'allowedAction 缺 prepareRun', response: { data: { ...validStatusResponse.data, allowedActions: Object.fromEntries(Object.entries(validStatusAllowedActions).filter(([key]) => key !== 'prepareRun')) } } },
+  { label: 'allowedAction 非布尔', response: { data: { ...validStatusResponse.data, allowedActions: { ...validStatusAllowedActions, prepareRun: 1 } } } },
+  { label: 'confirmationTexts 空对象', response: { data: { ...validStatusResponse.data, confirmationTexts: {} } } },
+  { label: 'confirmationText 为空', response: { data: { ...validStatusResponse.data, confirmationTexts: { ...validStatusConfirmationTexts, cleanup: '' } } } },
+  { label: 'activeRun 空对象', response: { data: { ...validStatusResponse.data, activeRun: {} } } },
+  { label: 'activeRun 缺 runId', response: { data: { ...validStatusResponse.data, activeRun: { ...validStatusActiveRun, runId: undefined } } } },
+  { label: 'activeRun 未知 status', response: { data: { ...validStatusResponse.data, activeRun: { ...validStatusActiveRun, status: 'unknown' } } } },
+  { label: 'activeRun Dataset 不匹配', response: { data: { ...validStatusResponse.data, activeRun: { ...validStatusActiveRun, datasetId: 'other-dataset' } } } },
+  { label: 'compatibility 空对象', response: { data: { ...validStatusResponse.data, activeRunCompatibility: {} } } },
+  { label: 'compatibility 缺 state', response: { data: { ...validStatusResponse.data, activeRunCompatibility: Object.fromEntries(Object.entries(validStatusCompatibility).filter(([key]) => key !== 'state')) } } },
+  { label: 'compatibility manifest 漂移', response: { data: { ...validStatusResponse.data, activeRunCompatibility: { ...validStatusCompatibility, actualManifestDigest: 'b'.repeat(64) } } } },
+  { label: 'activeRun 存在但 compatibility 为 null', response: { data: { ...validStatusResponse.data, activeRunCompatibility: null } } },
+  { label: 'cleaning writeEligible 不可为 true', response: {
+    data: {
+      ...validStatusResponse.data,
+      activeRun: { ...validStatusActiveRun, status: 'cleaning' },
+      activeRunCompatibility: {
+        ...demoRunTestContract.getDemoDatasetRunReadCompatibility({ ...validStatusActiveRun, status: 'cleaning' }),
+        writeEligible: true
+      }
+    }
+  } },
+  { label: 'cleaning state/code 不匹配', response: {
+    data: {
+      ...validStatusResponse.data,
+      activeRun: { ...validStatusActiveRun, status: 'cleaning' },
+      activeRunCompatibility: {
+        ...demoRunTestContract.getDemoDatasetRunReadCompatibility({ ...validStatusActiveRun, status: 'cleaning' }),
+        state: 'active',
+        code: 'DEMO_RUN_ACTIVE'
+      }
+    }
+  } },
+  { label: 'turnover writeEligible 不可为 true', response: {
+    data: {
+      ...validStatusResponse.data,
+      activeRun: turnoverRun,
+      activeRunCompatibility: {
+        ...demoRunTestContract.getDemoDatasetRunReadCompatibility(turnoverRun),
+        writeEligible: true
+      }
+    }
+  } },
+  { label: 'turnover state/code 不匹配', response: {
+    data: {
+      ...validStatusResponse.data,
+      activeRun: turnoverRun,
+      activeRunCompatibility: {
+        ...demoRunTestContract.getDemoDatasetRunReadCompatibility(turnoverRun),
+        state: 'active',
+        code: 'DEMO_RUN_ACTIVE'
+      }
+    }
+  } },
+  { label: 'turnover manifestCompatible 不可为 true', response: {
+    data: {
+      ...validStatusResponse.data,
+      activeRun: turnoverRun,
+      activeRunCompatibility: {
+        ...demoRunTestContract.getDemoDatasetRunReadCompatibility(turnoverRun),
+        manifestCompatible: true
+      }
+    }
+  } },
+  { label: 'turnover turnoverEligible 不可为 false', response: {
+    data: {
+      ...validStatusResponse.data,
+      activeRun: turnoverRun,
+      activeRunCompatibility: {
+        ...demoRunTestContract.getDemoDatasetRunReadCompatibility(turnoverRun),
+        turnoverEligible: false
+      }
+    }
+  } },
+  { label: 'turnover retryable 不可为 true', response: {
+    data: {
+      ...validStatusResponse.data,
+      activeRun: turnoverRun,
+      activeRunCompatibility: {
+        ...demoRunTestContract.getDemoDatasetRunReadCompatibility(turnoverRun),
+        retryable: true
+      }
+    }
+  } },
+  { label: 'compatible active writeEligible 不可为 false', response: {
+    data: {
+      ...validStatusResponse.data,
+      activeRunCompatibility: { ...validStatusCompatibility, writeEligible: false }
+    }
+  } },
+  { label: 'cleaning retryable 不可为 false', response: {
+    data: {
+      ...validStatusResponse.data,
+      activeRun: { ...validStatusActiveRun, status: 'cleaning' },
+      activeRunCompatibility: {
+        ...demoRunTestContract.getDemoDatasetRunReadCompatibility({ ...validStatusActiveRun, status: 'cleaning' }),
+        retryable: false
+      }
+    }
+  } },
+  { label: 'cleaning turnoverEligible 不可为 true', response: {
+    data: {
+      ...validStatusResponse.data,
+      activeRun: { ...validStatusActiveRun, status: 'cleaning' },
+      activeRunCompatibility: {
+        ...demoRunTestContract.getDemoDatasetRunReadCompatibility({ ...validStatusActiveRun, status: 'cleaning' }),
+        turnoverEligible: true
+      }
+    }
+  } },
+  { label: '无 run 使用 null/null', response: { data: { ...validStatusResponse.data, activeRun: null, activeRunCompatibility: null } } },
+  { label: '无 run 使用任意 state/code', response: {
+    data: {
+      ...validStatusResponse.data,
+      activeRun: null,
+      activeRunCompatibility: { ...validNoRunCompatibility, state: 'active', code: 'DEMO_RUN_ACTIVE' }
+    }
+  } }
+];
+for (const malformed of malformedStatusResponses) {
+  assert.equal(readStatusProjection(malformed.response), null, `${malformed.label} 必须保持 fail-closed 并拒绝关闭 recovery。`);
+}
+
+// cleanup 结果遵循“最后发起动作优先”，execute、status query 与治理清空共享同一 generation。
+let cleanupGeneration = 0;
+let committedCleanupResult = '';
+const oldStatusGeneration = ++cleanupGeneration;
+const latestExecuteGeneration = ++cleanupGeneration;
+if (demoDataModule.isLatestDemoRequest(latestExecuteGeneration, cleanupGeneration)) committedCleanupResult = 'execute-new';
+if (demoDataModule.isLatestDemoCleanupResultRequest(oldStatusGeneration, cleanupGeneration, 'cleanup-1', 'cleanup-1')) committedCleanupResult = 'status-old';
+assert.equal(committedCleanupResult, 'execute-new', '旧 cleanup status 响应不得覆盖后发 execute 结果。');
+assert.equal(
+  demoDataModule.isLatestDemoCleanupResultRequest(3, 3, 'cleanup-old', 'cleanup-current'),
+  false,
+  '请求 cleanupRunId 与当前输入身份不同时不得落地。'
+);
+const queryBeforeGovernanceClearGeneration = ++cleanupGeneration;
+cleanupGeneration += 1;
+assert.equal(
+  demoDataModule.isLatestDemoCleanupResultRequest(queryBeforeGovernanceClearGeneration, cleanupGeneration, 'cleanup-2', 'cleanup-2'),
+  false,
+  '治理投影清空后，旧 cleanup query 不得重新回填结果。'
+);
+const statusActionGeneration = ++cleanupGeneration;
+const executeActionGeneration = ++cleanupGeneration;
+const latestQueryGeneration = ++cleanupGeneration;
+assert.equal(demoDataModule.isLatestDemoRequest(statusActionGeneration, cleanupGeneration), false);
+assert.equal(demoDataModule.isLatestDemoRequest(executeActionGeneration, cleanupGeneration), false);
+assert.equal(
+  demoDataModule.isLatestDemoCleanupResultRequest(latestQueryGeneration, cleanupGeneration, 'cleanup-latest', 'cleanup-latest'),
+  true,
+  '多个 cleanup 动作并发时只有最后发起且身份匹配的动作可以落地。'
+);
+
+// cleanup 三类动作必须互斥，共享 generation 继续作为异常旧响应的第二层保护。
+assert.equal(demoDataModule.canStartDemoCleanupAction({ previewLoading: false, executeLoading: false, statusLoading: false }), true);
+assert.equal(
+  demoDataModule.canStartDemoCleanupAction({ previewLoading: false, executeLoading: true, statusLoading: false }),
+  false,
+  'execute loading 时 status query 必须禁用。'
+);
+assert.equal(
+  demoDataModule.canStartDemoCleanupAction({ previewLoading: false, executeLoading: false, statusLoading: true }),
+  false,
+  'status query loading 时 execute 和 preview 必须禁用。'
+);
+assert.equal(
+  demoDataModule.canStartDemoCleanupAction({ previewLoading: true, executeLoading: false, statusLoading: false }),
+  false,
+  'preview loading 时 status query 和 execute 必须禁用。'
+);
+
 // 内存 sessionStorage 模块，用于验证标签页隔离和定向清理。
 class MemorySessionStorage {
   constructor() {
@@ -286,6 +760,23 @@ class MemorySessionStorage {
 
   key(index) {
     return [...this.values.keys()][index] ?? null;
+  }
+}
+
+// 在 predecessor 清理二次读取前注入 successor token，模拟并发新签发完成。
+class ConcurrentReplacementStorage extends MemorySessionStorage {
+  constructor(replacementValue) {
+    super();
+    this.replacementValue = replacementValue;
+    this.readCounts = new Map();
+  }
+
+  getItem(key) {
+    const normalizedKey = String(key);
+    const nextCount = (this.readCounts.get(normalizedKey) || 0) + 1;
+    this.readCounts.set(normalizedKey, nextCount);
+    if (nextCount === 2) this.values.set(normalizedKey, JSON.stringify(this.replacementValue));
+    return super.getItem(normalizedKey);
   }
 }
 
@@ -333,6 +824,141 @@ const managedDownloadResult = await demoDataModule.downloadDemoCatalogArtifact({
 }, 'xlsx', tabStorage);
 assert.strictEqual(managedDownloadResult.demoContextStored, true);
 assert.strictEqual(demoDataModule.readDemoContext(managedMetadata.artifactKey, managedMetadata.handlerKey, tabStorage).runId, 'run-1');
+assert.equal(managedDownloadResult.turnover.performed, false, '普通 managed 下载不得误报自动换代。');
+
+// predecessor 定向清理必须通过 token CAS 保留清理期间并发写入的 successor context。
+const concurrentSuccessorContext = { ...managedMetadata, runId: 'run-2', token: 'i'.repeat(43) };
+const concurrentReplacementStorage = new ConcurrentReplacementStorage(concurrentSuccessorContext);
+demoDataModule.storeDemoContext({ ...managedMetadata, contextToken: 'j'.repeat(43) }, concurrentReplacementStorage);
+assert.equal(demoDataModule.clearDemoContextsForRun('run-1', concurrentReplacementStorage), 0, '并发 token 已变化时不得删除该 storage key。');
+assert.equal(
+  demoDataModule.readDemoContext(managedMetadata.artifactKey, managedMetadata.handlerKey, concurrentReplacementStorage).token,
+  concurrentSuccessorContext.token,
+  'predecessor 清理必须保留并发新签发 token。'
+);
+
+// 自动换代下载只依赖稳定响应头识别 predecessor/current run，并继续保存 successor context。
+const turnoverStorage = new MemorySessionStorage();
+const turnoverMetadata = {
+  ...managedMetadata,
+  runId: 'run-2',
+  manifestVersion: 'v2',
+  contextToken: 'd'.repeat(43)
+};
+const predecessorContextA = { ...managedMetadata, artifactKey: 'old-artifact-a', handlerKey: 'old-handler-a', contextToken: 'e'.repeat(43) };
+const predecessorContextB = { ...managedMetadata, artifactKey: 'old-artifact-b', handlerKey: 'old-handler-b', contextToken: 'f'.repeat(43) };
+const unrelatedContext = { ...managedMetadata, runId: 'run-other', artifactKey: 'other-artifact', handlerKey: 'other-handler', contextToken: 'g'.repeat(43) };
+demoDataModule.storeDemoContext({ ...managedMetadata, contextToken: 'h'.repeat(43) }, turnoverStorage);
+demoDataModule.storeDemoContext(predecessorContextA, turnoverStorage);
+demoDataModule.storeDemoContext(predecessorContextB, turnoverStorage);
+demoDataModule.storeDemoContext(unrelatedContext, turnoverStorage);
+globalThis.__demoContractDownloadResult = {
+  fileName: 'managed-turnover.xlsx',
+  headers: {
+    'X-Demo-Run-Id': 'run-2',
+    'X-Demo-Run-Reused': 'false',
+    'X-Demo-Run-Auto-Superseded': 'true',
+    'X-Demo-Run-Superseded-From': 'run-1',
+    'X-Demo-Runtime-Epoch': '8'
+  },
+  demo: turnoverMetadata
+};
+const turnoverDownloadResult = await demoDataModule.downloadDemoCatalogArtifact({
+  artifactKey: managedMetadata.artifactKey,
+  handlerKey: managedMetadata.handlerKey,
+  name: '班次定义',
+  downloadLifecycle: 'managed-context-auto-runtime',
+  downloads: { xlsx: '/api/templates/demo-park/13-shift-definitions.xlsx' }
+}, 'xlsx', turnoverStorage);
+assert.deepStrictEqual(turnoverDownloadResult.turnover, {
+  performed: true,
+  reused: false,
+  oldRunId: 'run-1',
+  newRunId: 'run-2',
+  oldManifestVersion: '',
+  newManifestVersion: 'v2',
+  runtimeEpoch: '8'
+});
+assert.equal(turnoverDownloadResult.clearedPredecessorContextCount, 2, 'managed turnover 必须只清理其他 predecessor context。');
+assert.equal(demoDataModule.readDemoContext(predecessorContextA.artifactKey, predecessorContextA.handlerKey, turnoverStorage), null);
+assert.equal(demoDataModule.readDemoContext(predecessorContextB.artifactKey, predecessorContextB.handlerKey, turnoverStorage), null);
+assert.equal(demoDataModule.readDemoContext(managedMetadata.artifactKey, managedMetadata.handlerKey, turnoverStorage).runId, 'run-2', '本次 successor context 必须保留。');
+assert.equal(demoDataModule.readDemoContext(managedMetadata.artifactKey, managedMetadata.handlerKey, turnoverStorage).token, turnoverMetadata.contextToken, '同 key 新 token 不得被 predecessor 清理误删。');
+assert.equal(demoDataModule.readDemoContext(unrelatedContext.artifactKey, unrelatedContext.handlerKey, turnoverStorage).runId, 'run-other', '非 predecessor run context 必须保留。');
+
+// 响应头解析必须兼容真实 AxiosHeaders，并在环境支持时兼容 Web Headers。
+const axiosTurnoverHeaders = new AxiosHeaders({
+  'X-Demo-Run-Id': 'run-axios',
+  'X-Demo-Run-Auto-Superseded': 'true',
+  'X-Demo-Run-Superseded-From': 'run-before-axios',
+  'X-Demo-Runtime-Epoch': '11'
+});
+assert.deepStrictEqual(demoDataModule.readDemoRunTurnover({
+  headers: axiosTurnoverHeaders,
+  demo: { runId: 'run-axios', manifestVersion: 'v-axios' }
+}), {
+  performed: true,
+  reused: false,
+  oldRunId: 'run-before-axios',
+  newRunId: 'run-axios',
+  oldManifestVersion: '',
+  newManifestVersion: 'v-axios',
+  runtimeEpoch: '11'
+});
+if (typeof globalThis.Headers === 'function') {
+  const webTurnoverHeaders = new Headers({
+    'X-Demo-Run-Id': 'run-web',
+    'X-Demo-Run-Auto-Superseded': 'true',
+    'X-Demo-Run-Superseded-From': 'run-before-web',
+    'X-Demo-Runtime-Epoch': '12'
+  });
+  assert.equal(demoDataModule.readDemoRunTurnover({ headers: webTurnoverHeaders, demo: { runId: 'run-web' } }).oldRunId, 'run-before-web');
+}
+
+// 显式 prepare turnover 使用固定 previousRun/successorRun 合同生成旧、新 run 与 manifest 版本摘要。
+assert.deepStrictEqual(demoDataModule.readDemoRunTurnover({
+  success: true,
+  data: {
+    runId: 'run-2',
+    manifestVersion: 'v2',
+    reused: false,
+    runtimeEpoch: 8,
+    turnover: {
+      performed: true,
+      reason: 'manifest_identity_changed',
+      trigger: 'explicit-run-prepare',
+      previousRun: { runId: 'run-1', status: 'active', manifestVersion: 'v1', manifestDigest: 'a'.repeat(64) },
+      successorRun: { runId: 'run-2', status: 'active', manifestVersion: 'v2', manifestDigest: 'b'.repeat(64) },
+      revokedContextCount: 1,
+      supersededCleanupPreviewCount: 0,
+      runtimeBefore: { enabled: true, runtimeEpoch: 7, revision: 10 },
+      runtimeAfter: { enabled: true, runtimeEpoch: 8, revision: 11 }
+    }
+  }
+}), {
+  performed: true,
+  reused: false,
+  oldRunId: 'run-1',
+  newRunId: 'run-2',
+  oldManifestVersion: 'v1',
+  newManifestVersion: 'v2',
+  runtimeEpoch: '8'
+});
+assert.equal(
+  demoDataModule.formatDemoRunTurnoverSuccessMessage({
+    oldRunId: 'run-1',
+    newRunId: 'run-2',
+    oldManifestVersion: 'v1',
+    newManifestVersion: 'v2'
+  }, 'active run 自动换代成功'),
+  'active run 自动换代成功：旧 run run-1（manifest v1） → 新 run run-2（manifest v2）。',
+  '显式 prepare 换代成功提示必须精确包含旧、新 run 与 manifest version。'
+);
+assert.equal(
+  demoDataModule.formatDemoRunTurnoverSuccessMessage({ oldRunId: 'run-1', newRunId: 'run-2' }, 'managed artifact 下载已自动换代 active run'),
+  'managed artifact 下载已自动换代 active run：旧 run run-1 → 新 run run-2。',
+  'managed 下载换代成功提示必须直接可读且不包含 digest。'
+);
 
 // 托管响应的 artifactKey 或 handlerKey 任一错配都必须明确失败，且不得留下响应错误条目的 context。
 const mismatchedDownloadStorage = new MemorySessionStorage();

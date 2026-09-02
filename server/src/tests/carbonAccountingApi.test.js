@@ -132,14 +132,53 @@ function multipart(server, pathname, filename, content, token) {
     assert(template.body.toString('utf8').startsWith('﻿"能源类型编码","地区","因子年份","活动数据单位","因子值","排放单位","因子来源","来源链接","有效开始日期","有效结束日期","状态"'), '碳因子模板必须使用中文字段头。');
 
     const created = await request(server, 'POST', '/api/carbon/factors', {
-      energyTypeCode: 'electricity', region: 'default', factorYear: 2028, unit: 'kWh', factorValue: 0.5, factorUnit: 'kgCO2e', source: 'API 测试因子', status: 'active'
+      energyTypeCode: 'electricity', region: 'default', factorYear: 2028, unit: 'kWh', factorValue: 0.5, factorUnit: 'kg CO₂e', source: 'API 测试因子', status: 'active'
     }, adminToken);
     assert.strictEqual(created.status, 201);
+    assert.strictEqual(created.body.data.factorUnit, 'kgCO2e', 'create 必须在写入前规范化合法单位别名。');
     const factorId = created.body.data.id;
     assert.strictEqual((await request(server, 'GET', `/api/carbon/factors/${factorId}`, undefined, factorToken)).status, 200, '仅因子查看角色必须能读取因子详情。');
     assert.strictEqual((await request(server, 'GET', `/api/carbon/factors/${factorId}`, undefined, emissionToken)).status, 403, '仅排放查看角色不得读取因子详情。');
     assert.strictEqual((await request(server, 'GET', `/api/carbon/factors/${factorId}`, undefined, adminToken)).body.data.status, 'active');
 
+    const defaultUnitCreated = await request(server, 'POST', '/api/carbon/factors', {
+      energyTypeCode: 'coal', region: 'default', factorYear: 2029, unit: 't', factorValue: 0.6,
+      source: 'API 缺省单位因子', status: 'active'
+    }, adminToken);
+    assert.strictEqual(defaultUnitCreated.status, 201);
+    assert.strictEqual(defaultUnitCreated.body.data.factorUnit, 'kgCO2e', '仅字段完全缺失时 create 才可采用默认单位。');
+    for (const invalidUnit of ['', null, {}, []]) {
+      const rejected = await request(server, 'POST', '/api/carbon/factors', {
+        energyTypeCode: 'heat', region: 'default', factorYear: 2029, unit: 'MJ', factorValue: 0.1,
+        factorUnit: invalidUnit, source: `API 非法单位-${typeof invalidUnit}`, status: 'active'
+      }, adminToken);
+      assert.strictEqual(rejected.status, 400);
+      assert.strictEqual(rejected.body.error.code, 'CARBON_EMISSION_UNIT_INVALID');
+      assert.deepStrictEqual(Object.keys(rejected.body.error.details).sort(), ['field', 'reason']);
+      assert.strictEqual(JSON.stringify(rejected.body.error).includes('API 非法单位'), false);
+    }
+
+    const aliasUpdated = await request(server, 'PUT', `/api/carbon/factors/${factorId}`, {
+      factor_unit: 't CO2e / MWh'
+    }, adminToken);
+    assert.strictEqual(aliasUpdated.status, 200);
+    assert.strictEqual(aliasUpdated.body.data.factorUnit, 'tCO2e/MWh');
+    const preservedUnit = await request(server, 'PUT', `/api/carbon/factors/${factorId}`, {
+      factorValue: 0.5
+    }, adminToken);
+    assert.strictEqual(preservedUnit.status, 200);
+    assert.strictEqual(preservedUnit.body.data.factorUnit, 'tCO2e/MWh');
+    const explicitEmptyUpdate = await request(server, 'PUT', `/api/carbon/factors/${factorId}`, {
+      factorUnit: ''
+    }, adminToken);
+    assert.strictEqual(explicitEmptyUpdate.status, 400);
+    assert.strictEqual(explicitEmptyUpdate.body.error.code, 'CARBON_EMISSION_UNIT_INVALID');
+    const restoreUnit = await request(server, 'PUT', `/api/carbon/factors/${factorId}`, {
+      factorUnit: 'kgCO2e'
+    }, adminToken);
+    assert.strictEqual(restoreUnit.status, 200);
+
+    let invalidHistoricalFactorId;
     const db = openDatabase();
     try {
       const electricityId = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
@@ -157,7 +196,24 @@ function multipart(server, pathname, filename, content, token) {
       ) VALUES (?, ?, ?, '2028-01', '2028-01', 'kWh', 100, 'kWh', 100,
         '碳统计部门', 'carbon-api-energy-record', 'active', datetime('now'), datetime('now'))`)
         .run(electricityId, organizationUnitId, meterDeviceId);
+      invalidHistoricalFactorId = Number(db.prepare(`INSERT INTO carbon_factors
+        (energy_type_id, region, factor_year, unit, factor_value, factor_unit, source, is_active)
+        VALUES (?, 'default', 2031, 'kWh', 0.7, 'legacyUnit', 'API 历史非法单位', 1)`)
+        .run(electricityId).lastInsertRowid);
     } finally { db.close(); }
+
+    const invalidHistoricalUpdate = await request(server, 'PUT', `/api/carbon/factors/${invalidHistoricalFactorId}`, {
+      factorValue: 0.8
+    }, adminToken);
+    assert.strictEqual(invalidHistoricalUpdate.status, 409);
+    assert.strictEqual(invalidHistoricalUpdate.body.error.code, 'CARBON_FACTOR_UNIT_INVALID');
+    assert.deepStrictEqual(invalidHistoricalUpdate.body.error.details, { factorId: invalidHistoricalFactorId });
+    assert.strictEqual(JSON.stringify(invalidHistoricalUpdate.body.error).includes('legacyUnit'), false);
+    const repairedHistorical = await request(server, 'PUT', `/api/carbon/factors/${invalidHistoricalFactorId}`, {
+      factor_unit: 'kg CO₂e / kWh'
+    }, adminToken);
+    assert.strictEqual(repairedHistorical.status, 200);
+    assert.strictEqual(repairedHistorical.body.data.factorUnit, 'kgCO2e/kWh');
 
     const calculated = await request(server, 'POST', '/api/carbon/emissions/calculate', { normalizedMonth: '2028-01' }, adminToken);
     assert.strictEqual(calculated.status, 201);
@@ -176,6 +232,36 @@ function multipart(server, pathname, filename, content, token) {
     assert.strictEqual(stats.body.data.byOrganizationUnit[0].organizationUnitCode, 'CARBON-API-OU');
     assert.strictEqual(stats.body.data.byOrganizationUnit[0].organizationUnitName, '碳统计组织');
     assert.strictEqual(stats.body.data.totalsByEmissionUnit[0].totalEmissionValue, 50);
+
+    let invalidCalculationFactorId;
+    const invalidCalculationDb = openDatabase();
+    try {
+      const electricityId = invalidCalculationDb.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
+      const organizationUnitId = invalidCalculationDb.prepare("SELECT id FROM organization_units WHERE unit_code = 'CARBON-API-OU'").get().id;
+      const meterDeviceId = invalidCalculationDb.prepare("SELECT id FROM meter_devices WHERE meter_code = 'CARBON-API-METER'").get().id;
+      invalidCalculationFactorId = Number(invalidCalculationDb.prepare(`INSERT INTO carbon_factors
+        (energy_type_id, region, factor_year, unit, factor_value, factor_unit, source, is_active)
+        VALUES (?, 'default', 2032, 'kWh', 0.9, 'PRIVATE_LEGACY_UNIT', 'API 计算非法单位', 1)`)
+        .run(electricityId).lastInsertRowid);
+      invalidCalculationDb.prepare(`INSERT INTO energy_records (
+        energy_type_id, organization_unit_id, meter_device_id, original_month, normalized_month,
+        original_unit, original_value, normalized_unit, normalized_value, duplicate_key, record_status
+      ) VALUES (?, ?, ?, '2032-01', '2032-01', 'kWh', 10, 'kWh', 10,
+        'carbon-api-invalid-unit-record', 'active')`)
+        .run(electricityId, organizationUnitId, meterDeviceId);
+    } finally { invalidCalculationDb.close(); }
+    const invalidCalculation = await request(server, 'POST', '/api/carbon/emissions/calculate', {
+      normalizedMonth: '2032-01'
+    }, adminToken);
+    assert.strictEqual(invalidCalculation.status, 409);
+    assert.strictEqual(invalidCalculation.body.error.code, 'CARBON_FACTOR_UNIT_INVALID');
+    assert.deepStrictEqual(invalidCalculation.body.error.details, { factorId: invalidCalculationFactorId });
+    assert.strictEqual(JSON.stringify(invalidCalculation.body.error).includes('PRIVATE_LEGACY_UNIT'), false);
+    const invalidCalculationCheckDb = openDatabase();
+    try {
+      assert.strictEqual(invalidCalculationCheckDb.prepare(`SELECT COUNT(*) AS total FROM carbon_emissions ce
+        JOIN energy_records er ON er.id = ce.energy_record_id WHERE er.normalized_month = '2032-01'`).get().total, 0);
+    } finally { invalidCalculationCheckDb.close(); }
 
     const safeKeyword = await request(server, 'GET', '/api/carbon/factors?keyword=%25', undefined, adminToken);
     assert.strictEqual(safeKeyword.status, 200);
@@ -197,12 +283,23 @@ function multipart(server, pathname, filename, content, token) {
       assert.strictEqual(historical.status, 'calculated');
     } finally { historyDb.close(); }
 
-    const englishCsv = 'energyTypeCode,region,factorYear,unit,factorValue,factorUnit,source,sourceUrl,effectiveFrom,effectiveTo,status\ncoal,default,2028,t,0.3,kgCO2e,英文表头兼容来源,,,,active\n';
+    const englishCsv = 'energyTypeCode,region,factorYear,unit,factorValue,factorUnit,source,sourceUrl,effectiveFrom,effectiveTo,status\ncoal,default,2028,t,0.3,kg CO₂e / (kWh),英文表头兼容来源,,,,active\n';
     const englishPreviewResponse = await multipart(server, '/api/carbon/factors/import/preview', 'carbon-factors-english.csv', englishCsv, adminToken);
     assert.strictEqual(englishPreviewResponse.status, 200);
     assert.strictEqual(englishPreviewResponse.body.data.summary.wouldImport, 1, '碳因子导入必须继续兼容旧英文表头。');
+    assert.strictEqual(englishPreviewResponse.body.data.candidateRows[0].factorUnit, 'kgCO2e/kWh');
 
-    const csv = '能源类型编码,地区,因子年份,活动数据单位,因子值,排放单位,因子来源,来源链接,有效开始日期,有效结束日期,状态\nheat,default,2028,MJ,0.1,kgCO2e,导入测试来源,,, ,active\nheat,default,2028,MJ,0.2,kgCO2e,导入测试来源,,,,active\n';
+    const invalidImportCsv = '能源类型编码,地区,因子年份,活动数据单位,因子值,排放单位,因子来源,来源链接,有效开始日期,有效结束日期,状态\nheat,default,2029,MJ,0.1,,导入空单位来源,,,,active\nheat,default,2030,MJ,0.2,kgCO2e/GJ,导入非法单位来源,,,,active\n';
+    const invalidImportPreview = await multipart(server, '/api/carbon/factors/import/preview', 'carbon-factors-invalid-unit.csv', invalidImportCsv, adminToken);
+    assert.strictEqual(invalidImportPreview.status, 200);
+    assert.strictEqual(invalidImportPreview.body.data.summary.wouldImport, 0);
+    assert.strictEqual(invalidImportPreview.body.data.summary.blocked, 2);
+    invalidImportPreview.body.data.items.forEach((item) => {
+      assert(item.reasonCodes.includes('CARBON_EMISSION_UNIT_INVALID'));
+      assert.strictEqual(JSON.stringify(item.reasons).includes('kgCO2e/GJ'), false);
+    });
+
+    const csv = '能源类型编码,地区,因子年份,活动数据单位,因子值,排放单位,因子来源,来源链接,有效开始日期,有效结束日期,状态\nheat,default,2028,MJ,0.1,t CO₂e / m³,导入测试来源,,, ,active\nheat,default,2028,MJ,0.2,tCO2e/m3,导入测试来源,,,,active\n';
     const previewResponse = await multipart(server, '/api/carbon/factors/import/preview', 'carbon-factors.csv', csv, adminToken);
     assert.strictEqual(previewResponse.status, 200);
     const preview = previewResponse.body.data;
@@ -210,6 +307,20 @@ function multipart(server, pathname, filename, content, token) {
     assert.strictEqual(preview.summary.skipped, 1);
     assert.strictEqual(preview.writesCarbonFactors, false);
     assert.strictEqual(preview.writesCarbonEmissions, false);
+    assert.strictEqual(preview.candidateRows[0].factorUnit, 'tCO2e/m3');
+    const tamperedExecute = await request(server, 'POST', '/api/carbon/factors/import/execute', {
+      confirmText: preview.confirmText,
+      previewSignature: preview.previewSignature,
+      expectedWouldImport: preview.summary.wouldImport,
+      candidateRowIds: preview.candidateRowIds,
+      candidateRows: preview.candidateRows.map((row) => ({ ...row, factorUnit: 'kgCO2e/GJ' })),
+      requireBackup: true,
+      acknowledgeSkippedRisks: true
+    }, adminToken);
+    assert.strictEqual(tamperedExecute.status, 400);
+    assert.strictEqual(tamperedExecute.body.error.code, 'CARBON_EMISSION_UNIT_INVALID');
+    assert.deepStrictEqual(Object.keys(tamperedExecute.body.error.details).sort(), ['field', 'reason']);
+    assert.strictEqual(JSON.stringify(tamperedExecute.body.error).includes('kgCO2e/GJ'), false);
     const auditPreview = getImportAuditBatchDetail(preview.batchId);
     assert.strictEqual(auditPreview.importType, 'carbon_factor');
     assert.strictEqual(auditPreview.auditPhase, 'preview');
@@ -227,8 +338,22 @@ function multipart(server, pathname, filename, content, token) {
     }, adminToken);
     assert.strictEqual(execute.status, 200);
     assert.strictEqual(execute.body.data.imported, 1);
+    assert.strictEqual(execute.body.data.importedRecords.length, 1);
+    assert.strictEqual(execute.body.data.importedRecords[0].factorUnit, 'tCO2e/m3', '正式导入 execute 响应必须返回规范化后的非默认排放单位。');
     assert.strictEqual(execute.body.data.writesCarbonEmissions, false);
     assert(!JSON.stringify(execute.body).includes(tmpDir), '导入执行响应不得泄露本地路径。');
+    // 导入结果标识用于直接核对隔离 SQLite 中的原始 factor_unit 列。
+    const importedFactorId = execute.body.data.importedIds[0];
+    // 持久化检查数据库仍由本测试顶部环境变量固定指向临时 SQLite。
+    const executeCheckDb = openDatabase();
+    try {
+      // 持久化行用于证明 execute 写入的是 canonical 单位而非默认值或原始别名。
+      const persistedImportedFactor = executeCheckDb.prepare('SELECT factor_unit FROM carbon_factors WHERE id = ?').get(importedFactorId);
+      assert(persistedImportedFactor, '正式导入 execute 必须在隔离 SQLite 中写入碳因子。');
+      assert.strictEqual(persistedImportedFactor.factor_unit, 'tCO2e/m3', '隔离 SQLite 的 factor_unit 必须持久化 canonical 非默认单位。');
+    } finally {
+      executeCheckDb.close();
+    }
     const auditExecute = getImportAuditBatchDetail(preview.batchId);
     assert.strictEqual(auditExecute.auditPhase, 'execute');
     assert.strictEqual(auditExecute.status, 'completed_with_errors');

@@ -4,6 +4,7 @@ const {
   carbonEmissionsStatusCheckAllowsSuperseded
 } = require('../db/database');
 const {
+  DEFAULT_EMISSION_UNIT,
   EMISSION_GROUP_COLUMNS,
   EMISSION_SORT_COLUMNS,
   calculateEmissionValue,
@@ -12,6 +13,12 @@ const {
   normalizeYear,
   selectBestCarbonFactor
 } = require('../services/carbonAccountingUtils');
+const {
+  DEFAULT_CARBON_EMISSION_UNIT
+} = require('../services/carbonEmissionUnitContract');
+
+assert.strictEqual(DEFAULT_EMISSION_UNIT, DEFAULT_CARBON_EMISSION_UNIT);
+assert.strictEqual(DEFAULT_EMISSION_UNIT, 'kgCO2e');
 
 const baseRecord = {
   id: 101,

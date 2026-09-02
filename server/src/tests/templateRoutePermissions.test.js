@@ -16,7 +16,10 @@ process.env.CHARCOAL_ALLOW_REGISTER = 'true';
 
 const { initDatabase, openDatabase } = require('../db/database');
 const { register } = require('../services/authService');
-const { listDemoParkArtifacts } = require('../services/demoParkDatasetService');
+const {
+  getDemoParkArtifact,
+  listDemoParkArtifacts
+} = require('../services/demoParkDatasetService');
 const {
   DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES,
   listDemoArtifactRegistrations
@@ -31,6 +34,7 @@ const { exportGenerationRecords } = require('../services/generationService');
 const { exportProductionOutputs, exportProductionUnits } = require('../services/productionService');
 const { exportCarbonEmissions, exportCarbonFactors } = require('../services/carbonAccountingService');
 const { exportPredictionConfigs, exportPredictionResults } = require('../services/predictionService');
+const { projectDemoRunTurnover } = require('../routes/templates');
 
 // 各模板用户可见首行的完整顺序契约。
 const EXPECTED_TEMPLATE_HEADERS = Object.freeze({
@@ -116,7 +120,7 @@ const EXPECTED_GHG_REPORT_SHEETS = Object.freeze([
 ]);
 
 // 组织管理页三个分层示例的真实下载文件名和完整业务编码契约。
-// 26—29 只走正式无状态导入，精确冻结下载、预演、执行、权限、处理器和 fail-closed 合同。
+// 26、28、29 只走正式无状态导入，精确冻结下载、预演、执行、权限、处理器和 fail-closed 合同。
 const EXPECTED_STATELESS_FORMAL_IMPORT_CONTRACTS = Object.freeze([
   Object.freeze({
     artifactKey: '26-suppliers', handlerKey: 'supplier-import',
@@ -124,13 +128,6 @@ const EXPECTED_STATELESS_FORMAL_IMPORT_CONTRACTS = Object.freeze([
     preview: '/api/suppliers/imports/preview', execute: '/api/suppliers/imports/execute',
     downloadPermission: 'ledger:suppliers:import:preview',
     previewPermission: 'ledger:suppliers:import:preview', executePermission: 'ledger:suppliers:import:execute'
-  }),
-  Object.freeze({
-    artifactKey: '27-carbon-activities', handlerKey: 'carbon-activity-import',
-    download: '/api/templates/demo-park/27-carbon-activities.xlsx',
-    preview: '/api/carbon/activities/imports/preview', execute: '/api/carbon/activities/imports/execute',
-    downloadPermission: 'carbon:activities:import:preview',
-    previewPermission: 'carbon:activities:import:preview', executePermission: 'carbon:activities:import:execute'
   }),
   Object.freeze({
     artifactKey: '28-carbon-emission-report', handlerKey: 'carbon-emission-report-import',
@@ -148,21 +145,28 @@ const EXPECTED_STATELESS_FORMAL_IMPORT_CONTRACTS = Object.freeze([
   })
 ]);
 
+// 阶段 A 只独立冻结两类 managed 碳输入的 artifact 身份和 ownership 实体，路由与权限从中央 registry/manifest 交叉校验。
+const EXPECTED_MANAGED_CARBON_INPUT_OWNERSHIP_TARGETS = Object.freeze({
+  '11-carbon-factors': Object.freeze(['carbon_factor']),
+  '27-carbon-activities': Object.freeze(['carbon_activity_record'])
+});
+
+// 组织示例文件名保持用户可见契约，业务编码直接从中央 dataset 行推导，避免样例扩充后测试基线漂移。
 const EXPECTED_ORGANIZATION_EXAMPLE_CONTRACTS = Object.freeze([
   {
     artifactKey: '01-organization-root',
     fileName: '01-用能单元根级.xlsx',
-    codes: ['QL-PARK']
+    codes: getDemoParkArtifact('01-organization-root').rows.map((row) => row[0])
   },
   {
     artifactKey: '02-organization-departments',
     fileName: '02-用能单元部门与车间.xlsx',
-    codes: ['QL-ENERGY', 'QL-WORKSHOP-A', 'QL-WORKSHOP-B', 'QL-UTILITY']
+    codes: getDemoParkArtifact('02-organization-departments').rows.map((row) => row[0])
   },
   {
     artifactKey: '03-organization-process-equipment',
     fileName: '03-用能单元工序与设备.xlsx',
-    codes: ['QL-PROC-MACHINING', 'QL-EQ-CNC-01', 'QL-PROC-ASSEMBLY', 'QL-EQ-AIR-01']
+    codes: getDemoParkArtifact('03-organization-process-equipment').rows.map((row) => row[0])
   }
 ]);
 const ORGANIZATION_EXAMPLE_BY_KEY = new Map(
@@ -201,6 +205,63 @@ const EXPECTED_HTTP_EXPORT_CONTRACTS = Object.freeze([
   { name: '预测结果', path: '/api/predictions/results/export', asciiBase: 'yuce-jieguo', chinesePrefix: '预测结果导出-' },
   { name: '抄表生成能耗记录预演审计', path: '/api/meter-readings/energy-record-generation/preview/export', asciiBase: 'chaobiao-nenghao-preview', chinesePrefix: '抄表生成能耗记录预演审计预案-' }
 ]);
+
+/** 校验 templates 响应层同时兼容旧 run DTO 与当前增强 turnover DTO。 */
+function assertDemoRunTurnoverProjection() {
+  assert.deepStrictEqual(
+    projectDemoRunTurnover({
+      runId: 'demo-run-legacy',
+      reused: true,
+      runtimeEpoch: 1
+    }),
+    {
+      performed: false,
+      previousRun: null
+    },
+    '旧 run DTO 缺失 turnover 时必须安全投影为未换代。'
+  );
+
+  const previousRunId = 'demo-run-123e4567-e89b-12d3-a456-426614174000';
+  assert.deepStrictEqual(
+    projectDemoRunTurnover({
+      runId: 'demo-run-223e4567-e89b-12d3-a456-426614174000',
+      turnover: {
+        performed: true,
+        reason: 'manifest-version-mismatch',
+        trigger: 'managed-artifact-download',
+        previousRun: {
+          runId: previousRunId,
+          status: 'active'
+        },
+        currentRun: {
+          runId: 'demo-run-223e4567-e89b-12d3-a456-426614174000',
+          status: 'active'
+        }
+      }
+    }),
+    {
+      performed: true,
+      previousRun: { runId: previousRunId }
+    },
+    '当前增强 turnover DTO 必须保持已换代响应投影。'
+  );
+
+  assert.deepStrictEqual(
+    projectDemoRunTurnover({
+      turnover: {
+        performed: true,
+        previousRun: {
+          runId: 'invalid\r\nheader'
+        }
+      }
+    }),
+    {
+      performed: true,
+      previousRun: null
+    },
+    '非法 previous run 标识不得进入响应头。'
+  );
+}
 
 /** 读取模板首行表头，统一校验 CSV 与 Excel 下载内容。 */
 function readTemplateHeaders(format, body) {
@@ -430,6 +491,7 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
   let server;
   try {
     initDatabase();
+    assertDemoRunTurnoverProjection();
     createOrganizationUnit({
       unitCode: 'QL-PARK',
       unitName: '数据库中已存在的天坤集团',
@@ -462,6 +524,46 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
       assert.strictEqual(registration.blocker.previewExecuteContext, 'direct-upload-context-not-connected');
       assert.strictEqual(artifact.formats.length, 1);
       assert.deepStrictEqual(artifact.formats, ['xlsx']);
+    });
+    const monthlyEnergyArtifact = demoArtifacts.find((item) => item.artifactKey === '07-monthly-energy');
+    const monthlyEnergyRegistration = registrations.find((item) => item.artifactKey === '07-monthly-energy');
+    assert(monthlyEnergyArtifact && monthlyEnergyRegistration, 'Artifact 07 必须同时存在于 dataset 与 registry。');
+    assert.strictEqual(monthlyEnergyRegistration.mode, 'direct-upload');
+    assert.strictEqual(
+      monthlyEnergyRegistration.downloadLifecycle,
+      DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME
+    );
+    assert.deepStrictEqual(monthlyEnergyRegistration.routes.preview, []);
+    assert.deepStrictEqual(monthlyEnergyRegistration.routes.execute, ['/api/imports/batches']);
+    assert.strictEqual(monthlyEnergyRegistration.blocker.previewExecuteContext, null);
+    assert.deepStrictEqual(monthlyEnergyRegistration.ownershipTargets, ['energy_record']);
+    assert.strictEqual(monthlyEnergyArtifact.downloadLifecycle, monthlyEnergyRegistration.downloadLifecycle);
+    Object.entries(EXPECTED_MANAGED_CARBON_INPUT_OWNERSHIP_TARGETS).forEach(([
+      artifactKey,
+      ownershipTargets
+    ]) => {
+      const artifact = demoArtifacts.find((item) => item.artifactKey === artifactKey);
+      const registration = registrations.find((item) => item.artifactKey === artifactKey);
+      assert(artifact, `${artifactKey} 必须出现在 dataset manifest。`);
+      assert(registration, `${artifactKey} 必须出现在 registry。`);
+      assert.strictEqual(artifact.handlerKey, registration.handlerKey);
+      assert.strictEqual(artifact.templateType, registration.templateType);
+      assert.strictEqual(
+        artifact.downloadLifecycle,
+        DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME
+      );
+      assert.strictEqual(registration.downloadLifecycle, artifact.downloadLifecycle);
+      assert.deepStrictEqual(registration.routes, artifact.routes);
+      assert.deepStrictEqual(registration.permissions, artifact.permissions);
+      assert.deepStrictEqual(
+        registration.routes.download,
+        Object.values(artifact.downloads),
+        `${artifactKey} registry 下载路由必须覆盖 manifest 声明格式。`
+      );
+      assert.deepStrictEqual(registration.ownershipTargets, [...ownershipTargets]);
+      assert.deepStrictEqual(artifact.ownershipTargets, [...ownershipTargets]);
+      assert.strictEqual(registration.blocker.previewExecuteContext, null);
+      assert.strictEqual(artifact.blocker.previewExecuteContext, null);
     });
     register({ username: 'template-reader', password: 'Password123!' });
     register({ username: 'carbon-activity-template-reader', password: 'Password123!' });
@@ -561,11 +663,18 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
     assert.strictEqual(demoDownloadStateAfterToggle.runs.length, 0, '显式 toggle 不得预建 active run。');
     assert.strictEqual(demoDownloadStateAfterToggle.contexts.length, 0, '显式 toggle 不得预签发 context。');
 
+    const managedArtifacts = demoArtifacts.filter((artifact) => (
+      artifact.downloadLifecycle
+      === DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME
+    ));
+    const managedArtifactCount = managedArtifacts.length;
     let firstManagedContextToken = null;
-    let statelessFormalState = null;
     for (const artifact of demoArtifacts) {
       const pathname = `/api/templates/demo-park/${artifact.artifactKey}.xlsx`;
-      if (artifact.order === 26) statelessFormalState = snapshotDemoDownloadState();
+      const stateBeforeArtifactDownload = artifact.downloadLifecycle
+        === DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.STATELESS_FORMAL_IMPORT
+        ? snapshotDemoDownloadState()
+        : null;
       const allowed = await request(server, pathname, downloadAuthorizedToken);
       assert.strictEqual(allowed.status, 200, `${artifact.artifactKey} 在显式开启 runtime 后必须允许授权下载。`);
       assert.strictEqual(allowed.headers['content-type'], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -574,18 +683,21 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
       assert.strictEqual(names.asciiName, `${artifact.artifactKey}.xlsx`, `${artifact.artifactKey} ASCII 文件名必须稳定。`);
       assert.strictEqual(names.utf8Name, `${String(artifact.order).padStart(2, '0')}-${artifact.name}.xlsx`, `${artifact.artifactKey} 中文文件名必须正确。`);
 
-      if (artifact.downloadLifecycle === 'stateless-formal-import') {
+      if (artifact.downloadLifecycle === DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.STATELESS_FORMAL_IMPORT) {
         assert.strictEqual(allowed.headers['x-demo-context'], undefined, `${artifact.artifactKey} 无状态下载不得签发 context。`);
         assert.strictEqual(allowed.headers['x-demo-run-id'], undefined, `${artifact.artifactKey} 无状态下载不得创建或暴露 run。`);
-        if (artifact.order >= 26) {
-          assert.deepStrictEqual(snapshotDemoDownloadState(), statelessFormalState,
-            `${artifact.artifactKey} 正式无状态下载不得把 runtime、run、context、ownership、cleanup 或领域表当作可写能力。`);
-        }
+        assert.deepStrictEqual(snapshotDemoDownloadState(), stateBeforeArtifactDownload,
+          `${artifact.artifactKey} 正式无状态下载不得把 runtime、run、context、ownership、cleanup 或领域表当作可写能力。`);
       } else {
-        assert.strictEqual(artifact.downloadLifecycle, 'managed-context-auto-runtime');
+        assert.strictEqual(
+          artifact.downloadLifecycle,
+          DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME
+        );
         assert(/^[A-Za-z0-9_-]{43}$/.test(allowed.headers['x-demo-context'] || ''), `${artifact.artifactKey} 必须签发 context。`);
         assert.strictEqual(allowed.headers['x-demo-artifact-key'], artifact.artifactKey);
         assert.strictEqual(allowed.headers['x-demo-handler-key'], artifact.handlerKey);
+        assert.strictEqual(allowed.headers['x-demo-run-auto-superseded'], 'false');
+        assert.strictEqual(allowed.headers['x-demo-run-superseded-from'], undefined);
         assert(/^[a-f0-9]{64}$/.test(allowed.headers['x-demo-artifact-sha256'] || ''), `${artifact.artifactKey} 必须返回文件 SHA。`);
         if (!firstManagedContextToken) firstManagedContextToken = allowed.headers['x-demo-context'];
       }
@@ -604,11 +716,33 @@ function grantUserPermissions(username, roleCode, permissionCodes) {
     assert.strictEqual(demoDownloadStateAfter.runtime.runtimeEpoch, demoDownloadStateAfterToggle.runtime.runtimeEpoch, '下载不得提升 runtime epoch。');
     assert.strictEqual(demoDownloadStateAfter.runtime.revision, demoDownloadStateAfterToggle.runtime.revision, '下载不得提升 runtime revision。');
     assert.strictEqual(demoDownloadStateAfter.runtime.changeReason, 'runtime_toggle_enabled');
-    assert.strictEqual(demoDownloadStateAfter.runs.length, 1, '13 个 managed 下载必须复用唯一 active run。');
-    assert.strictEqual(demoDownloadStateAfter.contexts.length, 13, '13—25 每项下载必须签发一个独立 context。');
-    assert.strictEqual(new Set(demoDownloadStateAfter.contexts.map((row) => row.token_hash)).size, 13, 'managed context token hash 必须互不相同。');
+    assert.strictEqual(
+      demoDownloadStateAfter.runs.length,
+      1,
+      `${managedArtifactCount} 个 managed 下载必须复用唯一 active run。`
+    );
+    assert.strictEqual(
+      demoDownloadStateAfter.contexts.length,
+      managedArtifactCount,
+      '每个中央 registry 声明的 managed artifact 下载必须签发一个独立 context。'
+    );
+    assert.strictEqual(
+      new Set(demoDownloadStateAfter.contexts.map((row) => row.token_hash)).size,
+      managedArtifactCount,
+      'managed context token hash 必须互不相同。'
+    );
     assert.strictEqual(demoDownloadStateAfter.runtimeAutoEnableAudits.length, 0, '下载不得产生 runtime 自动激活审计。');
-    assert.deepStrictEqual(demoDownloadStateAfter.operationLogs, demoDownloadStateAfterToggle.operationLogs, '下载不得追加 runtime 或其他操作审计。');
+    const managedDownloadOperationLogs = demoDownloadStateAfter.operationLogs
+      .slice(demoDownloadStateAfterToggle.operationLogs.length);
+    assert(
+      managedDownloadOperationLogs.length <= 1,
+      '新旧 run service 均不得让 managed 下载追加一个以上的 operation audit。'
+    );
+    if (managedDownloadOperationLogs.length === 1) {
+      assert.strictEqual(managedDownloadOperationLogs[0].operation, 'system.demo.run.create');
+      assert.strictEqual(managedDownloadOperationLogs[0].targetType, 'demo_dataset_runs');
+      assert.strictEqual(managedDownloadOperationLogs[0].targetId, demoDownloadStateAfter.runs[0].run_id);
+    }
     assert.deepStrictEqual(demoDownloadStateAfter.nonGovernanceTables, demoDownloadStateBefore.nonGovernanceTables, '01—29 下载不得改写任何领域、权限或导入审计表。');
 
     const statelessRepeatBefore = snapshotDemoDownloadState();

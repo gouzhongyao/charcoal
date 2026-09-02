@@ -481,7 +481,7 @@ function assertDatabaseEffects(testCase, preview, userId) {
           JOIN demo_data_registry source ON source.registry_id = relation.from_registry_id
           JOIN demo_data_registry target ON target.registry_id = relation.to_registry_id
           WHERE source.artifact_key = ? OR target.artifact_key = ?`).get(testCase.artifactKey, testCase.artifactKey).total, 0,
-        'artifact 15 没有真实 relation 语义，不得写 demo_data_relations。');
+        'artifact 15 先导入且 artifact 18 尚未登记时不得提前创建不完整策略输入关系。');
       } else if (testCase.artifactKey === '18-strategy-rules') {
         const rules = db.prepare(`SELECT id, source_batch_id, source_row_number, rule_code,
             rule_name, rule_version, formula_version, metric_code, threshold_operator,
@@ -513,6 +513,41 @@ function assertDatabaseEffects(testCase, preview, userId) {
           assert.strictEqual(ownershipRow.snapshotDigest,
             calculateDemoEntitySnapshotDigest('strategy_rule', ownershipRow.entityPk, projection));
         });
+        const strategyInputRelations = db.prepare(`SELECT relation.relation_type AS relationType,
+            source.run_id AS sourceRunId, source.entity_type AS sourceEntityType,
+            source.entity_pk AS sourceEntityPk, source.ownership_kind AS sourceOwnershipKind,
+            target.run_id AS targetRunId, target.entity_type AS targetEntityType,
+            target.entity_pk AS targetEntityPk, target.ownership_kind AS targetOwnershipKind
+          FROM demo_data_relations relation
+          JOIN demo_data_registry source ON source.registry_id = relation.from_registry_id
+          JOIN demo_data_registry target ON target.registry_id = relation.to_registry_id
+          WHERE source.artifact_key = '15-energy-timeseries'
+            AND target.artifact_key = '18-strategy-rules'
+          ORDER BY relation.relation_id`).all();
+        const timeseriesOwnershipCount = db.prepare(`SELECT COUNT(*) AS total
+          FROM demo_data_registry WHERE artifact_key = '15-energy-timeseries'
+            AND entity_type = 'energy_timeseries' AND ownership_kind = 'imported'
+            AND cleaned_at IS NULL`).get().total;
+        const expectedStrategyRelationCount = Number(timeseriesOwnershipCount) * ownershipRows.length;
+        assert.strictEqual(strategyInputRelations.length, expectedStrategyRelationCount,
+          'artifact 18 后导入时必须自动补齐当前 run 的时序×规则 imported uses_config 闭包。');
+        assert(strategyInputRelations.every((relation) => (
+          relation.relationType === 'uses_config'
+          && relation.sourceRunId === relation.targetRunId
+          && relation.sourceEntityType === 'energy_timeseries'
+          && relation.targetEntityType === 'strategy_rule'
+          && relation.sourceOwnershipKind === 'imported'
+          && relation.targetOwnershipKind === 'imported'
+        )), '策略输入关系必须保持固定方向、端点、类型和 imported ownership。');
+        const persistedExecuteResult = JSON.parse(
+          audits.find((audit) => audit.importType === 'strategy_rule').executeResultJson
+        );
+        assertManagedOwnershipPublicProjection(persistedExecuteResult.ownership, 'artifact 18 execute 审计');
+        assert.strictEqual(
+          persistedExecuteResult.ownership.relationCount,
+          expectedStrategyRelationCount,
+          'artifact 18 ownership 公共摘要必须反映自动准备的完整闭包基数。'
+        );
         assert.strictEqual(db.prepare(`SELECT COUNT(*) AS total FROM strategy_evaluation_runs`).get().total, 0,
           'artifact 18 策略配置导入不得创建 evaluation run。');
         assert.strictEqual(db.prepare(`SELECT COUNT(*) AS total FROM strategy_rule_hits`).get().total, 0,
@@ -1073,7 +1108,8 @@ async function assertArtifact25NonZeroMilliseconds(server, token) {
   assert.strictEqual(Number(invalidPreview.boundaryPreview.summary.blocked), 1);
   assert.strictEqual(Number(invalidPreview.itemPreview.summary.blocked), 3);
   const invalidIssueCodes = new Set(invalidPreview.auditIssues.map((issue) => issue.code));
-  assert(invalidIssueCodes.has('INVALID_TEMPLATE_CELL_TYPE'));
+  assert(invalidIssueCodes.has('STRICT_UTC_INPUT_PRECISION_INVALID'));
+  assert.strictEqual(invalidIssueCodes.has('INVALID_TEMPLATE_CELL_TYPE'), false, '非零毫秒必须投影明确 UTC 精度错误。');
   assert(invalidIssueCodes.has('ENERGY_BALANCE_IMPORT_REQUIRED_FIELD_MISSING'));
   assert(invalidIssueCodes.has('ENERGY_BALANCE_IMPORT_BOUNDARY_NOT_FOUND'));
   assert.throws(
@@ -1440,7 +1476,8 @@ async function assertManagedAnalysisAllSkipped(server, token, artifactKey, expec
   assert.strictEqual(result.ownership.insertedCount, 0);
   assert.strictEqual(result.ownership.idempotentCount, 0);
   assert.strictEqual(result.ownership.skippedCount, expectedSkipped);
-  assert.strictEqual(result.ownership.relationCount, 0);
+  assert.strictEqual(result.ownership.relationCount, before.relations,
+    `${artifactKey} 全 skipped 重试必须幂等返回既有完整策略输入闭包。`);
   assert.strictEqual(JSON.stringify(result.ownership).includes('rowWitness'), false,
     `${artifactKey} duplicate ownership 公共结果不得泄漏 row witness。`);
   assert.strictEqual(readContextState(issued.contextId).context.status, 'executed');
@@ -1490,21 +1527,14 @@ async function assertArtifact19AllSkipped(server, token, userId) {
     sourceDb.close();
   }
   assert(existingFactor, 'artifact 19 首次 execute 必须先写入可复用的折标系数。');
-  const duplicateHeaders = ['系数编码', '能源类型编码', '源单位', '折标系数值', '目标单位', '展示单位', '展示除数',
-    '来源', '文号', '版本', '生效开始时间（UTC）', '生效结束时间（UTC）', '来源时区', '状态'];
-  const duplicateValues = [existingFactor.factorCode, existingFactor.energyTypeCode, existingFactor.sourceUnit, existingFactor.factorValue,
-    existingFactor.targetUnit, existingFactor.displayUnit, existingFactor.displayDivisor, existingFactor.source,
-    existingFactor.documentNo, existingFactor.version, existingFactor.effectiveStartUtc, existingFactor.effectiveEndUtc,
-    existingFactor.sourceTimezone, existingFactor.status].map((value) => String(value ?? '').replace(/"/g, '""'));
-  const duplicateCsv = Buffer.from(`﻿${duplicateHeaders.join(',')}\n${duplicateValues.map((value) => `"${value}"`).join(',')}\n`, 'utf8');
+  // managed context 必须上传下载时签发的原始字节；首次已导入同一 canonical artifact，因此原文件重放即为全 skipped。
   const previewResponse = await requestMultipart(
     server,
     '/api/energy-benchmarks/imports/conversion-factors/preview',
     token,
     issuedToken,
-    '19-conversion-factors-duplicate.csv',
-    duplicateCsv,
-    'text/csv'
+    '19-conversion-factors.xlsx',
+    downloadResponse.buffer
   );
   assert.strictEqual(previewResponse.status, 200, `artifact 19 duplicate preview 失败：${previewResponse.text}`);
   const preview = previewResponse.body.data;
@@ -1820,7 +1850,34 @@ async function runCase(server, token, userId, testCase) {
     assert.strictEqual(publicOwnership.insertedCount, publicResult.imported);
     assert.strictEqual(publicOwnership.idempotentCount, 0);
     assert.strictEqual(publicOwnership.skippedCount, 0);
-    assert.strictEqual(publicOwnership.relationCount, 0);
+    if (testCase.artifactKey === '15-energy-timeseries') {
+      assert.strictEqual(publicOwnership.relationCount, 0,
+        'artifact 15 先导入时 counterpart 尚未存在，不得创建不完整策略关系。');
+    } else if (testCase.artifactKey === '18-strategy-rules') {
+      const relationDb = openDatabase();
+      let relationCount;
+      try {
+        relationCount = Number(relationDb.prepare(`SELECT COUNT(*) AS total
+          FROM demo_data_relations relation
+          JOIN demo_data_registry source ON source.registry_id = relation.from_registry_id
+          JOIN demo_data_registry target ON target.registry_id = relation.to_registry_id
+          WHERE source.run_id = target.run_id
+            AND source.artifact_key = '15-energy-timeseries'
+            AND source.entity_type = 'energy_timeseries'
+            AND source.ownership_kind = 'imported'
+            AND target.artifact_key = '18-strategy-rules'
+            AND target.entity_type = 'strategy_rule'
+            AND target.ownership_kind = 'imported'
+            AND relation.relation_type = 'uses_config'`).get().total);
+      } finally {
+        relationDb.close();
+      }
+      assert.strictEqual(publicOwnership.relationCount, relationCount,
+        'artifact 18 ownership 公共摘要必须反映自动生成的完整策略输入闭包。');
+      assert(relationCount > 0, 'artifact 18 后导入必须生成策略输入 relation。');
+    } else {
+      assert.strictEqual(publicOwnership.relationCount, 0);
+    }
   }
 
   const afterExecute = readContextState(issued.contextId);

@@ -812,14 +812,7 @@ function readSafeUploadFile(uploadRoot, storedPath, options = {}) {
     if (!beforeStat.isFile() || !isSameFileIdentity(pathStat, beforeStat)) {
       throw badRequest('打开文件与已校验路径不一致。', { code: 'ENERGY_ANALYSIS_UPLOAD_FILE_IDENTITY_MISMATCH' });
     }
-    if (typeof options.afterFileOpen === 'function') {
-      options.afterFileOpen({ fileDescriptor, filePath: currentPath });
-    }
-    const buffer = fs.readFileSync(fileDescriptor);
-    const afterStat = fs.fstatSync(fileDescriptor);
-    if (!isSameOpenedFileState(beforeStat, afterStat) || buffer.length !== beforeStat.size) {
-      throw badRequest('读取期间上传文件发生变化。', { code: 'ENERGY_ANALYSIS_UPLOAD_FILE_CHANGED_DURING_READ' });
-    }
+    // 大小约束必须在读取文件内容前完成，避免替换后的超大 retained 文件先进入内存。
     if (options.expectedSizeBytes !== undefined
       && (!Number.isSafeInteger(options.expectedSizeBytes) || options.expectedSizeBytes < 0 || beforeStat.size !== options.expectedSizeBytes)) {
       throw badRequest('保存文件大小与预期不一致。', {
@@ -835,6 +828,14 @@ function readSafeUploadFile(uploadRoot, storedPath, options = {}) {
         maxSizeBytes: options.maxSizeBytes,
         actualSizeBytes: beforeStat.size
       });
+    }
+    if (typeof options.afterFileOpen === 'function') {
+      options.afterFileOpen({ fileDescriptor, filePath: currentPath });
+    }
+    const buffer = fs.readFileSync(fileDescriptor);
+    const afterStat = fs.fstatSync(fileDescriptor);
+    if (!isSameOpenedFileState(beforeStat, afterStat) || buffer.length !== beforeStat.size) {
+      throw badRequest('读取期间上传文件发生变化。', { code: 'ENERGY_ANALYSIS_UPLOAD_FILE_CHANGED_DURING_READ' });
     }
     return {
       filePath: realFilePath,

@@ -2384,19 +2384,40 @@ CREATE TABLE IF NOT EXISTS demo_dataset_runs (
     length(manifest_digest) = 64
     AND manifest_digest NOT GLOB '*[^a-f0-9]*'
   ),
-  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'cleanup_pending', 'cleaning', 'cleaned', 'failed')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'cleanup_pending', 'cleaning', 'cleaned', 'failed', 'superseded')),
   created_by INTEGER,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   completed_at TEXT,
   cleanup_started_at TEXT,
   cleaned_at TEXT,
   failure_reason TEXT,
+  superseded_at TEXT CHECK (superseded_at IS NULL OR is_strict_utc_iso(superseded_at) = 1),
+  successor_run_id TEXT,
+  superseded_by INTEGER,
+  supersede_reason TEXT CHECK (supersede_reason IS NULL OR length(trim(supersede_reason)) BETWEEN 1 AND 128),
+  supersede_trigger TEXT CHECK (supersede_trigger IS NULL OR length(trim(supersede_trigger)) BETWEEN 1 AND 128),
   FOREIGN KEY (created_by) REFERENCES sys_users(id) ON DELETE SET NULL,
+  FOREIGN KEY (successor_run_id) REFERENCES demo_dataset_runs(run_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (superseded_by) REFERENCES sys_users(id) ON DELETE SET NULL,
   CHECK (length(trim(run_id)) BETWEEN 1 AND 128),
   CHECK (length(trim(dataset_id)) BETWEEN 1 AND 128),
   CHECK (length(trim(manifest_version)) BETWEEN 1 AND 64),
   CHECK ((status = 'cleaned' AND cleaned_at IS NOT NULL)
-    OR (status <> 'cleaned' AND cleaned_at IS NULL))
+    OR (status <> 'cleaned' AND cleaned_at IS NULL)),
+  CHECK (successor_run_id IS NULL OR successor_run_id <> run_id),
+  CHECK (
+    (status = 'superseded'
+      AND superseded_at IS NOT NULL
+      AND successor_run_id IS NOT NULL
+      AND supersede_reason IS NOT NULL
+      AND supersede_trigger IS NOT NULL)
+    OR (status <> 'superseded'
+      AND superseded_at IS NULL
+      AND successor_run_id IS NULL
+      AND superseded_by IS NULL
+      AND supersede_reason IS NULL
+      AND supersede_trigger IS NULL)
+  )
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_demo_dataset_runs_active_dataset
@@ -2525,7 +2546,7 @@ CREATE TABLE IF NOT EXISTS demo_cleanup_runs (
   summary_json TEXT,
   confirmation_text TEXT,
   requested_by INTEGER,
-  status TEXT NOT NULL DEFAULT 'previewed' CHECK (status IN ('previewed', 'executing', 'succeeded', 'blocked', 'failed', 'expired', 'noop')),
+  status TEXT NOT NULL DEFAULT 'previewed' CHECK (status IN ('previewed', 'executing', 'succeeded', 'blocked', 'failed', 'expired', 'noop', 'superseded')),
   backup_metadata_json TEXT,
   deleted_count INTEGER NOT NULL DEFAULT 0 CHECK (deleted_count >= 0),
   already_missing_count INTEGER NOT NULL DEFAULT 0 CHECK (already_missing_count >= 0),
@@ -2537,7 +2558,9 @@ CREATE TABLE IF NOT EXISTS demo_cleanup_runs (
   FOREIGN KEY (requested_by) REFERENCES sys_users(id) ON DELETE SET NULL,
   CHECK (length(trim(cleanup_run_id)) BETWEEN 1 AND 128),
   CHECK (length(trim(client_request_id)) BETWEEN 1 AND 128),
-  CHECK (length(trim(registry_watermark)) BETWEEN 1 AND 256)
+  CHECK (length(trim(registry_watermark)) BETWEEN 1 AND 256),
+  CHECK (status <> 'superseded'
+    OR (completed_at IS NOT NULL AND failure_reason = 'manifest_run_superseded'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_demo_cleanup_runs_status_created

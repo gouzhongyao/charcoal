@@ -19,7 +19,7 @@ export function buildEnergyFilters(filters = {}) {
     normalizedMonthStart: filters.normalizedMonthStart,
     normalizedMonthEnd: filters.normalizedMonthEnd,
     energyTypeCode: filters.energyTypeCode,
-    organization: filters.organization,
+    organizationUnitCode: filters.organizationUnitCode,
     keyword: filters.keyword,
     search: filters.search
   }).filter(([, value]) => value !== '' && value !== null && value !== undefined));

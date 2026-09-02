@@ -37,6 +37,7 @@ const {
   TIME_OF_USE_CONSUMPTION_ANALYSIS_FORMULA_VERSION,
   TIMESERIES_EXACT_ID_QUERY_BATCH_SIZE,
   TIMESERIES_QUERY_LIMIT,
+  assertEnergyLoadExactScopeCapability,
   buildEnergyLoadExactScope,
   getDeviceStateConsumptionAnalysis,
   getEnergyLoadCurve,
@@ -1058,6 +1059,105 @@ function testFullCoverageAndExactScope(db, ids, insertRecord) {
 }
 
 /**
+ * 验证 exact scope 和私有 metadata 仅允许创建连接对象消费。
+ * @param {object} dbA 创建 exact scope 的 SQLite 连接。
+ * @param {object} ids 主数据 ID。
+ * @param {object} exactScope dbA 创建的原始 exact scope capability。
+ * @param {object} exactResult dbA 生成的 exact 负荷摘要。
+ */
+function testExactScopeDatabaseIdentity(dbA, ids, exactScope, exactResult) {
+  // dbB 指向与 dbA 相同的临时 SQLite 文件，但必须保持独立连接对象身份。
+  const dbB = database.openDatabase();
+  // 保存 dbB 原始方法，便于统计 fail-closed 前是否执行 SQL 并保证异常路径清理连接。
+  const originalPrepare = dbB.prepare;
+  const originalExec = dbB.exec;
+  const originalClose = dbB.close;
+  // 保存数据库工厂，测试 exact scope 未显式传入连接时的自开连接拒绝与关闭边界。
+  const originalOpenDatabase = database.openDatabase;
+  // SQL 与关闭计数用于证明连接身份不匹配在业务查询和事务开始前拒绝。
+  let prepareCount = 0;
+  let execCount = 0;
+  let closeCount = 0;
+
+  dbB.prepare = function monitoredPrepare(...args) {
+    prepareCount += 1;
+    return originalPrepare.apply(dbB, args);
+  };
+  dbB.exec = function monitoredExec(...args) {
+    execCount += 1;
+    return originalExec.apply(dbB, args);
+  };
+  dbB.close = function monitoredClose(...args) {
+    closeCount += 1;
+    return originalClose.apply(dbB, args);
+  };
+
+  try {
+    assert.notStrictEqual(dbA, dbB, 'dbA/dbB 必须是不同 SQLite 连接对象。');
+    assert.strictEqual(
+      path.resolve(dbA.name),
+      path.resolve(dbB.name),
+      'dbA/dbB 必须指向同一物理临时 SQLite 文件。'
+    );
+
+    // legacy 查询不携带 exact scope，同物理库的独立 dbB 连接必须继续正常工作。
+    const legacyResult = getEnergyLoadSummary(createInput({
+      meterDeviceId: ids.primaryMeterId
+    }), { db: dbB });
+    assert.strictEqual(legacyResult.recordCount, 8);
+    assert.strictEqual(prepareCount > 0, true, 'legacy 查询必须真实读取 dbB。');
+    prepareCount = 0;
+    execCount = 0;
+
+    assertBadRequestCode(
+      () => assertEnergyLoadExactScopeCapability(exactScope, dbB),
+      'ENERGY_LOAD_EXACT_SCOPE_DATABASE_MISMATCH'
+    );
+    assert.strictEqual(prepareCount, 0);
+    assert.strictEqual(execCount, 0);
+
+    // exact 摘要必须在任何 dbB 业务 SQL 或读取事务开始前按连接对象身份 fail-closed。
+    assertBadRequestCode(
+      () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+        db: dbB,
+        exactScope
+      }),
+      'ENERGY_LOAD_EXACT_SCOPE_DATABASE_MISMATCH'
+    );
+    assert.strictEqual(prepareCount, 0, '跨连接 exact 摘要不得执行 dbB prepare。');
+    assert.strictEqual(execCount, 0, '跨连接 exact 摘要不得在 dbB 开始读取事务。');
+    assert.strictEqual(dbB.inTransaction, false);
+
+    // exact response metadata 同样只能由生成该响应的 dbA 对象读取。
+    assertBadRequestCode(
+      () => getExactScopeMetadata(exactResult, { db: dbB }),
+      'ENERGY_LOAD_EXACT_SCOPE_DATABASE_MISMATCH'
+    );
+    assertBadRequestCode(
+      () => getExactScopeMetadata(exactResult),
+      'ENERGY_LOAD_EXACT_SCOPE_DATABASE_MISMATCH'
+    );
+    assert.strictEqual(prepareCount, 0);
+    assert.strictEqual(execCount, 0);
+
+    // 未显式复用 dbA 时，服务即使自开同物理库 dbB 也必须拒绝 exact scope 并关闭连接。
+    database.openDatabase = () => dbB;
+    assertBadRequestCode(
+      () => getEnergyLoadSummary(createInput({ meterDeviceId: ids.primaryMeterId }), {
+        exactScope
+      }),
+      'ENERGY_LOAD_EXACT_SCOPE_DATABASE_MISMATCH'
+    );
+    assert.strictEqual(prepareCount, 0);
+    assert.strictEqual(execCount, 0);
+    assert.strictEqual(closeCount, 1, '跨连接拒绝后服务自开 dbB 必须由 finally 关闭。');
+  } finally {
+    database.openDatabase = originalOpenDatabase;
+    if (dbB.open) originalClose.call(dbB);
+  }
+}
+
+/**
  * 验证服务端私有 exact scope 的成功、阻断、漂移、覆盖和连接所有权边界。
  * @param {object} db SQLite 连接。
  * @param {object} ids 主数据 ID。
@@ -1128,6 +1228,7 @@ function testServerPrivateExactScope(db, ids, insertRecord) {
   assert(metadata, 'exact 响应必须关联服务端私有 metadata。');
   assert.deepStrictEqual(metadata.recordIds, exactRecordIds);
   assert.strictEqual(metadata.sourceBatchId, exactBatchId);
+  testExactScopeDatabaseIdentity(db, ids, exactScope, result);
   const publicJson = JSON.stringify(result);
   [
     'sourceBatchId',

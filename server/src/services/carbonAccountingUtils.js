@@ -1,9 +1,13 @@
 const { badRequest } = require('../utils/errors');
+const {
+  DEFAULT_CARBON_EMISSION_UNIT
+} = require('./carbonEmissionUnitContract');
 
 const MONTH_PATTERN = /^(\d{4})-(0[1-9]|1[0-2])$/;
 const DEFAULT_REGION = 'default';
 const DEFAULT_CALCULATION_METHOD = 'standard-factor';
-const DEFAULT_EMISSION_UNIT = 'kgCO2e';
+// 兼容既有 consumer 名称，实际默认值只由正式单位合同维护。
+const DEFAULT_EMISSION_UNIT = DEFAULT_CARBON_EMISSION_UNIT;
 const DEFAULT_PRECISION = 6;
 
 const EMISSION_GROUP_COLUMNS = Object.freeze({

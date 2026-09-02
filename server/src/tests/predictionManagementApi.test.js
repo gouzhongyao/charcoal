@@ -55,6 +55,9 @@ function multipart(server, pathname, filename, content, token) {
 
 (async () => {
   let server;
+  // canonicalBatchId 是训练数据批次，otherBatchId 仅用于 provenance/filter 分离回归。
+  let canonicalBatchId;
+  let otherBatchId;
   try {
     initDatabase();
     register({ username: 'prediction-reader', password: 'Password123!' });
@@ -98,6 +101,15 @@ function multipart(server, pathname, filename, content, token) {
     const db = openDatabase();
     try {
       const energyTypeId = db.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
+      const insertBatch = db.prepare(`INSERT INTO import_batches
+        (import_type, original_filename, file_type, status, total_rows, success_count)
+        VALUES ('energy_record', ?, 'csv', 'completed', 3, 3)`);
+      canonicalBatchId = Number(
+        insertBatch.run('prediction-api-training.csv').lastInsertRowid
+      );
+      otherBatchId = Number(
+        insertBatch.run('prediction-api-provenance.csv').lastInsertRowid
+      );
       const organizationUnitId = db.prepare(`INSERT INTO organization_units
         (unit_code, unit_name, unit_path, unit_type, status)
         VALUES ('PRED-UNIT', '预测用能单元', '/PRED-UNIT', 'enterprise', 'active')`).run().lastInsertRowid;
@@ -108,11 +120,14 @@ function multipart(server, pathname, filename, content, token) {
         organizationUnitId
       ).lastInsertRowid;
       const insert = db.prepare(`INSERT INTO energy_records
-        (energy_type_id, organization_unit_id, meter_device_id, original_month,
+        (source_batch_id, source_row_number, energy_type_id,
+          organization_unit_id, meter_device_id, original_month,
           normalized_month, original_unit, original_value, normalized_unit,
           normalized_value, duplicate_key, record_status)
-        VALUES (?, ?, ?, ?, ?, 'kWh', ?, 'kWh', ?, ?, 'active')`);
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'kWh', ?, 'kWh', ?, ?, 'active')`);
       [100, 120, 140].forEach((value, index) => insert.run(
+        canonicalBatchId,
+        index + 2,
         energyTypeId,
         organizationUnitId,
         meterDeviceId,
@@ -125,6 +140,188 @@ function multipart(server, pathname, filename, content, token) {
     } finally { db.close(); }
 
     const payload = { name: '关键字预测草稿', note: '可编辑', energyTypeCode: 'electricity', organizationUnitCode: 'PRED-UNIT', meterCode: 'PRED-METER', trainStartMonth: '2026-01', trainEndMonth: '2026-03', predictStartMonth: '2026-04', predictEndMonth: '2026-05', algorithm: 'linear_trend', status: 'draft' };
+
+    // 配置 API 使用 canonical 训练批次字段，旧 sourceBatchId 只作为普通写请求兼容别名。
+    for (const invalidCanonicalFilter of [
+      { sourceBatchFilterId: 0 },
+      { source_batch_filter_id: 0 }
+    ]) {
+      assert.strictEqual((await request(
+        server,
+        'POST',
+        '/api/predictions/configs',
+        { ...payload, ...invalidCanonicalFilter },
+        adminToken
+      )).status, 400);
+    }
+    const canonicalCreated = await request(
+      server,
+      'POST',
+      '/api/predictions/configs',
+      {
+        ...payload,
+        name: 'Canonical 批次筛选配置',
+        sourceBatchFilterId: canonicalBatchId
+      },
+      adminToken
+    );
+    assert.strictEqual(canonicalCreated.status, 201);
+    assert.strictEqual(canonicalCreated.body.data.sourceBatchId, null);
+    assert.strictEqual(
+      canonicalCreated.body.data.sourceBatchFilterId,
+      canonicalBatchId
+    );
+    const canonicalConfigId = canonicalCreated.body.data.id;
+    const snakeUpdated = await request(
+      server,
+      'PUT',
+      `/api/predictions/configs/${canonicalConfigId}`,
+      { source_batch_filter_id: otherBatchId },
+      adminToken
+    );
+    assert.strictEqual(snakeUpdated.status, 200);
+    assert.strictEqual(
+      snakeUpdated.body.data.sourceBatchFilterId,
+      otherBatchId
+    );
+    const canonicalRestored = await request(
+      server,
+      'PUT',
+      `/api/predictions/configs/${canonicalConfigId}`,
+      { sourceBatchFilterId: canonicalBatchId },
+      adminToken
+    );
+    assert.strictEqual(canonicalRestored.status, 200);
+    const canonicalSnakeCreated = await request(
+      server,
+      'POST',
+      '/api/predictions/configs',
+      {
+        ...payload,
+        name: 'Canonical snake 批次筛选配置',
+        source_batch_filter_id: canonicalBatchId
+      },
+      adminToken
+    );
+    assert.strictEqual(canonicalSnakeCreated.status, 201);
+    assert.strictEqual(
+      canonicalSnakeCreated.body.data.sourceBatchFilterId,
+      canonicalBatchId
+    );
+    const synonymousAliases = await request(
+      server,
+      'POST',
+      '/api/predictions/configs',
+      {
+        ...payload,
+        name: 'Canonical 同义批次配置',
+        sourceBatchFilterId: canonicalBatchId,
+        sourceBatchId: canonicalBatchId
+      },
+      adminToken
+    );
+    assert.strictEqual(synonymousAliases.status, 201);
+    assert.strictEqual(
+      synonymousAliases.body.data.sourceBatchFilterId,
+      canonicalBatchId
+    );
+    assert.strictEqual((await request(
+      server,
+      'POST',
+      '/api/predictions/configs',
+      {
+        ...payload,
+        name: 'Canonical 冲突批次配置',
+        sourceBatchFilterId: canonicalBatchId,
+        sourceBatchId: otherBatchId
+      },
+      adminToken
+    )).status, 400);
+
+    // 完整 GET DTO 中 sourceBatchId 是 provenance，不得覆盖或冲突训练 filter。
+    const provenanceDb = openDatabase();
+    try {
+      provenanceDb.prepare(`UPDATE prediction_configs
+        SET source_batch_id = ?, source_row_number = ?
+        WHERE id = ?`).run(
+        otherBatchId,
+        2,
+        canonicalConfigId
+      );
+    } finally {
+      provenanceDb.close();
+    }
+    const canonicalDto = await request(
+      server,
+      'GET',
+      `/api/predictions/configs/${canonicalConfigId}`,
+      undefined,
+      adminToken
+    );
+    assert.strictEqual(canonicalDto.status, 200);
+    assert.strictEqual(canonicalDto.body.data.sourceBatchId, otherBatchId);
+    assert.strictEqual(
+      canonicalDto.body.data.sourceBatchFilterId,
+      canonicalBatchId
+    );
+    const canonicalRoundTrip = await request(
+      server,
+      'PUT',
+      `/api/predictions/configs/${canonicalConfigId}`,
+      {
+        ...canonicalDto.body.data,
+        name: 'Canonical DTO 往返配置'
+      },
+      adminToken
+    );
+    assert.strictEqual(canonicalRoundTrip.status, 200);
+    assert.strictEqual(
+      canonicalRoundTrip.body.data.sourceBatchId,
+      otherBatchId
+    );
+    assert.strictEqual(
+      canonicalRoundTrip.body.data.sourceBatchFilterId,
+      canonicalBatchId
+    );
+    const canonicalRun = await request(
+      server,
+      'POST',
+      `/api/predictions/configs/${canonicalConfigId}/runs`,
+      {},
+      adminToken
+    );
+    assert.strictEqual(canonicalRun.status, 201);
+    assert.strictEqual(canonicalRun.body.data.run.status, 'completed');
+    assert.strictEqual(
+      canonicalRun.body.data.run.parameters.filters.sourceBatchId,
+      canonicalBatchId
+    );
+
+    assert.strictEqual((await request(server, 'POST', '/api/predictions/configs', {
+      ...payload,
+      sourceBatchId: 0
+    }, adminToken)).status, 400, '配置 API 的 sourceBatchId=0 必须显式拒绝。');
+    for (const invalidFilter of [
+      { sourceBatchId: 0 },
+      { source_batch_id: 0 },
+      { organizationUnitId: 0 },
+      { meterDeviceId: 0 }
+    ]) {
+      assert.strictEqual((await request(server, 'POST', '/api/predictions/runs', {
+        ...payload,
+        ...invalidFilter
+      }, adminToken)).status, 400, `运行 API 必须拒绝 0 过滤值：${Object.keys(invalidFilter)[0]}`);
+    }
+    assert.strictEqual((await request(server, 'POST', '/api/predictions/runs', {
+      ...payload,
+      sourceBatchId: 1,
+      source_batch_id: 2
+    }, adminToken)).status, 400, '冲突 source batch 别名必须 fail-closed。');
+    assert.strictEqual((await request(server, 'POST', '/api/predictions/runs', {
+      ...payload,
+      algorithm: 'moving_average',
+      windowSize: 0
+    }, adminToken)).status, 400, 'windowSize=0 不能套用默认窗口。');
     const created = await request(server, 'POST', '/api/predictions/configs', payload, adminToken);
     assert.strictEqual(created.status, 201);
     const configId = created.body.data.id;

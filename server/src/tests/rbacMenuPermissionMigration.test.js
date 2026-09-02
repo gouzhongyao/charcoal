@@ -42,6 +42,8 @@ const carbonActivityPermissions = [
 ];
 // 旧能耗结果导出继续使用独立旧权限，不能随查看权限自动扩权。
 const carbonEmissionExportPermission = 'carbon:emissions:export';
+// 碳因子下载、预演和执行共同使用正式导入权限，旧库补种不得自动扩给普通角色。
+const carbonFactorImportPermission = 'carbon:factor:import';
 // N7 温室气体报告四项独立权限不得从历史碳查看角色或独立碳活动角色自动扩权。
 const ghgReportPermissions = [
   'carbon:ghg-reports:view',
@@ -108,6 +110,148 @@ function request(server, method, pathname, body, token) {
 
 function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...flattenMenus(menu.children || [])]); }
 
+/** 读取碳因子导入权限菜单及其全部角色关系，用于验证初始化前后零变更。 */
+function readCarbonFactorImportPermissionSnapshot(db) {
+  return {
+    menus: db.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType,
+        menu_name AS menuName, route_path AS routePath, component,
+        permission_code AS permissionCode, icon, sort_order AS sortOrder,
+        visible, status, is_builtin AS isBuiltin, created_at AS createdAt, updated_at AS updatedAt
+      FROM sys_menus WHERE permission_code = ? ORDER BY id`).all(carbonFactorImportPermission),
+    roleMenus: db.prepare(`SELECT role_menu.role_id AS roleId, role_menu.menu_id AS menuId,
+        role_menu.created_at AS createdAt
+      FROM sys_role_menus AS role_menu
+      JOIN sys_menus AS menu ON menu.id = role_menu.menu_id
+      WHERE menu.permission_code = ? ORDER BY role_menu.role_id, role_menu.menu_id`)
+      .all(carbonFactorImportPermission)
+  };
+}
+
+/** 读取完整菜单与角色菜单关系表，用于验证初始化失败后的事务级零变更。 */
+function readFullRbacMenuTablesSnapshot(db) {
+  return {
+    menus: db.prepare('SELECT * FROM sys_menus ORDER BY id').all(),
+    roleMenus: db.prepare('SELECT * FROM sys_role_menus ORDER BY role_id, menu_id').all()
+  };
+}
+
+/** 验证 canonical /carbon 父菜单失效时返回稳定错误并回滚全部菜单表写入。 */
+function assertCarbonFactorImportParentMissingRollback() {
+  const setupDb = openDatabase();
+  let carbonParentId;
+  try {
+    carbonParentId = Number(setupDb.prepare(
+      "SELECT id FROM sys_menus WHERE route_path = '/carbon' AND menu_type = 'menu'"
+    ).get().id);
+    setupDb.prepare("UPDATE sys_menus SET menu_type = 'directory' WHERE id = ?").run(carbonParentId);
+  } finally {
+    setupDb.close();
+  }
+
+  const beforeDb = openDatabase();
+  const beforeSnapshot = readFullRbacMenuTablesSnapshot(beforeDb);
+  beforeDb.close();
+  let parentMissingError = null;
+  try {
+    initDatabase();
+  } catch (error) {
+    parentMissingError = error;
+  }
+  assert(parentMissingError, 'canonical /carbon 父菜单失效必须阻止初始化。');
+  assert.strictEqual(parentMissingError.code, 'CARBON_FACTOR_IMPORT_PERMISSION_PARENT_MISSING');
+  assert.strictEqual(parentMissingError.message, '碳因子导入权限种子缺少 canonical /carbon 父菜单。');
+
+  const verifyDb = openDatabase();
+  try {
+    assert.deepStrictEqual(readFullRbacMenuTablesSnapshot(verifyDb), beforeSnapshot,
+      '父菜单缺失错误必须回滚初始化期间对 sys_menus 和 sys_role_menus 的全部写入。');
+    verifyDb.prepare("UPDATE sys_menus SET menu_type = 'menu' WHERE id = ?").run(carbonParentId);
+  } finally {
+    verifyDb.close();
+  }
+}
+
+/** 验证 active/inactive 同码非 canonical 历史行在有无普通角色授权时均稳定 fail-closed。 */
+function assertCarbonFactorImportPermissionCollision({ status, hasOrdinaryGrant }) {
+  const setupDb = openDatabase();
+  const collisionTimestamp = '2000-01-01T00:00:00.000Z';
+  let canonicalParentId;
+  let factorImportMenuId;
+  let collisionRoleId;
+  try {
+    canonicalParentId = Number(setupDb.prepare("SELECT id FROM sys_menus WHERE route_path = '/carbon' AND menu_type = 'menu'").get().id);
+    factorImportMenuId = Number(setupDb.prepare('SELECT id FROM sys_menus WHERE permission_code = ?')
+      .get(carbonFactorImportPermission).id);
+    const energyParentId = Number(setupDb.prepare("SELECT id FROM sys_menus WHERE route_path = '/energy' AND menu_type = 'directory'").get().id);
+    const collisionRole = setupDb.prepare("SELECT id FROM sys_roles WHERE role_code = 'carbon_factor_collision_role'").get();
+    collisionRoleId = collisionRole
+      ? Number(collisionRole.id)
+      : Number(setupDb.prepare(`INSERT INTO sys_roles
+          (role_code, role_name, status, is_builtin, created_at, updated_at)
+        VALUES ('carbon_factor_collision_role', '碳因子碰撞测试角色', 'active', 0, ?, ?)`)
+        .run(collisionTimestamp, collisionTimestamp).lastInsertRowid);
+    const superAdminRoleId = Number(setupDb.prepare("SELECT id FROM sys_roles WHERE role_code = 'super_admin'").get().id);
+    setupDb.prepare('DELETE FROM sys_role_menus WHERE menu_id = ? AND role_id <> ?')
+      .run(factorImportMenuId, superAdminRoleId);
+    if (hasOrdinaryGrant) {
+      setupDb.prepare('INSERT INTO sys_role_menus (role_id, menu_id, created_at) VALUES (?, ?, ?)')
+        .run(collisionRoleId, factorImportMenuId, collisionTimestamp);
+    }
+    if (status === 'active') {
+      setupDb.prepare(`UPDATE sys_menus SET parent_id = ?, menu_type = 'menu',
+          menu_name = '历史碳因子导入', route_path = '/legacy-carbon-factor-import',
+          component = 'legacy/carbon-factor-import', icon = 'Upload', sort_order = 1,
+          visible = 0, status = 'active', is_builtin = 0, updated_at = ?
+        WHERE id = ?`).run(energyParentId, collisionTimestamp, factorImportMenuId);
+    } else {
+      setupDb.prepare(`UPDATE sys_menus SET parent_id = ?, menu_type = 'button',
+          menu_name = '碳因子导入', route_path = NULL, component = NULL, icon = NULL,
+          sort_order = 616, visible = 1, status = 'inactive', is_builtin = 1, updated_at = ?
+        WHERE id = ?`).run(canonicalParentId, collisionTimestamp, factorImportMenuId);
+    }
+  } finally {
+    setupDb.close();
+  }
+
+  const beforeDb = openDatabase();
+  const beforeSnapshot = readCarbonFactorImportPermissionSnapshot(beforeDb);
+  beforeDb.close();
+  let collisionError = null;
+  try {
+    initDatabase();
+  } catch (error) {
+    collisionError = error;
+  }
+  assert(collisionError, `${status}/${hasOrdinaryGrant ? 'granted' : 'ungranted'} 同码碰撞必须阻止初始化。`);
+  assert.strictEqual(collisionError.code, 'CARBON_FACTOR_IMPORT_PERMISSION_MENU_COLLISION');
+  assert.strictEqual(
+    collisionError.message,
+    `碳因子导入权限码存在非 canonical 历史行：${carbonFactorImportPermission}`
+  );
+  assert.deepStrictEqual(collisionError.details, {
+    permissionCode: carbonFactorImportPermission,
+    invalidFields: status === 'active'
+      ? ['parent_id', 'menu_type', 'menu_name', 'route_path', 'component', 'icon', 'sort_order', 'visible', 'is_builtin']
+      : ['status']
+  });
+
+  const verifyDb = openDatabase();
+  try {
+    const afterSnapshot = readCarbonFactorImportPermissionSnapshot(verifyDb);
+    assert.deepStrictEqual(afterSnapshot, beforeSnapshot,
+      `${status}/${hasOrdinaryGrant ? 'granted' : 'ungranted'} 碰撞失败不得修改菜单或角色关系。`);
+    assert.strictEqual(afterSnapshot.menus.length, 1, '碰撞失败不得创建第二条同权限码菜单。');
+    verifyDb.prepare(`UPDATE sys_menus SET parent_id = ?, menu_type = 'button',
+        menu_name = '碳因子导入', route_path = NULL, component = NULL, icon = NULL,
+        sort_order = 616, visible = 1, status = 'active', is_builtin = 1, updated_at = ?
+      WHERE id = ?`).run(canonicalParentId, new Date().toISOString(), factorImportMenuId);
+    verifyDb.prepare('DELETE FROM sys_role_menus WHERE role_id = ? AND menu_id = ?')
+      .run(collisionRoleId, factorImportMenuId);
+  } finally {
+    verifyDb.close();
+  }
+}
+
 (async () => {
   let server;
   let sampleFactorId;
@@ -120,6 +264,44 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
     initDatabase();
     const db = openDatabase();
     const now = new Date().toISOString();
+    // 新库必须直接包含唯一、完整且挂载到 /carbon 的正式碳因子导入按钮。
+    const initialCarbonParent = db.prepare("SELECT id FROM sys_menus WHERE route_path = '/carbon' AND menu_type = 'menu'").get();
+    const initialFactorImportMenus = db.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType,
+        menu_name AS menuName, route_path AS routePath, component, permission_code AS permissionCode,
+        icon, sort_order AS sortOrder, visible, status, is_builtin AS isBuiltin
+      FROM sys_menus WHERE permission_code = ? ORDER BY id`).all(carbonFactorImportPermission);
+    assert(initialCarbonParent, '新库必须包含 canonical /carbon 父菜单。');
+    assert.strictEqual(initialFactorImportMenus.length, 1, '新库必须且只能包含一条碳因子导入权限菜单。');
+    assert.deepStrictEqual({
+      parentId: Number(initialFactorImportMenus[0].parentId),
+      menuType: initialFactorImportMenus[0].menuType,
+      menuName: initialFactorImportMenus[0].menuName,
+      routePath: initialFactorImportMenus[0].routePath,
+      component: initialFactorImportMenus[0].component,
+      permissionCode: initialFactorImportMenus[0].permissionCode,
+      icon: initialFactorImportMenus[0].icon,
+      sortOrder: Number(initialFactorImportMenus[0].sortOrder),
+      visible: Number(initialFactorImportMenus[0].visible),
+      status: initialFactorImportMenus[0].status,
+      isBuiltin: Number(initialFactorImportMenus[0].isBuiltin)
+    }, {
+      parentId: Number(initialCarbonParent.id),
+      menuType: 'button',
+      menuName: '碳因子导入',
+      routePath: null,
+      component: null,
+      permissionCode: carbonFactorImportPermission,
+      icon: null,
+      sortOrder: 616,
+      visible: 1,
+      status: 'active',
+      isBuiltin: 1
+    });
+    // 模拟已有 SQLite 尚未包含该权限：删除种子和超管关联，后续初始化必须幂等补回。
+    db.prepare('DELETE FROM sys_role_menus WHERE menu_id = ?').run(initialFactorImportMenus[0].id);
+    db.prepare('DELETE FROM sys_menus WHERE id = ?').run(initialFactorImportMenus[0].id);
+    assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?')
+      .get(carbonFactorImportPermission).total, 0);
     const roleId = db.prepare(`INSERT INTO sys_roles (role_code, role_name, status, created_at, updated_at)
       VALUES ('legacy_viewer', '历史页面查看者', 'active', ?, ?)`).run(now, now).lastInsertRowid;
     const passwordHash = require('bcryptjs').hashSync('Password123!', 10);
@@ -167,6 +349,27 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
     assert.strictEqual(migratedDb.prepare(`SELECT COUNT(*) AS total FROM sys_role_menus
       WHERE role_id = ? AND menu_id = ?`).get(roleId, emissionsButton.id).total, 1,
     '历史碳查看角色必须迁移获得 emissions 按钮。');
+    // 已有库缺失权限菜单时，初始化必须补回唯一 canonical 按钮，且不得继承历史碳查看授权。
+    const factorImportButton = migratedDb.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType,
+        menu_name AS menuName, route_path AS routePath, component, icon,
+        sort_order AS sortOrder, visible, status, is_builtin AS isBuiltin
+      FROM sys_menus WHERE permission_code = ?`).get(carbonFactorImportPermission);
+    assert(factorImportButton, '已有库初始化必须补齐碳因子导入权限菜单。');
+    assert.strictEqual(Number(factorImportButton.parentId), legacyCarbonMenuId);
+    assert.strictEqual(factorImportButton.menuType, 'button');
+    assert.strictEqual(factorImportButton.menuName, '碳因子导入');
+    assert.strictEqual(factorImportButton.routePath, null);
+    assert.strictEqual(factorImportButton.component, null);
+    assert.strictEqual(factorImportButton.icon, null);
+    assert.strictEqual(Number(factorImportButton.sortOrder), 616);
+    assert.strictEqual(Number(factorImportButton.visible), 1);
+    assert.strictEqual(factorImportButton.status, 'active');
+    assert.strictEqual(Number(factorImportButton.isBuiltin), 1);
+    assert.strictEqual(migratedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?')
+      .get(carbonFactorImportPermission).total, 1);
+    assert.strictEqual(migratedDb.prepare(`SELECT COUNT(*) AS total FROM sys_role_menus
+      WHERE role_id = ? AND menu_id = ?`).get(roleId, factorImportButton.id).total, 0,
+    '历史碳查看角色不得因缺失菜单补种自动获得碳因子导入权限。');
     const emissionsExportButton = migratedDb.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType
       FROM sys_menus WHERE permission_code = ?`).get(carbonEmissionExportPermission);
     assert(emissionsExportButton, '必须建立独立 carbon:emissions:export 按钮。');
@@ -287,6 +490,9 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
       assert.strictEqual(repeatedDb.prepare("SELECT COUNT(*) AS total FROM sys_menus WHERE route_path = '/carbon'").get().total, 1);
       assert.strictEqual(repeatedDb.prepare("SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = 'carbon:emissions:view'").get().total, 1);
       assert.strictEqual(repeatedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?')
+        .get(carbonFactorImportPermission).total, 1,
+      '重复初始化不得复制碳因子导入权限菜单。');
+      assert.strictEqual(repeatedDb.prepare('SELECT COUNT(*) AS total FROM sys_menus WHERE permission_code = ?')
         .get(carbonEmissionExportPermission).total, 1,
       '重复初始化不得复制旧能耗结果导出权限。');
       carbonActivityPermissions.forEach((permissionCode) => {
@@ -319,6 +525,18 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
         0,
         '历史查看角色不得因旧库补种自动获得导入操作权限。'
       );
+      // 新权限只延续超管全量兜底，普通内置角色和初始化前已存在角色均不得自动扩权。
+      const factorImportPermissionCount = repeatedDb.prepare(`SELECT COUNT(*) AS total
+        FROM sys_role_menus AS role_menu
+        JOIN sys_roles AS role ON role.id = role_menu.role_id
+        JOIN sys_menus AS menu ON menu.id = role_menu.menu_id
+        WHERE role.role_code = ? AND menu.permission_code = ?`);
+      assert.strictEqual(factorImportPermissionCount.get('super_admin', carbonFactorImportPermission).total, 1,
+        '超级管理员必须延续全量权限兜底并获得碳因子导入权限。');
+      assert.strictEqual(factorImportPermissionCount.get('user', carbonFactorImportPermission).total, 0,
+        '普通内置 user 角色不得自动获得碳因子导入权限。');
+      assert.strictEqual(factorImportPermissionCount.get('legacy_viewer', carbonFactorImportPermission).total, 0,
+        '初始化前已存在的普通角色不得因补种自动获得碳因子导入权限。');
       const builtinActivityPermissionCount = repeatedDb.prepare(`SELECT COUNT(*) AS total
         FROM sys_role_menus AS role_menu
         JOIN sys_roles AS role ON role.id = role_menu.role_id
@@ -345,6 +563,15 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
         carbonActivityPermissions.length,
         '独立碳活动角色的显式授权必须在重复初始化后保留。'
       );
+      assert.strictEqual(factorImportPermissionCount.get('carbon_activity_operator', carbonFactorImportPermission).total, 0,
+        '既有独立碳活动角色不得在重复初始化时自动获得碳因子导入权限。');
+      const factorImportMenu = repeatedDb.prepare('SELECT id FROM sys_menus WHERE permission_code = ?')
+        .get(carbonFactorImportPermission);
+      const carbonActivityRole = repeatedDb.prepare("SELECT id FROM sys_roles WHERE role_code = 'carbon_activity_operator'").get();
+      repeatedDb.prepare('INSERT INTO sys_role_menus (role_id, menu_id, created_at) VALUES (?, ?, ?)')
+        .run(carbonActivityRole.id, factorImportMenu.id, now);
+      assert.strictEqual(factorImportPermissionCount.get('carbon_activity_operator', carbonFactorImportPermission).total, 1,
+        '管理员显式分配正式菜单后，普通角色必须获得碳因子导入权限。');
       const builtinGhgReportPermissionCount = repeatedDb.prepare(`SELECT COUNT(*) AS total
         FROM sys_role_menus AS role_menu
         JOIN sys_roles AS role ON role.id = role_menu.role_id
@@ -399,6 +626,23 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
       repeatedDb.close();
     }
 
+    // 完全 canonical 的同码行必须复用原 ID，并在重复初始化后完整保留普通角色显式关系。
+    const canonicalReuseBeforeDb = openDatabase();
+    const canonicalReuseBefore = readCarbonFactorImportPermissionSnapshot(canonicalReuseBeforeDb);
+    const canonicalReuseRoleId = Number(canonicalReuseBeforeDb.prepare(
+      "SELECT id FROM sys_roles WHERE role_code = 'carbon_activity_operator'"
+    ).get().id);
+    canonicalReuseBeforeDb.close();
+    assert.strictEqual(canonicalReuseBefore.menus.length, 1);
+    assert(canonicalReuseBefore.roleMenus.some((roleMenu) => Number(roleMenu.roleId) === canonicalReuseRoleId),
+      'canonical 行必须保留普通角色显式授权作为复用基线。');
+    initDatabase();
+    const canonicalReuseAfterDb = openDatabase();
+    const canonicalReuseAfter = readCarbonFactorImportPermissionSnapshot(canonicalReuseAfterDb);
+    canonicalReuseAfterDb.close();
+    assert.deepStrictEqual(canonicalReuseAfter, canonicalReuseBefore,
+      '完全 canonical 同码行重复初始化必须复用原 ID、字段和全部角色关系。');
+
     const sampleDb = openDatabase();
     try {
       const electricityId = sampleDb.prepare("SELECT id FROM energy_types WHERE code = 'electricity'").get().id;
@@ -439,6 +683,8 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
     carbonActivityPermissions.forEach((permissionCode) => {
       assert(carbonActivityProfile.permissions.includes(permissionCode), `独立碳活动角色必须获得 ${permissionCode}。`);
     });
+    assert(carbonActivityProfile.permissions.includes(carbonFactorImportPermission),
+      '显式分配正式菜单后，普通角色资料必须返回碳因子导入权限。');
     assert(!carbonActivityProfile.permissions.includes('carbon:emissions:view'), 'activity-only 角色不得隐式获得旧排放结果查看权限。');
     const carbonActivityRoutes = flattenMenus(getUserMenus(carbonActivityUserId));
     const carbonActivityPage = carbonActivityRoutes.find((menu) => menu.routePath === '/carbon');
@@ -496,6 +742,16 @@ function flattenMenus(menus = []) { return menus.flatMap((menu) => [menu, ...fla
     const permissionSource = fs.readFileSync(path.join(__dirname, '../../../client/src/views/ledger/LedgerManagement.vue'), 'utf8');
     assert(permissionSource.includes("permission:'ledger:production-unit'"));
     assert(permissionSource.includes("permission:'ledger:production-output'"));
+    await new Promise((resolve) => server.close(resolve));
+    server = null;
+
+    assertCarbonFactorImportParentMissingRollback();
+    // active/inactive 与普通角色有授权/无授权组成四类碰撞矩阵，全部必须稳定失败且零变更。
+    for (const status of ['active', 'inactive']) {
+      for (const hasOrdinaryGrant of [false, true]) {
+        assertCarbonFactorImportPermissionCollision({ status, hasOrdinaryGrant });
+      }
+    }
     console.log('rbac menu permission migration tests passed');
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));

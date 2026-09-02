@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { types: utilTypes } = require('util');
 const {
   databaseAdmissionBlocked: createDatabaseAdmissionBlockedError,
   databasePoisoned: createDatabasePoisonedError
@@ -25,8 +26,8 @@ const schemaPath = path.join(__dirname, 'schema.sql');
 
 // 最终正式库只接受当前 canonical 身份及唯一已审查 predecessor；任何其他旧版本继续 fail-closed。
 const CANONICAL_SCHEMA_STAGE = 'formal-canonical';
-const CANONICAL_SCHEMA_VERSION = '2026-08-28-formal-canonical-v3';
-const CANONICAL_SCHEMA_PREDECESSOR_VERSION = '2026-08-27-formal-canonical-v2';
+const CANONICAL_SCHEMA_VERSION = '2026-08-30-formal-canonical-v4';
+const CANONICAL_SCHEMA_PREDECESSOR_VERSION = '2026-08-28-formal-canonical-v3';
 const CANONICAL_SCHEMA_FINGERPRINT_ALGORITHM = 'sqlite-master-sha256-v1';
 // v2 后置动作切片固定由两表、三索引和九个跨行/跨表触发器组成。
 const DEMO_POST_ACTION_CANONICAL_SCHEMA_OBJECT_COUNT = 14;
@@ -39,12 +40,23 @@ let databasePoisoned = false;
 let databaseAdmissionPermit = null;
 // 仅跟踪正式数据库连接，候选库连接不参与切换窗口归零判断。
 let activeOfficialDatabaseConnections = 0;
+// 记录由数据库抽象创建的原始连接对象身份，Proxy、wrapper 和结构仿造对象均不能继承该身份。
+const openRawDatabaseConnections = new WeakSet();
+// 原始连接事务终结门禁从连接创建时即包装 exec/prepare，pending obligation 期间阻断事务终结语句。
+const rawDatabaseTransactionGuardStates = new WeakMap();
+// opaque obligation 的真实归属只保存在数据库模块私有 WeakMap，JSON/clone 无法伪造。
+const rawDatabaseTransactionObligationStates = new WeakMap();
+// SAVEPOINT release authority 只允许首个初始化期业务协议绑定，重复领取一律 fail-closed。
+let rawDatabaseSavepointReleaseAuthorityBound = false;
 // durable restore marker 使用固定协议和 UUID 操作身份，禁止文件名被伪造成正式数据库。
 const DATABASE_RESTORE_MARKER_SCHEMA = 'charcoal-database-restore-marker';
 const DATABASE_RESTORE_MARKER_VERSION = 1;
 const DATABASE_RESTORE_MARKER_PHASE = 'prepared';
 const DATABASE_RESTORE_MARKER_NAME = '.restore-in-progress.json';
 const DATABASE_RESTORE_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+// 原始连接识别只通过数据库模块的非枚举内部协议提供，业务服务不得直接加载 SQLite driver。
+const DATABASE_RAW_CONNECTION_INTERNAL_PROTOCOL_SYMBOL =
+  Symbol.for('charcoal.database.rawConnectionInternal.v1');
 // 导入批次保留全部历史类型，并为阶段 3 预留八类能源分析导入。
 const IMPORT_BATCH_TYPES = Object.freeze([
   'energy_record',
@@ -541,8 +553,8 @@ const DEMO_GOVERNANCE_CONTRACTS = Object.freeze({
     sqlTokens: ['CHECK (id = 1)', "enabled IN (0, 1)", 'runtime_epoch >= 1', 'revision >= 1', 'length(trim(change_reason)) BETWEEN 1 AND 500', 'REFERENCES sys_users(id)']
   },
   demo_dataset_runs: {
-    columns: ['run_id', 'dataset_id', 'manifest_version', 'manifest_digest', 'status', 'created_by', 'created_at', 'completed_at', 'cleanup_started_at', 'cleaned_at', 'failure_reason'],
-    sqlTokens: ['length(manifest_digest) = 64', "manifest_digest NOT GLOB '*[^a-f0-9]*'", "status = 'cleaned' AND cleaned_at IS NOT NULL", "status <> 'cleaned' AND cleaned_at IS NULL", 'REFERENCES sys_users(id)'],
+    columns: ['run_id', 'dataset_id', 'manifest_version', 'manifest_digest', 'status', 'created_by', 'created_at', 'completed_at', 'cleanup_started_at', 'cleaned_at', 'failure_reason', 'superseded_at', 'successor_run_id', 'superseded_by', 'supersede_reason', 'supersede_trigger'],
+    sqlTokens: ['length(manifest_digest) = 64', "manifest_digest NOT GLOB '*[^a-f0-9]*'", "status IN ('active', 'completed', 'cleanup_pending', 'cleaning', 'cleaned', 'failed', 'superseded')", "status = 'cleaned' AND cleaned_at IS NOT NULL", "status <> 'cleaned' AND cleaned_at IS NULL", 'successor_run_id <> run_id', "status = 'superseded'", 'DEFERRABLE INITIALLY DEFERRED', 'REFERENCES demo_dataset_runs(run_id)', 'REFERENCES sys_users(id)'],
     triggers: ['trg_demo_dataset_runs_post_action_dataset_update'],
     indexes: {
       ux_demo_dataset_runs_active_dataset: {
@@ -573,7 +585,7 @@ const DEMO_GOVERNANCE_CONTRACTS = Object.freeze({
   },
   demo_cleanup_runs: {
     columns: ['cleanup_run_id', 'run_id', 'client_request_id', 'preview_digest', 'preview_expires_at', 'runtime_revision', 'registry_watermark', 'candidate_count', 'blocker_count', 'summary_json', 'confirmation_text', 'requested_by', 'status', 'backup_metadata_json', 'deleted_count', 'already_missing_count', 'created_at', 'started_at', 'completed_at', 'failure_reason'],
-    sqlTokens: ['client_request_id TEXT NOT NULL UNIQUE', 'runtime_revision >= 1', 'REFERENCES demo_dataset_runs(run_id)', 'REFERENCES sys_users(id)'],
+    sqlTokens: ['client_request_id TEXT NOT NULL UNIQUE', 'runtime_revision >= 1', "status IN ('previewed', 'executing', 'succeeded', 'blocked', 'failed', 'expired', 'noop', 'superseded')", "failure_reason = 'manifest_run_superseded'", 'REFERENCES demo_dataset_runs(run_id)', 'REFERENCES sys_users(id)'],
     indexes: {
       idx_demo_cleanup_runs_status_created: { unique: false, columns: ['status', 'created_at'] }
     }
@@ -669,6 +681,51 @@ const DEMO_DATASET_RUNS_TABLE_SQL = `CREATE TABLE demo_dataset_runs (
     length(manifest_digest) = 64
     AND manifest_digest NOT GLOB '*[^a-f0-9]*'
   ),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'cleanup_pending', 'cleaning', 'cleaned', 'failed', 'superseded')),
+  created_by INTEGER,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  completed_at TEXT,
+  cleanup_started_at TEXT,
+  cleaned_at TEXT,
+  failure_reason TEXT,
+  superseded_at TEXT CHECK (superseded_at IS NULL OR is_strict_utc_iso(superseded_at) = 1),
+  successor_run_id TEXT,
+  superseded_by INTEGER,
+  supersede_reason TEXT CHECK (supersede_reason IS NULL OR length(trim(supersede_reason)) BETWEEN 1 AND 128),
+  supersede_trigger TEXT CHECK (supersede_trigger IS NULL OR length(trim(supersede_trigger)) BETWEEN 1 AND 128),
+  FOREIGN KEY (created_by) REFERENCES sys_users(id) ON DELETE SET NULL,
+  FOREIGN KEY (successor_run_id) REFERENCES demo_dataset_runs(run_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (superseded_by) REFERENCES sys_users(id) ON DELETE SET NULL,
+  CHECK (length(trim(run_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(dataset_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(manifest_version)) BETWEEN 1 AND 64),
+  CHECK ((status = 'cleaned' AND cleaned_at IS NOT NULL)
+    OR (status <> 'cleaned' AND cleaned_at IS NULL)),
+  CHECK (successor_run_id IS NULL OR successor_run_id <> run_id),
+  CHECK (
+    (status = 'superseded'
+      AND superseded_at IS NOT NULL
+      AND successor_run_id IS NOT NULL
+      AND supersede_reason IS NOT NULL
+      AND supersede_trigger IS NOT NULL)
+    OR (status <> 'superseded'
+      AND superseded_at IS NULL
+      AND successor_run_id IS NULL
+      AND superseded_by IS NULL
+      AND supersede_reason IS NULL
+      AND supersede_trigger IS NULL)
+  )
+);`;
+
+// canonical v3 predecessor 仅允许下列旧 run 与 cleanup 表结构，供精确 profile 和受控重建使用。
+const DEMO_DATASET_RUNS_V3_TABLE_SQL = `CREATE TABLE demo_dataset_runs (
+  run_id TEXT PRIMARY KEY,
+  dataset_id TEXT NOT NULL,
+  manifest_version TEXT NOT NULL,
+  manifest_digest TEXT NOT NULL CHECK (
+    length(manifest_digest) = 64
+    AND manifest_digest NOT GLOB '*[^a-f0-9]*'
+  ),
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'cleanup_pending', 'cleaning', 'cleaned', 'failed')),
   created_by INTEGER,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -682,6 +739,34 @@ const DEMO_DATASET_RUNS_TABLE_SQL = `CREATE TABLE demo_dataset_runs (
   CHECK (length(trim(manifest_version)) BETWEEN 1 AND 64),
   CHECK ((status = 'cleaned' AND cleaned_at IS NOT NULL)
     OR (status <> 'cleaned' AND cleaned_at IS NULL))
+);`;
+
+const DEMO_CLEANUP_RUNS_V3_TABLE_SQL = `CREATE TABLE demo_cleanup_runs (
+  cleanup_run_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  client_request_id TEXT NOT NULL UNIQUE,
+  preview_digest TEXT NOT NULL CHECK (length(preview_digest) = 64),
+  preview_expires_at TEXT NOT NULL,
+  runtime_revision INTEGER NOT NULL CHECK (runtime_revision >= 1),
+  registry_watermark TEXT NOT NULL,
+  candidate_count INTEGER NOT NULL DEFAULT 0 CHECK (candidate_count >= 0),
+  blocker_count INTEGER NOT NULL DEFAULT 0 CHECK (blocker_count >= 0),
+  summary_json TEXT,
+  confirmation_text TEXT,
+  requested_by INTEGER,
+  status TEXT NOT NULL DEFAULT 'previewed' CHECK (status IN ('previewed', 'executing', 'succeeded', 'blocked', 'failed', 'expired', 'noop')),
+  backup_metadata_json TEXT,
+  deleted_count INTEGER NOT NULL DEFAULT 0 CHECK (deleted_count >= 0),
+  already_missing_count INTEGER NOT NULL DEFAULT 0 CHECK (already_missing_count >= 0),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  started_at TEXT,
+  completed_at TEXT,
+  failure_reason TEXT,
+  FOREIGN KEY (run_id) REFERENCES demo_dataset_runs(run_id) ON DELETE RESTRICT,
+  FOREIGN KEY (requested_by) REFERENCES sys_users(id) ON DELETE SET NULL,
+  CHECK (length(trim(cleanup_run_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(client_request_id)) BETWEEN 1 AND 128),
+  CHECK (length(trim(registry_watermark)) BETWEEN 1 AND 256)
 );`;
 
 // 演示导入 context v4 冻结独立摘要、完整预演摘要和重新关联谱系。
@@ -1503,6 +1588,437 @@ function loadDatabaseDriver() {
   return require('better-sqlite3');
 }
 
+/** 判断对象是否为数据库抽象创建且仍打开的原始连接，不接受 Proxy、wrapper 或结构仿造对象。 */
+function isOpenRawDatabaseConnection(db) {
+  return Boolean(db)
+    && typeof db === 'object'
+    && openRawDatabaseConnections.has(db)
+    && db.open === true;
+}
+
+/** 屏蔽 SQL 注释与引号内容，仅保留真正位于 SQL 顶层文本中的分号。 */
+function maskRawDatabaseSqlLiterals(sql) {
+  let masked = '';
+  let index = 0;
+  let state = 'plain';
+  while (index < sql.length) {
+    const character = sql[index];
+    const nextCharacter = sql[index + 1] || '';
+    if (state === 'line-comment') {
+      if (character === '\n' || character === '\r') {
+        state = 'plain';
+        masked += character;
+      } else masked += ' ';
+      index += 1;
+      continue;
+    }
+    if (state === 'block-comment') {
+      if (character === '*' && nextCharacter === '/') {
+        masked += '  ';
+        index += 2;
+        state = 'plain';
+      } else {
+        masked += ' ';
+        index += 1;
+      }
+      continue;
+    }
+    if (state !== 'plain') {
+      const closingCharacter = state === 'single-quote'
+        ? "'"
+        : state === 'double-quote'
+          ? '"'
+          : state === 'backtick-quote'
+            ? '`'
+            : ']';
+      if (character === closingCharacter) {
+        if (closingCharacter !== ']' && nextCharacter === closingCharacter) {
+          masked += '  ';
+          index += 2;
+        } else {
+          masked += ' ';
+          index += 1;
+          state = 'plain';
+        }
+      } else {
+        masked += ' ';
+        index += 1;
+      }
+      continue;
+    }
+    if (character === '-' && nextCharacter === '-') {
+      masked += '  ';
+      index += 2;
+      state = 'line-comment';
+      continue;
+    }
+    if (character === '/' && nextCharacter === '*') {
+      masked += '  ';
+      index += 2;
+      state = 'block-comment';
+      continue;
+    }
+    if (character === "'" || character === '"' || character === '`' || character === '[') {
+      masked += ' ';
+      index += 1;
+      state = character === "'"
+        ? 'single-quote'
+        : character === '"'
+          ? 'double-quote'
+          : character === '`'
+            ? 'backtick-quote'
+            : 'bracket-quote';
+      continue;
+    }
+    masked += character;
+    index += 1;
+  }
+  return masked;
+}
+
+/** 读取有限事务控制语句；该识别器只服务于 fail-closed 门禁，不充当通用 SQL parser。 */
+function readRawDatabaseTransactionStatements(sql) {
+  if (typeof sql !== 'string') return [];
+  const maskedSql = maskRawDatabaseSqlLiterals(sql);
+  const startsWithCreateTrigger = /^\s*CREATE\s+(?:(?:TEMP|TEMPORARY)\s+)?TRIGGER\b/iu.test(maskedSql);
+  const transactionStatementPattern = /(?:^|;)\s*(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/giu;
+  const statements = [];
+  let skippedCreateTriggerEnd = false;
+  let match = transactionStatementPattern.exec(maskedSql);
+  while (match) {
+    const keyword = match[1].toUpperCase();
+    const remainder = maskedSql.slice(transactionStatementPattern.lastIndex);
+    // CREATE TRIGGER 的第一个独立 END; 只收口 trigger body；后续事务语句仍参与门禁。
+    if (keyword === 'END' && startsWithCreateTrigger && !skippedCreateTriggerEnd) {
+      skippedCreateTriggerEnd = true;
+      match = transactionStatementPattern.exec(maskedSql);
+      continue;
+    }
+    if (keyword === 'ROLLBACK') {
+      const rollbackToMatch = /^\s+TO(?:\s+SAVEPOINT)?\s+([A-Za-z_][A-Za-z0-9_]*)\b/iu.exec(remainder);
+      statements.push(Object.freeze({
+        type: rollbackToMatch ? 'rollback_to' : 'rollback',
+        savepointName: rollbackToMatch?.[1] || null
+      }));
+    } else if (keyword === 'SAVEPOINT') {
+      const savepointMatch = /^\s+([A-Za-z_][A-Za-z0-9_]*)\b/iu.exec(remainder);
+      statements.push(Object.freeze({
+        type: 'savepoint',
+        savepointName: savepointMatch?.[1] || null
+      }));
+    } else if (keyword === 'RELEASE') {
+      const releaseMatch = /^\s+(?:SAVEPOINT\s+)?([A-Za-z_][A-Za-z0-9_]*)\b/iu.exec(remainder);
+      statements.push(Object.freeze({
+        type: 'release',
+        savepointName: releaseMatch?.[1] || null
+      }));
+    } else {
+      statements.push(Object.freeze({ type: keyword.toLowerCase(), savepointName: null }));
+    }
+    match = transactionStatementPattern.exec(maskedSql);
+  }
+  return statements;
+}
+
+/** 当前连接事务由未经过包装器的上层 helper 建立时，保守标记为仍有外层事务。 */
+function synchronizeRawDatabaseTransactionState(db, state) {
+  if (db.inTransaction !== true) {
+    state.transactionKind = 'none';
+    state.savepointStack = [];
+  } else if (state.transactionKind === 'none') {
+    state.transactionKind = 'external';
+    state.savepointStack = [];
+  }
+}
+
+/** 在事务状态副本上应用有限控制语句。 */
+function applyRawDatabaseTransactionStatements(targetState, statements) {
+  statements.forEach((statement) => {
+    if (statement.type === 'begin') {
+      targetState.transactionKind = 'begin';
+      targetState.savepointStack = [];
+      return;
+    }
+    if (statement.type === 'savepoint') {
+      if (targetState.transactionKind === 'none') targetState.transactionKind = 'savepoint';
+      targetState.savepointStack.push(statement.savepointName);
+      return;
+    }
+    if (statement.type === 'rollback_to') {
+      const rollbackIndex = statement.savepointName
+        ? targetState.savepointStack.lastIndexOf(statement.savepointName)
+        : -1;
+      if (rollbackIndex >= 0) {
+        targetState.savepointStack = targetState.savepointStack.slice(0, rollbackIndex + 1);
+      }
+      return;
+    }
+    if (statement.type === 'release') {
+      const releaseIndex = statement.savepointName
+        ? targetState.savepointStack.lastIndexOf(statement.savepointName)
+        : -1;
+      if (releaseIndex >= 0) {
+        targetState.savepointStack = targetState.savepointStack.slice(0, releaseIndex);
+        if (targetState.transactionKind === 'savepoint'
+          && targetState.savepointStack.length === 0) {
+          targetState.transactionKind = 'none';
+        }
+      }
+      return;
+    }
+    if (['commit', 'end', 'rollback'].includes(statement.type)) {
+      targetState.transactionKind = 'none';
+      targetState.savepointStack = [];
+    }
+  });
+}
+
+/** 判断 RELEASE 是否会结束以最外层 SAVEPOINT 建立的 caller 事务。 */
+function isRawDatabaseReleaseFinalization(state, statement) {
+  if (!statement.savepointName) return true;
+  const releaseIndex = state.savepointStack.lastIndexOf(statement.savepointName);
+  if (releaseIndex < 0) return true;
+  return releaseIndex === 0 && state.transactionKind === 'savepoint';
+}
+
+/** 判断 SQL 是否尝试结束 caller 事务，同时允许可证明安全的嵌套 caller SAVEPOINT。 */
+function isRawDatabaseTransactionFinalizationSql(db, state, sql) {
+  synchronizeRawDatabaseTransactionState(db, state);
+  const simulatedState = {
+    transactionKind: state.transactionKind,
+    savepointStack: [...state.savepointStack]
+  };
+  return readRawDatabaseTransactionStatements(sql).some((statement) => {
+    const finalizesTransaction = ['commit', 'end', 'rollback'].includes(statement.type)
+      || (statement.type === 'release'
+        && isRawDatabaseReleaseFinalization(simulatedState, statement));
+    if (!finalizesTransaction) {
+      applyRawDatabaseTransactionStatements(simulatedState, [statement]);
+    }
+    return finalizesTransaction;
+  });
+}
+
+/** pending obligation 存在时通知全部持有者并抛出固定事务错误。 */
+function throwRawDatabaseTransactionObligationPending(state) {
+  state.obligations.forEach((obligation) => {
+    const obligationState = rawDatabaseTransactionObligationStates.get(obligation);
+    try {
+      obligationState?.onFinalizationBlocked?.();
+    } catch (_error) {
+      // 门禁通知不得覆盖固定事务错误。
+    }
+  });
+  const error = new Error('当前 SQLite 连接存在未完成的私有事务 obligation，禁止结束事务。');
+  error.code = 'DATABASE_TRANSACTION_OBLIGATION_PENDING';
+  throw error;
+}
+
+/** pending obligation 存在时阻止原连接直接结束 caller 事务。 */
+function assertRawDatabaseTransactionFinalizationAllowed(db, sql) {
+  const state = rawDatabaseTransactionGuardStates.get(db);
+  if (!state || state.obligations.size === 0
+    || !isRawDatabaseTransactionFinalizationSql(db, state, sql)) return;
+  throwRawDatabaseTransactionObligationPending(state);
+}
+
+/** SQL 成功后同步有限事务状态；失败后只保留仍有外层事务的保守事实。 */
+function updateRawDatabaseTransactionState(db, state, statements, succeeded) {
+  if (succeeded) {
+    applyRawDatabaseTransactionStatements(state, statements);
+    synchronizeRawDatabaseTransactionState(db, state);
+    return;
+  }
+  state.transactionKind = db.inTransaction === true ? 'external' : 'none';
+  state.savepointStack = [];
+}
+
+/** 包装 Statement 执行入口，防止先 prepare、后建立 obligation 再 run 绕过事务门禁。 */
+function guardRawDatabasePreparedStatement(db, sql, statement) {
+  const transactionStatements = readRawDatabaseTransactionStatements(sql);
+  ['run', 'get', 'all', 'iterate'].forEach((methodName) => {
+    if (typeof statement[methodName] !== 'function') return;
+    const originalMethod = statement[methodName].bind(statement);
+    Object.defineProperty(statement, methodName, {
+      value: function guardedDatabaseStatementMethod(...args) {
+        assertRawDatabaseTransactionFinalizationAllowed(db, sql);
+        const state = rawDatabaseTransactionGuardStates.get(db);
+        try {
+          const result = originalMethod(...args);
+          updateRawDatabaseTransactionState(db, state, transactionStatements, true);
+          return result;
+        } catch (error) {
+          updateRawDatabaseTransactionState(db, state, transactionStatements, false);
+          throw error;
+        }
+      },
+      enumerable: false,
+      writable: false,
+      configurable: false
+    });
+  });
+  return statement;
+}
+
+/** 在连接创建时安装不可绕过的 exec/prepare 事务终结门禁。 */
+function installRawDatabaseTransactionGuard(db) {
+  const originalExec = db.exec.bind(db);
+  const originalPrepare = db.prepare.bind(db);
+  const state = {
+    obligations: new Set(),
+    originalExec,
+    originalPrepare,
+    transactionKind: 'none',
+    savepointStack: []
+  };
+  rawDatabaseTransactionGuardStates.set(db, state);
+  db.exec = function guardedDatabaseExec(sql) {
+    assertRawDatabaseTransactionFinalizationAllowed(db, sql);
+    const transactionStatements = readRawDatabaseTransactionStatements(sql);
+    try {
+      const result = originalExec(sql);
+      updateRawDatabaseTransactionState(db, state, transactionStatements, true);
+      return result;
+    } catch (error) {
+      updateRawDatabaseTransactionState(db, state, transactionStatements, false);
+      throw error;
+    }
+  };
+  db.prepare = function guardedDatabasePrepare(sql) {
+    const statement = originalPrepare(sql);
+    return guardRawDatabasePreparedStatement(db, sql, statement);
+  };
+}
+
+/** 为原始连接签发一个只可由持有者完成的事务 obligation。 */
+function createRawDatabaseTransactionObligation(db, onFinalizationBlocked) {
+  if (!isOpenRawDatabaseConnection(db)) {
+    const error = new Error('事务 obligation 只能绑定仍打开的原始数据库连接。');
+    error.code = 'DATABASE_RAW_CONNECTION_REQUIRED';
+    throw error;
+  }
+  const state = rawDatabaseTransactionGuardStates.get(db);
+  if (!state) {
+    const error = new Error('原始数据库连接缺少事务终结门禁。');
+    error.code = 'DATABASE_TRANSACTION_GUARD_UNAVAILABLE';
+    throw error;
+  }
+  if (onFinalizationBlocked !== undefined && typeof onFinalizationBlocked !== 'function') {
+    const error = new Error('事务 obligation 阻断通知必须是函数。');
+    error.code = 'DATABASE_TRANSACTION_OBLIGATION_CALLBACK_INVALID';
+    throw error;
+  }
+  const obligation = Object.freeze({});
+  rawDatabaseTransactionObligationStates.set(obligation, {
+    db,
+    onFinalizationBlocked: onFinalizationBlocked || null,
+    status: 'pending'
+  });
+  state.obligations.add(obligation);
+  return obligation;
+}
+
+/** 使用当前连接上的有效 pending opaque obligation 子集作为私有 authority 释放单个受控 SAVEPOINT。 */
+function releaseRawDatabaseSavepointWithObligations(
+  db,
+  obligations,
+  savepointName
+) {
+  const state = rawDatabaseTransactionGuardStates.get(db);
+  const authorityObligations = Array.isArray(obligations)
+    ? new Set(obligations)
+    : null;
+  const validSavepointName = typeof savepointName === 'string'
+    && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(savepointName);
+  const authorityMatches = Boolean(
+    isOpenRawDatabaseConnection(db)
+    && db.inTransaction === true
+    && state
+    && authorityObligations
+    && authorityObligations.size > 0
+    && [...authorityObligations].every((obligation) => {
+      const obligationState = rawDatabaseTransactionObligationStates.get(obligation);
+      return obligationState?.db === db
+        && obligationState.status === 'pending'
+        && state.obligations.has(obligation);
+    })
+  );
+  if (!authorityMatches || !validSavepointName) {
+    const error = new Error('私有 SAVEPOINT release authority 无效、连接不匹配或 obligation 已失效。');
+    error.code = 'DATABASE_SAVEPOINT_RELEASE_AUTHORITY_INVALID';
+    throw error;
+  }
+  const releaseSql = `RELEASE SAVEPOINT ${savepointName}`;
+  const transactionStatements = readRawDatabaseTransactionStatements(releaseSql);
+  try {
+    const result = state.originalExec(releaseSql);
+    updateRawDatabaseTransactionState(db, state, transactionStatements, true);
+    return result;
+  } catch (error) {
+    updateRawDatabaseTransactionState(db, state, transactionStatements, false);
+    throw error;
+  }
+}
+
+/** 通过初始化期捕获的原始 prepare 读取连接累计变更计数，调用方不能替换查询入口。 */
+function readRawDatabaseTotalChanges(db) {
+  const state = rawDatabaseTransactionGuardStates.get(db);
+  if (!isOpenRawDatabaseConnection(db) || !state) {
+    const error = new Error('累计变更计数只能读取仍打开的原始数据库连接。');
+    error.code = 'DATABASE_RAW_CONNECTION_REQUIRED';
+    throw error;
+  }
+  const changeCount = Number(
+    state.originalPrepare('SELECT total_changes() AS changeCount').get().changeCount
+  );
+  if (!Number.isSafeInteger(changeCount) || changeCount < 0) {
+    const error = new Error('SQLite 累计变更计数无效。');
+    error.code = 'DATABASE_TOTAL_CHANGES_INVALID';
+    throw error;
+  }
+  return changeCount;
+}
+
+/** 初始化期一次性绑定 obligation 与私有 SAVEPOINT release 协议。 */
+function bindRawDatabaseTransactionAuthority(authority) {
+  const validAuthority = authority
+    && typeof authority === 'object'
+    && !Array.isArray(authority)
+    && !utilTypes.isProxy(authority)
+    && Object.getPrototypeOf(authority) === Object.prototype
+    && Object.isFrozen(authority)
+    && Reflect.ownKeys(authority).length === 0;
+  if (rawDatabaseSavepointReleaseAuthorityBound || !validAuthority) {
+    const error = new Error('数据库事务 authority 无效或已经被初始化期协议绑定。');
+    error.code = 'DATABASE_TRANSACTION_AUTHORITY_BINDING_INVALID';
+    throw error;
+  }
+  rawDatabaseSavepointReleaseAuthorityBound = true;
+  return Object.freeze({
+    completeTransactionObligation: completeRawDatabaseTransactionObligation,
+    createTransactionObligation: createRawDatabaseTransactionObligation,
+    readTotalChanges: readRawDatabaseTotalChanges,
+    releaseSavepointWithObligations: releaseRawDatabaseSavepointWithObligations
+  });
+}
+
+/** 完成原始 opaque obligation；clone、错连接和重复完成全部 fail-closed。 */
+function completeRawDatabaseTransactionObligation(db, obligation) {
+  const obligationState = obligation && typeof obligation === 'object'
+    ? rawDatabaseTransactionObligationStates.get(obligation)
+    : null;
+  const state = rawDatabaseTransactionGuardStates.get(db);
+  if (!obligationState || obligationState.db !== db || obligationState.status !== 'pending'
+    || !state || !state.obligations.has(obligation)) {
+    const error = new Error('事务 obligation 无效、连接不匹配或已经完成。');
+    error.code = 'DATABASE_TRANSACTION_OBLIGATION_INVALID';
+    throw error;
+  }
+  state.obligations.delete(obligation);
+  obligationState.status = 'completed';
+  return true;
+}
+
 /**
  * 判断值是否为严格 UTC ISO 时间戳。
  * @param {*} value 待验证值。
@@ -1678,6 +2194,8 @@ function openDatabase(options = {}) {
   const db = new Database(targetDatabasePath);
   registerEnergyAnalysisSqliteFunctions(db);
   db.pragma('foreign_keys = ON');
+  installRawDatabaseTransactionGuard(db);
+  openRawDatabaseConnections.add(db);
   if (isOfficialDatabase) {
     activeOfficialDatabaseConnections += 1;
     const originalClose = db.close.bind(db);
@@ -4724,6 +5242,13 @@ const DEMO_GOVERNANCE_PERMISSION_CODES = new Set([
   'system:demo:cleanup:execute'
 ]);
 
+// 碳因子导入权限行必须保持固定按钮合同；同码非 canonical 历史行必须 fail-closed。
+const CARBON_FACTOR_IMPORT_PERMISSION_MENU_CONTRACT = Object.freeze({
+  permissionCode: 'carbon:factor:import',
+  menuName: '碳因子导入',
+  sortOrder: 616
+});
+
 // N7 四项权限行必须保持固定按钮合同；同码非 canonical 历史行必须 fail-closed，禁止继承其普通角色授权。
 const GHG_REPORT_PERMISSION_MENU_CONTRACTS = Object.freeze([
   Object.freeze({ permissionCode: 'carbon:ghg-reports:view', menuName: '温室气体报告查看', sortOrder: 612 }),
@@ -4818,6 +5343,9 @@ const RBAC_MENU_SEEDS = [
   ['button', '温室气体报告导入预演', null, null, 'carbon:ghg-reports:import:preview', null, 613, '/carbon'],
   ['button', '温室气体报告导入执行', null, null, 'carbon:ghg-reports:import:execute', null, 614, '/carbon'],
   ['button', '温室气体报告导出', null, null, 'carbon:ghg-reports:export', null, 615, '/carbon'],
+  ['button', CARBON_FACTOR_IMPORT_PERMISSION_MENU_CONTRACT.menuName, null, null,
+    CARBON_FACTOR_IMPORT_PERMISSION_MENU_CONTRACT.permissionCode, null,
+    CARBON_FACTOR_IMPORT_PERMISSION_MENU_CONTRACT.sortOrder, '/carbon'],
 
   ['menu', '预测管理', '/predictions', 'predictions/index', 'prediction:config:view', 'DataAnalysis', 70, null],
   ['button', '预测配置新增', null, null, 'prediction:config:create', null, 702, '/predictions'],
@@ -5036,6 +5564,59 @@ function dedupeBuiltinDirectoryMenus(db) {
   return changed;
 }
 
+/** 补齐缺失的碳因子导入按钮，并对同权限码旧行执行严格 canonical 碰撞校验。 */
+function ensureCanonicalCarbonFactorImportPermissionMenu(db, timestamp = new Date().toISOString()) {
+  const carbonParent = db.prepare(`SELECT id FROM sys_menus
+    WHERE route_path = '/carbon' AND menu_type = 'menu' ORDER BY id LIMIT 1`).get();
+  if (!carbonParent) {
+    const error = new Error('碳因子导入权限种子缺少 canonical /carbon 父菜单。');
+    error.code = 'CARBON_FACTOR_IMPORT_PERMISSION_PARENT_MISSING';
+    throw error;
+  }
+  const contract = CARBON_FACTOR_IMPORT_PERMISSION_MENU_CONTRACT;
+  let menu = db.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType,
+    menu_name AS menuName, route_path AS routePath, component,
+    permission_code AS permissionCode, icon, sort_order AS sortOrder,
+    visible, status, is_builtin AS isBuiltin
+    FROM sys_menus WHERE permission_code = ?`).get(contract.permissionCode);
+  if (!menu) {
+    const result = db.prepare(`INSERT INTO sys_menus
+      (parent_id, menu_type, menu_name, route_path, component, permission_code, icon,
+       sort_order, visible, status, is_builtin, created_at, updated_at)
+      VALUES (?, 'button', ?, NULL, NULL, ?, NULL, ?, 1, 'active', 1, ?, ?)`).run(
+      carbonParent.id,
+      contract.menuName,
+      contract.permissionCode,
+      contract.sortOrder,
+      timestamp,
+      timestamp
+    );
+    menu = db.prepare(`SELECT id, parent_id AS parentId, menu_type AS menuType,
+      menu_name AS menuName, route_path AS routePath, component,
+      permission_code AS permissionCode, icon, sort_order AS sortOrder,
+      visible, status, is_builtin AS isBuiltin
+      FROM sys_menus WHERE id = ?`).get(result.lastInsertRowid);
+  }
+  const invalidFields = [];
+  if (menu.parentId !== carbonParent.id) invalidFields.push('parent_id');
+  if (menu.menuType !== 'button') invalidFields.push('menu_type');
+  if (menu.menuName !== contract.menuName) invalidFields.push('menu_name');
+  if (menu.routePath !== null) invalidFields.push('route_path');
+  if (menu.component !== null) invalidFields.push('component');
+  if (menu.icon !== null) invalidFields.push('icon');
+  if (menu.sortOrder !== contract.sortOrder) invalidFields.push('sort_order');
+  if (menu.visible !== 1) invalidFields.push('visible');
+  if (menu.status !== 'active') invalidFields.push('status');
+  if (menu.isBuiltin !== 1) invalidFields.push('is_builtin');
+  if (menu.permissionCode !== contract.permissionCode) invalidFields.push('permission_code');
+  if (invalidFields.length > 0) {
+    const error = new Error(`碳因子导入权限码存在非 canonical 历史行：${contract.permissionCode}`);
+    error.code = 'CARBON_FACTOR_IMPORT_PERMISSION_MENU_COLLISION';
+    error.details = { permissionCode: contract.permissionCode, invalidFields };
+    throw error;
+  }
+}
+
 /** 补齐缺失的 N7 权限按钮，并对同权限码旧行执行严格 canonical 碰撞校验。 */
 function ensureCanonicalGhgReportPermissionMenus(db, timestamp = new Date().toISOString()) {
   const carbonParent = db.prepare(`SELECT id FROM sys_menus
@@ -5133,6 +5714,7 @@ function ensureRbacSeedData(db) {
     migrateLegacyViewMenuPermissions(db, now);
     migrateCarbonMenuPermissionStructure(db, now);
     migrateNavigationMenuStructure(db, now);
+    ensureCanonicalCarbonFactorImportPermissionMenu(db, now);
     ensureCanonicalGhgReportPermissionMenus(db, now);
 
     const adminRole = db.prepare("SELECT id FROM sys_roles WHERE role_code = 'super_admin'").get();
@@ -5573,6 +6155,84 @@ function assertStrategyRulesMigratedSchemaProfile(
   }
 }
 
+/** 构造 canonical v3 run/cleanup 唯一 predecessor 的精确 SQL override。 */
+function buildDemoRunTurnoverPredecessorSqlOverrides() {
+  return new Map([
+    ['table:demo_dataset_runs:demo_dataset_runs', DEMO_DATASET_RUNS_V3_TABLE_SQL],
+    ['table:demo_cleanup_runs:demo_cleanup_runs', DEMO_CLEANUP_RUNS_V3_TABLE_SQL]
+  ]);
+}
+
+/** 在 v3→v4 迁移中受控重建 run/cleanup 表，并逐值保留全部历史业务列和关联身份。 */
+function migrateDemoRunTurnoverSchemaV4(db, schemaText) {
+  preflightDemoGovernanceData(db);
+  const runColumns = [
+    'run_id', 'dataset_id', 'manifest_version', 'manifest_digest', 'status', 'created_by',
+    'created_at', 'completed_at', 'cleanup_started_at', 'cleaned_at', 'failure_reason'
+  ];
+  const cleanupColumns = [
+    'cleanup_run_id', 'run_id', 'client_request_id', 'preview_digest', 'preview_expires_at',
+    'runtime_revision', 'registry_watermark', 'candidate_count', 'blocker_count', 'summary_json',
+    'confirmation_text', 'requested_by', 'status', 'backup_metadata_json', 'deleted_count',
+    'already_missing_count', 'created_at', 'started_at', 'completed_at', 'failure_reason'
+  ];
+  const runRowsBefore = db.prepare(`SELECT ${runColumns.join(', ')} FROM demo_dataset_runs ORDER BY run_id`).all();
+  const cleanupRowsBefore = db.prepare(`SELECT ${cleanupColumns.join(', ')} FROM demo_cleanup_runs ORDER BY cleanup_run_id`).all();
+
+  db.exec(`DROP TABLE IF EXISTS temp.demo_dataset_runs_v3_backup;
+    DROP TABLE IF EXISTS temp.demo_cleanup_runs_v3_backup;
+    CREATE TEMP TABLE demo_dataset_runs_v3_backup AS SELECT * FROM demo_dataset_runs ORDER BY run_id;
+    CREATE TEMP TABLE demo_cleanup_runs_v3_backup AS SELECT * FROM demo_cleanup_runs ORDER BY cleanup_run_id;
+    DROP TABLE demo_cleanup_runs;
+    DROP TABLE demo_dataset_runs;`);
+  db.exec(DEMO_DATASET_RUNS_TABLE_SQL);
+  db.exec(`INSERT INTO demo_dataset_runs (${runColumns.join(', ')})
+    SELECT ${runColumns.join(', ')} FROM temp.demo_dataset_runs_v3_backup ORDER BY run_id`);
+  db.exec(extractNamedCreateStatement(schemaText, 'table', 'demo_cleanup_runs'));
+  db.exec(`INSERT INTO demo_cleanup_runs (${cleanupColumns.join(', ')})
+    SELECT ${cleanupColumns.join(', ')} FROM temp.demo_cleanup_runs_v3_backup ORDER BY cleanup_run_id`);
+  db.exec(`DROP TABLE temp.demo_cleanup_runs_v3_backup;
+    DROP TABLE temp.demo_dataset_runs_v3_backup;`);
+
+  const runRowsAfter = db.prepare(`SELECT ${runColumns.join(', ')} FROM demo_dataset_runs ORDER BY run_id`).all();
+  const cleanupRowsAfter = db.prepare(`SELECT ${cleanupColumns.join(', ')} FROM demo_cleanup_runs ORDER BY cleanup_run_id`).all();
+  if (JSON.stringify(runRowsAfter) !== JSON.stringify(runRowsBefore)
+    || JSON.stringify(cleanupRowsAfter) !== JSON.stringify(cleanupRowsBefore)) {
+    const error = new Error('演示 run 换代 schema 迁移未逐值保留历史 run 或 cleanup 数据。');
+    error.code = 'DEMO_RUN_TURNOVER_MIGRATION_DATA_LOSS';
+    throw error;
+  }
+  const populatedTurnoverFields = db.prepare(`SELECT run_id AS runId FROM demo_dataset_runs
+    WHERE superseded_at IS NOT NULL OR successor_run_id IS NOT NULL OR superseded_by IS NOT NULL
+      OR supersede_reason IS NOT NULL OR supersede_trigger IS NOT NULL LIMIT 1`).get();
+  if (populatedTurnoverFields) {
+    const error = new Error('v3→v4 结构迁移不得自动生成 run 换代业务状态。');
+    error.code = 'DEMO_RUN_TURNOVER_MIGRATION_STATE_CHANGED';
+    error.details = populatedTurnoverFields;
+    throw error;
+  }
+  return true;
+}
+
+/** 精确复核 v3→v4 迁移结果，仅保留 admission 时已批准的非 run 物理结构变体。 */
+function assertDemoRunTurnoverMigratedSchemaProfile(db, canonicalProfile, admissionOverrides = new Map()) {
+  const targetOverrides = new Map(admissionOverrides);
+  targetOverrides.delete('table:demo_dataset_runs:demo_dataset_runs');
+  targetOverrides.delete('table:demo_cleanup_runs:demo_cleanup_runs');
+  const issues = compareSchemaObjectProfile(
+    readSchemaObjectProfile(db),
+    canonicalProfile,
+    new Set(),
+    targetOverrides
+  );
+  if (issues.length > 0) {
+    const error = new Error('演示 run 换代 v4 迁移后未命中 canonical schema profile。');
+    error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+    error.details = { profileStage: 'demo-run-turnover-migrated', issues: issues.slice(0, 20) };
+    throw error;
+  }
+}
+
 /** 在隔离内存库执行 schema，生成不受业务数据影响的 canonical 对象 profile。 */
 function buildCanonicalSchemaObjectProfile(schemaText) {
   const Database = loadDatabaseDriver();
@@ -5701,30 +6361,28 @@ function buildTrustedCanonicalSchemaProfiles() {
       fingerprint: calculateSchemaObjectProfileFingerprint(canonicalProfile, alteredOverrides)
     }
   ];
-  const strategyPredecessorOverrides = buildStrategyRulesPredecessorSqlOverrides(schemaText);
-  const strategyPredecessorProfiles = [
+  const turnoverPredecessorOverrides = buildDemoRunTurnoverPredecessorSqlOverrides();
+  const alteredTurnoverPredecessorOverrides = new Map([
+    ...alteredOverrides.entries(),
+    ...turnoverPredecessorOverrides.entries()
+  ]);
+  const turnoverPredecessorProfiles = [
     {
-      profileName: 'strategy-rules-predecessor',
+      profileName: 'demo-run-turnover-v3-predecessor',
       profile: canonicalProfile,
-      sqlOverrides: strategyPredecessorOverrides,
-      fingerprint: calculateSchemaObjectProfileFingerprint(canonicalProfile, strategyPredecessorOverrides)
+      sqlOverrides: turnoverPredecessorOverrides,
+      fingerprint: calculateSchemaObjectProfileFingerprint(canonicalProfile, turnoverPredecessorOverrides)
     },
     {
-      profileName: 'energy-balance-alter-strategy-rules-predecessor',
+      profileName: 'energy-balance-alter-demo-run-turnover-v3-predecessor',
       profile: canonicalProfile,
-      sqlOverrides: new Map([
-        ...alteredOverrides.entries(),
-        ...strategyPredecessorOverrides.entries()
-      ]),
-      fingerprint: calculateSchemaObjectProfileFingerprint(canonicalProfile, new Map([
-        ...alteredOverrides.entries(),
-        ...strategyPredecessorOverrides.entries()
-      ]))
+      sqlOverrides: alteredTurnoverPredecessorOverrides,
+      fingerprint: calculateSchemaObjectProfileFingerprint(canonicalProfile, alteredTurnoverPredecessorOverrides)
     }
   ];
   return new Map([
     [CANONICAL_SCHEMA_VERSION, currentProfiles],
-    [CANONICAL_SCHEMA_PREDECESSOR_VERSION, strategyPredecessorProfiles]
+    [CANONICAL_SCHEMA_PREDECESSOR_VERSION, turnoverPredecessorProfiles]
   ]);
 }
 
@@ -5910,11 +6568,11 @@ function initDatabase(options = {}) {
     const transactionalSchema = schema
       .replace(/^PRAGMA journal_mode = WAL;\s*/i, '')
       .replace(/^PRAGMA foreign_keys = ON;\s*/i, '');
-    // canonical v3 仅允许当前版本幂等初始化，或 v2 strategy_rules provenance 唯一 predecessor 迁移。
+    // canonical v4 仅允许当前版本幂等初始化、精确平衡来源物理变体，或 v3 run 换代唯一 predecessor 迁移。
     let canonicalSchemaMigrated = false;
     let canonicalSchemaProfile = null;
-    let strategyRulesProvenanceMigrated = false;
-    let strategyRulesCanonicalProfile = null;
+    let demoRunTurnoverSchemaMigrated = false;
+    let demoRunTurnoverCanonicalProfile = null;
     let trustedAdmissionProfile = null;
     const shouldDisableForeignKeys = !existingIdentity.fresh;
     const wasForeignKeysEnabled = db.pragma('foreign_keys', { simple: true }) === 1;
@@ -5926,49 +6584,96 @@ function initDatabase(options = {}) {
     try {
       db.transaction(() => {
         if (!existingIdentity.fresh) {
-          trustedAdmissionProfile = matchTrustedCanonicalSchemaProfile(
-            db,
-            existingIdentity.version
-          );
-          const admissionFingerprint = calculateSchemaFingerprint(db);
-          if (admissionFingerprint !== existingIdentity.fingerprint
-            || admissionFingerprint !== trustedAdmissionProfile.fingerprint) {
-            const error = new Error('当前 SQLite 结构与代码控制的 schema fingerprint 不一致。');
-            error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
-            error.details = {
-              metadataFingerprint: existingIdentity.fingerprint,
-              actual: admissionFingerprint,
-              trustedFingerprint: trustedAdmissionProfile.fingerprint
+          const balanceSourceColumnsMissing = ['energy_balance_boundaries', 'energy_balance_items']
+            .some((tableName) => {
+              const columns = getTableColumns(db, tableName);
+              return !columns.includes('source_batch_id') || !columns.includes('source_row_number');
+            });
+          // 平衡来源 predecessor 仅限当前版本，并先通过专用严格 profile；其他版本仍走全局可信 profile。
+          const usesBalanceSourceLegacyAdmission = balanceSourceColumnsMissing
+            && existingIdentity.version === CANONICAL_SCHEMA_VERSION;
+          if (usesBalanceSourceLegacyAdmission) {
+            canonicalSchemaProfile = buildCanonicalSchemaObjectProfile(transactionalSchema);
+            assertEnergyBalanceImportSourceLegacySchemaProfile(
+              db,
+              transactionalSchema,
+              canonicalSchemaProfile
+            );
+            const admissionFingerprint = calculateSchemaFingerprint(db);
+            if (admissionFingerprint !== existingIdentity.fingerprint) {
+              const error = new Error('平衡来源 predecessor 结构与已登记 schema fingerprint 不一致。');
+              error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+              error.details = {
+                profileStage: 'legacy-admission',
+                metadataFingerprint: existingIdentity.fingerprint,
+                actual: admissionFingerprint
+              };
+              throw error;
+            }
+            trustedAdmissionProfile = {
+              profileName: 'energy-balance-source-predecessor',
+              fingerprint: admissionFingerprint,
+              schemaVersion: existingIdentity.version
             };
-            throw error;
+          } else {
+            try {
+              trustedAdmissionProfile = matchTrustedCanonicalSchemaProfile(
+                db,
+                existingIdentity.version
+              );
+            } catch (error) {
+              // ALTER/RENAME 可能只产生简单标识符引号差异；仍须命中迁移后严格 profile 才能受控进入。
+              if (balanceSourceColumnsMissing
+                || existingIdentity.version !== CANONICAL_SCHEMA_VERSION
+                || error?.code !== 'SCHEMA_FINGERPRINT_MISMATCH') {
+                throw error;
+              }
+              canonicalSchemaProfile = buildCanonicalSchemaObjectProfile(transactionalSchema);
+              assertEnergyBalanceImportSourceMigratedSchemaProfile(
+                db,
+                transactionalSchema,
+                canonicalSchemaProfile
+              );
+              trustedAdmissionProfile = {
+                profileName: 'energy-balance-source-migrated',
+                fingerprint: calculateSchemaFingerprint(db),
+                schemaVersion: existingIdentity.version
+              };
+            }
+            const admissionFingerprint = calculateSchemaFingerprint(db);
+            if (admissionFingerprint !== existingIdentity.fingerprint
+              || admissionFingerprint !== trustedAdmissionProfile.fingerprint) {
+              const error = new Error('当前 SQLite 结构与代码控制的 schema fingerprint 不一致。');
+              error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
+              error.details = {
+                metadataFingerprint: existingIdentity.fingerprint,
+                actual: admissionFingerprint,
+                trustedFingerprint: trustedAdmissionProfile.fingerprint
+              };
+              throw error;
+            }
           }
           if (existingIdentity.version === CANONICAL_SCHEMA_PREDECESSOR_VERSION) {
-            strategyRulesProvenanceMigrated = true;
-            strategyRulesCanonicalProfile = buildCanonicalSchemaObjectProfile(transactionalSchema);
+            demoRunTurnoverSchemaMigrated = true;
+            demoRunTurnoverCanonicalProfile = buildCanonicalSchemaObjectProfile(transactionalSchema);
+          }
+          if (balanceSourceColumnsMissing) {
+            // 来源列必须先于 schema 中引用这些列的索引创建，且 admission 与迁移保持同一事务。
+            canonicalSchemaProfile = canonicalSchemaProfile
+              || buildCanonicalSchemaObjectProfile(transactionalSchema);
+            if (!usesBalanceSourceLegacyAdmission) {
+              assertEnergyBalanceImportSourceLegacySchemaProfile(
+                db,
+                transactionalSchema,
+                canonicalSchemaProfile
+              );
+            }
+            canonicalSchemaMigrated = migrateEnergyBalanceImportSourceColumns(db);
+          }
+          if (demoRunTurnoverSchemaMigrated) {
+            migrateDemoRunTurnoverSchemaV4(db, transactionalSchema);
           }
         }
-
-      if (!existingIdentity.fresh) {
-        const balanceSourceColumnsMissing = ['energy_balance_boundaries', 'energy_balance_items']
-          .some((tableName) => {
-            const columns = getTableColumns(db, tableName);
-            return !columns.includes('source_batch_id') || !columns.includes('source_row_number');
-          });
-        if (balanceSourceColumnsMissing) {
-          // 来源列必须先于 schema 中引用这些列的索引创建，且旧库必须精确匹配已审查 profile。
-          canonicalSchemaProfile = buildCanonicalSchemaObjectProfile(transactionalSchema);
-          assertEnergyBalanceImportSourceLegacySchemaProfile(db, transactionalSchema, canonicalSchemaProfile);
-          canonicalSchemaMigrated = migrateEnergyBalanceImportSourceColumns(db);
-        }
-        if (strategyRulesProvenanceMigrated) {
-          migrateStrategyRulesProvenance(
-            db,
-            transactionalSchema,
-            strategyRulesCanonicalProfile,
-            trustedAdmissionProfile?.sqlOverrides
-          );
-        }
-      }
       // schema.sql 是最终新库唯一事实源；已有非 canonical 库在进入这里前已被拒绝。
       db.exec(transactionalSchema);
       assertDemoGovernanceContracts(db);
@@ -5998,19 +6703,16 @@ function initDatabase(options = {}) {
           canonicalSchemaProfile || buildCanonicalSchemaObjectProfile(transactionalSchema)
         );
       }
-      if (!existingIdentity.fresh && strategyRulesProvenanceMigrated) {
-        const targetOverrides = new Map(trustedAdmissionProfile?.sqlOverrides || []);
-        targetOverrides.delete('table:strategy_rules:strategy_rules');
-        assertStrategyRulesMigratedSchemaProfile(
+      if (!existingIdentity.fresh && demoRunTurnoverSchemaMigrated) {
+        assertDemoRunTurnoverMigratedSchemaProfile(
           db,
-          transactionalSchema,
-          strategyRulesCanonicalProfile || buildCanonicalSchemaObjectProfile(transactionalSchema),
-          targetOverrides
+          demoRunTurnoverCanonicalProfile || buildCanonicalSchemaObjectProfile(transactionalSchema),
+          trustedAdmissionProfile?.sqlOverrides
         );
       }
       if (!existingIdentity.fresh
         && !canonicalSchemaMigrated
-        && !strategyRulesProvenanceMigrated
+        && !demoRunTurnoverSchemaMigrated
         && fingerprint !== existingIdentity.fingerprint) {
         const error = new Error('当前 SQLite 结构与已登记 canonical schema fingerprint 不一致。');
         error.code = 'SCHEMA_FINGERPRINT_MISMATCH';
@@ -6060,11 +6762,13 @@ module.exports = {
   databasePath,
   schemaPath,
   CANONICAL_SCHEMA_FINGERPRINT_ALGORITHM,
+  CANONICAL_SCHEMA_PREDECESSOR_VERSION,
   CANONICAL_SCHEMA_STAGE,
   CANONICAL_SCHEMA_VERSION,
   IMPORT_BATCH_TYPES,
   blockDatabaseAdmission,
   calculateSchemaFingerprint,
+  buildDemoRunTurnoverPredecessorSqlOverrides,
   buildCarbonEmissionsStatusMigrationSql,
   buildGenerationRecordsDataSourceMigrationSql,
   buildImportBatchesImportTypeMigrationSql,
@@ -6103,6 +6807,7 @@ module.exports = {
   migrateDemoImportContextsV3: migrateDemoImportContextsV4,
   migrateDemoImportContextsV4,
   migrateDemoRunImportBatchRole,
+  migrateDemoRunTurnoverSchemaV4,
   prepareDemoGovernanceTablesForMigration,
   preflightDemoGovernanceData,
   migrateEnergyBalanceCalculationRuns,
@@ -6124,3 +6829,18 @@ module.exports = {
   unblockDatabaseAdmission,
   verifyCanonicalDatabaseIntegrity
 };
+
+// 原始连接校验保持为非枚举内部能力，避免业务模块绕过数据库抽象直接加载 driver。
+Object.defineProperty(
+  module.exports,
+  DATABASE_RAW_CONNECTION_INTERNAL_PROTOCOL_SYMBOL,
+  {
+    value: Object.freeze({
+      bindTransactionAuthority: bindRawDatabaseTransactionAuthority,
+      isOpenRawDatabaseConnection
+    }),
+    enumerable: false,
+    writable: false,
+    configurable: false
+  }
+);

@@ -1,40 +1,90 @@
 'use strict';
 
+// 服务导出壳在任何依赖加载前绑定到当前 Module，阻止初始化窗口整体替换 require.cache exports。
+const demoOwnershipServiceExports = {};
+// 使用稳定 Proxy 壳绕开 Node 23 循环加载器对普通 exports 原型的临时改写。
+const demoOwnershipServiceExportsProxy = new Proxy(demoOwnershipServiceExports, {});
+Object.defineProperty(module, 'exports', {
+  value: demoOwnershipServiceExportsProxy,
+  enumerable: true,
+  writable: false,
+  configurable: false
+});
+
+// 协议依赖的函数声明在模块初始化首段固定，供协议 linker 在任一加载顺序下捕获同一函数对象。
+Object.entries({
+  abortStrategyEvaluationRegistrationScopeInTransaction,
+  activateStrategyEvaluationRegistrationScopeInTransaction,
+  calculateDemoEntityIdentityDigest,
+  calculateDemoEntitySnapshotDigest,
+  refreshDerivedStrategyRuleHitOwnershipInTransaction,
+  registerDerivedStrategyEvaluationInTransaction,
+  verifyDerivedStrategyEvaluationReceiptInTransaction
+}).forEach(([fieldName, handler]) => {
+  Object.defineProperty(demoOwnershipServiceExports, fieldName, {
+    value: handler,
+    enumerable: true,
+    writable: false,
+    configurable: false
+  });
+});
+
 const crypto = require('crypto');
+const fs = require('fs');
 const path = require('path');
 const { types: utilTypes } = require('util');
-const { openDatabase } = require('../db/database');
+const {
+  backupsDir: defaultBackupsDir,
+  openDatabase,
+  openReadOnlyDatabase,
+  uploadsDir: defaultUploadsDir
+} = require('../db/database');
 const { AppError } = require('../utils/errors');
+const { MAX_IMPORT_FILE_SIZE_BYTES } = require('../middleware/upload');
+const { readSafeUploadFile } = require('./energyAnalysisImportCore');
+const { recordOperation } = require('./sessionService');
 const {
   getDemoArtifactRegistration,
   requireDemoArtifactHandler
 } = require('./demoArtifactRegistry');
 const {
+  hashDemoContextToken,
   markDemoContextExecutedInTransaction,
-  validateDemoContext
+  validateDemoContext,
+  validateDemoContextTerminalReplay,
+  validateDemoContextToken,
+  validatePreviewAuditDigest,
+  validateSha256
 } = require('./demoContextService');
 const {
   getImportAuditSummary,
   updateExecuteAuditResult
 } = require('./importAuditService');
-const { requireDemoDatasetRun } = require('./demoRunService');
+const {
+  assertDemoRuntimeEnabled,
+  requireDemoDatasetRun
+} = require('./demoRunService');
 const {
   SUPPORTED_FORMULA_VERSION,
   SUPPORTED_METRIC_CODES,
   assertEnergyStrategyExactScopeCapability,
   bindEnergyStrategyRegistrationScopeCapability,
-  consumeEnergyStrategyEvaluationCompletionWitness,
-  markEnergyStrategyRegistrationScopeActive,
-  markEnergyStrategyRegistrationScopeFailed,
+  consumeEnergyStrategyEvaluationWitnessForOwnership,
   getStrategyRuleHitWithDb,
   insertOperationLogWithDb,
   parseEvidenceRequirements
 } = require('./energyStrategyEvaluationService');
+const { energyStrategyEvaluatorProtocol } = require('./energyStrategyOwnershipProtocol');
 const {
   ENERGY_ANALYSIS_REASON_CODES,
   RULE_THRESHOLD_OPERATORS,
   isIanaTimeZone
 } = require('./energyAnalysisContracts');
+const {
+  buildPredictionConfidenceFacts,
+  isPredictionRoundedValue,
+  parsePredictionForecastMethodNote
+} = require('./predictionUtils');
 
 // 当前清理阶段只开放已经逐项核对删除副作用的静态实体类型；未知类型必须阻断而不是动态拼表。
 const DEMO_CLEANUP_ENTITY_ORDER = Object.freeze([
@@ -50,6 +100,11 @@ const DEMO_OWNERSHIP_REGISTRATION_CONNECTED = false;
 const DEMO_IMPORTED_OWNERSHIP_KIND = 'imported';
 // registry 关系类型由服务端固定，调用方不得传入动态 SQL 或未知关系。
 const DEMO_RELATION_TYPES = new Set(['contains', 'generated_from', 'uses_config', 'uses_factor']);
+// 策略评价输入关系只在 artifact 15/18 的正式 managed ownership 事务中准备，不代表执行策略评价。
+const DEMO_STRATEGY_INPUT_ARTIFACT_KEYS = new Set([
+  '15-energy-timeseries',
+  '18-strategy-rules'
+]);
 // inserted 记录必须绑定正整数主键；清理 handler 当前也只接受此类主键。
 const DEMO_ENTITY_PK_PATTERN = /^[1-9]\d*$/;
 // ownership 固定投影中的审计时间必须是严格 UTC 毫秒格式，禁止秒精度或本地墙钟值混入摘要。
@@ -60,11 +115,44 @@ const DEMO_UTC_SECOND_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 const DEMO_WALL_CLOCK_MINUTE_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
 // 行见证只保存在当前 Node.js 进程的私有 WeakMap 中，普通 JSON 或调用方自造对象无法伪造。
 const DEMO_INSERTED_ROW_WITNESS_STATE = new WeakMap();
+// 碳活动 managed 替代意图使用私有 WeakMap 绑定旧 ownership 快照和当前事务，JSON 无法伪造。
+const DEMO_CARBON_ACTIVITY_SUPERSEDE_WITNESS_STATE = new WeakMap();
 // ownership 事务 scope 及连接当前 scope 均为模块私有状态，callback 结束后立即失效。
 const DEMO_OWNERSHIP_TRANSACTION_SCOPE_STATE = new WeakMap();
 const DEMO_ACTIVE_OWNERSHIP_SCOPE_BY_DB = new WeakMap();
 // strategy derived registration scope 只接受一次 issue/activate/consume/abort 生命周期。
 const DEMO_STRATEGY_REGISTRATION_SCOPE_STATE = new WeakMap();
+// strategy registrar receipt 只保存在本模块私有状态中，clone、JSON clone 和重放均拒绝。
+const DEMO_STRATEGY_RECEIPT_STATE = new WeakMap();
+// registration scope 使用未提交的内部审计 marker 证明仍处于 issue 时的原始事务。
+const DEMO_STRATEGY_SCOPE_MARKER_OPERATION = '__charcoal_strategy_registration_scope_marker';
+const DEMO_STRATEGY_RECEIPT_CONSUMED = new WeakSet();
+// canonical ownership 构造器仅通过非枚举内部协议提供给固定派生 registrar。
+const DEMO_OWNERSHIP_CANONICAL_INTERNAL_PROTOCOL_SYMBOL =
+  Symbol.for('charcoal.demoOwnership.canonicalInternal.v1');
+// Artifact 12 单一 operation 仅通过非枚举内部协议签发，不向业务调用方暴露分步写能力。
+const DEMO_PREDICTION_CONFIG_MANAGED_PROTOCOL_SYMBOL =
+  Symbol.for('charcoal.demoOwnership.predictionConfigManaged.v1');
+const PREDICTION_CONFIG_MANAGED_CORE_PROTOCOL_SYMBOL =
+  Symbol.for('charcoal.predictionConfig.managedCore.v1');
+const DEMO_PREDICTION_CONFIG_MANAGED_OPERATION_AUTHORITY = Object.freeze({});
+let predictionConfigManagedCoreProtocol = null;
+// Artifact 07 通过通用事务 wrapper 的不可拆分 operation intent 执行，不向 scope 或模块导出分步写协议。
+const DEMO_MANAGED_DIRECT_IMPORT_OPERATION = 'artifact-07-managed-direct:v1';
+// managed direct import 固定绑定唯一 artifact、handler、批次角色和业务导入类型。
+const DEMO_MANAGED_DIRECT_IMPORT_BINDING = Object.freeze({
+  artifactKey: '07-monthly-energy',
+  handlerKey: 'monthly-energy-import',
+  batchRole: 'primary',
+  importType: 'energy_record'
+});
+// Artifact 12 managed retained 导入固定绑定 prediction_config，并且训练批次只能来自同 run Artifact 07。
+const DEMO_PREDICTION_CONFIG_IMPORT_BINDING = Object.freeze({
+  artifactKey: '12-prediction-configs',
+  handlerKey: 'prediction-configs-import',
+  batchRole: 'primary',
+  importType: 'prediction_config'
+});
 // inserted/skipped/relation 元数据采用服务端白名单，额外字段一律 fail-closed。
 const DEMO_INSERTED_RECORD_FIELDS = Object.freeze(['entityType', 'entityPk', 'batchRole', 'sourceRowNumber', 'rowWitness']);
 const DEMO_SKIPPED_RECORD_FIELDS = Object.freeze(['entityType', 'entityPk', 'batchRole', 'sourceRowNumber', 'reason']);
@@ -149,6 +237,24 @@ function sha256Stable(value) {
   return crypto.createHash('sha256')
     .update(JSON.stringify(normalizeDigestValue(value)), 'utf8')
     .digest('hex');
+}
+
+/** 深复制并冻结 strategy 私有协议快照，禁止返回 live metadata。 */
+function cloneFrozenStrategyOwnershipSnapshot(value) {
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map(cloneFrozenStrategyOwnershipSnapshot));
+  }
+  if (value && typeof value === 'object') {
+    return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => (
+      [key, cloneFrozenStrategyOwnershipSnapshot(item)]
+    ))));
+  }
+  return value;
+}
+
+/** 使用模块初始化期间已捕获的 evaluator 闭包协议，不再读取对端 require/cache exports。 */
+function getEnergyStrategyEvaluatorProtocol() {
+  return energyStrategyEvaluatorProtocol;
 }
 
 /** 规范化静态 handler 使用的整数主键，拒绝数字字符串的容错重写。 */
@@ -271,6 +377,265 @@ function assertDemoProjectionDate(value, fieldName) {
   }
 }
 
+/** 校验 Prediction config snapshot 的固定 JSON 合同和可空关联字段一致性。 */
+function assertPredictionConfigSnapshotProjection(configSnapshot, parameters) {
+  if (configSnapshot === null) return;
+  if (!configSnapshot || Array.isArray(configSnapshot)
+    || typeof configSnapshot !== 'object'
+    || Object.getPrototypeOf(configSnapshot) !== Object.prototype) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID',
+      'snapshot.parameters_json.configSnapshot 必须是严格 JSON object 或 null。',
+      { fieldName: 'snapshot.parameters_json.configSnapshot' },
+      400
+    );
+  }
+  assertStrictDemoProjectionJsonFields(
+    configSnapshot,
+    'snapshot.parameters_json.configSnapshot',
+    ['configId', 'config']
+  );
+  assertDemoProjectionInteger(
+    configSnapshot.configId,
+    'snapshot.parameters_json.configSnapshot.configId',
+    { min: 1 }
+  );
+  const config = configSnapshot.config;
+  if (!config || Array.isArray(config) || typeof config !== 'object'
+    || Object.getPrototypeOf(config) !== Object.prototype) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID',
+      'snapshot.parameters_json.configSnapshot.config 必须是严格 JSON object。',
+      { fieldName: 'snapshot.parameters_json.configSnapshot.config' },
+      400
+    );
+  }
+  assertStrictDemoProjectionJsonFields(
+    config,
+    'snapshot.parameters_json.configSnapshot.config',
+    [
+      'name', 'note', 'energyTypeCode', 'organizationUnitId', 'organizationUnitCode',
+      'meterDeviceId', 'meterCode', 'sourceBatchId', 'trainStartMonth', 'trainEndMonth',
+      'predictStartMonth', 'predictEndMonth', 'algorithm', 'windowSize'
+    ]
+  );
+  assertDemoProjectionString(config.name, 'snapshot.parameters_json.configSnapshot.config.name', { nonEmpty: true });
+  assertDemoProjectionString(config.note, 'snapshot.parameters_json.configSnapshot.config.note', { nullable: true });
+  assertDemoProjectionString(config.energyTypeCode, 'snapshot.parameters_json.configSnapshot.config.energyTypeCode', { nullable: true, nonEmpty: true });
+  assertDemoProjectionInteger(config.organizationUnitId, 'snapshot.parameters_json.configSnapshot.config.organizationUnitId', { nullable: true, min: 1 });
+  assertDemoProjectionString(config.organizationUnitCode, 'snapshot.parameters_json.configSnapshot.config.organizationUnitCode', { nullable: true, nonEmpty: true });
+  assertDemoProjectionInteger(config.meterDeviceId, 'snapshot.parameters_json.configSnapshot.config.meterDeviceId', { nullable: true, min: 1 });
+  assertDemoProjectionString(config.meterCode, 'snapshot.parameters_json.configSnapshot.config.meterCode', { nullable: true, nonEmpty: true });
+  assertDemoProjectionInteger(config.sourceBatchId, 'snapshot.parameters_json.configSnapshot.config.sourceBatchId', { min: 1 });
+  ['trainStartMonth', 'trainEndMonth', 'predictStartMonth', 'predictEndMonth'].forEach((fieldName) => {
+    assertDemoProjectionMonth(
+      config[fieldName],
+      `snapshot.parameters_json.configSnapshot.config.${fieldName}`
+    );
+  });
+  assertDemoProjectionEnum(
+    config.algorithm,
+    'snapshot.parameters_json.configSnapshot.config.algorithm',
+    ['moving_average', 'linear_trend']
+  );
+  assertDemoProjectionInteger(
+    config.windowSize,
+    'snapshot.parameters_json.configSnapshot.config.windowSize',
+    { nullable: true, min: 2 }
+  );
+  if (config.windowSize !== null && config.windowSize > 12) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+      'snapshot.parameters_json.configSnapshot.config.windowSize 超出固定范围。',
+      { fieldName: 'snapshot.parameters_json.configSnapshot.config.windowSize', max: 12 },
+      400
+    );
+  }
+  const nullablePairsMatch = (left, right) => (left === null) === (right === null);
+  if (!nullablePairsMatch(config.organizationUnitId, config.organizationUnitCode)
+    || !nullablePairsMatch(config.meterDeviceId, config.meterCode)
+    || config.algorithm !== parameters.algorithm
+    || config.windowSize !== parameters.windowSize
+    || config.trainStartMonth !== parameters.trainMonths[0]
+    || config.trainEndMonth !== parameters.trainMonths.at(-1)
+    || config.predictStartMonth !== parameters.predictionMonths[0]
+    || config.predictEndMonth !== parameters.predictionMonths.at(-1)) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+      'snapshot.parameters_json.configSnapshot 与算法、月份或关联字段不一致。',
+      { fieldName: 'snapshot.parameters_json.configSnapshot.config' },
+      400
+    );
+  }
+}
+
+/** 校验 Prediction run parameters_json 的固定 JSON 合同，禁止隐式数值转换和未知字段。 */
+function assertPredictionRunParametersProjection(value, row) {
+  const parameters = parseStrictDemoProjectionJsonObject(value, 'snapshot.parameters_json');
+  assertStrictDemoProjectionJsonFields(parameters, 'snapshot.parameters_json', [
+    'algorithm', 'windowSize', 'filters', 'trainMonths', 'predictionMonths',
+    'requiredHistoryMonths', 'configSnapshot', 'warnings'
+  ]);
+  assertDemoProjectionEnum(parameters.algorithm, 'snapshot.parameters_json.algorithm', [
+    'moving_average', 'linear_trend'
+  ]);
+  if (parameters.algorithm !== row.algorithm) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+      'snapshot.parameters_json.algorithm 必须与预测运行算法一致。',
+      { fieldName: 'snapshot.parameters_json.algorithm' },
+      400
+    );
+  }
+  assertDemoProjectionInteger(
+    parameters.windowSize,
+    'snapshot.parameters_json.windowSize',
+    { nullable: true, min: 2 }
+  );
+  if (parameters.windowSize !== null && parameters.windowSize > 12) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+      'snapshot.parameters_json.windowSize 超出固定范围。',
+      { fieldName: 'snapshot.parameters_json.windowSize', max: 12 },
+      400
+    );
+  }
+  if ((parameters.algorithm === 'moving_average' && parameters.windowSize === null)
+    || (parameters.algorithm === 'linear_trend' && parameters.windowSize !== null)) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+      'snapshot.parameters_json.windowSize 与预测算法不一致。',
+      { fieldName: 'snapshot.parameters_json.windowSize' },
+      400
+    );
+  }
+  const filters = parameters.filters;
+  if (!filters || Array.isArray(filters) || typeof filters !== 'object'
+    || Object.getPrototypeOf(filters) !== Object.prototype) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID',
+      'snapshot.parameters_json.filters 必须是严格 JSON object。',
+      { fieldName: 'snapshot.parameters_json.filters' },
+      400
+    );
+  }
+  const allowedFilterFields = [
+    'energyTypeCode', 'organizationUnitCode', 'organizationUnitId',
+    'meterCode', 'meterDeviceId', 'sourceBatchId'
+  ];
+  const filterFields = Object.keys(filters);
+  if (filterFields.some((fieldName) => !allowedFilterFields.includes(fieldName))) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID',
+      'snapshot.parameters_json.filters 包含未知字段。',
+      { fieldName: 'snapshot.parameters_json.filters', actualFields: filterFields },
+      400
+    );
+  }
+  ['energyTypeCode', 'organizationUnitCode', 'meterCode'].forEach((fieldName) => {
+    if (Object.prototype.hasOwnProperty.call(filters, fieldName)) {
+      assertDemoProjectionString(
+        filters[fieldName],
+        `snapshot.parameters_json.filters.${fieldName}`,
+        { nonEmpty: true }
+      );
+    }
+  });
+  ['organizationUnitId', 'meterDeviceId', 'sourceBatchId'].forEach((fieldName) => {
+    if (Object.prototype.hasOwnProperty.call(filters, fieldName)) {
+      assertDemoProjectionInteger(
+        filters[fieldName],
+        `snapshot.parameters_json.filters.${fieldName}`,
+        { min: 1 }
+      );
+    }
+  });
+  const assertMonthArray = (months, fieldName) => {
+    const monthIndexes = Array.isArray(months) ? months.map((month) => {
+      try {
+        assertDemoProjectionMonth(month, fieldName);
+        const [year, monthNumber] = month.split('-').map(Number);
+        return year * 12 + monthNumber - 1;
+      } catch (_error) {
+        return null;
+      }
+    }) : [];
+    const hasGapOrReorder = monthIndexes.some((monthIndex, index) => (
+      monthIndex === null || (index > 0 && monthIndex !== monthIndexes[index - 1] + 1)
+    ));
+    if (!Array.isArray(months) || months.length === 0
+      || hasGapOrReorder || new Set(months).size !== months.length) {
+      throw createDemoOwnershipError(
+        'DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID',
+        `${fieldName} 必须是非空、无重复的严格月份数组。`,
+        { fieldName },
+        400
+      );
+    }
+  };
+  assertMonthArray(parameters.trainMonths, 'snapshot.parameters_json.trainMonths');
+  assertMonthArray(parameters.predictionMonths, 'snapshot.parameters_json.predictionMonths');
+  assertDemoProjectionInteger(
+    parameters.requiredHistoryMonths,
+    'snapshot.parameters_json.requiredHistoryMonths',
+    { min: 3 }
+  );
+  const expectedRequiredMonths = parameters.algorithm === 'moving_average'
+    ? Math.max(3, parameters.windowSize)
+    : 3;
+  if (parameters.requiredHistoryMonths !== expectedRequiredMonths) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+      'snapshot.parameters_json.requiredHistoryMonths 与算法规则不一致。',
+      { fieldName: 'snapshot.parameters_json.requiredHistoryMonths' },
+      400
+    );
+  }
+  assertPredictionConfigSnapshotProjection(parameters.configSnapshot, parameters);
+  if (!Array.isArray(parameters.warnings)
+    || parameters.warnings.some((warning) => typeof warning !== 'string')) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID',
+      'snapshot.parameters_json.warnings 必须是字符串数组。',
+      { fieldName: 'snapshot.parameters_json.warnings' },
+      400
+    );
+  }
+  return parameters;
+}
+
+/** 校验 Prediction result 方法说明、六位舍入和算法固定 confidence 合同。 */
+function assertPredictionResultMethodNote(value, row) {
+  assertDemoProjectionString(value, 'snapshot.method_note', { nonEmpty: true });
+  let methodFact = null;
+  let confidence = null;
+  try {
+    methodFact = parsePredictionForecastMethodNote(value);
+    confidence = methodFact
+      ? buildPredictionConfidenceFacts(methodFact.algorithm, row.predicted_value)
+      : null;
+  } catch (_error) {
+    methodFact = null;
+    confidence = null;
+  }
+  const rounded = isPredictionRoundedValue(row.predicted_value, { nonNegative: true })
+    && isPredictionRoundedValue(row.confidence_low, { nonNegative: true })
+    && isPredictionRoundedValue(row.confidence_high, { nonNegative: true });
+  if (!methodFact || !confidence || !rounded
+    || methodFact.canonicalUnit !== row.predicted_unit
+    || row.confidence_low !== confidence.confidenceLow
+    || row.confidence_high !== confidence.confidenceHigh
+    || (methodFact.clampedToZero && row.predicted_value !== 0)) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+      'Prediction result 方法说明、算法 confidence 或六位舍入合同无效。',
+      { fieldName: 'snapshot.method_note/confidence_low/confidence_high' },
+      400
+    );
+  }
+  return methodFact;
+}
+
 // 当前只声明已经有固定业务表、主键、导入类型和快照字段的 ownership handler；不代表开放 cleanup capability。
 const DEMO_OWNERSHIP_ENTITY_HANDLERS = Object.freeze({
   meter_reading: Object.freeze({
@@ -362,6 +727,106 @@ const DEMO_OWNERSHIP_ENTITY_HANDLERS = Object.freeze({
           train_start_month, train_end_month, predict_start_month, predict_end_month,
           algorithm, window_size, status, created_at, updated_at, archived_at
         FROM prediction_configs WHERE id = ?`).get(entityPk) || null;
+    }
+  }),
+  prediction_run: Object.freeze({
+    entityType: 'prediction_run',
+    tableName: 'prediction_runs',
+    primaryKeyColumn: 'id',
+    expectedImportTypes: Object.freeze([]),
+    projectionVersion: 'demo-entity-snapshot:v1',
+    projectionFields: Object.freeze([
+      'id', 'name', 'algorithm', 'status', 'target_energy_type_id',
+      'train_start_month', 'train_end_month', 'predict_start_month', 'predict_end_month',
+      'parameters_json', 'created_at', 'completed_at', 'note'
+    ]),
+    validateProjectionRow(row) {
+      assertDemoProjectionInteger(row.id, 'snapshot.id', { min: 1 });
+      assertDemoProjectionString(row.name, 'snapshot.name', { nonEmpty: true });
+      assertDemoProjectionEnum(row.algorithm, 'snapshot.algorithm', ['moving_average', 'linear_trend']);
+      assertDemoProjectionEnum(row.status, 'snapshot.status', ['completed']);
+      assertDemoProjectionInteger(row.target_energy_type_id, 'snapshot.target_energy_type_id', { nullable: true, min: 1 });
+      assertDemoProjectionMonth(row.train_start_month, 'snapshot.train_start_month');
+      assertDemoProjectionMonth(row.train_end_month, 'snapshot.train_end_month');
+      assertDemoProjectionMonth(row.predict_start_month, 'snapshot.predict_start_month');
+      assertDemoProjectionMonth(row.predict_end_month, 'snapshot.predict_end_month');
+      if (row.train_start_month > row.train_end_month
+        || row.predict_start_month > row.predict_end_month
+        || row.predict_start_month <= row.train_end_month) {
+        throw createDemoOwnershipError(
+          'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+          'Prediction run 月份范围不符合训练早于预测的固定合同。',
+          { fieldName: 'snapshot.train_start_month/predict_start_month' },
+          400
+        );
+      }
+      const parameters = assertPredictionRunParametersProjection(row.parameters_json, row);
+      if (parameters.trainMonths[0] !== row.train_start_month
+        || parameters.trainMonths.at(-1) !== row.train_end_month
+        || parameters.predictionMonths[0] !== row.predict_start_month
+        || parameters.predictionMonths.at(-1) !== row.predict_end_month) {
+        throw createDemoOwnershipError(
+          'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+          'Prediction run parameters_json 月份边界与运行字段不一致。',
+          { fieldName: 'snapshot.parameters_json.trainMonths/predictionMonths' },
+          400
+        );
+      }
+      assertDemoProjectionUtcMilliseconds(row.created_at, 'snapshot.created_at');
+      assertDemoProjectionUtcMilliseconds(row.completed_at, 'snapshot.completed_at');
+      if (Date.parse(row.completed_at) < Date.parse(row.created_at)) {
+        throw createDemoOwnershipError(
+          'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+          'Prediction run 完成时间不能早于创建时间。',
+          { fieldName: 'snapshot.completed_at' },
+          400
+        );
+      }
+      assertDemoProjectionString(row.note, 'snapshot.note', { nonEmpty: true });
+    },
+    readProjection(db, entityPk) {
+      return db.prepare(`SELECT id, name, algorithm, status, target_energy_type_id,
+          train_start_month, train_end_month, predict_start_month, predict_end_month,
+          parameters_json, created_at, completed_at, note
+        FROM prediction_runs WHERE id = ?`).get(entityPk) || null;
+    }
+  }),
+  prediction_result: Object.freeze({
+    entityType: 'prediction_result',
+    tableName: 'prediction_results',
+    primaryKeyColumn: 'id',
+    expectedImportTypes: Object.freeze([]),
+    projectionVersion: 'demo-entity-snapshot:v1',
+    projectionFields: Object.freeze([
+      'id', 'prediction_run_id', 'energy_type_id', 'target_month', 'predicted_value',
+      'predicted_unit', 'confidence_low', 'confidence_high', 'method_note', 'created_at'
+    ]),
+    validateProjectionRow(row) {
+      assertDemoProjectionInteger(row.id, 'snapshot.id', { min: 1 });
+      assertDemoProjectionInteger(row.prediction_run_id, 'snapshot.prediction_run_id', { min: 1 });
+      assertDemoProjectionInteger(row.energy_type_id, 'snapshot.energy_type_id', { min: 1 });
+      assertDemoProjectionMonth(row.target_month, 'snapshot.target_month');
+      assertDemoProjectionFiniteNumber(row.predicted_value, 'snapshot.predicted_value', { min: 0 });
+      assertDemoProjectionString(row.predicted_unit, 'snapshot.predicted_unit', { nonEmpty: true });
+      assertDemoProjectionFiniteNumber(row.confidence_low, 'snapshot.confidence_low', { min: 0 });
+      assertDemoProjectionFiniteNumber(row.confidence_high, 'snapshot.confidence_high', { min: 0 });
+      if (row.confidence_low > row.predicted_value
+        || row.predicted_value > row.confidence_high) {
+        throw createDemoOwnershipError(
+          'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+          'Prediction result 置信区间必须包含预测值。',
+          { fieldName: 'snapshot.confidence_low/confidence_high' },
+          400
+        );
+      }
+      assertPredictionResultMethodNote(row.method_note, row);
+      assertDemoProjectionUtcMilliseconds(row.created_at, 'snapshot.created_at');
+    },
+    readProjection(db, entityPk) {
+      return db.prepare(`SELECT id, prediction_run_id, energy_type_id, target_month,
+          predicted_value, predicted_unit, confidence_low, confidence_high,
+          method_note, created_at
+        FROM prediction_results WHERE id = ?`).get(entityPk) || null;
     }
   }),
   energy_record: Object.freeze({
@@ -1188,8 +1653,616 @@ const DEMO_OWNERSHIP_ENTITY_HANDLERS = Object.freeze({
           formula_version, record_status, void_reason, voided_at, created_at, updated_at
         FROM energy_flow_records WHERE id = ?`).get(entityPk) || null;
     }
+  }),
+  carbon_factor: Object.freeze({
+    entityType: 'carbon_factor',
+    tableName: 'carbon_factors',
+    primaryKeyColumn: 'id',
+    expectedImportTypes: Object.freeze(['carbon_factor']),
+    projectionVersion: 'demo-entity-snapshot:v1',
+    projectionFields: Object.freeze([
+      'id', 'source_batch_id', 'source_row_number', 'energy_type_id', 'region',
+      'factor_year', 'unit', 'factor_value', 'factor_unit', 'source', 'source_url',
+      'effective_from', 'effective_to', 'is_active', 'created_at', 'updated_at'
+    ]),
+    validateProjectionRow(row) {
+      assertDemoProjectionInteger(row.id, 'snapshot.id', { min: 1 });
+      assertDemoProjectionInteger(row.source_batch_id, 'snapshot.source_batch_id', { nullable: true, min: 1 });
+      assertDemoProjectionInteger(row.source_row_number, 'snapshot.source_row_number', { nullable: true, min: 1 });
+      if ((row.source_batch_id === null) !== (row.source_row_number === null)) {
+        throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳因子来源批次与行号必须成对出现。', { fieldName: 'snapshot.source_batch_id/source_row_number' }, 400);
+      }
+      assertDemoProjectionInteger(row.energy_type_id, 'snapshot.energy_type_id', { min: 1 });
+      assertDemoProjectionString(row.region, 'snapshot.region', { nonEmpty: true });
+      assertDemoProjectionInteger(row.factor_year, 'snapshot.factor_year', { nullable: true, min: 1900 });
+      if (row.factor_year !== null && row.factor_year > 2200) {
+        throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳因子年份超出固定范围。', { fieldName: 'snapshot.factor_year' }, 400);
+      }
+      assertDemoProjectionString(row.unit, 'snapshot.unit', { nonEmpty: true });
+      assertDemoProjectionFiniteNumber(row.factor_value, 'snapshot.factor_value', { min: Number.MIN_VALUE });
+      assertDemoProjectionString(row.factor_unit, 'snapshot.factor_unit', { nonEmpty: true });
+      assertDemoProjectionString(row.source, 'snapshot.source', { nonEmpty: true });
+      assertDemoProjectionString(row.source_url, 'snapshot.source_url', { nullable: true });
+      if (row.effective_from !== null) assertDemoProjectionDate(row.effective_from, 'snapshot.effective_from');
+      if (row.effective_to !== null) assertDemoProjectionDate(row.effective_to, 'snapshot.effective_to');
+      if (row.effective_from !== null && row.effective_to !== null && row.effective_from > row.effective_to) {
+        throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳因子有效期起始日期不得晚于结束日期。', { fieldName: 'snapshot.effective_from/effective_to' }, 400);
+      }
+      assertDemoProjectionInteger(row.is_active, 'snapshot.is_active', { min: 0 });
+      if (![0, 1].includes(row.is_active)) {
+        throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳因子启用状态只允许 0 或 1。', { fieldName: 'snapshot.is_active' }, 400);
+      }
+      assertDemoProjectionUtcMilliseconds(row.created_at, 'snapshot.created_at');
+      assertDemoProjectionUtcMilliseconds(row.updated_at, 'snapshot.updated_at');
+    },
+    readProjection(db, entityPk) {
+      return db.prepare(`SELECT id, source_batch_id, source_row_number, energy_type_id,
+          region, factor_year, unit, factor_value, factor_unit, source, source_url,
+          effective_from, effective_to, is_active, created_at, updated_at
+        FROM carbon_factors WHERE id = ?`).get(entityPk) || null;
+    }
+  }),
+  carbon_activity_record: Object.freeze({
+    entityType: 'carbon_activity_record',
+    tableName: 'carbon_activity_records',
+    primaryKeyColumn: 'id',
+    expectedImportTypes: Object.freeze(['carbon_activity']),
+    projectionVersion: 'demo-entity-snapshot:v1',
+    projectionFields: Object.freeze([
+      'id', 'source_type', 'source_batch_id', 'source_row_number', 'energy_record_id',
+      'activity_code', 'activity_code_key', 'supersedes_activity_id', 'superseded_by_activity_id',
+      'emission_scope', 'activity_category', 'activity_category_key', 'organization_unit_id',
+      'energy_type_id', 'start_wall_clock', 'end_wall_clock', 'source_timezone', 'start_utc',
+      'end_utc', 'activity_value', 'activity_unit', 'factor_region', 'source_reference',
+      'evidence_reference', 'note', 'duplicate_key', 'record_status', 'void_reason',
+      'voided_at', 'voided_by', 'created_by', 'created_at', 'updated_at'
+    ]),
+    validateProjectionRow(row) {
+      assertDemoProjectionInteger(row.id, 'snapshot.id', { min: 1 });
+      assertDemoProjectionEnum(row.source_type, 'snapshot.source_type', ['independent_activity', 'energy_record']);
+      assertDemoProjectionInteger(row.source_batch_id, 'snapshot.source_batch_id', { nullable: true, min: 1 });
+      assertDemoProjectionInteger(row.source_row_number, 'snapshot.source_row_number', { nullable: true, min: 1 });
+      if ((row.source_batch_id === null) !== (row.source_row_number === null)) {
+        throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳活动来源批次与行号必须成对出现。', { fieldName: 'snapshot.source_batch_id/source_row_number' }, 400);
+      }
+      assertDemoProjectionInteger(row.energy_record_id, 'snapshot.energy_record_id', { nullable: true, min: 1 });
+      if ((row.source_type === 'independent_activity') !== (row.energy_record_id === null)) {
+        throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳活动来源类型与能耗记录引用不一致。', { fieldName: 'snapshot.source_type/energy_record_id' }, 400);
+      }
+      ['activity_code', 'activity_code_key', 'activity_category', 'activity_category_key',
+        'activity_unit', 'factor_region', 'source_reference'].forEach((fieldName) => {
+        assertDemoProjectionString(row[fieldName], `snapshot.${fieldName}`, { nonEmpty: true });
+      });
+      assertDemoProjectionInteger(row.supersedes_activity_id, 'snapshot.supersedes_activity_id', { nullable: true, min: 1 });
+      assertDemoProjectionInteger(row.superseded_by_activity_id, 'snapshot.superseded_by_activity_id', { nullable: true, min: 1 });
+      assertDemoProjectionEnum(row.emission_scope, 'snapshot.emission_scope', ['scope_1', 'scope_2', 'scope_3']);
+      assertDemoProjectionInteger(row.organization_unit_id, 'snapshot.organization_unit_id', { min: 1 });
+      assertDemoProjectionInteger(row.energy_type_id, 'snapshot.energy_type_id', { min: 1 });
+      assertDemoProjectionWallClockMinute(row.start_wall_clock, 'snapshot.start_wall_clock');
+      assertDemoProjectionWallClockMinute(row.end_wall_clock, 'snapshot.end_wall_clock');
+      assertDemoProjectionTimeZone(row.source_timezone, 'snapshot.source_timezone');
+      assertDemoProjectionUtcIso(row.start_utc, 'snapshot.start_utc');
+      assertDemoProjectionUtcIso(row.end_utc, 'snapshot.end_utc');
+      if (Date.parse(row.start_utc) >= Date.parse(row.end_utc)) {
+        throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳活动开始时间必须早于结束时间。', { fieldName: 'snapshot.start_utc/end_utc' }, 400);
+      }
+      assertDemoProjectionFiniteNumber(row.activity_value, 'snapshot.activity_value', { min: 0 });
+      assertDemoProjectionString(row.evidence_reference, 'snapshot.evidence_reference', { nullable: true });
+      assertDemoProjectionString(row.note, 'snapshot.note', { nullable: true });
+      if (typeof row.duplicate_key !== 'string' || !/^[a-f0-9]{64}$/.test(row.duplicate_key)) {
+        throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳活动重复键必须是固定 SHA-256 文本。', { fieldName: 'snapshot.duplicate_key' }, 400);
+      }
+      assertDemoProjectionEnum(row.record_status, 'snapshot.record_status', ['active', 'superseded', 'void']);
+      assertDemoProjectionString(row.void_reason, 'snapshot.void_reason', { nullable: true });
+      assertDemoProjectionUtcIso(row.voided_at, 'snapshot.voided_at', { nullable: true });
+      assertDemoProjectionInteger(row.voided_by, 'snapshot.voided_by', { nullable: true, min: 1 });
+      assertDemoProjectionInteger(row.created_by, 'snapshot.created_by', { nullable: true, min: 1 });
+      if ((row.record_status === 'active' && row.superseded_by_activity_id !== null)
+        || (row.record_status === 'superseded' && row.superseded_by_activity_id === null)
+        || (row.record_status !== 'void' && (row.void_reason !== null || row.voided_at !== null || row.voided_by !== null))) {
+        throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳活动生命周期字段与状态不一致。', { fieldName: 'snapshot.record_status' }, 400);
+      }
+      assertDemoProjectionUtcMilliseconds(row.created_at, 'snapshot.created_at');
+      assertDemoProjectionUtcMilliseconds(row.updated_at, 'snapshot.updated_at');
+    },
+    readProjection(db, entityPk) {
+      return db.prepare(`SELECT id, source_type, source_batch_id, source_row_number, energy_record_id,
+          activity_code, activity_code_key, supersedes_activity_id, superseded_by_activity_id,
+          emission_scope, activity_category, activity_category_key, organization_unit_id,
+          energy_type_id, start_wall_clock, end_wall_clock, source_timezone, start_utc, end_utc,
+          activity_value, activity_unit, factor_region, source_reference, evidence_reference,
+          note, duplicate_key, record_status, void_reason, voided_at, voided_by, created_by,
+          created_at, updated_at
+        FROM carbon_activity_records WHERE id = ?`).get(entityPk) || null;
+    }
+  }),
+  carbon_calculation_run: Object.freeze({
+    entityType: 'carbon_calculation_run',
+    tableName: 'carbon_calculation_runs',
+    primaryKeyColumn: 'id',
+    expectedImportTypes: Object.freeze([]),
+    projectionVersion: 'demo-entity-snapshot:v1',
+    projectionFields: Object.freeze([
+      'id', 'run_code', 'snapshot_schema_version', 'source_type', 'status',
+      'calculation_method', 'start_utc', 'end_utc', 'activity_filter_json',
+      'actor_snapshot_json', 'activity_snapshot_digest', 'activity_count', 'result_count',
+      'calculated_count', 'factor_missing_count', 'emission_totals_json', 'created_by',
+      'started_at', 'completed_at', 'created_at'
+    ]),
+    validateProjectionRow(row) {
+      assertCarbonCalculationRunProjection(row);
+    },
+    readProjection(db, entityPk) {
+      return db.prepare(`SELECT id, run_code, snapshot_schema_version, source_type, status,
+          calculation_method, start_utc, end_utc, activity_filter_json, actor_snapshot_json,
+          activity_snapshot_digest, activity_count, result_count, calculated_count,
+          factor_missing_count, emission_totals_json, created_by, started_at, completed_at,
+          created_at
+        FROM carbon_calculation_runs WHERE id = ?`).get(entityPk) || null;
+    }
+  }),
+  carbon_accounting_result: Object.freeze({
+    entityType: 'carbon_accounting_result',
+    tableName: 'carbon_accounting_results',
+    primaryKeyColumn: 'id',
+    expectedImportTypes: Object.freeze([]),
+    projectionVersion: 'demo-entity-snapshot:v1',
+    projectionFields: Object.freeze([
+      'id', 'calculation_run_id', 'snapshot_schema_version', 'source_type',
+      'activity_record_id', 'carbon_factor_id', 'emission_scope', 'activity_category',
+      'organization_unit_id', 'energy_type_id', 'activity_start_wall_clock',
+      'activity_end_wall_clock', 'activity_start_utc', 'activity_end_utc', 'activity_value',
+      'activity_unit', 'requested_region', 'factor_year', 'factor_value', 'factor_unit',
+      'emission_value', 'emission_unit', 'status', 'missing_reason', 'calculation_basis',
+      'match_priority', 'activity_snapshot_json', 'organization_snapshot_json',
+      'energy_type_snapshot_json', 'factor_snapshot_json', 'matching_snapshot_json',
+      'formula_snapshot_json', 'created_at'
+    ]),
+    validateProjectionRow(row) {
+      assertCarbonAccountingResultProjection(row);
+    },
+    readProjection(db, entityPk) {
+      return db.prepare(`SELECT id, calculation_run_id, snapshot_schema_version, source_type,
+          activity_record_id, carbon_factor_id, emission_scope, activity_category,
+          organization_unit_id, energy_type_id, activity_start_wall_clock,
+          activity_end_wall_clock, activity_start_utc, activity_end_utc, activity_value,
+          activity_unit, requested_region, factor_year, factor_value, factor_unit,
+          emission_value, emission_unit, status, missing_reason, calculation_basis,
+          match_priority, activity_snapshot_json, organization_snapshot_json,
+          energy_type_snapshot_json, factor_snapshot_json, matching_snapshot_json,
+          formula_snapshot_json, created_at
+        FROM carbon_accounting_results WHERE id = ?`).get(entityPk) || null;
+    }
   })
 });
+
+/** 解析碳核算版本化 JSON 快照，并固定 envelope 与 payload 字段集合。 */
+function parseCarbonAccountingSnapshotEnvelope(value, fieldName, payloadName, payloadFields) {
+  const envelope = assertStrictDemoProjectionJsonFields(
+    parseStrictDemoProjectionJsonObject(value, fieldName),
+    fieldName,
+    ['version', payloadName]
+  );
+  assertDemoProjectionInteger(envelope.version, `${fieldName}.version`, { min: 1 });
+  if (envelope.version !== 1) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID',
+      `${fieldName}.version 必须是正式碳核算快照版本 1。`,
+      { fieldName: `${fieldName}.version`, value: envelope.version },
+      400
+    );
+  }
+  if (!envelope[payloadName] || Array.isArray(envelope[payloadName])
+    || typeof envelope[payloadName] !== 'object'
+    || Object.getPrototypeOf(envelope[payloadName]) !== Object.prototype) {
+    throw createDemoOwnershipError(
+      'DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID',
+      `${fieldName}.${payloadName} 必须是严格 JSON object。`,
+      { fieldName: `${fieldName}.${payloadName}` },
+      400
+    );
+  }
+  assertStrictDemoProjectionJsonFields(
+    envelope[payloadName],
+    `${fieldName}.${payloadName}`,
+    payloadFields
+  );
+  normalizeStrictJsonValue(envelope[payloadName], `${fieldName}.${payloadName}`);
+  return envelope[payloadName];
+}
+
+/** 校验 exact 碳核算运行 projection 与服务端固定筛选、actor 和汇总结构。 */
+function assertCarbonCalculationRunProjection(row) {
+  assertDemoProjectionInteger(row.id, 'snapshot.id', { min: 1 });
+  assertDemoProjectionString(row.run_code, 'snapshot.run_code', { nonEmpty: true });
+  assertDemoProjectionInteger(row.snapshot_schema_version, 'snapshot.snapshot_schema_version', { min: 1 });
+  if (row.snapshot_schema_version !== 1) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算运行快照版本无效。', { fieldName: 'snapshot.snapshot_schema_version' }, 400);
+  }
+  assertDemoProjectionEnum(row.source_type, 'snapshot.source_type', ['independent_activity']);
+  assertDemoProjectionEnum(row.status, 'snapshot.status', ['completed']);
+  assertDemoProjectionEnum(row.calculation_method, 'snapshot.calculation_method', ['standard-factor']);
+  assertDemoProjectionUtcSecond(row.start_utc, 'snapshot.start_utc');
+  assertDemoProjectionUtcSecond(row.end_utc, 'snapshot.end_utc');
+  if (Date.parse(row.start_utc) >= Date.parse(row.end_utc)) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算运行开始时间必须早于结束时间。', { fieldName: 'snapshot.start_utc/end_utc' }, 400);
+  }
+  const filterEnvelope = parseStrictDemoProjectionJsonObject(
+    row.activity_filter_json,
+    'snapshot.activity_filter_json'
+  );
+  assertStrictDemoProjectionJsonFields(filterEnvelope, 'snapshot.activity_filter_json', [
+    'version', 'sourceType', 'recordStatus', 'interval', 'selectionMode',
+    'usesFullActivityValue', 'overlapProration', 'maxActivities'
+  ]);
+  if (!filterEnvelope.interval || Array.isArray(filterEnvelope.interval)
+    || typeof filterEnvelope.interval !== 'object'
+    || Object.getPrototypeOf(filterEnvelope.interval) !== Object.prototype) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID', '碳核算运行 interval 必须是严格 JSON object。', { fieldName: 'snapshot.activity_filter_json.interval' }, 400);
+  }
+  const filter = assertStrictDemoProjectionJsonFields(
+    filterEnvelope.interval,
+    'snapshot.activity_filter_json.interval',
+    ['startUtc', 'endUtc', 'semantics', 'positiveOverlapOnly']
+  );
+  assertDemoProjectionInteger(filterEnvelope.version, 'snapshot.activity_filter_json.version', { min: 1 });
+  if (filterEnvelope.version !== 1) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算运行 exact activity filter 版本无效。', { fieldName: 'snapshot.activity_filter_json.version' }, 400);
+  }
+  assertDemoProjectionEnum(filterEnvelope.sourceType, 'snapshot.activity_filter_json.sourceType', ['independent_activity']);
+  assertDemoProjectionEnum(filterEnvelope.recordStatus, 'snapshot.activity_filter_json.recordStatus', ['active']);
+  assertDemoProjectionEnum(filterEnvelope.selectionMode, 'snapshot.activity_filter_json.selectionMode', ['server-owned-exact-demo-scope']);
+  if (filter.startUtc !== row.start_utc || filter.endUtc !== row.end_utc
+    || filter.semantics !== 'server-derived-exact-activity-bounds'
+    || filter.positiveOverlapOnly !== false
+    || filterEnvelope.usesFullActivityValue !== true
+    || filterEnvelope.overlapProration !== false
+    || filterEnvelope.maxActivities !== 5000) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算运行 exact activity filter 与持久事实不一致。', { fieldName: 'snapshot.activity_filter_json' }, 400);
+  }
+  assertDemoProjectionUtcSecond(filter.startUtc, 'snapshot.activity_filter_json.interval.startUtc');
+  assertDemoProjectionUtcSecond(filter.endUtc, 'snapshot.activity_filter_json.interval.endUtc');
+  const actor = parseCarbonAccountingSnapshotEnvelope(
+    row.actor_snapshot_json,
+    'snapshot.actor_snapshot_json',
+    'actor',
+    ['userId', 'username', 'displayName', 'ip']
+  );
+  assertDemoProjectionInteger(actor.userId, 'snapshot.actor_snapshot_json.actor.userId', { nullable: true, min: 1 });
+  ['username', 'displayName', 'ip'].forEach((fieldName) => {
+    assertDemoProjectionString(actor[fieldName], `snapshot.actor_snapshot_json.actor.${fieldName}`, { nullable: true });
+  });
+  if (actor.userId !== row.created_by) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算运行 actor 与 created_by 不一致。', { fieldName: 'snapshot.actor_snapshot_json.actor.userId' }, 400);
+  }
+  if (typeof row.activity_snapshot_digest !== 'string' || !/^[a-f0-9]{64}$/.test(row.activity_snapshot_digest)) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算运行活动摘要必须是小写 SHA-256。', { fieldName: 'snapshot.activity_snapshot_digest' }, 400);
+  }
+  ['activity_count', 'result_count', 'calculated_count', 'factor_missing_count'].forEach((fieldName) => {
+    assertDemoProjectionInteger(row[fieldName], `snapshot.${fieldName}`, { min: 0 });
+  });
+  if (row.activity_count < 1 || row.activity_count > 5000
+    || row.result_count !== row.activity_count
+    || row.calculated_count + row.factor_missing_count !== row.result_count) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算运行计数不符合 exact 闭包。', { fieldName: 'snapshot.activity_count/result_count' }, 400);
+  }
+  const totalsEnvelope = assertStrictDemoProjectionJsonFields(
+    parseStrictDemoProjectionJsonObject(row.emission_totals_json, 'snapshot.emission_totals_json'),
+    'snapshot.emission_totals_json',
+    ['version', 'totals']
+  );
+  if (totalsEnvelope.version !== 1 || !Array.isArray(totalsEnvelope.totals)) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID', '碳核算汇总必须使用版本 1 的 totals 数组。', { fieldName: 'snapshot.emission_totals_json' }, 400);
+  }
+  let totalCalculatedCount = 0;
+  const totalUnits = new Set();
+  totalsEnvelope.totals.forEach((total, index) => {
+    if (!total || Array.isArray(total) || typeof total !== 'object'
+      || Object.getPrototypeOf(total) !== Object.prototype) {
+      throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID', '碳核算汇总项必须是严格 JSON object。', { index }, 400);
+    }
+    assertStrictDemoProjectionJsonFields(total, `snapshot.emission_totals_json.totals[${index}]`, [
+      'emissionUnit', 'totalEmissionValue', 'calculatedCount'
+    ]);
+    assertDemoProjectionString(total.emissionUnit, `snapshot.emission_totals_json.totals[${index}].emissionUnit`, { nonEmpty: true });
+    assertDemoProjectionFiniteNumber(total.totalEmissionValue, `snapshot.emission_totals_json.totals[${index}].totalEmissionValue`, { min: 0 });
+    assertDemoProjectionInteger(total.calculatedCount, `snapshot.emission_totals_json.totals[${index}].calculatedCount`, { min: 1 });
+    if (totalUnits.has(total.emissionUnit)) {
+      throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID', '碳核算汇总单位不得重复。', { emissionUnit: total.emissionUnit }, 400);
+    }
+    totalUnits.add(total.emissionUnit);
+    totalCalculatedCount += total.calculatedCount;
+  });
+  if (totalCalculatedCount !== row.calculated_count) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算汇总计数与运行 calculated_count 不一致。', { fieldName: 'snapshot.emission_totals_json' }, 400);
+  }
+  assertDemoProjectionInteger(row.created_by, 'snapshot.created_by', { nullable: true, min: 1 });
+  assertDemoProjectionUtcMilliseconds(row.started_at, 'snapshot.started_at');
+  assertDemoProjectionUtcMilliseconds(row.completed_at, 'snapshot.completed_at');
+  assertDemoProjectionUtcMilliseconds(row.created_at, 'snapshot.created_at');
+  if (Date.parse(row.started_at) > Date.parse(row.completed_at)
+    || row.completed_at !== row.created_at) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算运行审计时间线不一致。', { fieldName: 'snapshot.started_at/completed_at/created_at' }, 400);
+  }
+}
+
+/** 校验碳核算活动快照全部字段类型和值域。 */
+function assertCarbonActivitySnapshotFields(activity, fieldName) {
+  ['id', 'sourceBatchId', 'sourceRowNumber', 'organizationUnitId', 'energyTypeId'].forEach((key) => {
+    assertDemoProjectionInteger(activity[key], `${fieldName}.${key}`, { min: 1 });
+  });
+  ['energyRecordId', 'supersedesActivityId', 'supersededByActivityId', 'voidedBy', 'createdBy'].forEach((key) => {
+    assertDemoProjectionInteger(activity[key], `${fieldName}.${key}`, { nullable: true, min: 1 });
+  });
+  assertDemoProjectionEnum(activity.sourceType, `${fieldName}.sourceType`, ['independent_activity']);
+  if (activity.energyRecordId !== null) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', 'exact 活动快照不得引用 energy_record。', { fieldName: `${fieldName}.energyRecordId` }, 400);
+  }
+  ['activityCode', 'activityCodeKey', 'activityCategory', 'activityCategoryKey', 'activityUnit',
+    'factorRegion', 'sourceReference', 'duplicateKey'].forEach((key) => {
+    assertDemoProjectionString(activity[key], `${fieldName}.${key}`, { nonEmpty: true });
+  });
+  ['evidenceReference', 'note', 'voidReason'].forEach((key) => {
+    assertDemoProjectionString(activity[key], `${fieldName}.${key}`, { nullable: true });
+  });
+  assertDemoProjectionEnum(activity.emissionScope, `${fieldName}.emissionScope`, ['scope_1', 'scope_2', 'scope_3']);
+  assertDemoProjectionWallClockMinute(activity.startWallClock, `${fieldName}.startWallClock`);
+  assertDemoProjectionWallClockMinute(activity.endWallClock, `${fieldName}.endWallClock`);
+  assertDemoProjectionTimeZone(activity.sourceTimezone, `${fieldName}.sourceTimezone`);
+  assertDemoProjectionUtcIso(activity.startUtc, `${fieldName}.startUtc`);
+  assertDemoProjectionUtcIso(activity.endUtc, `${fieldName}.endUtc`);
+  assertDemoProjectionFiniteNumber(activity.activityValue, `${fieldName}.activityValue`, { min: 0 });
+  if (!/^[a-f0-9]{64}$/.test(activity.duplicateKey)) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '活动快照 duplicateKey 必须是小写 SHA-256。', { fieldName: `${fieldName}.duplicateKey` }, 400);
+  }
+  assertDemoProjectionEnum(activity.recordStatus, `${fieldName}.recordStatus`, ['active']);
+  if (activity.supersededByActivityId !== null || activity.voidReason !== null
+    || activity.voidedAt !== null || activity.voidedBy !== null) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', 'active 活动快照生命周期字段无效。', { fieldName: `${fieldName}.recordStatus` }, 400);
+  }
+  assertDemoProjectionUtcIso(activity.voidedAt, `${fieldName}.voidedAt`, { nullable: true });
+  assertDemoProjectionUtcMilliseconds(activity.createdAt, `${fieldName}.createdAt`);
+  assertDemoProjectionUtcMilliseconds(activity.updatedAt, `${fieldName}.updatedAt`);
+}
+
+/** 校验碳核算组织快照全部字段类型。 */
+function assertCarbonOrganizationSnapshotFields(organization, fieldName) {
+  assertDemoProjectionInteger(organization.id, `${fieldName}.id`, { min: 1 });
+  assertDemoProjectionInteger(organization.parentId, `${fieldName}.parentId`, { nullable: true, min: 1 });
+  ['unitCode', 'unitName', 'unitPath', 'unitType', 'status'].forEach((key) => {
+    assertDemoProjectionString(organization[key], `${fieldName}.${key}`, { nonEmpty: true });
+  });
+  assertDemoProjectionFiniteNumber(organization.area, `${fieldName}.area`, { nullable: true, min: 0 });
+  assertDemoProjectionInteger(organization.sortOrder, `${fieldName}.sortOrder`);
+  assertDemoProjectionString(organization.remark, `${fieldName}.remark`, { nullable: true });
+  assertDemoProjectionUtcMilliseconds(organization.createdAt, `${fieldName}.createdAt`);
+  assertDemoProjectionUtcMilliseconds(organization.updatedAt, `${fieldName}.updatedAt`);
+}
+
+/** 校验碳核算能源类型快照全部字段类型。 */
+function assertCarbonEnergyTypeSnapshotFields(energyType, fieldName) {
+  assertDemoProjectionInteger(energyType.id, `${fieldName}.id`, { min: 1 });
+  ['code', 'name', 'category', 'defaultUnit', 'standardUnit'].forEach((key) => {
+    assertDemoProjectionString(energyType[key], `${fieldName}.${key}`, { nonEmpty: true });
+  });
+  ['carbonFactorRequired', 'isActive'].forEach((key) => {
+    assertDemoProjectionInteger(energyType[key], `${fieldName}.${key}`, { min: 0 });
+    if (![0, 1].includes(energyType[key])) {
+      throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '能源类型布尔整数只允许 0 或 1。', { fieldName: `${fieldName}.${key}` }, 400);
+    }
+  });
+  assertDemoProjectionInteger(energyType.displayOrder, `${fieldName}.displayOrder`);
+  assertDemoProjectionUtcMilliseconds(energyType.createdAt, `${fieldName}.createdAt`);
+  assertDemoProjectionUtcMilliseconds(energyType.updatedAt, `${fieldName}.updatedAt`);
+}
+
+/** 校验碳核算因子快照全部字段类型。 */
+function assertCarbonFactorSnapshotFields(factor, fieldName) {
+  ['id', 'sourceBatchId', 'sourceRowNumber', 'energyTypeId'].forEach((key) => {
+    assertDemoProjectionInteger(factor[key], `${fieldName}.${key}`, { min: 1 });
+  });
+  assertDemoProjectionInteger(factor.factorYear, `${fieldName}.factorYear`, { nullable: true, min: 1 });
+  if (factor.factorYear !== null && factor.factorYear > 9999) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '因子快照年份超出固定范围。', { fieldName: `${fieldName}.factorYear` }, 400);
+  }
+  ['region', 'unit', 'factorUnit', 'source'].forEach((key) => {
+    assertDemoProjectionString(factor[key], `${fieldName}.${key}`, { nonEmpty: true });
+  });
+  assertDemoProjectionString(factor.sourceUrl, `${fieldName}.sourceUrl`, { nullable: true });
+  assertDemoProjectionFiniteNumber(factor.factorValue, `${fieldName}.factorValue`, { min: Number.MIN_VALUE });
+  if (factor.effectiveFrom !== null) assertDemoProjectionDate(factor.effectiveFrom, `${fieldName}.effectiveFrom`);
+  if (factor.effectiveTo !== null) assertDemoProjectionDate(factor.effectiveTo, `${fieldName}.effectiveTo`);
+  assertDemoProjectionInteger(factor.isActive, `${fieldName}.isActive`, { min: 0 });
+  if (factor.isActive !== 1) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', 'exact 因子快照必须处于启用状态。', { fieldName: `${fieldName}.isActive` }, 400);
+  }
+  assertDemoProjectionUtcMilliseconds(factor.createdAt, `${fieldName}.createdAt`);
+  assertDemoProjectionUtcMilliseconds(factor.updatedAt, `${fieldName}.updatedAt`);
+}
+
+/** 校验 exact 碳核算结果 projection、快照字段和 calculated/missing 分支闭包。 */
+function assertCarbonAccountingResultProjection(row) {
+  ['id', 'calculation_run_id', 'activity_record_id', 'organization_unit_id', 'energy_type_id'].forEach((fieldName) => {
+    assertDemoProjectionInteger(row[fieldName], `snapshot.${fieldName}`, { min: 1 });
+  });
+  assertDemoProjectionInteger(row.snapshot_schema_version, 'snapshot.snapshot_schema_version', { min: 1 });
+  if (row.snapshot_schema_version !== 1) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算结果快照版本无效。', { fieldName: 'snapshot.snapshot_schema_version' }, 400);
+  }
+  assertDemoProjectionEnum(row.source_type, 'snapshot.source_type', ['independent_activity']);
+  assertDemoProjectionInteger(row.carbon_factor_id, 'snapshot.carbon_factor_id', { nullable: true, min: 1 });
+  assertDemoProjectionEnum(row.emission_scope, 'snapshot.emission_scope', ['scope_1', 'scope_2', 'scope_3']);
+  ['activity_category', 'activity_unit', 'requested_region', 'calculation_basis'].forEach((fieldName) => {
+    assertDemoProjectionString(row[fieldName], `snapshot.${fieldName}`, { nonEmpty: true });
+  });
+  if (row.calculation_basis !== 'activity_value * factor_value') {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算结果计算基础无效。', { fieldName: 'snapshot.calculation_basis' }, 400);
+  }
+  assertDemoProjectionWallClockMinute(row.activity_start_wall_clock, 'snapshot.activity_start_wall_clock');
+  assertDemoProjectionWallClockMinute(row.activity_end_wall_clock, 'snapshot.activity_end_wall_clock');
+  assertDemoProjectionUtcIso(row.activity_start_utc, 'snapshot.activity_start_utc');
+  assertDemoProjectionUtcIso(row.activity_end_utc, 'snapshot.activity_end_utc');
+  if (Date.parse(row.activity_start_utc) >= Date.parse(row.activity_end_utc)) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算结果活动开始时间必须早于结束时间。', { fieldName: 'snapshot.activity_start_utc/activity_end_utc' }, 400);
+  }
+  assertDemoProjectionFiniteNumber(row.activity_value, 'snapshot.activity_value', { min: 0 });
+  assertDemoProjectionInteger(row.factor_year, 'snapshot.factor_year', { min: 1 });
+  if (row.factor_year > 9999) throwDemoProjectionFieldTypeError('snapshot.factor_year', 'integer_1_9999', row.factor_year);
+  ['factor_value', 'emission_value'].forEach((fieldName) => {
+    assertDemoProjectionFiniteNumber(row[fieldName], `snapshot.${fieldName}`, { nullable: true, min: 0 });
+  });
+  ['factor_unit', 'emission_unit', 'missing_reason'].forEach((fieldName) => {
+    assertDemoProjectionString(row[fieldName], `snapshot.${fieldName}`, { nullable: true });
+  });
+  assertDemoProjectionInteger(row.match_priority, 'snapshot.match_priority', { nullable: true, min: 1 });
+  if (row.match_priority !== null && row.match_priority > 4) throwDemoProjectionFieldTypeError('snapshot.match_priority', 'integer_1_4', row.match_priority);
+  assertDemoProjectionEnum(row.status, 'snapshot.status', ['calculated', 'factor_missing']);
+  const calculated = row.status === 'calculated';
+  if (calculated !== (row.carbon_factor_id !== null)
+    || calculated !== (row.factor_value !== null)
+    || calculated !== (row.factor_unit !== null)
+    || calculated !== (row.emission_value !== null)
+    || calculated !== (row.emission_unit !== null)
+    || calculated !== (row.match_priority !== null)
+    || calculated !== (row.factor_snapshot_json !== null)
+    || calculated === (row.missing_reason !== null)) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算结果 calculated/factor_missing 字段闭包不一致。', { fieldName: 'snapshot.status' }, 400);
+  }
+  if (!calculated && row.missing_reason !== 'NO_ACTIVE_EXACT_UNIT_FACTOR') {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '缺因子结果原因码无效。', { fieldName: 'snapshot.missing_reason' }, 400);
+  }
+  const activity = parseCarbonAccountingSnapshotEnvelope(row.activity_snapshot_json, 'snapshot.activity_snapshot_json', 'activity', [
+    'id', 'sourceType', 'sourceBatchId', 'sourceRowNumber', 'energyRecordId', 'activityCode',
+    'activityCodeKey', 'supersedesActivityId', 'supersededByActivityId', 'emissionScope',
+    'activityCategory', 'activityCategoryKey', 'organizationUnitId', 'energyTypeId',
+    'startWallClock', 'endWallClock', 'sourceTimezone', 'startUtc', 'endUtc', 'activityValue',
+    'activityUnit', 'factorRegion', 'sourceReference', 'evidenceReference', 'note', 'duplicateKey',
+    'recordStatus', 'voidReason', 'voidedAt', 'voidedBy', 'createdBy', 'createdAt', 'updatedAt'
+  ]);
+  assertCarbonActivitySnapshotFields(activity, 'snapshot.activity_snapshot_json.activity');
+  if (activity.id !== row.activity_record_id || activity.sourceType !== row.source_type
+    || activity.emissionScope !== row.emission_scope || activity.activityCategory !== row.activity_category
+    || activity.organizationUnitId !== row.organization_unit_id || activity.energyTypeId !== row.energy_type_id
+    || activity.startWallClock !== row.activity_start_wall_clock || activity.endWallClock !== row.activity_end_wall_clock
+    || activity.startUtc !== row.activity_start_utc || activity.endUtc !== row.activity_end_utc
+    || activity.activityValue !== row.activity_value || activity.activityUnit !== row.activity_unit
+    || activity.factorRegion !== row.requested_region || activity.recordStatus !== 'active') {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算结果活动快照与筛选列不一致。', { fieldName: 'snapshot.activity_snapshot_json' }, 400);
+  }
+  const organization = parseCarbonAccountingSnapshotEnvelope(row.organization_snapshot_json, 'snapshot.organization_snapshot_json', 'organization', [
+    'id', 'parentId', 'unitCode', 'unitName', 'unitPath', 'unitType', 'area', 'sortOrder',
+    'status', 'remark', 'createdAt', 'updatedAt'
+  ]);
+  const energyType = parseCarbonAccountingSnapshotEnvelope(row.energy_type_snapshot_json, 'snapshot.energy_type_snapshot_json', 'energyType', [
+    'id', 'code', 'name', 'category', 'defaultUnit', 'standardUnit', 'carbonFactorRequired',
+    'isActive', 'displayOrder', 'createdAt', 'updatedAt'
+  ]);
+  assertCarbonOrganizationSnapshotFields(
+    organization,
+    'snapshot.organization_snapshot_json.organization'
+  );
+  assertCarbonEnergyTypeSnapshotFields(
+    energyType,
+    'snapshot.energy_type_snapshot_json.energyType'
+  );
+  if (organization.id !== row.organization_unit_id || energyType.id !== row.energy_type_id) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算结果组织或能源类型快照与筛选列不一致。', { fieldName: 'snapshot.organization_snapshot_json/energy_type_snapshot_json' }, 400);
+  }
+  if (calculated) {
+    const factor = parseCarbonAccountingSnapshotEnvelope(row.factor_snapshot_json, 'snapshot.factor_snapshot_json', 'factor', [
+      'id', 'sourceBatchId', 'sourceRowNumber', 'energyTypeId', 'region', 'factorYear', 'unit',
+      'factorValue', 'factorUnit', 'source', 'sourceUrl', 'effectiveFrom', 'effectiveTo', 'isActive',
+      'createdAt', 'updatedAt'
+    ]);
+    assertCarbonFactorSnapshotFields(factor, 'snapshot.factor_snapshot_json.factor');
+    if (factor.id !== row.carbon_factor_id || factor.energyTypeId !== row.energy_type_id
+      || factor.factorValue !== row.factor_value || factor.factorUnit !== row.factor_unit
+      || factor.isActive !== 1) {
+      throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算结果因子快照与筛选列不一致。', { fieldName: 'snapshot.factor_snapshot_json' }, 400);
+    }
+  }
+  const matching = assertStrictDemoProjectionJsonFields(
+    parseStrictDemoProjectionJsonObject(row.matching_snapshot_json, 'snapshot.matching_snapshot_json'),
+    'snapshot.matching_snapshot_json',
+    ['version', 'policy', 'request', 'selected', 'missing']
+  );
+  if (matching.version !== 1) throwDemoProjectionFieldTypeError('snapshot.matching_snapshot_json.version', 'integer_1', matching.version);
+  if (!matching.policy || Array.isArray(matching.policy) || typeof matching.policy !== 'object'
+    || Object.getPrototypeOf(matching.policy) !== Object.prototype
+    || !matching.request || Array.isArray(matching.request) || typeof matching.request !== 'object'
+    || Object.getPrototypeOf(matching.request) !== Object.prototype) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_JSON_INVALID', '碳核算匹配 policy/request 必须是严格 JSON object。', { fieldName: 'snapshot.matching_snapshot_json' }, 400);
+  }
+  assertStrictDemoProjectionJsonFields(matching.policy, 'snapshot.matching_snapshot_json.policy', [
+    'activeOnly', 'exactEnergyType', 'exactActivityUnit', 'effectiveRangeParticipates',
+    'priority', 'tieBreaker'
+  ]);
+  if (matching.policy.activeOnly !== true || matching.policy.exactEnergyType !== true
+    || matching.policy.exactActivityUnit !== true
+    || matching.policy.effectiveRangeParticipates !== false
+    || matching.policy.tieBreaker !== 'factor_id_desc'
+    || !Array.isArray(matching.policy.priority)
+    || sha256Stable(matching.policy.priority) !== sha256Stable([
+      'requested_region+requested_year',
+      'default_region+requested_year',
+      'requested_region+generic_year',
+      'default_region+generic_year'
+    ])) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算匹配 policy 与正式四级优先级不一致。', { fieldName: 'snapshot.matching_snapshot_json.policy' }, 400);
+  }
+  assertStrictDemoProjectionJsonFields(matching.request, 'snapshot.matching_snapshot_json.request', [
+    'requestedRegion', 'factorYear', 'energyTypeId', 'activityUnit'
+  ]);
+  if (matching.request.requestedRegion !== row.requested_region
+    || matching.request.factorYear !== row.factor_year
+    || matching.request.energyTypeId !== row.energy_type_id
+    || matching.request.activityUnit !== row.activity_unit) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算匹配 request 与结果筛选列不一致。', { fieldName: 'snapshot.matching_snapshot_json.request' }, 400);
+  }
+  if (calculated) {
+    if (!matching.selected || Array.isArray(matching.selected)
+      || typeof matching.selected !== 'object'
+      || Object.getPrototypeOf(matching.selected) !== Object.prototype
+      || matching.missing !== null) {
+      throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', 'calculated 匹配快照必须只包含 selected。', { fieldName: 'snapshot.matching_snapshot_json' }, 400);
+    }
+    assertStrictDemoProjectionJsonFields(matching.selected, 'snapshot.matching_snapshot_json.selected', [
+      'factorId', 'matchPriority'
+    ]);
+    if (matching.selected.factorId !== row.carbon_factor_id
+      || matching.selected.matchPriority !== row.match_priority) {
+      throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算结果匹配快照与 calculated 结果不一致。', { fieldName: 'snapshot.matching_snapshot_json' }, 400);
+    }
+  } else {
+    if (matching.selected !== null || !matching.missing || Array.isArray(matching.missing)
+      || typeof matching.missing !== 'object'
+      || Object.getPrototypeOf(matching.missing) !== Object.prototype) {
+      throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', 'factor_missing 匹配快照必须只包含 missing。', { fieldName: 'snapshot.matching_snapshot_json' }, 400);
+    }
+    assertStrictDemoProjectionJsonFields(matching.missing, 'snapshot.matching_snapshot_json.missing', [
+      'code', 'message'
+    ]);
+    if (matching.missing.code !== row.missing_reason
+      || matching.missing.message !== '未找到活动能源类型、活动单位、请求地区和来源墙钟年份对应的启用碳因子。') {
+      throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算结果匹配快照与缺因子结果不一致。', { fieldName: 'snapshot.matching_snapshot_json' }, 400);
+    }
+  }
+  const formula = assertStrictDemoProjectionJsonFields(
+    parseStrictDemoProjectionJsonObject(row.formula_snapshot_json, 'snapshot.formula_snapshot_json'),
+    'snapshot.formula_snapshot_json',
+    ['version', 'expression', 'usesFullActivityValue', 'overlapProration', 'activityValue',
+      'activityUnit', 'factorValue', 'factorUnit', 'emissionValue', 'emissionUnit', 'decimalPlaces']
+  );
+  if (formula.version !== 1 || formula.expression !== 'round(activity_value * factor_value, 6)'
+    || formula.usesFullActivityValue !== true || formula.overlapProration !== false
+    || formula.activityValue !== row.activity_value || formula.activityUnit !== row.activity_unit
+    || formula.factorValue !== row.factor_value || formula.factorUnit !== row.factor_unit
+    || formula.emissionValue !== row.emission_value || formula.emissionUnit !== row.emission_unit
+    || formula.decimalPlaces !== 6) {
+    throw createDemoOwnershipError('DEMO_OWNERSHIP_SNAPSHOT_FIELD_VALUE_INVALID', '碳核算结果公式快照与筛选列不一致。', { fieldName: 'snapshot.formula_snapshot_json' }, 400);
+  }
+  assertDemoProjectionUtcMilliseconds(row.created_at, 'snapshot.created_at');
+}
 
 /** 读取实体静态 ownership handler；未知实体不得猜测表名或主键。 */
 function getDemoOwnershipEntityHandler(entityType) {
@@ -2276,16 +3349,1120 @@ function createDemoOwnershipDatabaseFacade(state) {
   return Object.freeze(facade);
 }
 
+/** 校验 Artifact 07 managed direct intent 只能使用路由固定注入的 context 字段。 */
+function requireManagedDirectImportContextIntent(demoContext) {
+  assertExactPlainObjectFields(
+    demoContext,
+    ['artifactKey', 'handlerKey', 'token', 'userId'],
+    'DEMO_MANAGED_DIRECT_CONTEXT_INTENT_INVALID',
+    'Artifact 07 managed direct context 只能包含固定服务端字段。'
+  );
+  if (demoContext.artifactKey !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.artifactKey
+    || demoContext.handlerKey !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.handlerKey) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_CONTEXT_MISMATCH',
+      'managed direct context 与 Artifact 07 固定 handler 不匹配。',
+      { artifactKey: demoContext.artifactKey || null },
+      409
+    );
+  }
+  return demoContext;
+}
+
+/** 读取 Artifact 07 context 的固定内部字段，不返回 token hash。 */
+function readManagedDirectContextByToken(state, token) {
+  const tokenHash = hashDemoContextToken(validateDemoContextToken(token));
+  return state.privateDb.prepare(`SELECT context_id AS contextId, run_id AS runId,
+      dataset_id AS datasetId, manifest_version AS manifestVersion,
+      manifest_digest AS manifestDigest, artifact_key AS artifactKey,
+      handler_key AS handlerKey, artifact_file_sha256 AS artifactFileSha256,
+      issued_to_user_id AS issuedToUserId, runtime_epoch AS runtimeEpoch,
+      status, issued_at AS issuedAt, expires_at AS expiresAt,
+      upload_file_sha256 AS uploadFileSha256, preview_digest AS previewDigest,
+      previewed_at AS previewedAt, executed_at AS executedAt
+    FROM demo_import_contexts WHERE token_hash = ?`).get(tokenHash) || null;
+}
+
+/** Artifact 07 没有公开 preview 权限，direct issued 校验固定使用 execute 权限。 */
+function assertManagedDirectExecutePermission(state, userId) {
+  if (!Number.isSafeInteger(userId) || userId < 1) {
+    throw new AppError('UNAUTHENTICATED', '请先登录。', { statusCode: 401 });
+  }
+  const actor = state.privateDb.prepare("SELECT id FROM sys_users WHERE id = ? AND status = 'active'").get(userId);
+  if (!actor) throw new AppError('UNAUTHENTICATED', '账号不存在或已停用。', { statusCode: 401 });
+  const artifact = requireDemoArtifactHandler(
+    DEMO_MANAGED_DIRECT_IMPORT_BINDING.artifactKey,
+    DEMO_MANAGED_DIRECT_IMPORT_BINDING.handlerKey
+  );
+  const authorized = state.privateDb.prepare(`SELECT 1
+    FROM sys_user_roles ur
+    JOIN sys_roles r ON r.id = ur.role_id
+    LEFT JOIN sys_role_menus rm ON rm.role_id = r.id
+    LEFT JOIN sys_menus m ON m.id = rm.menu_id
+    WHERE ur.user_id = ? AND r.status = 'active'
+      AND (r.role_code = 'super_admin'
+        OR (m.status = 'active' AND m.permission_code = ?))
+    LIMIT 1`).get(userId, artifact.permissions.execute);
+  if (!authorized) {
+    throw new AppError('FORBIDDEN', '当前账号没有执行该演示数据操作的领域权限。', {
+      statusCode: 403,
+      details: { requiredPermissions: [artifact.permissions.execute], mode: 'all' }
+    });
+  }
+  return artifact;
+}
+
+/** 在 active ownership scope 内验证 Artifact 07 issued context 及下载原字节 SHA。 */
+function validateManagedDirectIssuedContext(state, intent) {
+  assertExactPlainObjectFields(
+    intent,
+    ['demoContext', 'uploadFileSha256'],
+    'DEMO_MANAGED_DIRECT_CONTEXT_INTENT_INVALID',
+    'Artifact 07 managed direct issued 校验 intent 字段无效。'
+  );
+  const demoContext = requireManagedDirectImportContextIntent(intent.demoContext);
+  const uploadFileSha256 = validateSha256(intent.uploadFileSha256, 'uploadFileSha256');
+  const artifact = assertManagedDirectExecutePermission(state, demoContext.userId);
+  const runtime = assertDemoRuntimeEnabled({ db: state.privateDb });
+  const context = readManagedDirectContextByToken(state, demoContext.token);
+  if (!context) {
+    throw new AppError('DEMO_CONTEXT_NOT_FOUND', '演示 context 不存在或已失效。', { statusCode: 409 });
+  }
+  const expiryMs = Date.parse(context.expiresAt);
+  if (!Number.isFinite(expiryMs) || expiryMs <= Date.now()) {
+    throw new AppError('DEMO_CONTEXT_EXPIRED', '演示 context 已过期。', { statusCode: 410 });
+  }
+  const run = requireDemoDatasetRun(state.privateDb, context.runId);
+  const bindingsMatch = context.status === 'issued'
+    && context.issuedToUserId === demoContext.userId
+    && context.artifactKey === artifact.artifactKey
+    && context.handlerKey === artifact.handlerKey
+    && context.runtimeEpoch === runtime.runtimeEpoch
+    && context.datasetId === run.datasetId
+    && context.manifestVersion === run.manifestVersion
+    && context.manifestDigest === run.manifestDigest
+    && context.uploadFileSha256 === null
+    && context.previewDigest === null;
+  if (!bindingsMatch) {
+    throw new AppError('DEMO_CONTEXT_BINDING_MISMATCH', '演示 context 与当前 direct execute 请求绑定不一致。', {
+      statusCode: 409,
+      details: { artifactKey: artifact.artifactKey, phase: 'direct-execute' }
+    });
+  }
+  if (context.artifactFileSha256 !== uploadFileSha256) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_FILE_SHA256_MISMATCH',
+      'Artifact 07 上传文件与服务端签发 context 的下载原字节不一致。',
+      { artifactKey: context.artifactKey },
+      409
+    );
+  }
+  return context;
+}
+
+/** 对 executed Artifact 07 context 执行严格终态回放；非 executed 状态返回 null。 */
+function readManagedDirectTerminalReplay(state, intent) {
+  assertExactPlainObjectFields(
+    intent,
+    ['demoContext', 'uploadFileSha256'],
+    'DEMO_MANAGED_DIRECT_REPLAY_INTENT_INVALID',
+    'Artifact 07 managed direct replay intent 字段无效。'
+  );
+  const demoContext = requireManagedDirectImportContextIntent(intent.demoContext);
+  const uploadFileSha256 = validateSha256(intent.uploadFileSha256, 'uploadFileSha256');
+  const tokenHash = hashDemoContextToken(validateDemoContextToken(demoContext.token));
+  const contextRow = state.privateDb.prepare(`SELECT context_id AS contextId, status,
+      run_id AS runId, issued_to_user_id AS issuedToUserId,
+      artifact_file_sha256 AS artifactFileSha256, upload_file_sha256 AS uploadFileSha256,
+      preview_digest AS previewDigest
+    FROM demo_import_contexts WHERE token_hash = ?`).get(tokenHash);
+  if (!contextRow || contextRow.status !== 'executed') return null;
+  const bindingRows = state.privateDb.prepare(`SELECT rib.import_batch_id AS batchId,
+      rib.batch_role AS batchRole, ib.import_type AS importType
+    FROM demo_run_import_batches rib
+    JOIN import_batches ib ON ib.id = rib.import_batch_id
+    WHERE rib.context_id = ?
+    ORDER BY rib.batch_role, rib.import_batch_id`).all(contextRow.contextId);
+  if (bindingRows.length !== 1
+    || bindingRows[0].batchRole !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.batchRole
+    || bindingRows[0].importType !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_TERMINAL_BINDING_INVALID',
+      'Artifact 07 已执行 context 缺少唯一可信 primary 批次绑定。',
+      { contextId: contextRow.contextId },
+      409
+    );
+  }
+  const replay = validateDemoContextTerminalReplay({
+    db: state.privateDb,
+    ...demoContext,
+    uploadFileSha256,
+    previewDigest: validatePreviewAuditDigest(contextRow.previewDigest),
+    batchBindings: bindingRows.map((binding) => ({
+      batchId: Number(binding.batchId),
+      batchRole: binding.batchRole,
+      importType: binding.importType
+    }))
+  });
+  if (contextRow.artifactFileSha256 !== uploadFileSha256
+    || contextRow.uploadFileSha256 !== uploadFileSha256) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_FILE_SHA256_MISMATCH',
+      'Artifact 07 终态回放文件 SHA 与 context 原始绑定不一致。',
+      { artifactKey: DEMO_MANAGED_DIRECT_IMPORT_BINDING.artifactKey },
+      409
+    );
+  }
+  const replayBatch = replay.batches[0];
+  verifyManagedDirectCompletedClosure(state, {
+    batchId: Number(replayBatch.batchId),
+    contextId: contextRow.contextId,
+    runId: contextRow.runId,
+    actorUserId: Number(contextRow.issuedToUserId),
+    previewDigest: validatePreviewAuditDigest(contextRow.previewDigest),
+    expectedContextStatus: 'executed'
+  });
+  return replayBatch;
+}
+
+/** 在 active ownership scope 内创建 Artifact 07 唯一 energy_record execute 批次。 */
+function insertManagedDirectImportBatch(state, intent) {
+  assertExactPlainObjectFields(
+    intent,
+    ['fieldMapping', 'file'],
+    'DEMO_MANAGED_DIRECT_BATCH_INTENT_INVALID',
+    'Artifact 07 managed direct 批次 intent 字段无效。'
+  );
+  assertExactPlainObjectFields(
+    intent.file,
+    ['fileSha256', 'fileSizeBytes', 'fileType', 'originalFilename', 'storedFilename'],
+    'DEMO_MANAGED_DIRECT_BATCH_INTENT_INVALID',
+    'Artifact 07 managed direct 文件 metadata 字段无效。'
+  );
+  const originalFilename = String(intent.file.originalFilename || '').trim();
+  const storedFilename = String(intent.file.storedFilename || '').trim();
+  const fileType = String(intent.file.fileType || '').trim().toLowerCase();
+  const fileSizeBytes = Number(intent.file.fileSizeBytes);
+  const fileSha256 = validateSha256(intent.file.fileSha256, 'fileSha256');
+  if (!originalFilename || originalFilename.length > 1024
+    || !storedFilename || storedFilename !== path.basename(storedFilename)
+    || !['xlsx', 'xls', 'csv'].includes(fileType)
+    || !Number.isSafeInteger(fileSizeBytes) || fileSizeBytes < 0) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_BATCH_METADATA_INVALID',
+      'Artifact 07 managed direct 文件 metadata 无效。',
+      null,
+      400
+    );
+  }
+  const fieldMappingJson = JSON.stringify(normalizeStrictJsonValue(intent.fieldMapping || {}, 'fieldMapping'));
+  const now = new Date().toISOString();
+  const result = state.privateDb.prepare(`INSERT INTO import_batches
+    (import_type, original_filename, stored_filename, file_type, file_size_bytes, file_sha256,
+      status, audit_phase, duplicate_strategy, field_mapping_json, started_at, created_at, updated_at)
+    VALUES ('energy_record', ?, ?, ?, ?, ?, 'processing', 'execute', 'skip', ?, ?, ?, ?)`).run(
+    originalFilename,
+    storedFilename,
+    fileType,
+    fileSizeBytes,
+    fileSha256,
+    fieldMappingJson,
+    now,
+    now,
+    now
+  );
+  return Number(result.lastInsertRowid);
+}
+
+/** 在 active ownership scope 内写入 Artifact 07 当前批次的真实错误或 warning 明细。 */
+function insertManagedDirectImportIssue(state, intent) {
+  assertExactPlainObjectFields(
+    intent,
+    ['batchId', 'errorCode', 'errorReason', 'fieldName', 'rawValue', 'rowNumber', 'severity'],
+    'DEMO_MANAGED_DIRECT_ISSUE_INTENT_INVALID',
+    'Artifact 07 managed direct issue intent 字段无效。'
+  );
+  const batchId = Number(intent.batchId);
+  const rowNumber = Number(intent.rowNumber);
+  const severity = String(intent.severity || '').trim();
+  const errorCode = String(intent.errorCode || '').trim();
+  const errorReason = String(intent.errorReason || '').trim();
+  if (!Number.isSafeInteger(batchId) || batchId < 1
+    || !Number.isSafeInteger(rowNumber) || rowNumber < 1
+    || !['error', 'warning'].includes(severity)
+    || !errorCode || !errorReason) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_ISSUE_INVALID',
+      'Artifact 07 managed direct issue 内容无效。',
+      null,
+      400
+    );
+  }
+  return state.privateDb.prepare(`INSERT INTO import_errors
+    (batch_id, row_number, field_name, raw_value, error_code, error_reason, severity)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+    batchId,
+    rowNumber,
+    intent.fieldName === null || intent.fieldName === undefined ? null : String(intent.fieldName),
+    intent.rawValue === null || intent.rawValue === undefined ? null : String(intent.rawValue),
+    errorCode,
+    errorReason,
+    severity
+  ).changes;
+}
+
+/** 在 active ownership scope 内二次校验并把 Artifact 07 context 绑定到唯一 primary 批次。 */
+function bindManagedDirectImportContext(state, intent) {
+  assertExactPlainObjectFields(
+    intent,
+    ['batchId', 'demoContext', 'previewDigest', 'uploadFileSha256'],
+    'DEMO_MANAGED_DIRECT_BIND_INTENT_INVALID',
+    'Artifact 07 managed direct binding intent 字段无效。'
+  );
+  const context = validateManagedDirectIssuedContext(state, {
+    demoContext: intent.demoContext,
+    uploadFileSha256: intent.uploadFileSha256
+  });
+  const batchId = Number(intent.batchId);
+  if (!Number.isSafeInteger(batchId) || batchId < 1) {
+    throw createDemoOwnershipError('DEMO_MANAGED_DIRECT_BATCH_ID_INVALID', 'Artifact 07 批次主键无效。', null, 400);
+  }
+  const uploadFileSha256 = validateSha256(intent.uploadFileSha256, 'uploadFileSha256');
+  const previewDigest = validatePreviewAuditDigest(intent.previewDigest);
+  const previewedAt = new Date().toISOString();
+  const update = state.privateDb.prepare(`UPDATE demo_import_contexts
+    SET status = 'previewed', upload_file_sha256 = ?, preview_digest = ?, previewed_at = ?
+    WHERE context_id = ? AND issued_to_user_id = ? AND status = 'issued'
+      AND runtime_epoch = ? AND expires_at = ? AND run_id = ? AND dataset_id = ?
+      AND manifest_version = ? AND manifest_digest = ? AND artifact_key = ? AND handler_key = ?
+      AND artifact_file_sha256 = ? AND upload_file_sha256 IS NULL AND preview_digest IS NULL`).run(
+    uploadFileSha256,
+    previewDigest,
+    previewedAt,
+    context.contextId,
+    context.issuedToUserId,
+    context.runtimeEpoch,
+    context.expiresAt,
+    context.runId,
+    context.datasetId,
+    context.manifestVersion,
+    context.manifestDigest,
+    context.artifactKey,
+    context.handlerKey,
+    uploadFileSha256
+  );
+  if (update.changes !== 1) {
+    throw new AppError('DEMO_CONTEXT_STATE_CONFLICT', '演示 context 状态已变化。', { statusCode: 409 });
+  }
+  state.privateDb.prepare(`INSERT INTO demo_run_import_batches
+    (run_id, artifact_key, context_id, import_batch_id, batch_role)
+    VALUES (?, ?, ?, ?, ?)`).run(
+    context.runId,
+    context.artifactKey,
+    context.contextId,
+    batchId,
+    DEMO_MANAGED_DIRECT_IMPORT_BINDING.batchRole
+  );
+  return {
+    ...context,
+    status: 'previewed',
+    uploadFileSha256,
+    previewDigest,
+    previewedAt
+  };
+}
+
+/** 在 ownership 与批次绑定完成后写入 Artifact 07 最终 execute 审计。 */
+function finalizeManagedDirectImportBatch(state, intent) {
+  assertExactPlainObjectFields(
+    intent,
+    ['batchId', 'errorSummary', 'executeResult', 'fieldMapping', 'previewDigest', 'statistics', 'status'],
+    'DEMO_MANAGED_DIRECT_FINALIZE_INTENT_INVALID',
+    'Artifact 07 managed direct finalize intent 字段无效。'
+  );
+  assertExactPlainObjectFields(
+    intent.statistics,
+    ['failureCount', 'skippedCount', 'successCount', 'totalRows'],
+    'DEMO_MANAGED_DIRECT_FINALIZE_INTENT_INVALID',
+    'Artifact 07 managed direct statistics 字段无效。'
+  );
+  const batchId = Number(intent.batchId);
+  const statistics = Object.fromEntries(Object.entries(intent.statistics).map(([key, value]) => [key, Number(value)]));
+  const status = String(intent.status || '').trim();
+  if (!Number.isSafeInteger(batchId) || batchId < 1
+    || !['completed', 'completed_with_errors'].includes(status)
+    || Object.values(statistics).some((value) => !Number.isSafeInteger(value) || value < 0)
+    || statistics.successCount + statistics.failureCount + statistics.skippedCount > statistics.totalRows) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_FINALIZE_INVALID',
+      'Artifact 07 managed direct 最终审计统计无效。',
+      null,
+      400
+    );
+  }
+  const previewDigest = validatePreviewAuditDigest(intent.previewDigest);
+  const fieldMappingJson = JSON.stringify(normalizeStrictJsonValue(intent.fieldMapping || {}, 'fieldMapping'));
+  const executeResultJson = JSON.stringify(normalizeStrictJsonValue(intent.executeResult, 'executeResult'));
+  const now = new Date().toISOString();
+  const result = state.privateDb.prepare(`UPDATE import_batches
+    SET status = ?, audit_phase = 'execute', preview_audit_digest = ?, execute_result_json = ?,
+      total_rows = ?, success_count = ?, failure_count = ?, skipped_count = ?,
+      field_mapping_json = ?, finished_at = ?, updated_at = ?, error_summary = ?
+    WHERE id = ? AND import_type = 'energy_record' AND status = 'processing'`).run(
+    status,
+    previewDigest,
+    executeResultJson,
+    statistics.totalRows,
+    statistics.successCount,
+    statistics.failureCount,
+    statistics.skippedCount,
+    fieldMappingJson,
+    now,
+    now,
+    intent.errorSummary === null || intent.errorSummary === undefined ? null : String(intent.errorSummary),
+    batchId
+  );
+  if (result.changes !== 1) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_BATCH_STATE_CONFLICT',
+      'Artifact 07 managed direct 批次状态已变化。',
+      { batchId },
+      409
+    );
+  }
+  return true;
+}
+
+/** 抛出 Artifact 07 固定闭包损坏错误，所有 replay 漂移使用同一稳定 fail-closed 合同。 */
+function throwManagedDirectClosureInvalid(reason, batchId, details = {}) {
+  throw createDemoOwnershipError(
+    'DEMO_MANAGED_DIRECT_CLOSURE_INVALID',
+    'Artifact 07 managed direct 批次缺少可信业务记录与 ownership 闭包。',
+    { reason, batchId: Number(batchId) || null, ...details },
+    409
+  );
+}
+
+/** 判断对象是否只包含指定数据字段，供持久 execute 摘要执行严格白名单复验。 */
+function hasExactManagedDirectFields(value, expectedFields) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || utilTypes.isProxy(value)
+    || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const actualFields = Object.keys(descriptors).sort();
+  const normalizedExpectedFields = [...expectedFields].sort();
+  return actualFields.length === normalizedExpectedFields.length
+    && actualFields.every((fieldName, index) => fieldName === normalizedExpectedFields[index]
+      && !descriptors[fieldName].get && !descriptors[fieldName].set);
+}
+
+/** managed execute_result 中冻结的 context terminal 字段集合。 */
+const DEMO_MANAGED_CONTEXT_TERMINAL_FIELDS = Object.freeze([
+  'artifactFileSha256',
+  'artifactKey',
+  'contextId',
+  'datasetId',
+  'executedAt',
+  'expiresAt',
+  'handlerKey',
+  'issuedAt',
+  'issuedToUserId',
+  'manifestDigest',
+  'manifestVersion',
+  'previewDigest',
+  'previewSignature',
+  'previewedAt',
+  'runId',
+  'runtimeEpoch',
+  'status',
+  'uploadFileSha256'
+]);
+
+/** 从 context CAS 返回值构造不可变 terminal closure，严格保留 previewedAt null 语义。 */
+function buildManagedContextTerminalFacts(context, previewSignature = null) {
+  const timestampFields = ['issuedAt', 'expiresAt', 'executedAt'];
+  const validContext = context && typeof context === 'object'
+    && context.status === 'executed'
+    && timestampFields.every((fieldName) => (
+      typeof context[fieldName] === 'string'
+        && DEMO_UTC_MILLISECOND_PATTERN.test(context[fieldName])
+    ))
+    && (context.previewedAt === null
+      || (typeof context.previewedAt === 'string'
+        && DEMO_UTC_MILLISECOND_PATTERN.test(context.previewedAt)))
+    && typeof context.artifactFileSha256 === 'string'
+    && /^[0-9a-f]{64}$/u.test(context.artifactFileSha256)
+    && context.uploadFileSha256 === context.artifactFileSha256
+    && typeof context.previewDigest === 'string'
+    && /^hmac-sha256:v1:audit:[0-9a-f]{64}$/u.test(context.previewDigest)
+    && (previewSignature === null
+      || (typeof previewSignature === 'string'
+        && /^hmac-sha256:v1:[0-9a-f]{64}$/u.test(previewSignature)));
+  if (!validContext) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_CONTEXT_TERMINAL_INVALID',
+      'managed context terminal closure 字段无效。',
+      { contextId: context?.contextId || null },
+      409
+    );
+  }
+  return Object.freeze({
+    contextId: context.contextId,
+    runId: context.runId,
+    datasetId: context.datasetId,
+    manifestVersion: context.manifestVersion,
+    manifestDigest: context.manifestDigest,
+    artifactKey: context.artifactKey,
+    handlerKey: context.handlerKey,
+    issuedToUserId: Number(context.issuedToUserId),
+    runtimeEpoch: Number(context.runtimeEpoch),
+    status: context.status,
+    issuedAt: context.issuedAt,
+    expiresAt: context.expiresAt,
+    artifactFileSha256: context.artifactFileSha256,
+    uploadFileSha256: context.uploadFileSha256,
+    previewDigest: context.previewDigest,
+    previewedAt: context.previewedAt,
+    executedAt: context.executedAt,
+    previewSignature
+  });
+}
+
+/** 验证当前 context 与 execute-time durable terminal baseline 完全一致。 */
+function isManagedContextTerminalClosureExact(context, terminal, previewSignature = null) {
+  if (!hasExactManagedDirectFields(terminal, DEMO_MANAGED_CONTEXT_TERMINAL_FIELDS)) return false;
+  try {
+    return sha256Stable(terminal) === sha256Stable(
+      buildManagedContextTerminalFacts(context, previewSignature)
+    );
+  } catch (_error) {
+    return false;
+  }
+}
+
+/** 将 CAS 后 terminal closure 追加到既有 execute_result_json，使用原 JSON 精确 CAS 防止覆盖漂移。 */
+function persistManagedContextTerminalExecuteResult(db, batchId, terminalFacts) {
+  const batch = db.prepare(`SELECT execute_result_json AS executeResultJson
+    FROM import_batches WHERE id = ? AND audit_phase = 'execute'`).get(Number(batchId));
+  let executeResult;
+  try {
+    executeResult = JSON.parse(batch?.executeResultJson);
+  } catch (_error) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_CONTEXT_TERMINAL_PERSIST_CONFLICT',
+      'managed execute_result 无法追加 context terminal closure。',
+      { batchId: Number(batchId) },
+      409
+    );
+  }
+  if (!executeResult || typeof executeResult !== 'object' || Array.isArray(executeResult)
+    || Object.prototype.hasOwnProperty.call(executeResult, 'contextTerminal')) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_CONTEXT_TERMINAL_PERSIST_CONFLICT',
+      'managed execute_result context terminal closure 已存在或形状无效。',
+      { batchId: Number(batchId) },
+      409
+    );
+  }
+  const finalizedExecuteResult = { ...executeResult, contextTerminal: terminalFacts };
+  const finalizedJson = JSON.stringify(finalizedExecuteResult);
+  const result = db.prepare(`UPDATE import_batches SET execute_result_json = ?, updated_at = ?
+    WHERE id = ? AND audit_phase = 'execute' AND execute_result_json = ?`).run(
+    finalizedJson,
+    new Date().toISOString(),
+    Number(batchId),
+    batch.executeResultJson
+  );
+  if (result.changes !== 1) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_CONTEXT_TERMINAL_PERSIST_CONFLICT',
+      'managed execute_result context terminal closure CAS 失败。',
+      { batchId: Number(batchId) },
+      409
+    );
+  }
+  return finalizedExecuteResult;
+}
+
+/** 在不可拆分 operation 内调用测试故障钩子；生产 HTTP 不提供该函数。 */
+function invokeManagedDirectOperationFault(intent, stage, summary = {}) {
+  if (intent.faultInjector === null) return;
+  if (typeof intent.faultInjector !== 'function') {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_FAULT_INJECTOR_INVALID',
+      'Artifact 07 managed direct 故障注入器必须为服务端函数。'
+    );
+  }
+  intent.faultInjector(stage, Object.freeze({ ...summary }));
+}
+
+/** 规范化业务回调结果，只接受批次统计和公开字段映射，不接受 witness、ownership 或 terminal 控制。 */
+function normalizeManagedDirectBusinessResult(result) {
+  assertExactPlainObjectFields(
+    result,
+    ['errorSummary', 'failureCount', 'fieldMapping', 'skippedCount', 'status', 'successCount', 'totalRows', 'validationErrorCount'],
+    'DEMO_MANAGED_DIRECT_BUSINESS_RESULT_INVALID',
+    'Artifact 07 managed direct 业务结果字段无效。'
+  );
+  const statistics = {
+    totalRows: Number(result.totalRows),
+    successCount: Number(result.successCount),
+    failureCount: Number(result.failureCount),
+    skippedCount: Number(result.skippedCount)
+  };
+  const validationErrorCount = Number(result.validationErrorCount);
+  const status = String(result.status || '').trim();
+  if (Object.values(statistics).some((value) => !Number.isSafeInteger(value) || value < 0)
+    || !Number.isSafeInteger(validationErrorCount) || validationErrorCount < 0
+    || statistics.successCount + statistics.failureCount + statistics.skippedCount !== statistics.totalRows
+    || !['completed', 'completed_with_errors', 'failed'].includes(status)) {
+    throwManagedDirectClosureInvalid('business-result-statistics-invalid', null);
+  }
+  const expectedStatus = statistics.failureCount > 0 || statistics.skippedCount > 0
+    ? 'completed_with_errors'
+    : 'completed';
+  if (status !== 'failed' && status !== expectedStatus) {
+    throwManagedDirectClosureInvalid('business-result-status-invalid', null);
+  }
+  return {
+    status,
+    statistics,
+    validationErrorCount,
+    fieldMapping: normalizeStrictJsonValue(result.fieldMapping || {}, 'fieldMapping'),
+    errorSummary: result.errorSummary === null || result.errorSummary === undefined
+      ? null
+      : String(result.errorSummary)
+  };
+}
+
+/** 在 Artifact 07 operation 内执行固定 energy_record INSERT，并由 wrapper 私有持有 row witness。 */
+function insertManagedDirectEnergyRecord(state, transactionScope, batchId, record) {
+  assertExactPlainObjectFields(
+    record,
+    ['batchId', 'duplicateKey', 'energyTypeId', 'meterDeviceId', 'normalizedMonth', 'normalizedUnit',
+      'normalizedValue', 'organizationUnitId', 'originalMonth', 'originalUnit', 'originalValue',
+      'remark', 'sourceRowNumber'],
+    'DEMO_MANAGED_DIRECT_ENERGY_RECORD_INVALID',
+    'Artifact 07 managed direct 业务记录字段无效。'
+  );
+  if (Number(record.batchId) !== batchId) {
+    throwManagedDirectClosureInvalid('business-record-batch-mismatch', batchId);
+  }
+  const rowWitness = createDemoOwnershipInsertWitness({
+    transactionScope,
+    entityType: DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType,
+    insertSql: `INSERT INTO energy_records (source_batch_id, source_row_number, energy_type_id, organization_unit_id, meter_device_id, original_month, normalized_month, original_unit, original_value, normalized_unit, normalized_value, remark, duplicate_key, record_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+    insertParams: [
+      batchId,
+      record.sourceRowNumber,
+      record.energyTypeId,
+      record.organizationUnitId,
+      record.meterDeviceId,
+      record.originalMonth,
+      record.normalizedMonth,
+      record.originalUnit,
+      record.originalValue,
+      record.normalizedUnit,
+      record.normalizedValue,
+      record.remark,
+      record.duplicateKey
+    ],
+    sourceBatchId: batchId,
+    sourceRowNumber: record.sourceRowNumber
+  });
+  return { entityPk: Number(rowWitness.lastInsertRowid), rowWitness };
+}
+
+/** 读取并严格验证 Artifact 07 业务行、错误分类与 active imported ownership 的 exact closure。 */
+function readManagedDirectClosureFacts(state, input) {
+  const db = state.privateDb;
+  const batchId = Number(input.batchId);
+  const businessRows = db.prepare(`SELECT id, source_row_number AS sourceRowNumber, record_status AS recordStatus
+    FROM energy_records WHERE source_batch_id = ? ORDER BY source_row_number, id`).all(batchId);
+  if (businessRows.some((row) => row.recordStatus !== 'active'
+    || !Number.isSafeInteger(Number(row.sourceRowNumber)) || Number(row.sourceRowNumber) < 2)) {
+    throwManagedDirectClosureInvalid('business-records-invalid', batchId);
+  }
+  const businessEntityIds = new Set();
+  const businessRowNumbers = new Set();
+  businessRows.forEach((row) => {
+    const entityPk = String(Number(row.id));
+    const rowNumber = Number(row.sourceRowNumber);
+    if (businessEntityIds.has(entityPk) || businessRowNumbers.has(rowNumber)) {
+      throwManagedDirectClosureInvalid('business-record-identity-duplicate', batchId);
+    }
+    businessEntityIds.add(entityPk);
+    businessRowNumbers.add(rowNumber);
+  });
+
+  const issueRows = db.prepare(`SELECT row_number AS rowNumber, severity, error_code AS errorCode
+    FROM import_errors WHERE batch_id = ? ORDER BY row_number, id`).all(batchId);
+  const validationErrorRows = issueRows.filter((row) => row.severity === 'error');
+  const duplicateSkippedRows = issueRows.filter((row) => (
+    row.severity === 'warning' && row.errorCode === 'DUPLICATE_SKIPPED'
+  ));
+  if (issueRows.length !== validationErrorRows.length + duplicateSkippedRows.length) {
+    throwManagedDirectClosureInvalid('import-issue-classification-invalid', batchId);
+  }
+  const failureRowNumbers = new Set(validationErrorRows.map((row) => Number(row.rowNumber)));
+  const skippedRowNumbers = new Set(duplicateSkippedRows.map((row) => Number(row.rowNumber)));
+  if (skippedRowNumbers.size !== duplicateSkippedRows.length
+    || [...failureRowNumbers, ...skippedRowNumbers].some((rowNumber) => (
+      !Number.isSafeInteger(rowNumber) || rowNumber < 2 || businessRowNumbers.has(rowNumber)
+    ))
+    || [...failureRowNumbers].some((rowNumber) => skippedRowNumbers.has(rowNumber))) {
+    throwManagedDirectClosureInvalid('import-row-category-overlap', batchId);
+  }
+  const categoryRowNumbers = new Set([
+    ...businessRowNumbers,
+    ...failureRowNumbers,
+    ...skippedRowNumbers
+  ]);
+  const statistics = {
+    totalRows: categoryRowNumbers.size,
+    successCount: businessRows.length,
+    failureCount: failureRowNumbers.size,
+    skippedCount: skippedRowNumbers.size
+  };
+  const expectedRowNumbers = Array.from({ length: statistics.totalRows }, (_item, index) => index + 2);
+  if (expectedRowNumbers.some((rowNumber) => !categoryRowNumbers.has(rowNumber))) {
+    throwManagedDirectClosureInvalid('import-row-sequence-invalid', batchId);
+  }
+  // 零新增 terminal 只允许非空文件全部唯一归类为 duplicate skipped；空文件和 validation failure 继续 fail-closed。
+  const noInsertedRecords = statistics.successCount === 0;
+  const isCompleteDuplicateSkipClosure = noInsertedRecords
+    && statistics.totalRows > 0
+    && statistics.failureCount === 0
+    && statistics.skippedCount === statistics.totalRows;
+  if (noInsertedRecords && !isCompleteDuplicateSkipClosure) {
+    throwManagedDirectClosureInvalid('no-insert-classification-invalid', batchId, { statistics });
+  }
+
+  const registryRowsByBatch = db.prepare(`SELECT registry_id AS registryId, run_id AS runId,
+      artifact_key AS artifactKey, entity_type AS entityType, entity_pk AS entityPk,
+      ownership_kind AS ownershipKind, identity_digest AS identityDigest,
+      snapshot_digest AS snapshotDigest, source_batch_id AS sourceBatchId,
+      source_row_number AS sourceRowNumber, registered_by AS registeredBy,
+      cleaned_at AS cleanedAt
+    FROM demo_data_registry WHERE source_batch_id = ? ORDER BY entity_type, entity_pk`).all(batchId);
+  if (registryRowsByBatch.length !== businessRows.length) {
+    throwManagedDirectClosureInvalid('ownership-count-mismatch', batchId, {
+      businessCount: businessRows.length,
+      ownershipCount: registryRowsByBatch.length
+    });
+  }
+  const registryEntityIds = new Set(registryRowsByBatch.map((row) => String(row.entityPk)));
+  if (registryEntityIds.size !== registryRowsByBatch.length
+    || [...registryEntityIds].some((entityPk) => !businessEntityIds.has(entityPk))) {
+    throwManagedDirectClosureInvalid('ownership-entity-set-mismatch', batchId);
+  }
+
+  const handler = getDemoOwnershipEntityHandler(DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType);
+  const closureRecords = businessRows.map((businessRow) => {
+    const entityPk = String(Number(businessRow.id));
+    const projectedRow = handler.readProjection(db, Number(businessRow.id));
+    const registry = readActiveRegistryEntity(db, DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType, entityPk);
+    if (!projectedRow || !registry
+      || registry.runId !== input.runId
+      || registry.artifactKey !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.artifactKey
+      || registry.entityType !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType
+      || registry.ownershipKind !== DEMO_IMPORTED_OWNERSHIP_KIND
+      || Number(registry.sourceBatchId) !== batchId
+      || Number(registry.sourceRowNumber) !== Number(businessRow.sourceRowNumber)
+      || Number(registry.registeredBy) !== Number(input.actorUserId)
+      || Number(projectedRow.source_batch_id) !== batchId
+      || Number(projectedRow.source_row_number) !== Number(businessRow.sourceRowNumber)
+      || projectedRow.record_status !== 'active') {
+      throwManagedDirectClosureInvalid('ownership-provenance-mismatch', batchId, { entityPk });
+    }
+    const identityDigest = calculateDemoEntityIdentityDigest(
+      DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType,
+      entityPk
+    );
+    const snapshotDigest = calculateDemoEntitySnapshotDigest(
+      DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType,
+      entityPk,
+      projectedRow
+    );
+    if (registry.identityDigest !== identityDigest || registry.snapshotDigest !== snapshotDigest) {
+      throwManagedDirectClosureInvalid('ownership-digest-mismatch', batchId, { entityPk });
+    }
+    return {
+      entityPk,
+      sourceRowNumber: Number(businessRow.sourceRowNumber),
+      identityDigest,
+      snapshotDigest
+    };
+  }).sort((left, right) => left.sourceRowNumber - right.sourceRowNumber || left.entityPk.localeCompare(right.entityPk));
+
+  return {
+    statistics,
+    noInsertedRecords,
+    writesBusinessRecords: !noInsertedRecords,
+    validationErrorCount: validationErrorRows.length,
+    skippedRowNumbers: [...skippedRowNumbers].sort((left, right) => left - right),
+    ownershipClosureDigest: sha256Stable({
+      domain: 'artifact-07-managed-direct-ownership-closure:v1',
+      runId: input.runId,
+      artifactKey: DEMO_MANAGED_DIRECT_IMPORT_BINDING.artifactKey,
+      batchId,
+      records: closureRecords
+    })
+  };
+}
+
+/** 将业务回调声明的统计与 SQLite exact closure 比较，任何漂移都在 finalize 前回滚。 */
+function assertManagedDirectBusinessResultMatchesClosure(result, facts, batchId) {
+  const expectedStatistics = result.statistics;
+  if (Object.keys(expectedStatistics).some((fieldName) => (
+    Number(expectedStatistics[fieldName]) !== Number(facts.statistics[fieldName])
+  )) || result.validationErrorCount !== facts.validationErrorCount) {
+    throwManagedDirectClosureInvalid('business-statistics-drift', batchId, {
+      expected: expectedStatistics,
+      actual: facts.statistics
+    });
+  }
+}
+
+/** 复验已完成批次的 audit、binding、统计和 ownership closure；首次 terminal 与 replay 共用。 */
+function verifyManagedDirectCompletedClosure(state, input) {
+  const db = state.privateDb;
+  const batchId = Number(input.batchId);
+  const context = db.prepare(`SELECT context_id AS contextId, run_id AS runId,
+      dataset_id AS datasetId, manifest_version AS manifestVersion,
+      manifest_digest AS manifestDigest, artifact_key AS artifactKey,
+      handler_key AS handlerKey, artifact_file_sha256 AS artifactFileSha256,
+      issued_to_user_id AS issuedToUserId, runtime_epoch AS runtimeEpoch,
+      status, issued_at AS issuedAt, expires_at AS expiresAt,
+      upload_file_sha256 AS uploadFileSha256, preview_digest AS previewDigest,
+      previewed_at AS previewedAt, executed_at AS executedAt
+    FROM demo_import_contexts WHERE context_id = ?`).get(input.contextId);
+  if (!context || context.status !== input.expectedContextStatus
+    || context.runId !== input.runId
+    || Number(context.issuedToUserId) !== Number(input.actorUserId)
+    || context.artifactKey !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.artifactKey
+    || context.handlerKey !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.handlerKey
+    || context.previewDigest !== input.previewDigest) {
+    throwManagedDirectClosureInvalid('context-terminal-facts-invalid', batchId);
+  }
+  const bindings = db.prepare(`SELECT run_id AS runId, artifact_key AS artifactKey,
+      context_id AS contextId, import_batch_id AS batchId, batch_role AS batchRole
+    FROM demo_run_import_batches WHERE context_id = ? ORDER BY batch_role, import_batch_id`).all(input.contextId);
+  if (bindings.length !== 1
+    || bindings[0].runId !== input.runId
+    || bindings[0].artifactKey !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.artifactKey
+    || bindings[0].contextId !== input.contextId
+    || Number(bindings[0].batchId) !== batchId
+    || bindings[0].batchRole !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.batchRole) {
+    throwManagedDirectClosureInvalid('primary-binding-invalid', batchId);
+  }
+  const batch = db.prepare(`SELECT import_type AS importType, status, audit_phase AS auditPhase,
+      preview_signature AS previewSignature, preview_audit_digest AS previewDigest,
+      execute_result_json AS executeResultJson, total_rows AS totalRows,
+      success_count AS successCount, failure_count AS failureCount,
+      skipped_count AS skippedCount
+    FROM import_batches WHERE id = ?`).get(batchId);
+  if (!batch || batch.importType !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType
+    || !['completed', 'completed_with_errors'].includes(batch.status)
+    || batch.auditPhase !== 'execute' || batch.previewDigest !== input.previewDigest) {
+    throwManagedDirectClosureInvalid('batch-audit-invalid', batchId);
+  }
+  let executeResult;
+  try {
+    executeResult = JSON.parse(batch.executeResultJson);
+  } catch (_error) {
+    throwManagedDirectClosureInvalid('execute-result-json-invalid', batchId);
+  }
+  const expectedExecuteResultFields = input.expectedContextStatus === 'executed'
+    ? ['contextTerminal', 'executed', 'ownership', 'statistics', 'writesBusinessRecords']
+    : ['executed', 'ownership', 'statistics', 'writesBusinessRecords'];
+  if (!hasExactManagedDirectFields(executeResult, expectedExecuteResultFields)
+    || executeResult.executed !== true || typeof executeResult.writesBusinessRecords !== 'boolean'
+    || !hasExactManagedDirectFields(executeResult.statistics, ['failureCount', 'skippedCount', 'successCount', 'totalRows'])
+    || !hasExactManagedDirectFields(executeResult.ownership, [
+      'applied', 'closureDigest', 'idempotentCount', 'insertedCount', 'mode',
+      'noInsertedRecords', 'registrationCount', 'relationCount', 'skippedCount'
+    ])
+    || (input.expectedContextStatus === 'executed'
+      && !isManagedContextTerminalClosureExact(
+        context,
+        executeResult.contextTerminal,
+        batch.previewSignature
+      ))) {
+    throwManagedDirectClosureInvalid('execute-result-shape-invalid', batchId);
+  }
+  const facts = readManagedDirectClosureFacts(state, input);
+  const batchStatistics = {
+    totalRows: Number(batch.totalRows),
+    successCount: Number(batch.successCount),
+    failureCount: Number(batch.failureCount),
+    skippedCount: Number(batch.skippedCount)
+  };
+  const expectedStatus = facts.statistics.failureCount > 0 || facts.statistics.skippedCount > 0
+    ? 'completed_with_errors'
+    : 'completed';
+  if (batch.status !== expectedStatus
+    || executeResult.writesBusinessRecords !== facts.writesBusinessRecords
+    || Object.keys(facts.statistics).some((fieldName) => (
+      batchStatistics[fieldName] !== facts.statistics[fieldName]
+      || Number(executeResult.statistics[fieldName]) !== facts.statistics[fieldName]
+    ))) {
+    throwManagedDirectClosureInvalid('batch-statistics-drift', batchId);
+  }
+  const ownership = executeResult.ownership;
+  if (ownership.applied !== true || ownership.mode !== 'demo'
+    || ownership.noInsertedRecords !== facts.noInsertedRecords
+    || Number(ownership.registrationCount) !== facts.statistics.successCount
+    || Number(ownership.insertedCount) !== facts.statistics.successCount
+    || Number(ownership.idempotentCount) !== 0
+    || Number(ownership.skippedCount) !== facts.statistics.skippedCount
+    || Number(ownership.relationCount) !== 0
+    || ownership.closureDigest !== facts.ownershipClosureDigest) {
+    throwManagedDirectClosureInvalid('ownership-summary-drift', batchId);
+  }
+  if (state.pendingWitnesses.size !== 0) {
+    throwManagedDirectClosureInvalid('ownership-witness-unconsumed', batchId, {
+      pendingCount: state.pendingWitnesses.size
+    });
+  }
+  return facts;
+}
+
+/** 执行 Artifact 07 唯一不可拆分 managed direct operation；调用方只能提供业务行处理回调。 */
+function executeManagedDirectImportOperation(state, transactionScope, intent) {
+  assertExactPlainObjectFields(
+    intent,
+    ['demoContext', 'executeBusinessRows', 'faultInjector', 'fieldMapping', 'file', 'operation', 'previewDigest', 'uploadFileSha256'],
+    'DEMO_MANAGED_DIRECT_OPERATION_INTENT_INVALID',
+    'Artifact 07 managed direct operation intent 字段无效。'
+  );
+  if (intent.operation !== DEMO_MANAGED_DIRECT_IMPORT_OPERATION
+    || typeof intent.executeBusinessRows !== 'function') {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_OPERATION_INTENT_INVALID',
+      'Artifact 07 managed direct operation 类型或业务执行器无效。',
+      null,
+      400
+    );
+  }
+  const uploadFileSha256 = validateSha256(intent.uploadFileSha256, 'uploadFileSha256');
+  const previewDigest = validatePreviewAuditDigest(intent.previewDigest);
+  const replay = readManagedDirectTerminalReplay(state, {
+    demoContext: intent.demoContext,
+    uploadFileSha256
+  });
+  if (replay) return { batchId: Number(replay.batchId), terminalReplay: true };
+
+  validateManagedDirectIssuedContext(state, {
+    demoContext: intent.demoContext,
+    uploadFileSha256
+  });
+  const batchId = insertManagedDirectImportBatch(state, {
+    fieldMapping: intent.fieldMapping,
+    file: intent.file
+  });
+  const boundContext = bindManagedDirectImportContext(state, {
+    batchId,
+    demoContext: intent.demoContext,
+    uploadFileSha256,
+    previewDigest
+  });
+  invokeManagedDirectOperationFault(intent, 'after-context-binding', { batchId });
+
+  let writerActive = true;
+  const insertedRecords = [];
+  const writer = Object.freeze({
+    insertIssue(issue) {
+      if (!writerActive) throwManagedDirectClosureInvalid('business-writer-expired', batchId);
+      return insertManagedDirectImportIssue(state, issue);
+    },
+    insertRecord(record) {
+      if (!writerActive) throwManagedDirectClosureInvalid('business-writer-expired', batchId);
+      const insertion = insertManagedDirectEnergyRecord(state, transactionScope, batchId, record);
+      insertedRecords.push({
+        entityType: DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType,
+        entityPk: Number(insertion.entityPk),
+        batchRole: DEMO_MANAGED_DIRECT_IMPORT_BINDING.batchRole,
+        sourceRowNumber: Number(record.sourceRowNumber),
+        rowWitness: insertion.rowWitness
+      });
+      return insertion;
+    }
+  });
+  let rawBusinessResult;
+  try {
+    rawBusinessResult = intent.executeBusinessRows(Object.freeze({
+      batchId,
+      db: state.facade,
+      writer
+    }));
+  } finally {
+    writerActive = false;
+  }
+  if (rawBusinessResult && typeof rawBusinessResult.then === 'function') {
+    Promise.resolve(rawBusinessResult).catch(() => undefined);
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_BUSINESS_ASYNC_FORBIDDEN',
+      'Artifact 07 managed direct 业务执行器必须同步完成。',
+      null,
+      409
+    );
+  }
+  const businessResult = normalizeManagedDirectBusinessResult(rawBusinessResult);
+  if (businessResult.status === 'failed') {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_DIRECT_IMPORT_REJECTED',
+      businessResult.errorSummary || 'Artifact 07 managed direct 导入未通过校验。',
+      null,
+      400
+    );
+  }
+  if (insertedRecords.length !== businessResult.statistics.successCount) {
+    throwManagedDirectClosureInvalid('inserted-business-record-count-mismatch', batchId, {
+      declaredSuccessCount: businessResult.statistics.successCount,
+      witnessedInsertCount: insertedRecords.length
+    });
+  }
+  const noInsertedRecords = insertedRecords.length === 0;
+  if (noInsertedRecords && !(businessResult.statistics.totalRows > 0
+    && businessResult.statistics.failureCount === 0
+    && businessResult.statistics.skippedCount === businessResult.statistics.totalRows)) {
+    throwManagedDirectClosureInvalid('no-insert-classification-invalid', batchId, {
+      statistics: businessResult.statistics
+    });
+  }
+  invokeManagedDirectOperationFault(intent, 'after-business-records', {
+    batchId,
+    insertedCount: insertedRecords.length,
+    skippedCount: businessResult.statistics.skippedCount
+  });
+
+  const skippedRecords = state.privateDb.prepare(`SELECT row_number AS sourceRowNumber
+    FROM import_errors
+    WHERE batch_id = ? AND severity = 'warning' AND error_code = 'DUPLICATE_SKIPPED'
+    ORDER BY row_number`).all(batchId).map((row) => ({
+    entityType: DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType,
+    entityPk: null,
+    batchRole: DEMO_MANAGED_DIRECT_IMPORT_BINDING.batchRole,
+    sourceRowNumber: Number(row.sourceRowNumber),
+    reason: 'duplicate_skipped'
+  }));
+  const ownership = registerImportedDemoOwnershipInTransaction({
+    transactionScope,
+    demoContext: {
+      ...intent.demoContext,
+      uploadFileSha256,
+      previewDigest
+    },
+    actorUserId: intent.demoContext.userId,
+    batchBindings: [{
+      batchId,
+      batchRole: DEMO_MANAGED_DIRECT_IMPORT_BINDING.batchRole,
+      entityType: DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType
+    }],
+    insertedRecords,
+    skippedRecords,
+    noInsertedRecords
+  });
+  invokeManagedDirectOperationFault(intent, 'after-ownership', {
+    batchId,
+    registrationCount: Number(ownership.registrationCount || 0)
+  });
+  if (state.pendingWitnesses.size !== 0
+    || ownership.applied !== true || ownership.mode !== 'demo'
+    || ownership.noInsertedRecords !== noInsertedRecords
+    || Number(ownership.registrationCount) !== insertedRecords.length
+    || Number(ownership.insertedCount) !== insertedRecords.length
+    || Number(ownership.idempotentCount) !== 0
+    || Number(ownership.skippedCount) !== skippedRecords.length
+    || Number(ownership.relationCount) !== 0) {
+    throwManagedDirectClosureInvalid('ownership-registration-incomplete', batchId);
+  }
+  const facts = readManagedDirectClosureFacts(state, {
+    batchId,
+    runId: boundContext.runId,
+    actorUserId: boundContext.issuedToUserId
+  });
+  assertManagedDirectBusinessResultMatchesClosure(businessResult, facts, batchId);
+  const executeResult = {
+    executed: true,
+    writesBusinessRecords: facts.writesBusinessRecords,
+    statistics: facts.statistics,
+    ownership: {
+      applied: true,
+      mode: 'demo',
+      noInsertedRecords: facts.noInsertedRecords,
+      registrationCount: insertedRecords.length,
+      insertedCount: insertedRecords.length,
+      idempotentCount: 0,
+      skippedCount: facts.statistics.skippedCount,
+      relationCount: 0,
+      closureDigest: facts.ownershipClosureDigest
+    }
+  };
+  finalizeManagedDirectImportBatch(state, {
+    batchId,
+    status: businessResult.status,
+    statistics: facts.statistics,
+    fieldMapping: businessResult.fieldMapping,
+    previewDigest,
+    executeResult,
+    errorSummary: businessResult.errorSummary
+  });
+  verifyManagedDirectCompletedClosure(state, {
+    batchId,
+    contextId: boundContext.contextId,
+    runId: boundContext.runId,
+    actorUserId: boundContext.issuedToUserId,
+    previewDigest,
+    expectedContextStatus: 'previewed'
+  });
+  invokeManagedDirectOperationFault(intent, 'after-audit', { batchId });
+  const executedContext = markDemoContextExecutedInTransaction({
+    db: state.privateDb,
+    ...intent.demoContext,
+    uploadFileSha256,
+    previewDigest,
+    batchBindings: [{ batchId, batchRole: DEMO_MANAGED_DIRECT_IMPORT_BINDING.batchRole }]
+  });
+  const contextTerminal = buildManagedContextTerminalFacts(executedContext, null);
+  persistManagedContextTerminalExecuteResult(
+    state.privateDb,
+    batchId,
+    contextTerminal
+  );
+  invokeManagedDirectOperationFault(intent, 'after-context-executed', { batchId });
+  verifyManagedDirectCompletedClosure(state, {
+    batchId,
+    contextId: boundContext.contextId,
+    runId: boundContext.runId,
+    actorUserId: boundContext.issuedToUserId,
+    previewDigest,
+    expectedContextStatus: 'executed'
+  });
+  return { batchId, terminalReplay: false };
+}
+
 /**
- * 使用独占私有 SQLite 连接创建 ownership scope；callback 只能通过 facade 只读查询，
- * 业务写入仅能调用声明式 witness helper，治理写入仅由 registrar 内部执行。
+ * 使用独占私有 SQLite 连接创建 ownership scope；普通 callback 仍只接收只读 facade。
+ * Artifact 07 只能提交固定 operation intent，由 wrapper 在单次事务中不可拆分地执行完整闭包。
  * 外部连接或路径仅用于定位数据库，外部 raw exec/prototype 方法无法影响私有事务。
  */
-function runWithDemoOwnershipTransaction(target, callback) {
-  if (typeof callback !== 'function') {
+function runWithDemoOwnershipTransaction(target, callbackOrOperation) {
+  // operation 类型只从普通对象自有数据属性读取，拒绝 getter 或 Proxy 在事务前重入。
+  const operationDescriptor = callbackOrOperation
+    && typeof callbackOrOperation === 'object'
+    && !Array.isArray(callbackOrOperation)
+    && !utilTypes.isProxy(callbackOrOperation)
+    && Object.getPrototypeOf(callbackOrOperation) === Object.prototype
+    ? Object.getOwnPropertyDescriptor(callbackOrOperation, 'operation')
+    : null;
+  const isManagedDirectOperation = Boolean(operationDescriptor
+    && !operationDescriptor.get && !operationDescriptor.set
+    && operationDescriptor.value === DEMO_MANAGED_DIRECT_IMPORT_OPERATION);
+  if (typeof callbackOrOperation !== 'function' && !isManagedDirectOperation) {
     throw createDemoOwnershipError(
       'DEMO_OWNERSHIP_TRANSACTION_SCOPE_INVALID',
-      'ownership transaction wrapper callback 参数无效。',
+      'ownership transaction wrapper callback 或固定 operation 参数无效。',
       null,
       400
     );
@@ -2311,6 +4488,7 @@ function runWithDemoOwnershipTransaction(target, callback) {
     poisoned: false,
     witnesses: new Set(),
     pendingWitnesses: new Set(),
+    managedPredictionOperationActive: false,
     facade: null
   };
   const transactionScope = Object.create(null);
@@ -2327,7 +4505,9 @@ function runWithDemoOwnershipTransaction(target, callback) {
     privateDb.exec('BEGIN IMMEDIATE');
     DEMO_OWNERSHIP_TRANSACTION_SCOPE_STATE.set(transactionScope, state);
     DEMO_ACTIVE_OWNERSHIP_SCOPE_BY_DB.set(privateDb, transactionScope);
-    result = callback(transactionScope, state.facade);
+    result = isManagedDirectOperation
+      ? executeManagedDirectImportOperation(state, transactionScope, callbackOrOperation)
+      : callbackOrOperation(transactionScope, state.facade);
     const then = result && result.then;
     if (typeof then === 'function') {
       // 先为原始 Promise/thenable 绑定 rejection 消费，再同步拒绝 callback，避免 unhandledRejection。
@@ -2393,11 +4573,24 @@ function runWithDemoOwnershipTransaction(target, callback) {
  * 使用独占私有 SQLite 连接创建可等待的 ownership scope；供已固定绑定的 managed execute 使用，
  * 允许锁内等待在线备份，但仍不向消费者暴露 raw connection 或事务控制能力。
  */
-async function runWithDemoOwnershipTransactionAsync(target, callback) {
-  if (typeof callback !== 'function') {
+async function runWithDemoOwnershipTransactionAsync(target, callbackOrOperation) {
+  const operationDescriptor = callbackOrOperation
+    && typeof callbackOrOperation === 'object'
+    && !Array.isArray(callbackOrOperation)
+    && !utilTypes.isProxy(callbackOrOperation)
+    && Object.getPrototypeOf(callbackOrOperation) === Object.prototype
+    ? Object.getOwnPropertyDescriptor(callbackOrOperation, 'authority')
+    : null;
+  const isManagedPredictionOperation = Boolean(
+    operationDescriptor
+    && !operationDescriptor.get
+    && !operationDescriptor.set
+    && operationDescriptor.value === DEMO_PREDICTION_CONFIG_MANAGED_OPERATION_AUTHORITY
+  );
+  if (typeof callbackOrOperation !== 'function' && !isManagedPredictionOperation) {
     throw createDemoOwnershipError(
       'DEMO_OWNERSHIP_TRANSACTION_SCOPE_INVALID',
-      'ownership transaction wrapper callback 参数无效。',
+      'ownership transaction wrapper callback 或固定 operation 参数无效。',
       null,
       400
     );
@@ -2423,6 +4616,11 @@ async function runWithDemoOwnershipTransactionAsync(target, callback) {
     poisoned: false,
     witnesses: new Set(),
     pendingWitnesses: new Set(),
+    managedPredictionOperationActive: false,
+    managedPredictionBackupCompensation: null,
+    managedPredictionBatchId: null,
+    managedPredictionActorUserId: null,
+    managedPredictionActorIp: null,
     facade: null
   };
   const transactionScope = Object.create(null);
@@ -2439,7 +4637,13 @@ async function runWithDemoOwnershipTransactionAsync(target, callback) {
     privateDb.exec('BEGIN IMMEDIATE');
     DEMO_OWNERSHIP_TRANSACTION_SCOPE_STATE.set(transactionScope, state);
     DEMO_ACTIVE_OWNERSHIP_SCOPE_BY_DB.set(privateDb, transactionScope);
-    result = await callback(transactionScope, state.facade);
+    result = isManagedPredictionOperation
+      ? await executeManagedPredictionConfigImportOperation(
+          state,
+          transactionScope,
+          callbackOrOperation
+        )
+      : await callbackOrOperation(transactionScope, state.facade);
     if (state.poisoned || privateDb.inTransaction !== true) {
       throw createDemoOwnershipError(
         'DEMO_OWNERSHIP_TRANSACTION_SCOPE_BROKEN',
@@ -2476,9 +4680,19 @@ async function runWithDemoOwnershipTransactionAsync(target, callback) {
     if (privateDb.inTransaction) {
       try { privateDb.exec('ROLLBACK'); } catch (_rollbackError) { /* 连接关闭前无需继续传播回滚异常。 */ }
     }
-  } finally {
-    privateDb.close();
   }
+  if (failure && state.managedPredictionBackupCompensation) {
+    try {
+      compensateManagedPredictionBackupFile(state.managedPredictionBackupCompensation);
+    } catch (cleanupError) {
+      reportManagedPredictionBackupCompensationFailure(
+        state,
+        state.managedPredictionBackupCompensation,
+        cleanupError
+      );
+    }
+  }
+  privateDb.close();
   if (failure) throw failure;
   return result;
 }
@@ -2848,6 +5062,15 @@ function createDemoOwnershipInsertWitness(input = {}) {
   scopeState.poisoned = true;
   const db = scopeState.privateDb;
   const entityType = normalizeCanonicalEntityType(input.entityType);
+  if (entityType === DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType
+    && scopeState.managedPredictionOperationActive !== true) {
+    throw createDemoOwnershipError(
+      'DEMO_PREDICTION_CONFIG_OPERATION_REQUIRED',
+      'Artifact 12 prediction_config 只能由单一 managed operation 插入。',
+      null,
+      409
+    );
+  }
   const sourceBatchId = input.sourceBatchId;
   const sourceRowNumber = input.sourceRowNumber;
   if (!Number.isSafeInteger(sourceBatchId) || sourceBatchId < 1
@@ -2945,6 +5168,160 @@ function createDemoOwnershipInsertWitness(input = {}) {
   scopeState.pendingWitnesses.add(witness);
   scopeState.poisoned = false;
   return witness;
+}
+
+/** 在 managed 碳活动导入中校验当前 run imported ownership，并原子锁定替代目标。 */
+function beginCarbonActivitySupersedeInOwnershipTransaction(input = {}) {
+  assertExactPlainObjectFields(
+    input,
+    ['transactionScope', 'demoContext', 'targetActivityId', 'uploadFileSha256', 'previewDigest', 'updatedAt'],
+    'DEMO_CARBON_ACTIVITY_SUPERSEDE_INTENT_INVALID',
+    '碳活动替代 intent 只能包含固定字段。'
+  );
+  const scopeState = requireDemoOwnershipTransactionScope(input.transactionScope);
+  const db = scopeState.privateDb;
+  const targetActivityId = Number(input.targetActivityId);
+  assertDemoProjectionInteger(targetActivityId, 'targetActivityId', { min: 1 });
+  assertDemoProjectionUtcMilliseconds(input.updatedAt, 'updatedAt');
+  const demoContext = input.demoContext || {};
+  const context = validateDemoContext({
+    token: demoContext.token,
+    userId: demoContext.userId,
+    artifactKey: demoContext.artifactKey,
+    handlerKey: demoContext.handlerKey,
+    phase: 'execute',
+    uploadFileSha256: input.uploadFileSha256,
+    previewDigest: input.previewDigest,
+    db
+  });
+  if (context.artifactKey !== '27-carbon-activities' || context.handlerKey !== 'carbon-activity-import') {
+    throw createDemoOwnershipError('DEMO_CARBON_ACTIVITY_SUPERSEDE_CONTEXT_MISMATCH', '碳活动替代只允许 artifact 27 的 managed context。', null, 409);
+  }
+  assertDemoContextMetadataMatches(context, demoContext);
+  const handler = getDemoOwnershipEntityHandler('carbon_activity_record');
+  const targetRow = handler.readProjection(db, targetActivityId);
+  const registry = db.prepare(`SELECT registry_id AS registryId, snapshot_digest AS snapshotDigest
+    FROM demo_data_registry
+    WHERE run_id = ? AND artifact_key = '27-carbon-activities'
+      AND entity_type = 'carbon_activity_record' AND entity_pk = ?
+      AND ownership_kind = 'imported' AND cleaned_at IS NULL`).get(context.runId, String(targetActivityId));
+  if (!targetRow || targetRow.source_type !== 'independent_activity' || targetRow.record_status !== 'active'
+    || !registry) {
+    throw createDemoOwnershipError(
+      'DEMO_CARBON_ACTIVITY_SUPERSEDE_OWNERSHIP_REQUIRED',
+      'managed 碳活动只能替代当前 run 已登记的 active imported 独立活动。',
+      { targetActivityId },
+      409
+    );
+  }
+  const currentSnapshotDigest = calculateDemoEntitySnapshotDigest(
+    'carbon_activity_record',
+    String(targetActivityId),
+    targetRow
+  );
+  if (registry.snapshotDigest !== currentSnapshotDigest) {
+    throw createDemoOwnershipError('DEMO_CARBON_ACTIVITY_SUPERSEDE_SNAPSHOT_STALE', '待替代碳活动 ownership 快照已变化。', { targetActivityId }, 409);
+  }
+  const result = db.prepare(`UPDATE carbon_activity_records
+    SET record_status = 'superseded', superseded_by_activity_id = id, updated_at = ?
+    WHERE id = ? AND source_type = 'independent_activity' AND record_status = 'active'
+      AND superseded_by_activity_id IS NULL`).run(input.updatedAt, targetActivityId);
+  if (result.changes !== 1) {
+    throw createDemoOwnershipError('DEMO_CARBON_ACTIVITY_SUPERSEDE_TARGET_STALE', '待替代碳活动已变化，请重新预演。', { targetActivityId }, 409);
+  }
+  const witness = Object.freeze(Object.assign(Object.create(null), { targetActivityId }));
+  DEMO_CARBON_ACTIVITY_SUPERSEDE_WITNESS_STATE.set(witness, Object.freeze({
+    transactionScope: input.transactionScope,
+    contextId: context.contextId,
+    registryId: Number(registry.registryId),
+    targetActivityId,
+    previousSnapshotDigest: registry.snapshotDigest
+  }));
+  return witness;
+}
+
+/** 完成 managed 碳活动替代，并以旧摘要 CAS 刷新目标 imported ownership 快照。 */
+function finalizeCarbonActivitySupersedeInOwnershipTransaction(input = {}) {
+  assertExactPlainObjectFields(
+    input,
+    ['transactionScope', 'supersedeWitness', 'newActivityId', 'updatedAt'],
+    'DEMO_CARBON_ACTIVITY_SUPERSEDE_FINALIZE_INVALID',
+    '碳活动替代完成 intent 只能包含固定字段。'
+  );
+  const scopeState = requireDemoOwnershipTransactionScope(input.transactionScope);
+  const state = input.supersedeWitness && typeof input.supersedeWitness === 'object'
+    ? DEMO_CARBON_ACTIVITY_SUPERSEDE_WITNESS_STATE.get(input.supersedeWitness)
+    : null;
+  const newActivityId = Number(input.newActivityId);
+  assertDemoProjectionInteger(newActivityId, 'newActivityId', { min: 1 });
+  assertDemoProjectionUtcMilliseconds(input.updatedAt, 'updatedAt');
+  if (!state || state.transactionScope !== input.transactionScope) {
+    throw createDemoOwnershipError('DEMO_CARBON_ACTIVITY_SUPERSEDE_WITNESS_INVALID', '碳活动替代见证无效或不属于当前事务。', null, 409);
+  }
+  const db = scopeState.privateDb;
+  const inserted = db.prepare(`SELECT id FROM carbon_activity_records
+    WHERE id = ? AND source_type = 'independent_activity' AND record_status = 'active'
+      AND supersedes_activity_id = ?`).get(newActivityId, state.targetActivityId);
+  if (!inserted) {
+    throw createDemoOwnershipError('DEMO_CARBON_ACTIVITY_SUPERSEDE_NEW_ROW_MISMATCH', '新碳活动与替代目标绑定不一致。', null, 409);
+  }
+  const targetUpdate = db.prepare(`UPDATE carbon_activity_records
+    SET superseded_by_activity_id = ?, updated_at = ?
+    WHERE id = ? AND record_status = 'superseded' AND superseded_by_activity_id = id`).run(
+    newActivityId,
+    input.updatedAt,
+    state.targetActivityId
+  );
+  if (targetUpdate.changes !== 1) {
+    throw createDemoOwnershipError('DEMO_CARBON_ACTIVITY_SUPERSEDE_TARGET_STALE', '待替代碳活动完成链接时已变化。', null, 409);
+  }
+  const handler = getDemoOwnershipEntityHandler('carbon_activity_record');
+  const targetRow = handler.readProjection(db, state.targetActivityId);
+  const nextSnapshotDigest = calculateDemoEntitySnapshotDigest(
+    'carbon_activity_record',
+    String(state.targetActivityId),
+    targetRow
+  );
+  const registryUpdate = db.prepare(`UPDATE demo_data_registry SET snapshot_digest = ?
+    WHERE registry_id = ? AND snapshot_digest = ? AND cleaned_at IS NULL`).run(
+    nextSnapshotDigest,
+    state.registryId,
+    state.previousSnapshotDigest
+  );
+  if (registryUpdate.changes !== 1) {
+    throw createDemoOwnershipError('DEMO_CARBON_ACTIVITY_SUPERSEDE_REGISTRY_STALE', '待替代碳活动 ownership 快照刷新失败。', null, 409);
+  }
+  DEMO_CARBON_ACTIVITY_SUPERSEDE_WITNESS_STATE.delete(input.supersedeWitness);
+  return { targetActivityId: state.targetActivityId, newActivityId, snapshotDigest: nextSnapshotDigest };
+}
+
+/** 在 ownership 私有事务内写入固定碳活动导入 execute 操作审计。 */
+function writeCarbonActivityExecuteAuditInOwnershipTransaction(input = {}) {
+  assertExactPlainObjectFields(
+    input,
+    ['transactionScope', 'actorUserId', 'actorIp', 'batchId', 'activityIds', 'createdAt'],
+    'DEMO_CARBON_ACTIVITY_AUDIT_INTENT_INVALID',
+    '碳活动 execute 审计 intent 只能包含固定字段。'
+  );
+  const scopeState = requireDemoOwnershipTransactionScope(input.transactionScope);
+  const db = scopeState.privateDb;
+  const actorUserId = requireDemoOwnershipActor(db, { actorUserId: input.actorUserId });
+  assertDemoProjectionInteger(input.batchId, 'batchId', { min: 1 });
+  if (!Array.isArray(input.activityIds) || input.activityIds.some((id) => !Number.isSafeInteger(id) || id < 1)) {
+    throw createDemoOwnershipError('DEMO_CARBON_ACTIVITY_AUDIT_INTENT_INVALID', '碳活动 execute 审计主键集合无效。', null, 400);
+  }
+  assertDemoProjectionString(input.actorIp, 'actorIp', { nullable: true });
+  assertDemoProjectionUtcMilliseconds(input.createdAt, 'createdAt');
+  db.prepare(`INSERT INTO sys_operation_logs
+    (user_id, operation, target_type, target_id, detail_json, ip, created_at)
+    VALUES (?, 'carbon.activity.import.execute', 'carbon_activity', ?, ?, ?, ?)`).run(
+    actorUserId,
+    String(input.batchId),
+    JSON.stringify({ batchId: input.batchId, imported: input.activityIds.length, activityIds: input.activityIds }),
+    input.actorIp,
+    input.createdAt
+  );
+  return true;
 }
 
 /** 在 ownership 私有事务内停用同编码的既有 active 班次版本，不暴露写连接。 */
@@ -3487,7 +5864,8 @@ function readActiveRegistryEntity(db, entityType, entityPk) {
       artifact_key AS artifactKey, entity_type AS entityType, entity_pk AS entityPk,
       ownership_kind AS ownershipKind, identity_digest AS identityDigest,
       snapshot_digest AS snapshotDigest, source_batch_id AS sourceBatchId,
-      source_row_number AS sourceRowNumber, registered_by AS registeredBy
+      source_row_number AS sourceRowNumber, registered_by AS registeredBy,
+      registered_at AS registeredAt
     FROM demo_data_registry
     WHERE entity_type = ? AND entity_pk = ? AND cleaned_at IS NULL`).get(entityType, entityPk) || null;
 }
@@ -3657,7 +6035,10 @@ function registerDemoRelationsInTransaction(db, context, relations) {
       );
     }
     seenRelationKeys.add(relationKey);
-    const existing = db.prepare(`SELECT relation_id AS relationId FROM demo_data_relations
+    const existing = db.prepare(`SELECT relation_id AS relationId, run_id AS runId,
+        from_registry_id AS fromRegistryId, to_registry_id AS toRegistryId,
+        relation_type AS relationType, created_at AS createdAt
+      FROM demo_data_relations
       WHERE from_registry_id = ? AND to_registry_id = ? AND relation_type = ?`).get(
       fromRegistry.registryId,
       toRegistry.registryId,
@@ -3666,28 +6047,41 @@ function registerDemoRelationsInTransaction(db, context, relations) {
     if (existing) {
       return {
         relationId: Number(existing.relationId),
-        runId: context.runId,
-        fromRegistryId: fromRegistry.registryId,
-        toRegistryId: toRegistry.registryId,
-        relationType: relation.relationType,
+        runId: existing.runId,
+        fromRegistryId: Number(existing.fromRegistryId),
+        toRegistryId: Number(existing.toRegistryId),
+        relationType: existing.relationType,
+        createdAt: existing.createdAt,
         result: 'idempotent'
       };
     }
     try {
-      const result = db.prepare(`INSERT INTO demo_data_relations
-        (run_id, from_registry_id, to_registry_id, relation_type)
-        VALUES (?, ?, ?, ?)`).run(
-        context.runId,
-        fromRegistry.registryId,
-        toRegistry.registryId,
-        relation.relationType
-      );
+      const createdAt = typeof context.createdAt === 'string' ? context.createdAt : null;
+      const result = createdAt
+        ? db.prepare(`INSERT INTO demo_data_relations
+          (run_id, from_registry_id, to_registry_id, relation_type, created_at)
+          VALUES (?, ?, ?, ?, ?)`).run(
+          context.runId,
+          fromRegistry.registryId,
+          toRegistry.registryId,
+          relation.relationType,
+          createdAt
+        )
+        : db.prepare(`INSERT INTO demo_data_relations
+          (run_id, from_registry_id, to_registry_id, relation_type)
+          VALUES (?, ?, ?, ?)`).run(
+          context.runId,
+          fromRegistry.registryId,
+          toRegistry.registryId,
+          relation.relationType
+        );
       return {
         relationId: Number(result.lastInsertRowid),
         runId: context.runId,
         fromRegistryId: fromRegistry.registryId,
         toRegistryId: toRegistry.registryId,
         relationType: relation.relationType,
+        createdAt,
         result: 'registered'
       };
     } catch (error) {
@@ -3934,6 +6328,47 @@ function createStrategyRegistrationSavepointName(prefix) {
   return `${prefix}_${crypto.randomBytes(12).toString('hex')}`;
 }
 
+/** registrar 私有 SAVEPOINT 恢复异常时完整回滚，仍失败则关闭连接。 */
+function failClosedStrategyRegistrarTransaction(db) {
+  let fullRollbackError = null;
+  let closeError = null;
+  try {
+    if (db.inTransaction === true) db.exec('ROLLBACK');
+  } catch (error) {
+    fullRollbackError = error;
+  }
+  if (fullRollbackError) {
+    try {
+      db.close();
+    } catch (error) {
+      closeError = error;
+    }
+  }
+  return { fullRollbackError, closeError };
+}
+
+/** 回滚 registrar 私有 SAVEPOINT；ROLLBACK TO 失败后严禁继续 RELEASE。 */
+function recoverStrategyRegistrarSavepoint(db, savepointName) {
+  let rollbackError = null;
+  let releaseError = null;
+  try {
+    db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+  } catch (error) {
+    rollbackError = error;
+  }
+  if (!rollbackError) {
+    try {
+      db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+    } catch (error) {
+      releaseError = error;
+    }
+  }
+  const failClosed = rollbackError || releaseError
+    ? failClosedStrategyRegistrarTransaction(db)
+    : { fullRollbackError: null, closeError: null };
+  return { rollbackError, releaseError, ...failClosed };
+}
+
 /** 规范 strategy evaluator 与 registration scope 共用的完整领域绑定。 */
 function normalizeStrategyRegistrationDomainBinding(domainBinding) {
   assertExactPlainObjectFields(
@@ -3975,7 +6410,121 @@ function normalizeStrategyRegistrationDomainBinding(domainBinding) {
   });
 }
 
-/** 校验 strategy registration scope 是当前连接上的原始一次性 capability。 */
+/** 将 strategy registration scope 同步标记为失败，阻止跨连接或失效事务后的重放。 */
+function failStrategyRegistrationScopeState(registrationScope, state) {
+  state.status = 'failed';
+}
+
+/** 读取 registration scope 内部未提交 marker 的固定 projection。 */
+function readStrategyScopeMarker(db, markerId) {
+  return db.prepare(`SELECT id AS id, user_id AS userId, operation AS operation,
+      target_type AS targetType, target_id AS targetId, detail_json AS detailJson,
+      ip AS ip, created_at AS createdAt
+    FROM sys_operation_logs WHERE id = ?`).get(markerId) || null;
+}
+
+/** 证明 scope marker 仍只存在于 issue 时的 caller transaction，拒绝 COMMIT-BEGIN 重放。 */
+function assertStrategyScopeTransactionContinuity(db, state) {
+  const localMarker = readStrategyScopeMarker(db, state.markerId);
+  if (!localMarker || localMarker.operation !== DEMO_STRATEGY_SCOPE_MARKER_OPERATION
+    || Number(localMarker.userId) !== state.actorUserId
+    || localMarker.targetType !== 'strategy-registration-scope'
+    || localMarker.targetId !== state.markerTargetId
+    || localMarker.detailJson !== state.markerDetailJson
+    || localMarker.ip !== null
+    || localMarker.createdAt !== state.markerCreatedAt) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_SCOPE_TRANSACTION_MISMATCH',
+      '策略评价 registration scope marker 已缺失或被改写，禁止事务重放。',
+      null,
+      409
+    );
+  }
+  if (!db.name || typeof db.name !== 'string' || db.name === ':memory:') {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_SCOPE_TRANSACTION_IDENTITY_UNAVAILABLE',
+      '策略评价 registration scope 无法证明原始 SQLite 事务身份。',
+      null,
+      409
+    );
+  }
+  let observer = null;
+  try {
+    observer = openReadOnlyDatabase({ databasePath: db.name });
+    const committedMarker = observer.prepare(
+      'SELECT id FROM sys_operation_logs WHERE id = ?'
+    ).get(state.markerId);
+    if (committedMarker) {
+      // 原 marker 已随 caller COMMIT 落盘；先丢弃新事务，再用独立连接清理 marker，
+      // 最后恢复一个空 caller transaction，避免调用方后续 COMMIT 交出半成品或内部 marker。
+      try {
+        if (db.inTransaction === true) db.exec('ROLLBACK');
+        const cleanupDb = openDatabase({ databasePath: db.name });
+        try {
+          cleanupDb.exec('BEGIN IMMEDIATE');
+          cleanupDb.prepare('DELETE FROM sys_operation_logs WHERE id = ?').run(state.markerId);
+          cleanupDb.exec('COMMIT');
+        } finally {
+          cleanupDb.close();
+        }
+        db.exec('BEGIN IMMEDIATE');
+        state.markerId = null;
+      } catch (cleanupError) {
+        try {
+          db.close();
+        } catch (_closeError) {
+          // 原始连接已经不可安全复用时保持关闭。
+        }
+        throw createDemoOwnershipError(
+          'DEMO_DERIVED_STRATEGY_SCOPE_TRANSACTION_RECOVERY_FAILED',
+          '策略评价 registration scope 事务世代恢复失败，连接已关闭。',
+          { cause: cleanupError.code || null },
+          500
+        );
+      }
+      throw createDemoOwnershipError(
+        'DEMO_DERIVED_STRATEGY_SCOPE_TRANSACTION_MISMATCH',
+        '策略评价 registration scope 已跨越 COMMIT-BEGIN 事务边界，禁止重放。',
+        null,
+        409
+      );
+    }
+  } catch (error) {
+    if (error?.code === 'DEMO_DERIVED_STRATEGY_SCOPE_TRANSACTION_MISMATCH'
+      || error?.code === 'DEMO_DERIVED_STRATEGY_SCOPE_TRANSACTION_RECOVERY_FAILED') throw error;
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_SCOPE_TRANSACTION_IDENTITY_UNAVAILABLE',
+      '策略评价 registration scope 无法读取原始 SQLite 事务身份。',
+      { cause: error.code || null },
+      409
+    );
+  } finally {
+    if (observer) observer.close();
+  }
+}
+
+/** 删除 scope marker；失败路径不得把内部 marker 留给 caller 提交。 */
+function cleanupStrategyScopeMarker(db, state) {
+  if (!state.markerId || !db || typeof db.prepare !== 'function') return;
+  const result = db.prepare(`DELETE FROM sys_operation_logs
+    WHERE id = ? AND operation = ? AND target_type = ? AND target_id = ?`).run(
+    state.markerId,
+    DEMO_STRATEGY_SCOPE_MARKER_OPERATION,
+    'strategy-registration-scope',
+    state.markerTargetId
+  );
+  if (result.changes !== 1) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_SCOPE_MARKER_INVALID',
+      '策略评价 registration scope marker 无法安全清理。',
+      { markerId: state.markerId },
+      409
+    );
+  }
+  state.markerId = null;
+}
+
+/** 校验 strategy registration scope、exact scope 与当前连接均保持原始对象身份。 */
 function requireStrategyRegistrationScopeState(db, registrationScope, allowedStatuses) {
   const state = registrationScope && typeof registrationScope === 'object'
     ? DEMO_STRATEGY_REGISTRATION_SCOPE_STATE.get(registrationScope)
@@ -3989,8 +6538,7 @@ function requireStrategyRegistrationScopeState(db, registrationScope, allowedSta
     );
   }
   if (state.db !== db) {
-    state.status = 'failed';
-    markEnergyStrategyRegistrationScopeFailed(registrationScope);
+    failStrategyRegistrationScopeState(registrationScope, state);
     throw createDemoOwnershipError(
       'DEMO_DERIVED_STRATEGY_REGISTRATION_SCOPE_DATABASE_MISMATCH',
       '策略评价 registration scope 与 SQLite 连接不一致。',
@@ -3998,15 +6546,26 @@ function requireStrategyRegistrationScopeState(db, registrationScope, allowedSta
       409
     );
   }
+  try {
+    getEnergyStrategyEvaluatorProtocol().assertExactScope(state.exactScope, db);
+  } catch (error) {
+    failStrategyRegistrationScopeState(registrationScope, state);
+    throw error;
+  }
   if (db.inTransaction !== true) {
-    state.status = 'failed';
-    markEnergyStrategyRegistrationScopeFailed(registrationScope);
+    failStrategyRegistrationScopeState(registrationScope, state);
     throw createDemoOwnershipError(
       'DEMO_DERIVED_OWNERSHIP_TRANSACTION_REQUIRED',
       '策略评价 registration scope 必须保留原 caller transaction。',
       null,
       409
     );
+  }
+  try {
+    assertStrategyScopeTransactionContinuity(db, state);
+  } catch (error) {
+    failStrategyRegistrationScopeState(registrationScope, state);
+    throw error;
   }
   if (!allowedStatuses.includes(state.status)) {
     throw createDemoOwnershipError(
@@ -4019,130 +6578,9 @@ function requireStrategyRegistrationScopeState(db, registrationScope, allowedSta
   return state;
 }
 
-/** 回滚并释放 registration guard；任一恢复失败均阻断外层提交。 */
-function rollbackAndReleaseStrategyRegistrationGuard(state, originalError = null) {
-  let rollbackError = null;
-  let releaseError = null;
-  try {
-    state.db.exec(`ROLLBACK TO SAVEPOINT ${state.guardName}`);
-  } catch (error) {
-    rollbackError = error;
-  }
-  try {
-    state.db.exec(`RELEASE SAVEPOINT ${state.guardName}`);
-  } catch (error) {
-    releaseError = error;
-  }
-  state.guardName = null;
-  if (rollbackError || releaseError) {
-    throw createDemoOwnershipError(
-      'DEMO_DERIVED_STRATEGY_SCOPE_RECOVERY_FAILED',
-      '策略评价 registration scope guard 恢复失败，禁止继续提交外层事务。',
-      {
-        originalCode: originalError?.code || originalError?.details?.code || null,
-        rollbackCode: rollbackError?.code || null,
-        releaseCode: releaseError?.code || null
-      },
-      500
-    );
-  }
-}
-
-/** 按 scope 当前状态执行 fail-closed abort，不接管外层事务生命周期。 */
-/** 在 evaluator 私有 SAVEPOINT 建立后创建事务 liveness marker。 */
-function prepareStrategyRegistrationScopeLiveness(registrationScope, state) {
-  if (state.status !== 'active' || state.livenessName) {
-    state.status = 'failed';
-    markEnergyStrategyRegistrationScopeFailed(registrationScope);
-    throw createDemoOwnershipError(
-      'DEMO_DERIVED_STRATEGY_SCOPE_STATE_INVALID',
-      '策略评价 registration scope 不能重复建立事务 marker。',
-      null,
-      409
-    );
-  }
-  state.livenessName = createStrategyRegistrationSavepointName('demo_strategy_registration_live');
-  try {
-    state.db.exec(`SAVEPOINT ${state.livenessName}`);
-  } catch (error) {
-    state.livenessName = null;
-    state.status = 'failed';
-    markEnergyStrategyRegistrationScopeFailed(registrationScope);
-    throw createDemoOwnershipError(
-      'DEMO_DERIVED_STRATEGY_SCOPE_LIVENESS_FAILED',
-      '策略评价 registration scope 事务 marker 创建失败。',
-      { cause: error.code || null },
-      409
-    );
-  }
-}
-
-/** 激活回调返回后释放预写 marker；失败意味着 callback 已结束或替换 caller transaction。 */
-function confirmStrategyRegistrationScopeActivation(registrationScope, state) {
-  if (state.status !== 'active' || !state.livenessName) {
-    state.status = 'failed';
-    markEnergyStrategyRegistrationScopeFailed(registrationScope);
-    throw createDemoOwnershipError(
-      'DEMO_DERIVED_STRATEGY_SCOPE_TRANSACTION_MISMATCH',
-      '策略评价 registration scope 预写事务 marker 不存在。',
-      null,
-      409
-    );
-  }
-  const livenessName = state.livenessName;
-  try {
-    state.db.exec(`RELEASE SAVEPOINT ${livenessName}`);
-    state.livenessName = null;
-  } catch (error) {
-    state.livenessName = null;
-    state.status = 'failed';
-    markEnergyStrategyRegistrationScopeFailed(registrationScope);
-    throw createDemoOwnershipError(
-      'DEMO_DERIVED_STRATEGY_SCOPE_TRANSACTION_MISMATCH',
-      '策略评价 registration scope caller transaction 已在首次 evaluator 写入前结束或被替换。',
-      { cause: error.code || null },
-      409
-    );
-  }
-}
-
-/** 旋转事务 marker；释放失败意味着 caller transaction 已结束或被替换。 */
-function rotateStrategyRegistrationScopeLiveness(registrationScope, state) {
-  if (state.status !== 'active' || !state.livenessName) {
-    state.status = 'failed';
-    markEnergyStrategyRegistrationScopeFailed(registrationScope);
-    throw createDemoOwnershipError(
-      'DEMO_DERIVED_STRATEGY_SCOPE_TRANSACTION_MISMATCH',
-      '策略评价 registration scope 事务 marker 不存在。',
-      null,
-      409
-    );
-  }
-  const previousName = state.livenessName;
-  try {
-    state.db.exec(`RELEASE SAVEPOINT ${previousName}`);
-    state.livenessName = createStrategyRegistrationSavepointName('demo_strategy_registration_live');
-    state.db.exec(`SAVEPOINT ${state.livenessName}`);
-  } catch (error) {
-    state.livenessName = null;
-    state.status = 'failed';
-    markEnergyStrategyRegistrationScopeFailed(registrationScope);
-    throw createDemoOwnershipError(
-      'DEMO_DERIVED_STRATEGY_SCOPE_TRANSACTION_MISMATCH',
-      '策略评价 registration scope caller transaction 已结束或被替换。',
-      { cause: error.code || null },
-      409
-    );
-  }
-}
-
-/** 在成功/失败时清理 marker 由 evaluator 外层 SAVEPOINT 统一管理。 */
+/** 按 scope 当前状态执行 fail-closed abort，不接管外层事务或 SAVEPOINT 生命周期。 */
 function abortStrategyRegistrationScopeState(registrationScope, state) {
-  if (state.status === 'issued' && state.guardName) {
-    rollbackAndReleaseStrategyRegistrationGuard(state);
-  }
   if (state.status !== 'consumed') state.status = 'failed';
-  markEnergyStrategyRegistrationScopeFailed(registrationScope);
 }
 
 /**
@@ -4164,7 +6602,7 @@ function issueStrategyEvaluationRegistrationScopeInTransaction(input = {}) {
       409
     );
   }
-  assertEnergyStrategyExactScopeCapability(input.exactScope, db);
+  getEnergyStrategyEvaluatorProtocol().assertExactScope(input.exactScope, db);
   const actorUserId = requireDemoOwnershipActor(db, { actorUserId: input.actorUserId });
   const runId = typeof input.runId === 'string'
     && input.runId.trim() === input.runId && input.runId.length > 0
@@ -4185,8 +6623,17 @@ function issueStrategyEvaluationRegistrationScopeInTransaction(input = {}) {
   const domainBinding = normalizeStrategyRegistrationDomainBinding(input.domainBinding);
   const run = requireDemoDatasetRun(db, runId);
   requireStrategyDerivedActionRun(db, { actionRunId, actorUserId }, run);
-  const guardName = createStrategyRegistrationSavepointName('demo_strategy_registration_issue');
-  db.exec(`SAVEPOINT ${guardName}`);
+  const markerTargetId = crypto.randomBytes(24).toString('hex');
+  const markerCreatedAt = new Date().toISOString();
+  const markerId = insertOperationLogWithDb(db, {
+    userId: actorUserId,
+    operation: DEMO_STRATEGY_SCOPE_MARKER_OPERATION,
+    targetType: 'strategy-registration-scope',
+    targetId: markerTargetId,
+    detail: { actionRunId },
+    ip: null,
+    createdAt: markerCreatedAt
+  });
   const registrationScope = Object.freeze({});
   const state = {
     db,
@@ -4197,62 +6644,59 @@ function issueStrategyEvaluationRegistrationScopeInTransaction(input = {}) {
     exactScope: input.exactScope,
     domainBinding,
     domainBindingDigest: sha256Stable(domainBinding),
-    guardName,
+    markerId,
+    markerTargetId,
+    markerDetailJson: JSON.stringify({ actionRunId }),
+    markerCreatedAt,
     status: 'issued'
   };
   DEMO_STRATEGY_REGISTRATION_SCOPE_STATE.set(registrationScope, state);
   try {
-    bindEnergyStrategyRegistrationScopeCapability({
+    getEnergyStrategyEvaluatorProtocol().bindRegistrationScope({
       db,
       registrationScope,
       exactScope: input.exactScope,
-      domainBinding,
-      confirmActive: () => confirmStrategyRegistrationScopeActivation(registrationScope, state),
-      prepareRegistrar: () => prepareStrategyRegistrationScopeLiveness(registrationScope, state),
-      abort: () => abortStrategyRegistrationScopeState(registrationScope, state)
+      domainBinding
     });
   } catch (error) {
     state.status = 'failed';
-    rollbackAndReleaseStrategyRegistrationGuard(state, error);
+    try {
+      cleanupStrategyScopeMarker(db, state);
+    } catch (_cleanupError) {
+      // issue 失败时保留原始绑定错误，marker 仍随 caller transaction 回滚。
+    }
     throw error;
   }
   return registrationScope;
 }
 
-/** 在 evaluator 首次业务写入前释放 issue guard 并激活原始 scope。 */
+/** 在 evaluator 首次业务写入前激活原始 scope。 */
 function activateStrategyEvaluationRegistrationScopeInTransaction(input = {}) {
   assertExactPlainObjectFields(
     input,
-    ['db', 'registrationScope'],
+    ['db', 'registrationScope', 'actorUserId'],
     'DEMO_DERIVED_STRATEGY_SCOPE_ACTIVATE_INPUT_INVALID',
-    '策略评价 registration scope activate 只能接收 db 和原始 scope。'
+    '策略评价 registration scope activate 只能接收 db、actorUserId 和原始 scope。'
   );
   const state = requireStrategyRegistrationScopeState(
     input.db,
     input.registrationScope,
     ['issued']
   );
-  const run = requireDemoDatasetRun(input.db, state.runId);
-  requireDemoOwnershipActor(input.db, { actorUserId: state.actorUserId });
-  requireStrategyDerivedActionRun(input.db, state, run);
-  try {
-    input.db.exec(`RELEASE SAVEPOINT ${state.guardName}`);
-    state.guardName = null;
-    markEnergyStrategyRegistrationScopeActive(input.registrationScope);
-    state.status = 'active';
-    // 预写 marker 在 beforeEvaluationWrite 返回后立即验证，阻止 callback 内替换 caller transaction。
-    prepareStrategyRegistrationScopeLiveness(input.registrationScope, state);
-    return input.registrationScope;
-  } catch (error) {
-    state.status = 'failed';
-    markEnergyStrategyRegistrationScopeFailed(input.registrationScope);
+  const actorUserId = requireDemoOwnershipActor(input.db, { actorUserId: input.actorUserId });
+  if (actorUserId !== state.actorUserId) {
+    failStrategyRegistrationScopeState(input.registrationScope, state);
     throw createDemoOwnershipError(
-      'DEMO_DERIVED_STRATEGY_SCOPE_ACTIVATION_FAILED',
-      '策略评价 registration scope guard 已失效或事务已被替换。',
-      { cause: error.code || error.details?.code || null },
+      'DEMO_DERIVED_STRATEGY_ACTOR_MISMATCH',
+      '策略评价 registration scope 与 evaluator actor 不一致。',
+      null,
       409
     );
   }
+  const run = requireDemoDatasetRun(input.db, state.runId);
+  requireStrategyDerivedActionRun(input.db, state, run);
+  state.status = 'active';
+  return input.registrationScope;
 }
 
 /** 主动终止一次 registration scope；issued guard 只回滚到自身且不结束外层事务。 */
@@ -4263,13 +6707,33 @@ function abortStrategyEvaluationRegistrationScopeInTransaction(input = {}) {
     'DEMO_DERIVED_STRATEGY_SCOPE_ABORT_INPUT_INVALID',
     '策略评价 registration scope abort 只能接收 db 和原始 scope。'
   );
-  const state = requireStrategyRegistrationScopeState(
-    input.db,
-    input.registrationScope,
-    ['issued', 'active']
-  );
-  abortStrategyRegistrationScopeState(input.registrationScope, state);
-  return input.registrationScope;
+  const registrationScope = input.registrationScope;
+  const state = registrationScope && typeof registrationScope === 'object'
+    ? DEMO_STRATEGY_REGISTRATION_SCOPE_STATE.get(registrationScope)
+    : null;
+  if (!state || state.db !== input.db) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_REGISTRATION_SCOPE_REQUIRED',
+      '策略评价 registration scope abort 必须使用原始 scope 和 SQLite 连接。',
+      null,
+      409
+    );
+  }
+  if (state.status === 'consumed') {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_REGISTRATION_SCOPE_REPLAY',
+      '策略评价 registration scope 已完成消费。',
+      null,
+      409
+    );
+  }
+  if (input.db.inTransaction === true && state.markerId) {
+    const marker = readStrategyScopeMarker(input.db, state.markerId);
+    if (marker) cleanupStrategyScopeMarker(input.db, state);
+    else state.markerId = null;
+  }
+  abortStrategyRegistrationScopeState(registrationScope, state);
+  return registrationScope;
 }
 
 /** 校验 strategy evaluation derived registrar 只能绑定当前 executing 后置动作。 */
@@ -4376,8 +6840,36 @@ function requireStrategyImportedSource(db, run, entityType, entityPk, artifactKe
   return { registry, row };
 }
 
+/** 构造 registrar 写入前固定的完整 derived registry 事实合同。 */
+function buildExpectedStrategyRegistryFact(registryId, run, actorUserId, registration, registeredAt) {
+  return {
+    registryId: Number(registryId),
+    runId: run.runId,
+    artifactKey: '18-strategy-rules',
+    entityType: registration.entityType,
+    entityPk: registration.entityPk,
+    ownershipKind: 'derived',
+    identityDigest: registration.identityDigest,
+    snapshotDigest: registration.snapshotDigest,
+    sourceBatchId: null,
+    sourceRowNumber: null,
+    legacyClaimRunId: null,
+    registeredBy: actorUserId,
+    registeredAt,
+    cleanedAt: null,
+    cleanupRunId: null,
+    cleanupResult: null
+  };
+}
+
 /** 校验已有 derived registry 与本次固定 run/hit snapshot 完全一致，并支持稳定重试。 */
-function registerSingleDerivedStrategyEntityInTransaction(db, run, actorUserId, registration) {
+function registerSingleDerivedStrategyEntityInTransaction(
+  db,
+  run,
+  actorUserId,
+  registration,
+  registeredAt
+) {
   const existing = readActiveRegistryEntity(db, registration.entityType, registration.entityPk);
   if (existing) {
     const matches = existing.runId === run.runId
@@ -4398,30 +6890,29 @@ function registerSingleDerivedStrategyEntityInTransaction(db, run, actorUserId, 
     }
     return { ...existing, ...registration, result: 'idempotent' };
   }
+  const effectiveRegisteredAt = registeredAt || new Date().toISOString();
   try {
     const result = db.prepare(`INSERT INTO demo_data_registry
       (run_id, artifact_key, entity_type, entity_pk, ownership_kind,
-       identity_digest, snapshot_digest, source_batch_id, source_row_number, registered_by)
-      VALUES (?, '18-strategy-rules', ?, ?, 'derived', ?, ?, NULL, NULL, ?)`).run(
+       identity_digest, snapshot_digest, source_batch_id, source_row_number,
+       registered_by, registered_at)
+      VALUES (?, '18-strategy-rules', ?, ?, 'derived', ?, ?, NULL, NULL, ?, ?)`).run(
       run.runId,
       registration.entityType,
       registration.entityPk,
       registration.identityDigest,
       registration.snapshotDigest,
-      actorUserId
+      actorUserId,
+      effectiveRegisteredAt
     );
     return {
-      registryId: Number(result.lastInsertRowid),
-      runId: run.runId,
-      artifactKey: '18-strategy-rules',
-      entityType: registration.entityType,
-      entityPk: registration.entityPk,
-      ownershipKind: 'derived',
-      identityDigest: registration.identityDigest,
-      snapshotDigest: registration.snapshotDigest,
-      sourceBatchId: null,
-      sourceRowNumber: null,
-      registeredBy: actorUserId,
+      ...buildExpectedStrategyRegistryFact(
+        Number(result.lastInsertRowid),
+        run,
+        actorUserId,
+        registration,
+        effectiveRegisteredAt
+      ),
       result: 'registered'
     };
   } catch (error) {
@@ -4645,12 +7136,10 @@ function buildStrategyExpectedSourceMap(snapshots, sourceBatchId, entityType) {
 
 /** 校验 witness 来源 metadata、exact scope 对象与 registration domain binding 完全一致。 */
 function assertStrategyWitnessScopeBindings(scopeState, witnessState) {
-  if (witnessState.registrationScope === null
-    || witnessState.exactScope !== scopeState.exactScope
-    || sha256Stable(witnessState.domainBinding) !== scopeState.domainBindingDigest) {
+  if (sha256Stable(witnessState.domainBinding) !== scopeState.domainBindingDigest) {
     throw createDemoOwnershipError(
       'DEMO_DERIVED_STRATEGY_WITNESS_BINDING_MISMATCH',
-      '策略评价 completion witness 与 registration scope 绑定不一致。',
+      '策略评价 completion witness 与 registration scope 领域绑定不一致。',
       null,
       409
     );
@@ -4686,6 +7175,62 @@ function assertStrategyWitnessScopeBindings(scopeState, witnessState) {
 }
 
 /** 校验 evaluator 返回 run/hit 快照仍与 registrar 重读事实完全一致。 */
+/** 校验 completion witness 中 operation audit 固定投影仍未被删除或改写。 */
+function assertStrategyWitnessOperationAudit(db, witnessState) {
+  const auditId = normalizeIntegerEntityPk(witnessState.operationAuditId);
+  const expected = witnessState.operationAuditSnapshot;
+  if (!auditId || !expected || typeof expected !== 'object') {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_OPERATION_AUDIT_INVALID',
+      '策略评价 completion witness 缺少固定 operation audit 见证。',
+      null,
+      409
+    );
+  }
+  const row = db.prepare(`SELECT id AS id, user_id AS userId, operation AS operation,
+      target_type AS targetType, target_id AS targetId, detail_json AS detailJson,
+      ip AS ip, created_at AS createdAt
+    FROM sys_operation_logs WHERE id = ?`).get(auditId);
+  if (!row) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_OPERATION_AUDIT_MISMATCH',
+      '策略评价 operation audit 已缺失。',
+      { operationLogId: auditId },
+      409
+    );
+  }
+  let detail;
+  try {
+    detail = row.detailJson === null ? null : JSON.parse(row.detailJson);
+  } catch (_error) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_OPERATION_AUDIT_MISMATCH',
+      '策略评价 operation audit detail_json 已被改写。',
+      { operationLogId: auditId },
+      409
+    );
+  }
+  const actual = {
+    id: Number(row.id),
+    userId: row.userId === null ? null : Number(row.userId),
+    operation: row.operation,
+    targetType: row.targetType,
+    targetId: row.targetId,
+    detail,
+    ip: row.ip,
+    createdAt: row.createdAt
+  };
+  if (sha256Stable(actual) !== sha256Stable(expected)) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_OPERATION_AUDIT_MISMATCH',
+      '策略评价 operation audit 已缺失或被改写。',
+      { operationLogId: auditId },
+      409
+    );
+  }
+  return actual;
+}
+
 function assertStrategyWitnessReturnSnapshots(db, evaluationRun, hitIds, witnessState) {
   const runScope = parseStrictDemoProjectionJsonObject(
     evaluationRun.scope_reference,
@@ -4714,6 +7259,122 @@ function assertStrategyWitnessReturnSnapshots(db, evaluationRun, hitIds, witness
       409
     );
   }
+  assertStrategyWitnessOperationAudit(db, witnessState);
+}
+
+/** 读取 registrar receipt 绑定的完整 registry 持久事实。 */
+function readStrategyReceiptRegistryFact(db, registryId) {
+  return db.prepare(`SELECT registry_id AS registryId, run_id AS runId,
+      artifact_key AS artifactKey, entity_type AS entityType, entity_pk AS entityPk,
+      ownership_kind AS ownershipKind, identity_digest AS identityDigest,
+      snapshot_digest AS snapshotDigest, source_batch_id AS sourceBatchId,
+      source_row_number AS sourceRowNumber, legacy_claim_run_id AS legacyClaimRunId,
+      registered_by AS registeredBy, registered_at AS registeredAt,
+      cleaned_at AS cleanedAt, cleanup_run_id AS cleanupRunId,
+      cleanup_result AS cleanupResult
+    FROM demo_data_registry WHERE registry_id = ?`).get(registryId) || null;
+}
+
+/** 读取 registrar receipt 绑定的完整 relation 持久事实。 */
+function readStrategyReceiptRelationFact(db, relationId) {
+  return db.prepare(`SELECT relation_id AS relationId, run_id AS runId,
+      from_registry_id AS fromRegistryId, to_registry_id AS toRegistryId,
+      relation_type AS relationType, created_at AS createdAt
+    FROM demo_data_relations WHERE relation_id = ?`).get(relationId) || null;
+}
+
+/** 校验 registrar 预期 registry/relation 合同与写入后事实逐字段完全一致。 */
+function assertStrategyRegistrarIntentFacts(expectedFacts, actualFacts, code, message) {
+  if (!Array.isArray(expectedFacts) || !Array.isArray(actualFacts)
+    || expectedFacts.length !== actualFacts.length
+    || sha256Stable(expectedFacts) !== sha256Stable(actualFacts)) {
+    throw createDemoOwnershipError(code, message, null, 409);
+  }
+}
+
+/** 校验 receipt 中的 registry 完整集合仍与当前事务持久事实逐项一致。 */
+function assertStrategyReceiptRegistryFacts(db, receiptFacts) {
+  const expectedFacts = receiptFacts.registryFacts;
+  if (!Array.isArray(expectedFacts) || expectedFacts.length === 0) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_RECEIPT_REGISTRY_INVALID',
+      '策略评价 registrar receipt 缺少完整 registry 事实。',
+      null,
+      409
+    );
+  }
+  assertStrategyRegistrarIntentFacts(
+    receiptFacts.registryIntents,
+    expectedFacts,
+    'DEMO_DERIVED_STRATEGY_RECEIPT_REGISTRY_INTENT_MISMATCH',
+    '策略评价 registrar receipt registry 事实与写入前合同不一致。'
+  );
+  const registryIds = expectedFacts.map((item) => Number(item.registryId));
+  if (new Set(registryIds).size !== registryIds.length) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_RECEIPT_REGISTRY_INVALID',
+      '策略评价 registrar receipt registry 集合包含重复项。',
+      null,
+      409
+    );
+  }
+  expectedFacts.forEach((expectedFact) => {
+    const currentFact = readStrategyReceiptRegistryFact(db, Number(expectedFact.registryId));
+    if (!currentFact || sha256Stable(currentFact) !== sha256Stable(expectedFact)) {
+      throw createDemoOwnershipError(
+        'DEMO_DERIVED_STRATEGY_RECEIPT_REGISTRY_MISMATCH',
+        '策略评价 registrar receipt registry 事实已缺失或被改写。',
+        { registryId: Number(expectedFact.registryId) || null },
+        409
+      );
+    }
+  });
+  return registryIds;
+}
+
+/** 校验 receipt relation 完整集合及其所有 derived 端点关系均保持精确一致。 */
+function assertStrategyReceiptRelationFacts(db, receiptFacts, registryIds) {
+  const expectedFacts = receiptFacts.relationFacts;
+  if (!Array.isArray(expectedFacts)) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_RECEIPT_RELATION_INVALID',
+      '策略评价 registrar receipt 缺少完整 relation 事实。',
+      null,
+      409
+    );
+  }
+  assertStrategyRegistrarIntentFacts(
+    receiptFacts.relationIntents,
+    expectedFacts,
+    'DEMO_DERIVED_STRATEGY_RECEIPT_RELATION_INTENT_MISMATCH',
+    '策略评价 registrar receipt relation 事实与写入前意图不一致。'
+  );
+  const relationIds = expectedFacts.map((item) => Number(item.relationId));
+  if (new Set(relationIds).size !== relationIds.length) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_RECEIPT_RELATION_INVALID',
+      '策略评价 registrar receipt relation 集合包含重复项。',
+      null,
+      409
+    );
+  }
+  const placeholders = registryIds.map(() => '?').join(', ');
+  const currentFacts = db.prepare(`SELECT relation_id AS relationId, run_id AS runId,
+      from_registry_id AS fromRegistryId, to_registry_id AS toRegistryId,
+      relation_type AS relationType, created_at AS createdAt
+    FROM demo_data_relations
+    WHERE from_registry_id IN (${placeholders}) OR to_registry_id IN (${placeholders})
+    ORDER BY relation_id`).all(...registryIds, ...registryIds);
+  const normalizedExpectedFacts = [...expectedFacts]
+    .sort((left, right) => Number(left.relationId) - Number(right.relationId));
+  if (sha256Stable(currentFacts) !== sha256Stable(normalizedExpectedFacts)) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_RECEIPT_RELATION_MISMATCH',
+      '策略评价 registrar receipt relation 完整集合已缺失、增加或被改写。',
+      null,
+      409
+    );
+  }
 }
 
 /**
@@ -4723,11 +7384,12 @@ function assertStrategyWitnessReturnSnapshots(db, evaluationRun, hitIds, witness
 function registerDerivedStrategyEvaluationInTransaction(input = {}) {
   assertExactPlainObjectFields(
     input,
-    ['db', 'registrationScope', 'evaluationWitness'],
+    ['registrarAuthority', 'db', 'registrationScope', 'evaluationWitness'],
     'DEMO_DERIVED_STRATEGY_INPUT_INVALID',
-    '策略评价 derived ownership 只能接收 db、registrationScope 和 evaluationWitness。'
+    '策略评价 derived ownership 只能接收 evaluator 固定私有协议字段。'
   );
   const db = input.db;
+  const registrationScope = input.registrationScope;
   if (!db || db.inTransaction !== true) {
     throw createDemoOwnershipError(
       'DEMO_DERIVED_OWNERSHIP_TRANSACTION_REQUIRED',
@@ -4738,32 +7400,32 @@ function registerDerivedStrategyEvaluationInTransaction(input = {}) {
   }
   const scopeState = requireStrategyRegistrationScopeState(
     db,
-    input.registrationScope,
+    registrationScope,
     ['active']
   );
-  const run = requireDemoDatasetRun(db, scopeState.runId);
-  const actorUserId = requireDemoOwnershipActor(db, { actorUserId: scopeState.actorUserId });
-  requireStrategyDerivedActionRun(db, scopeState, run);
-  rotateStrategyRegistrationScopeLiveness(input.registrationScope, scopeState);
-  const savepointName = createStrategyRegistrationSavepointName('demo_strategy_registrar');
-  db.exec(`SAVEPOINT ${savepointName}`);
-  let savepointActive = true;
+  let run = null;
+  let actorUserId = null;
+  let savepointName = null;
+  let savepointActive = false;
   try {
-    const witnessState = consumeEnergyStrategyEvaluationCompletionWitness({
+    run = requireDemoDatasetRun(db, scopeState.runId);
+    actorUserId = requireDemoOwnershipActor(db, { actorUserId: scopeState.actorUserId });
+    requireStrategyDerivedActionRun(db, scopeState, run);
+    savepointName = createStrategyRegistrationSavepointName('demo_strategy_registrar');
+    db.exec(`SAVEPOINT ${savepointName}`);
+    savepointActive = true;
+  } catch (error) {
+    scopeState.status = 'failed';
+    throw error;
+  }
+  try {
+    const witnessState = getEnergyStrategyEvaluatorProtocol().consumeWitness({
+      registrarAuthority: input.registrarAuthority,
       db,
-      registrationScope: input.registrationScope,
-      exactScope: scopeState.exactScope,
+      registrationScope,
       evaluationWitness: input.evaluationWitness
     });
-    scopeState.status = 'consumed';
-    if (witnessState.registrationScope !== input.registrationScope) {
-      throw createDemoOwnershipError(
-        'DEMO_DERIVED_STRATEGY_WITNESS_BINDING_MISMATCH',
-        '策略评价 completion witness 与 registration scope 对象身份不一致。',
-        null,
-        409
-      );
-    }
+    scopeState.status = 'registering';
     const sourceSets = assertStrategyWitnessScopeBindings(scopeState, witnessState);
     const evaluationRunId = normalizeIntegerEntityPk(witnessState.evaluationRunId);
     if (!evaluationRunId) {
@@ -4878,13 +7540,21 @@ function registerDerivedStrategyEvaluationInTransaction(input = {}) {
       entityPk: evaluationRunId,
       row: evaluationRun
     });
+    const registryRegisteredAt = new Date().toISOString();
     const registrations = [
-      registerSingleDerivedStrategyEntityInTransaction(db, run, actorUserId, runContract),
+      registerSingleDerivedStrategyEntityInTransaction(
+        db,
+        run,
+        actorUserId,
+        runContract,
+        registryRegisteredAt
+      ),
       ...hitContracts.map((contract) => registerSingleDerivedStrategyEntityInTransaction(
         db,
         run,
         actorUserId,
-        contract
+        contract,
+        registryRegisteredAt
       ))
     ];
     const relationIntents = [];
@@ -4910,9 +7580,10 @@ function registerDerivedStrategyEvaluationInTransaction(input = {}) {
       });
     });
     assertStrategyDerivedRelationsExact(db, relationIntents, registrations);
+    const relationCreatedAt = new Date().toISOString();
     const relations = registerDemoRelationsInTransaction(
       db,
-      { runId: run.runId },
+      { runId: run.runId, createdAt: relationCreatedAt },
       relationIntents
     );
     if (relations.length !== (2 * hitRows.length) + sourceSets.timeseriesIds.length) {
@@ -4923,48 +7594,209 @@ function registerDerivedStrategyEvaluationInTransaction(input = {}) {
         409
       );
     }
+    const registryIntents = registrations.map((item) => (
+      buildExpectedStrategyRegistryFact(
+        item.registryId,
+        run,
+        actorUserId,
+        item,
+        item.registeredAt
+      )
+    ));
+    const registryFacts = registrations.map((item) => (
+      readStrategyReceiptRegistryFact(db, Number(item.registryId))
+    ));
+    const relationIntentsForReceipt = relationIntents.map((intent, index) => {
+      const from = registrations.find((item) => (
+        item.entityType === intent.from.entityType && item.entityPk === intent.from.entityPk
+      )) || readActiveRegistryEntity(db, intent.from.entityType, intent.from.entityPk);
+      const to = registrations.find((item) => (
+        item.entityType === intent.to.entityType && item.entityPk === intent.to.entityPk
+      )) || readActiveRegistryEntity(db, intent.to.entityType, intent.to.entityPk);
+      const relation = relations[index];
+      return {
+        relationId: Number(relation.relationId),
+        runId: run.runId,
+        fromRegistryId: Number(from.registryId),
+        toRegistryId: Number(to.registryId),
+        relationType: intent.relationType,
+        createdAt: relation.createdAt || relationCreatedAt
+      };
+    });
+    const relationFacts = relations.map((item) => (
+      readStrategyReceiptRelationFact(db, Number(item.relationId))
+    ));
+    if (registryFacts.some((item) => !item) || relationFacts.some((item) => !item)) {
+      throw createDemoOwnershipError(
+        'DEMO_DERIVED_STRATEGY_RECEIPT_FACTS_MISSING',
+        '策略评价 registrar 写入后无法读取完整 registry/relation 事实。',
+        null,
+        409
+      );
+    }
+    assertStrategyRegistrarIntentFacts(
+      registryIntents,
+      registryFacts,
+      'DEMO_DERIVED_STRATEGY_REGISTRY_CONTRACT_MISMATCH',
+      '策略评价 registry 持久事实与 registrar contract 不一致。'
+    );
+    assertStrategyRegistrarIntentFacts(
+      relationIntentsForReceipt,
+      relationFacts,
+      'DEMO_DERIVED_STRATEGY_RELATION_INTENT_MISMATCH',
+      '策略评价 relation 持久事实与 registrar intent 不一致。'
+    );
+    const operationAuditFact = assertStrategyWitnessOperationAudit(db, witnessState);
+    const receipt = Object.freeze({});
+    const receiptFacts = {
+      registrarAuthority: input.registrarAuthority,
+      db,
+      registrationScope,
+      evaluationWitness: input.evaluationWitness,
+      runId: run.runId,
+      evaluationRunId,
+      operationAuditId: witnessState.operationAuditId,
+      operationAuditFact: cloneFrozenStrategyOwnershipSnapshot(operationAuditFact),
+      registryIntents: cloneFrozenStrategyOwnershipSnapshot(registryIntents),
+      relationIntents: cloneFrozenStrategyOwnershipSnapshot(relationIntentsForReceipt),
+      registryFacts: cloneFrozenStrategyOwnershipSnapshot(registryFacts),
+      relationFacts: cloneFrozenStrategyOwnershipSnapshot(relationFacts),
+      status: 'issued'
+    };
     db.exec(`RELEASE SAVEPOINT ${savepointName}`);
     savepointActive = false;
-    return {
-      registrationCount: registrations.length,
-      relationCount: relations.length,
-      registrations,
-      relations,
-      evaluationRunId,
-      hitIds,
-      sourceTimeseriesIds: sourceSets.timeseriesIds,
-      strategyRuleIds
-    };
+    scopeState.status = 'registered';
+    DEMO_STRATEGY_RECEIPT_STATE.set(receipt, receiptFacts);
+    return receipt;
   } catch (error) {
-    scopeState.status = scopeState.status === 'consumed' ? 'consumed' : 'failed';
-    markEnergyStrategyRegistrationScopeFailed(input.registrationScope);
+    scopeState.status = 'failed';
     if (savepointActive) {
-      let rollbackError = null;
-      let releaseError = null;
-      try {
-        db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
-      } catch (recoveryError) {
-        rollbackError = recoveryError;
-      }
-      try {
-        db.exec(`RELEASE SAVEPOINT ${savepointName}`);
-      } catch (recoveryError) {
-        releaseError = recoveryError;
-      }
+      const recovery = db.inTransaction === true
+        ? recoverStrategyRegistrarSavepoint(db, savepointName)
+        : { rollbackError: null, releaseError: null, fullRollbackError: null, closeError: null };
       savepointActive = false;
-      if (rollbackError || releaseError) {
+      if (recovery.rollbackError || recovery.releaseError
+        || recovery.fullRollbackError || recovery.closeError) {
         throw createDemoOwnershipError(
           'DEMO_DERIVED_STRATEGY_REGISTRAR_RECOVERY_FAILED',
           '策略评价 registrar 私有 SAVEPOINT 恢复失败，禁止继续提交外层事务。',
           {
             originalCode: error.code || error.details?.code || null,
-            rollbackCode: rollbackError?.code || null,
-            releaseCode: releaseError?.code || null
+            rollbackCode: recovery.rollbackError?.code || null,
+            releaseCode: recovery.releaseError?.code || null,
+            fullRollbackCode: recovery.fullRollbackError?.code || null,
+            closeCode: recovery.closeError?.code || null
           },
           500
         );
       }
     }
+    if (db.inTransaction === true && scopeState.markerId) {
+      try {
+        cleanupStrategyScopeMarker(db, scopeState);
+      } catch (cleanupError) {
+        const failClosed = failClosedStrategyRegistrarTransaction(db);
+        throw createDemoOwnershipError(
+          'DEMO_DERIVED_STRATEGY_REGISTRAR_RECOVERY_FAILED',
+          '策略评价 registrar 失败后无法清理事务 marker，已完整回滚外层事务。',
+          {
+            originalCode: error.code || error.details?.code || null,
+            cleanupCode: cleanupError.code || cleanupError.details?.code || null,
+            fullRollbackCode: failClosed.fullRollbackError?.code || null,
+            closeCode: failClosed.closeError?.code || null
+          },
+          500
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+/**
+ * 在 evaluator 外层 SAVEPOINT 释放前一次性验证 registrar receipt 的原始身份和完整持久事实。
+ * clone、JSON clone、错库、错 scope、错 witness 和重放均 fail-closed。
+ */
+function verifyDerivedStrategyEvaluationReceiptInTransaction(input = {}) {
+  assertExactPlainObjectFields(
+    input,
+    ['registrarAuthority', 'db', 'registrationScope', 'evaluationWitness', 'receipt'],
+    'DEMO_DERIVED_STRATEGY_RECEIPT_INPUT_INVALID',
+    '策略评价 registrar receipt verifier 只能接收固定私有协议字段。'
+  );
+  const receiptFacts = input.receipt && typeof input.receipt === 'object'
+    ? DEMO_STRATEGY_RECEIPT_STATE.get(input.receipt)
+    : null;
+  if (!receiptFacts) {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_RECEIPT_CAPABILITY_REQUIRED',
+      '策略评价必须使用正式 registrar 返回的原始 receipt。',
+      null,
+      409
+    );
+  }
+  if (DEMO_STRATEGY_RECEIPT_CONSUMED.has(input.receipt) || receiptFacts.status !== 'issued') {
+    throw createDemoOwnershipError(
+      'DEMO_DERIVED_STRATEGY_RECEIPT_REPLAY',
+      '策略评价 registrar receipt 已消费或失效。',
+      null,
+      409
+    );
+  }
+  let scopeState = null;
+  try {
+    if (input.registrarAuthority !== receiptFacts.registrarAuthority) {
+      throw createDemoOwnershipError(
+        'DEMO_DERIVED_STRATEGY_RECEIPT_AUTHORITY_MISMATCH',
+        '策略评价 registrar receipt authority 对象身份不一致。',
+        null,
+        409
+      );
+    }
+    if (input.db !== receiptFacts.db || input.db?.inTransaction !== true) {
+      throw createDemoOwnershipError(
+        'DEMO_DERIVED_STRATEGY_RECEIPT_TRANSACTION_MISMATCH',
+        '策略评价 registrar receipt 必须在原 caller transaction 中验证。',
+        null,
+        409
+      );
+    }
+    if (input.registrationScope !== receiptFacts.registrationScope
+      || input.evaluationWitness !== receiptFacts.evaluationWitness) {
+      throw createDemoOwnershipError(
+        'DEMO_DERIVED_STRATEGY_RECEIPT_BINDING_MISMATCH',
+        '策略评价 registrar receipt 与 registration scope 或 completion witness 不一致。',
+        null,
+        409
+      );
+    }
+    scopeState = requireStrategyRegistrationScopeState(
+      input.db,
+      input.registrationScope,
+      ['registered']
+    );
+    if (scopeState.runId !== receiptFacts.runId) {
+      throw createDemoOwnershipError(
+        'DEMO_DERIVED_STRATEGY_RECEIPT_RUN_MISMATCH',
+        '策略评价 registrar receipt 与演示 run 绑定不一致。',
+        null,
+        409
+      );
+    }
+    assertStrategyWitnessOperationAudit(input.db, {
+      operationAuditId: receiptFacts.operationAuditId,
+      operationAuditSnapshot: receiptFacts.operationAuditFact
+    });
+    const registryIds = assertStrategyReceiptRegistryFacts(input.db, receiptFacts);
+    assertStrategyReceiptRelationFacts(input.db, receiptFacts, registryIds);
+    cleanupStrategyScopeMarker(input.db, scopeState);
+    receiptFacts.status = 'consumed';
+    DEMO_STRATEGY_RECEIPT_CONSUMED.add(input.receipt);
+    scopeState.status = 'consumed';
+    return true;
+  } catch (error) {
+    receiptFacts.status = 'failed';
+    if (scopeState && scopeState.status !== 'consumed') scopeState.status = 'failed';
     throw error;
   }
 }
@@ -5011,6 +7843,40 @@ function refreshDerivedStrategyRuleHitOwnershipInTransaction(input = {}) {
   };
 }
 
+/** 读取当前 run 中指定 artifact/entity 的 active imported registry，关系准备只使用服务端已登记事实。 */
+function readActiveImportedStrategyInputRegistryRows(db, runId, artifactKey, entityType) {
+  return db.prepare(`SELECT registry_id AS registryId, entity_pk AS entityPk
+    FROM demo_data_registry
+    WHERE run_id = ? AND artifact_key = ? AND entity_type = ?
+      AND ownership_kind = 'imported' AND cleaned_at IS NULL
+    ORDER BY registry_id`).all(runId, artifactKey, entityType).map((row) => ({
+    registryId: Number(row.registryId),
+    entityPk: String(row.entityPk)
+  }));
+}
+
+/** 构造 artifact 15 时序到 artifact 18 规则的 imported uses_config 笛卡尔闭包。 */
+function buildStrategyInputRelationClosureInTransaction(db, context) {
+  if (!context || !DEMO_STRATEGY_INPUT_ARTIFACT_KEYS.has(context.artifactKey)) return [];
+  const timeseriesRows = readActiveImportedStrategyInputRegistryRows(
+    db,
+    context.runId,
+    '15-energy-timeseries',
+    'energy_timeseries'
+  );
+  const ruleRows = readActiveImportedStrategyInputRegistryRows(
+    db,
+    context.runId,
+    '18-strategy-rules',
+    'strategy_rule'
+  );
+  return timeseriesRows.flatMap((timeseries) => ruleRows.map((rule) => ({
+    from: { entityType: 'energy_timeseries', entityPk: timeseries.entityPk },
+    to: { entityType: 'strategy_rule', entityPk: rule.entityPk },
+    relationType: 'uses_config'
+  })));
+}
+
 /**
  * 在当前 ownership 私有事务内登记本次 imported ownership、批次关系和必要 relation。
  * 无 demoContext 时明确返回正式导入 no-op；存在无效 context 时复用现有校验并 fail-closed。
@@ -5031,6 +7897,15 @@ function registerImportedDemoOwnershipInTransaction(input = {}) {
   const db = scopeState.privateDb;
   const actorUserId = requireDemoOwnershipActor(db, input);
   const demoContext = input.demoContext;
+  if (demoContext.artifactKey === DEMO_PREDICTION_CONFIG_IMPORT_BINDING.artifactKey
+    && scopeState.managedPredictionOperationActive !== true) {
+    throw createDemoOwnershipError(
+      'DEMO_PREDICTION_CONFIG_OPERATION_REQUIRED',
+      'Artifact 12 ownership 只能由单一 managed operation 登记。',
+      null,
+      409
+    );
+  }
   const artifact = requireDemoArtifactHandler(demoContext.artifactKey, demoContext.handlerKey);
   const context = validateDemoContext({
     token: demoContext.token,
@@ -5108,7 +7983,19 @@ function registerImportedDemoOwnershipInTransaction(input = {}) {
   const registrations = insertedRecords.map((record) => (
     registerSingleImportedRecordInTransaction(db, context, record, actorUserId)
   ));
-  const relations = registerDemoRelationsInTransaction(db, context, input.relations);
+  // 调用方领域关系与固定 strategy 输入关系分别校验登记，避免相同合法关系在单次输入中被误判为重复。
+  const requestedRelations = registerDemoRelationsInTransaction(db, context, input.relations);
+  // strategy 输入关系由已完成 imported ownership 登记后的服务端事实构造，不接受 preview 或请求正文补写。
+  const strategyInputRelations = registerDemoRelationsInTransaction(
+    db,
+    context,
+    buildStrategyInputRelationClosureInTransaction(db, context)
+  );
+  const relationsById = new Map();
+  [...requestedRelations, ...strategyInputRelations].forEach((relation) => {
+    relationsById.set(Number(relation.relationId), relation);
+  });
+  const relations = [...relationsById.values()];
   const activeScopeState = requireDemoOwnershipTransactionScope(transactionScope);
   input.insertedRecords.forEach((record) => activeScopeState.pendingWitnesses.delete(record.rowWitness));
   return {
@@ -5136,6 +8023,1472 @@ function registerImportedDemoOwnershipInTransaction(input = {}) {
   };
 }
 
+/** 一次性捕获 prediction service 的非枚举 managed core 协议。 */
+function getPredictionConfigManagedCoreProtocol() {
+  if (predictionConfigManagedCoreProtocol) return predictionConfigManagedCoreProtocol;
+  const predictionService = require('./predictionService');
+  const protocol = predictionService[PREDICTION_CONFIG_MANAGED_CORE_PROTOCOL_SYMBOL];
+  const requiredHandlers = [
+    'assertBatchMatches', 'getAuditSummary', 'getBatch', 'getConfigById',
+    'projectAuditIssues', 'projectBackup', 'projectOwnership', 'rebuildPreview'
+  ];
+  if (!protocol || requiredHandlers.some((fieldName) => typeof protocol[fieldName] !== 'function')
+    || typeof protocol.backupReason !== 'string') {
+    throw createDemoOwnershipError(
+      'DEMO_PREDICTION_CONFIG_CORE_PROTOCOL_UNAVAILABLE',
+      'Artifact 12 prediction config managed core 协议未完成初始化。',
+      null,
+      500
+    );
+  }
+  predictionConfigManagedCoreProtocol = Object.freeze({
+    assertBatchMatches: protocol.assertBatchMatches,
+    backupReason: protocol.backupReason,
+    getAuditSummary: protocol.getAuditSummary,
+    getBatch: protocol.getBatch,
+    getConfigById: protocol.getConfigById,
+    projectAuditIssues: protocol.projectAuditIssues,
+    projectBackup: protocol.projectBackup,
+    projectOwnership: protocol.projectOwnership,
+    rebuildPreview: protocol.rebuildPreview
+  });
+  return predictionConfigManagedCoreProtocol;
+}
+
+/** 触发 Artifact 12 固定阶段故障注入，不向测试钩子暴露 SQLite 连接或事务 scope。 */
+function invokeManagedPredictionOperationFault(intent, stage, facts = {}) {
+  if (typeof intent.faultInjector === 'function') {
+    intent.faultInjector(stage, Object.freeze({ ...facts }));
+  }
+}
+
+/** 读取并投影 import_errors 的 exact canonical 集合。 */
+function readManagedPredictionAuditIssues(db, batchId) {
+  return db.prepare(`SELECT row_number AS rowNumber, field_name AS fieldName,
+      raw_value AS rawValue, error_code AS errorCode,
+      error_reason AS errorReason, severity
+    FROM import_errors WHERE batch_id = ? ORDER BY row_number, id`).all(batchId).map((issue) => ({
+    rowNumber: Number(issue.rowNumber),
+    fieldName: issue.fieldName,
+    rawValue: issue.rawValue,
+    errorCode: issue.errorCode,
+    errorReason: issue.errorReason,
+    severity: issue.severity
+  }));
+}
+
+/** 比较 retained 重建结果与持久行级审计的 exact canonical 集合。 */
+function assertManagedPredictionAuditIssuesMatch(db, batchId, expectedIssues) {
+  const actualIssues = readManagedPredictionAuditIssues(db, batchId);
+  if (JSON.stringify(actualIssues) !== JSON.stringify(expectedIssues)) {
+    throw createManagedPredictionClosureError('prediction-import-errors-drift', {
+      batchId,
+      expectedCount: expectedIssues.length,
+      actualCount: actualIssues.length
+    });
+  }
+  return actualIssues;
+}
+
+/** 快照受控备份目录中的既有文件名，用于证明补偿目标由当前 operation 新建。 */
+function snapshotManagedPredictionBackupNames(backupRoot = defaultBackupsDir) {
+  try {
+    const rootPath = path.resolve(backupRoot);
+    const rootStat = fs.lstatSync(rootPath);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return new Set();
+    return new Set(fs.readdirSync(rootPath, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return new Set();
+    throw error;
+  }
+}
+
+/** 仅为当前 operation 新建且具备 exact name/size/SHA 的备份建立补偿删除凭据。 */
+function buildManagedPredictionBackupCompensation(backupRoot, backup, existingNames) {
+  const backupName = typeof backup?.backupName === 'string'
+    ? backup.backupName
+    : null;
+  const sizeBytes = Number(backup?.sizeBytes);
+  const sha256 = typeof backup?.sha256 === 'string'
+    ? backup.sha256
+    : null;
+  const safeToDelete = Boolean(
+    backup && typeof backup === 'object' && !Array.isArray(backup)
+    && backupName && backupName === path.basename(backupName)
+    && !existingNames.has(backupName)
+    && Number.isSafeInteger(sizeBytes) && sizeBytes > 0
+    && sha256 && /^[0-9a-f]{64}$/.test(sha256)
+  );
+  return Object.freeze({
+    backupRoot: path.resolve(backupRoot),
+    backupName,
+    sizeBytes: Number.isSafeInteger(sizeBytes) ? sizeBytes : null,
+    sha256,
+    safeToDelete
+  });
+}
+
+/** 回滚后按 exact name/size/SHA 删除当前 operation 新建的备份，任何漂移均拒绝删除。 */
+function compensateManagedPredictionBackupFile(compensation) {
+  if (!compensation) return { attempted: false, deleted: false };
+  if (compensation.safeToDelete !== true) {
+    throw createManagedPredictionClosureError('prediction-backup-compensation-credential-invalid', {
+      backupName: compensation.backupName || null
+    });
+  }
+  const safeBackup = readSafeUploadFile(
+    compensation.backupRoot,
+    compensation.backupName,
+    { expectedSizeBytes: compensation.sizeBytes }
+  );
+  if (safeBackup.fileSha256 !== compensation.sha256) {
+    throw createManagedPredictionClosureError('prediction-backup-compensation-sha256-mismatch', {
+      backupName: compensation.backupName
+    });
+  }
+  const quarantineName = `.prediction-backup-rollback-${crypto.randomUUID()}.tmp`;
+  const quarantinePath = path.join(compensation.backupRoot, quarantineName);
+  fs.renameSync(safeBackup.filePath, quarantinePath);
+  try {
+    const quarantinedBackup = readSafeUploadFile(
+      compensation.backupRoot,
+      quarantineName,
+      { expectedSizeBytes: compensation.sizeBytes }
+    );
+    if (quarantinedBackup.fileSha256 !== compensation.sha256) {
+      throw createManagedPredictionClosureError('prediction-backup-compensation-sha256-mismatch', {
+        backupName: compensation.backupName
+      });
+    }
+    fs.rmSync(quarantinedBackup.filePath, { force: false });
+  } catch (error) {
+    const originalPath = path.join(compensation.backupRoot, compensation.backupName);
+    try {
+      if (fs.existsSync(quarantinePath) && !fs.existsSync(originalPath)) {
+        fs.renameSync(quarantinePath, originalPath);
+      }
+    } catch (_restoreError) {
+      // 保留原 cleanup error；安全审计会记录补偿失败，且不得删除无法复验的文件。
+    }
+    throw error;
+  }
+  return { attempted: true, deleted: true };
+}
+
+/** 补偿清理失败时持久记录安全审计；审计失败则输出最小安全日志，均不得覆盖原业务错误。 */
+function reportManagedPredictionBackupCompensationFailure(state, compensation, cleanupError) {
+  const detail = {
+    backupName: compensation?.backupName || null,
+    sizeBytes: compensation?.sizeBytes || null,
+    sha256: compensation?.sha256 || null,
+    cleanupCode: cleanupError?.details?.code || cleanupError?.code || 'UNKNOWN'
+  };
+  try {
+    recordOperation({
+      userId: state.managedPredictionActorUserId || null,
+      operation: 'prediction.config.import.backup.compensation.failed',
+      targetType: 'prediction_config_import',
+      targetId: state.managedPredictionBatchId || null,
+      detail,
+      ip: state.managedPredictionActorIp || null,
+      db: state.privateDb
+    });
+  } catch (auditError) {
+    console.error('[prediction-backup-compensation-failed]', JSON.stringify({
+      batchId: state.managedPredictionBatchId || null,
+      backupName: detail.backupName,
+      cleanupCode: detail.cleanupCode,
+      auditCode: auditError?.details?.code || auditError?.code || 'UNKNOWN'
+    }));
+  }
+}
+
+/** 校验 mandatory backup 元数据与受控目录中的实际文件 size/SHA。 */
+function verifyManagedPredictionBackupFile(
+  backup,
+  backupRoot = defaultBackupsDir,
+  expectedReason = null
+) {
+  const expectedFields = [
+    'backupName', 'reason', 'method', 'sizeBytes',
+    'createdAt', 'updatedAt', 'sha256'
+  ].sort();
+  const actualFields = backup && typeof backup === 'object' && !Array.isArray(backup)
+    ? Object.keys(backup).sort()
+    : [];
+  if (!backup || typeof backup !== 'object' || Array.isArray(backup)
+    || actualFields.length !== expectedFields.length
+    || actualFields.some((fieldName, index) => fieldName !== expectedFields[index])
+    || typeof backup.backupName !== 'string' || !backup.backupName
+    || typeof backup.reason !== 'string' || !backup.reason
+    || (expectedReason !== null && backup.reason !== expectedReason)
+    || typeof backup.method !== 'string' || !backup.method
+    || typeof backup.createdAt !== 'string' || !DEMO_UTC_MILLISECOND_PATTERN.test(backup.createdAt)
+    || typeof backup.updatedAt !== 'string' || !DEMO_UTC_MILLISECOND_PATTERN.test(backup.updatedAt)
+    || !Number.isSafeInteger(Number(backup.sizeBytes)) || Number(backup.sizeBytes) < 1
+    || typeof backup.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(backup.sha256)) {
+    throw createManagedPredictionClosureError('prediction-backup-metadata-invalid');
+  }
+  let safeBackup;
+  try {
+    safeBackup = readSafeUploadFile(backupRoot, backup.backupName, {
+      expectedSizeBytes: Number(backup.sizeBytes)
+    });
+  } catch (error) {
+    throw createManagedPredictionClosureError('prediction-backup-file-invalid', {
+      backupName: backup.backupName,
+      causeCode: error?.details?.code || error?.code || null
+    });
+  }
+  if (safeBackup.fileSha256 !== backup.sha256) {
+    throw createManagedPredictionClosureError('prediction-backup-file-sha256-invalid', {
+      backupName: backup.backupName
+    });
+  }
+  return safeBackup;
+}
+
+/** 计算 Artifact 12 retained/audit/backup/business/ownership 的 stable closure digest。 */
+function calculateManagedPredictionConfigClosureDigest(input) {
+  return sha256Stable({
+    domain: 'artifact-12-managed-retained-closure:v1',
+    runId: input.runId,
+    contextId: input.contextId,
+    batchId: Number(input.batchId),
+    trainingBatchId: Number(input.trainingBatchId),
+    retainedFileSha256: input.retainedFileSha256,
+    previewSignature: input.previewSignature,
+    previewAuditDigest: input.previewAuditDigest,
+    auditIssues: input.auditIssues,
+    backup: input.backup,
+    configId: Number(input.configId),
+    identityDigest: input.identityDigest,
+    snapshotDigest: input.snapshotDigest
+  });
+}
+
+/** 构造 Artifact 12 闭包校验的稳定冲突错误。 */
+function createManagedPredictionClosureError(reason, details = null) {
+  return createDemoOwnershipError(
+    'DEMO_PREDICTION_CONFIG_CLOSURE_INVALID',
+    'Artifact 12 预测配置 managed 闭包不完整或已漂移。',
+    { reason, ...(details || {}) },
+    409
+  );
+}
+
+/** 读取 Artifact 12 context，并校验其仍属于固定 run、actor、runtime 和 manifest。 */
+function readManagedPredictionContext(db, contextId) {
+  const context = db.prepare(`SELECT context_id AS contextId, run_id AS runId,
+      dataset_id AS datasetId, manifest_version AS manifestVersion,
+      manifest_digest AS manifestDigest, artifact_key AS artifactKey,
+      handler_key AS handlerKey, artifact_file_sha256 AS artifactFileSha256,
+      issued_to_user_id AS issuedToUserId, runtime_epoch AS runtimeEpoch,
+      status, issued_at AS issuedAt, expires_at AS expiresAt,
+      upload_file_sha256 AS uploadFileSha256, preview_digest AS previewDigest,
+      previewed_at AS previewedAt, executed_at AS executedAt
+    FROM demo_import_contexts WHERE context_id = ?`).get(contextId);
+  if (!context
+    || context.artifactKey !== DEMO_PREDICTION_CONFIG_IMPORT_BINDING.artifactKey
+    || context.handlerKey !== DEMO_PREDICTION_CONFIG_IMPORT_BINDING.handlerKey
+    || !['previewed', 'executed'].includes(context.status)) {
+    throw createManagedPredictionClosureError('prediction-context-invalid', { contextId });
+  }
+  return context;
+}
+
+/** 从同一 run 重建并严格复验 Artifact 07 唯一 executed primary 训练批次。 */
+function readManagedMonthlyEnergyPrimaryForPrediction(db, predictionContextId, state = null) {
+  const predictionContext = readManagedPredictionContext(db, predictionContextId);
+  const energyContexts = db.prepare(`SELECT context_id AS contextId, run_id AS runId,
+      dataset_id AS datasetId, manifest_version AS manifestVersion,
+      manifest_digest AS manifestDigest, artifact_key AS artifactKey,
+      handler_key AS handlerKey, issued_to_user_id AS issuedToUserId,
+      runtime_epoch AS runtimeEpoch, status, preview_digest AS previewDigest
+    FROM demo_import_contexts
+    WHERE run_id = ? AND artifact_key = ? AND handler_key = ? AND status = 'executed'
+    ORDER BY context_id`).all(
+    predictionContext.runId,
+    DEMO_MANAGED_DIRECT_IMPORT_BINDING.artifactKey,
+    DEMO_MANAGED_DIRECT_IMPORT_BINDING.handlerKey
+  );
+  if (energyContexts.length !== 1) {
+    throw createManagedPredictionClosureError('monthly-energy-executed-context-count-invalid', {
+      runId: predictionContext.runId,
+      contextCount: energyContexts.length
+    });
+  }
+  const energyContext = energyContexts[0];
+  if (energyContext.runId !== predictionContext.runId
+    || energyContext.datasetId !== predictionContext.datasetId
+    || energyContext.manifestVersion !== predictionContext.manifestVersion
+    || energyContext.manifestDigest !== predictionContext.manifestDigest
+    || energyContext.runtimeEpoch !== predictionContext.runtimeEpoch
+    || Number(energyContext.issuedToUserId) !== Number(predictionContext.issuedToUserId)
+    || energyContext.artifactKey !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.artifactKey
+    || energyContext.handlerKey !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.handlerKey
+    || !energyContext.previewDigest) {
+    throw createManagedPredictionClosureError('monthly-energy-context-binding-invalid', {
+      contextId: energyContext.contextId
+    });
+  }
+  const bindings = db.prepare(`SELECT rib.run_id AS runId, rib.artifact_key AS artifactKey,
+      rib.context_id AS contextId, rib.import_batch_id AS batchId,
+      rib.batch_role AS batchRole, ib.import_type AS importType
+    FROM demo_run_import_batches rib
+    JOIN import_batches ib ON ib.id = rib.import_batch_id
+    WHERE rib.context_id = ?
+    ORDER BY rib.batch_role, rib.import_batch_id`).all(energyContext.contextId);
+  if (bindings.length !== 1
+    || bindings[0].runId !== predictionContext.runId
+    || bindings[0].artifactKey !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.artifactKey
+    || bindings[0].contextId !== energyContext.contextId
+    || bindings[0].batchRole !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.batchRole
+    || bindings[0].importType !== DEMO_MANAGED_DIRECT_IMPORT_BINDING.importType) {
+    throw createManagedPredictionClosureError('monthly-energy-primary-binding-invalid', {
+      contextId: energyContext.contextId
+    });
+  }
+  const batchId = Number(bindings[0].batchId);
+  const closureState = state || { privateDb: db, pendingWitnesses: new Set() };
+  const facts = verifyManagedDirectCompletedClosure(closureState, {
+    batchId,
+    contextId: energyContext.contextId,
+    runId: predictionContext.runId,
+    actorUserId: Number(predictionContext.issuedToUserId),
+    previewDigest: energyContext.previewDigest,
+    expectedContextStatus: 'executed'
+  });
+  if (facts.writesBusinessRecords !== true || facts.statistics.successCount < 1) {
+    throw createManagedPredictionClosureError('monthly-energy-business-rows-required', { batchId });
+  }
+  return {
+    batchId,
+    contextId: energyContext.contextId,
+    runId: predictionContext.runId,
+    recordCount: facts.statistics.successCount,
+    ownershipClosureDigest: facts.ownershipClosureDigest
+  };
+}
+
+/** 复验 Artifact 12 唯一 draft 配置、execute audit、binding 与 active imported ownership。 */
+function readManagedPredictionConfigClosure(db, input) {
+  const context = readManagedPredictionContext(db, input.contextId);
+  if (context.status !== input.expectedContextStatus
+    || context.runId !== input.runId
+    || Number(context.issuedToUserId) !== Number(input.actorUserId)
+    || context.artifactFileSha256 !== input.retainedFileSha256
+    || context.uploadFileSha256 !== input.retainedFileSha256) {
+    throw createManagedPredictionClosureError('prediction-context-terminal-facts-invalid', {
+      contextId: input.contextId
+    });
+  }
+  const bindings = db.prepare(`SELECT run_id AS runId, artifact_key AS artifactKey,
+      context_id AS contextId, import_batch_id AS batchId, batch_role AS batchRole
+    FROM demo_run_import_batches WHERE context_id = ?
+    ORDER BY batch_role, import_batch_id`).all(input.contextId);
+  if (bindings.length !== 1
+    || bindings[0].runId !== context.runId
+    || bindings[0].artifactKey !== DEMO_PREDICTION_CONFIG_IMPORT_BINDING.artifactKey
+    || bindings[0].contextId !== context.contextId
+    || Number(bindings[0].batchId) !== Number(input.batchId)
+    || bindings[0].batchRole !== DEMO_PREDICTION_CONFIG_IMPORT_BINDING.batchRole) {
+    throw createManagedPredictionClosureError('prediction-primary-binding-invalid', {
+      batchId: input.batchId
+    });
+  }
+  const executedContexts = db.prepare(`SELECT context_id AS contextId
+    FROM demo_import_contexts
+    WHERE run_id = ? AND artifact_key = ? AND handler_key = ? AND status = 'executed'
+    ORDER BY context_id`).all(
+    context.runId,
+    DEMO_PREDICTION_CONFIG_IMPORT_BINDING.artifactKey,
+    DEMO_PREDICTION_CONFIG_IMPORT_BINDING.handlerKey
+  );
+  const executedContextValid = input.expectedContextStatus === 'previewed'
+    ? executedContexts.length === 0
+    : executedContexts.length === 1 && executedContexts[0].contextId === context.contextId;
+  if (!executedContextValid) {
+    throw createManagedPredictionClosureError('prediction-executed-context-count-invalid', {
+      runId: context.runId,
+      contextCount: executedContexts.length
+    });
+  }
+  const batch = db.prepare(`SELECT import_type AS importType, status,
+      audit_phase AS auditPhase, preview_signature AS previewSignature,
+      preview_audit_digest AS previewDigest, execute_result_json AS executeResultJson,
+      backup_json AS backupJson, file_sha256 AS fileSha256,
+      total_rows AS totalRows, success_count AS successCount,
+      failure_count AS failureCount, skipped_count AS skippedCount
+    FROM import_batches WHERE id = ?`).get(input.batchId);
+  const statistics = batch ? {
+    totalRows: Number(batch.totalRows),
+    successCount: Number(batch.successCount),
+    failureCount: Number(batch.failureCount),
+    skippedCount: Number(batch.skippedCount)
+  } : null;
+  if (!batch || batch.importType !== DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType
+    || !['completed', 'completed_with_errors'].includes(batch.status)
+    || batch.auditPhase !== 'execute' || batch.previewDigest !== context.previewDigest
+    || batch.previewDigest !== input.preview.previewAuditDigest
+    || batch.previewSignature !== input.preview.previewSignature
+    || batch.fileSha256 !== input.retainedFileSha256
+    || !statistics || statistics.successCount !== 1
+    || statistics.totalRows < 1
+    || statistics.successCount + statistics.failureCount + statistics.skippedCount !== statistics.totalRows) {
+    throw createManagedPredictionClosureError('prediction-execute-audit-invalid', {
+      batchId: input.batchId
+    });
+  }
+  const auditIssues = assertManagedPredictionAuditIssuesMatch(
+    db,
+    Number(input.batchId),
+    input.expectedAuditIssues
+  );
+  let backup;
+  try {
+    backup = JSON.parse(batch.backupJson);
+  } catch (_error) {
+    throw createManagedPredictionClosureError('prediction-backup-json-invalid', {
+      batchId: input.batchId
+    });
+  }
+  if (!backup || typeof backup !== 'object' || Array.isArray(backup)) {
+    throw createManagedPredictionClosureError('prediction-backup-json-invalid', {
+      batchId: input.batchId
+    });
+  }
+  verifyManagedPredictionBackupFile(
+    backup,
+    input.backupsDir,
+    input.backupReason
+  );
+  const configs = db.prepare(`SELECT id, source_batch_id AS sourceBatchId,
+      source_row_number AS sourceRowNumber, source_batch_filter_id AS sourceBatchFilterId,
+      status FROM prediction_configs WHERE source_batch_id = ? ORDER BY id`).all(input.batchId);
+  if (configs.length !== 1
+    || Number(configs[0].sourceBatchId) !== Number(input.batchId)
+    || !Number.isSafeInteger(Number(configs[0].sourceRowNumber))
+    || Number(configs[0].sourceRowNumber) < 1
+    || Number(configs[0].sourceBatchFilterId) !== Number(input.trainingBatchId)
+    || configs[0].status !== 'draft') {
+    throw createManagedPredictionClosureError('prediction-business-row-invalid', {
+      batchId: input.batchId,
+      configCount: configs.length
+    });
+  }
+  const configId = Number(configs[0].id);
+  const handler = getDemoOwnershipEntityHandler(DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType);
+  const projectedRow = handler.readProjection(db, configId);
+  const registryRows = db.prepare(`SELECT registry_id AS registryId, run_id AS runId,
+      artifact_key AS artifactKey, entity_type AS entityType, entity_pk AS entityPk,
+      ownership_kind AS ownershipKind, identity_digest AS identityDigest,
+      snapshot_digest AS snapshotDigest, source_batch_id AS sourceBatchId,
+      source_row_number AS sourceRowNumber, registered_by AS registeredBy,
+      cleaned_at AS cleanedAt
+    FROM demo_data_registry
+    WHERE run_id = ? AND artifact_key = ? AND entity_type = ?
+      AND ownership_kind = 'imported' AND cleaned_at IS NULL
+    ORDER BY registry_id`).all(
+    context.runId,
+    DEMO_PREDICTION_CONFIG_IMPORT_BINDING.artifactKey,
+    DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType
+  );
+  const registry = registryRows[0];
+  if (!projectedRow || registryRows.length !== 1
+    || String(registry.entityPk) !== String(configId)
+    || registry.runId !== context.runId
+    || registry.artifactKey !== DEMO_PREDICTION_CONFIG_IMPORT_BINDING.artifactKey
+    || registry.entityType !== DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType
+    || registry.ownershipKind !== DEMO_IMPORTED_OWNERSHIP_KIND
+    || Number(registry.sourceBatchId) !== Number(input.batchId)
+    || Number(registry.sourceRowNumber) !== Number(configs[0].sourceRowNumber)
+    || Number(registry.registeredBy) !== Number(input.actorUserId)) {
+    throw createManagedPredictionClosureError('prediction-ownership-provenance-invalid', {
+      batchId: input.batchId
+    });
+  }
+  const identityDigest = calculateDemoEntityIdentityDigest(
+    DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType,
+    String(configId)
+  );
+  const snapshotDigest = calculateDemoEntitySnapshotDigest(
+    DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType,
+    String(configId),
+    projectedRow
+  );
+  if (registry.identityDigest !== identityDigest || registry.snapshotDigest !== snapshotDigest) {
+    throw createManagedPredictionClosureError('prediction-ownership-digest-invalid', {
+      configId
+    });
+  }
+  let executeResult;
+  try {
+    executeResult = JSON.parse(batch.executeResultJson);
+  } catch (_error) {
+    throw createManagedPredictionClosureError('prediction-execute-result-json-invalid', {
+      batchId: input.batchId
+    });
+  }
+  const terminalClosureValid = input.expectedContextStatus === 'executed'
+    ? isManagedContextTerminalClosureExact(
+        context,
+        executeResult?.contextTerminal,
+        batch.previewSignature
+      )
+    : !Object.prototype.hasOwnProperty.call(executeResult || {}, 'contextTerminal');
+  if (!terminalClosureValid) {
+    throw createManagedPredictionClosureError('prediction-context-terminal-closure-drift', {
+      contextId: input.contextId,
+      batchId: input.batchId
+    });
+  }
+  const importedIds = Array.isArray(executeResult?.importedIds)
+    ? executeResult.importedIds.map(Number)
+    : [];
+  const importedRecords = Array.isArray(executeResult?.importedRecords)
+    ? executeResult.importedRecords
+    : [];
+  const ownership = executeResult && executeResult.ownership;
+  const closureDigest = calculateManagedPredictionConfigClosureDigest({
+    runId: context.runId,
+    contextId: context.contextId,
+    batchId: input.batchId,
+    trainingBatchId: input.trainingBatchId,
+    retainedFileSha256: input.retainedFileSha256,
+    previewSignature: input.preview.previewSignature,
+    previewAuditDigest: input.preview.previewAuditDigest,
+    auditIssues,
+    backup,
+    configId,
+    identityDigest,
+    snapshotDigest
+  });
+  if (executeResult?.executed !== true
+    || Number(executeResult.imported) !== 1
+    || Number(executeResult.sourceTrainingBatchId) !== Number(input.trainingBatchId)
+    || executeResult.previewSignature !== batch.previewSignature
+    || executeResult.previewAuditDigest !== batch.previewDigest
+    || importedIds.length !== 1 || importedIds[0] !== configId
+    || importedRecords.length !== 1 || Number(importedRecords[0]?.id) !== configId
+    || Number(importedRecords[0]?.sourceBatchId) !== Number(input.batchId)
+    || Number(importedRecords[0]?.sourceBatchFilterId) !== Number(input.trainingBatchId)
+    || importedRecords[0]?.status !== 'draft'
+    || sha256Stable(executeResult.backup) !== sha256Stable(backup)
+    || ownership?.applied !== true || ownership.mode !== 'demo'
+    || ownership.closureDigest !== closureDigest
+    || Number(ownership.registrationCount) !== 1
+    || Number(ownership.insertedCount) !== 1
+    || Number(ownership.idempotentCount) !== 0
+    || Number(ownership.skippedCount) !== statistics.skippedCount
+    || Number(ownership.relationCount) !== 0) {
+    throw createManagedPredictionClosureError('prediction-execute-result-drift', {
+      batchId: input.batchId,
+      configId
+    });
+  }
+  const operationLogs = db.prepare(`SELECT operation, user_id AS userId, detail_json AS detailJson
+    FROM sys_operation_logs
+    WHERE operation IN (
+        'prediction.config.import.preview',
+        'prediction.config.import.execute'
+      )
+      AND target_type = 'prediction_config_import' AND target_id = ?
+    ORDER BY id`).all(String(input.batchId));
+  const previewOperationLogs = operationLogs.filter(
+    (row) => row.operation === 'prediction.config.import.preview'
+  );
+  const executeOperationLogs = operationLogs.filter(
+    (row) => row.operation === 'prediction.config.import.execute'
+  );
+  if (previewOperationLogs.length !== 1 || executeOperationLogs.length !== 1
+    || Number(previewOperationLogs[0].userId) !== Number(input.actorUserId)
+    || Number(executeOperationLogs[0].userId) !== Number(input.actorUserId)) {
+    throw createManagedPredictionClosureError('prediction-operation-audit-invalid', {
+      batchId: input.batchId,
+      previewOperationCount: previewOperationLogs.length,
+      executeOperationCount: executeOperationLogs.length
+    });
+  }
+  let previewOperationDetail;
+  let executeOperationDetail;
+  try {
+    previewOperationDetail = JSON.parse(previewOperationLogs[0].detailJson);
+    executeOperationDetail = JSON.parse(executeOperationLogs[0].detailJson);
+  } catch (_error) {
+    throw createManagedPredictionClosureError('prediction-operation-audit-invalid', {
+      batchId: input.batchId
+    });
+  }
+  if (!hasExactManagedDirectFields(previewOperationDetail, ['blocked', 'wouldImport'])
+    || Number(previewOperationDetail.wouldImport) !== Number(input.preview.summary.wouldImport)
+    || Number(previewOperationDetail.blocked) !== Number(input.preview.summary.blocked)
+    || !hasExactManagedDirectFields(executeOperationDetail, [
+      'imported', 'writesPredictionRuns', 'writesPredictionResults'
+    ])
+    || Number(executeOperationDetail.imported) !== 1
+    || executeOperationDetail.writesPredictionRuns !== false
+    || executeOperationDetail.writesPredictionResults !== false) {
+    throw createManagedPredictionClosureError('prediction-operation-audit-invalid', {
+      batchId: input.batchId,
+      previewOperationDetail,
+      executeOperationDetail
+    });
+  }
+  return {
+    batchId: Number(input.batchId),
+    configId,
+    contextId: context.contextId,
+    runId: context.runId,
+    trainingBatchId: Number(input.trainingBatchId),
+    identityDigest,
+    snapshotDigest,
+    closureDigest
+  };
+}
+
+/** 读取并验证 managed source 唯一 executed context 与 primary batch 的冻结治理事实。 */
+function readManagedSourceExecutedContext(db, input) {
+  const contexts = db.prepare(`SELECT context_id AS contextId, run_id AS runId,
+      dataset_id AS datasetId, manifest_version AS manifestVersion,
+      manifest_digest AS manifestDigest, artifact_key AS artifactKey,
+      handler_key AS handlerKey, artifact_file_sha256 AS artifactFileSha256,
+      issued_to_user_id AS issuedToUserId, runtime_epoch AS runtimeEpoch,
+      status, issued_at AS issuedAt, expires_at AS expiresAt,
+      upload_file_sha256 AS uploadFileSha256, preview_digest AS previewDigest,
+      previewed_at AS previewedAt, executed_at AS executedAt
+    FROM demo_import_contexts
+    WHERE run_id = ? AND artifact_key = ? AND handler_key = ? AND status = 'executed'
+    ORDER BY context_id`).all(input.runId, input.artifactKey, input.handlerKey);
+  if (contexts.length !== 1) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'managed source 必须存在唯一正确 executed context。',
+      { artifactKey: input.artifactKey, reason: 'executed-context-count', count: contexts.length },
+      409
+    );
+  }
+  const context = contexts[0];
+  const timestampFields = ['issuedAt', 'expiresAt', 'executedAt'];
+  const validContext = context.runId === input.runId
+    && context.datasetId === input.demoRun.datasetId
+    && context.manifestVersion === input.demoRun.manifestVersion
+    && context.manifestDigest === input.demoRun.manifestDigest
+    && context.artifactKey === input.artifactKey
+    && context.handlerKey === input.handlerKey
+    && Number(context.issuedToUserId) === input.actorUserId
+    && Number(context.runtimeEpoch) === input.runtimeEpoch
+    && context.status === 'executed'
+    && timestampFields.every((fieldName) => (
+      typeof context[fieldName] === 'string'
+        && DEMO_UTC_MILLISECOND_PATTERN.test(context[fieldName])
+    ))
+    && (context.previewedAt === null
+      || (typeof context.previewedAt === 'string'
+        && DEMO_UTC_MILLISECOND_PATTERN.test(context.previewedAt)))
+    && typeof context.artifactFileSha256 === 'string'
+    && /^[0-9a-f]{64}$/.test(context.artifactFileSha256)
+    && context.uploadFileSha256 === context.artifactFileSha256
+    && typeof context.previewDigest === 'string'
+    && /^hmac-sha256:v1:audit:[0-9a-f]{64}$/.test(context.previewDigest);
+  if (!validContext) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'managed source context 的 manifest、runtime、actor、时间或摘要事实已漂移。',
+      { artifactKey: input.artifactKey, reason: 'executed-context-facts' },
+      409
+    );
+  }
+  const primaryBindings = db.prepare(`SELECT rib.run_id AS runId,
+      rib.artifact_key AS artifactKey, rib.context_id AS contextId,
+      rib.import_batch_id AS batchId, rib.batch_role AS batchRole,
+      ib.import_type AS importType, ib.preview_signature AS previewSignature,
+      ib.execute_result_json AS executeResultJson
+    FROM demo_run_import_batches rib
+    JOIN demo_import_contexts dic ON dic.context_id = rib.context_id
+    JOIN import_batches ib ON ib.id = rib.import_batch_id
+    WHERE rib.run_id = ? AND rib.artifact_key = ? AND rib.batch_role = 'primary'
+      AND dic.status = 'executed'
+    ORDER BY rib.context_id, rib.import_batch_id`).all(input.runId, input.artifactKey);
+  if (primaryBindings.length !== 1
+    || primaryBindings[0].runId !== input.runId
+    || primaryBindings[0].artifactKey !== input.artifactKey
+    || primaryBindings[0].contextId !== context.contextId
+    || primaryBindings[0].batchRole !== 'primary'
+    || primaryBindings[0].importType !== input.importType) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'managed source 缺少唯一 active primary batch binding。',
+      { artifactKey: input.artifactKey, reason: 'primary-binding' },
+      409
+    );
+  }
+  const primaryBinding = primaryBindings[0];
+  let executeResult;
+  try {
+    executeResult = JSON.parse(primaryBinding.executeResultJson);
+  } catch (_error) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'managed source execute_result terminal baseline 无法解析。',
+      { artifactKey: input.artifactKey, reason: 'context-terminal-json' },
+      409
+    );
+  }
+  if (!isManagedContextTerminalClosureExact(
+    context,
+    executeResult?.contextTerminal,
+    primaryBinding.previewSignature
+  )) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'managed source 当前 context 与 execute-time terminal baseline 不一致。',
+      { artifactKey: input.artifactKey, reason: 'context-terminal-drift' },
+      409
+    );
+  }
+  return {
+    context,
+    batchId: Number(primaryBinding.batchId),
+    contextTerminalDigest: sha256Stable(executeResult.contextTerminal)
+  };
+}
+
+/** 验证 managed source retained upload 的名称、大小与实际 SHA 均未漂移。 */
+function verifyManagedSourceRetainedFile(db, context, batchId, uploadsRoot = defaultUploadsDir) {
+  const batch = db.prepare(`SELECT stored_filename AS storedFilename,
+      file_size_bytes AS fileSizeBytes, file_sha256 AS fileSha256
+    FROM import_batches WHERE id = ?`).get(batchId);
+  if (!batch || typeof batch.storedFilename !== 'string' || !batch.storedFilename
+    || !Number.isSafeInteger(Number(batch.fileSizeBytes)) || Number(batch.fileSizeBytes) < 1
+    || typeof batch.fileSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(batch.fileSha256)) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'managed source retained upload metadata 无效。',
+      { batchId, reason: 'retained-metadata' },
+      409
+    );
+  }
+  let safeFile;
+  try {
+    safeFile = readSafeUploadFile(uploadsRoot, batch.storedFilename, {
+      expectedSizeBytes: Number(batch.fileSizeBytes),
+      maxSizeBytes: MAX_IMPORT_FILE_SIZE_BYTES
+    });
+  } catch (error) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'managed source retained upload 无法安全复验。',
+      { batchId, reason: error?.details?.code || error?.code || 'retained-read' },
+      409
+    );
+  }
+  if (safeFile.fileSha256 !== batch.fileSha256
+    || safeFile.fileSha256 !== context.artifactFileSha256
+    || safeFile.fileSha256 !== context.uploadFileSha256) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'managed source retained upload SHA 与 context/batch 冻结事实不一致。',
+      { batchId, reason: 'retained-sha' },
+      409
+    );
+  }
+  return safeFile;
+}
+
+/** 使用已验证 Artifact 12 config 的固定列，在 Artifact 07 primary batch 内重建正式训练筛选全集。 */
+function readManagedPredictionFilteredEnergyIds(db, energyBatchId, configRow) {
+  const filterClauses = [
+    "record_status = 'active'",
+    'source_batch_id = @energyBatchId',
+    'normalized_month >= @trainStartMonth',
+    'normalized_month <= @trainEndMonth'
+  ];
+  const filterParams = {
+    energyBatchId,
+    trainStartMonth: configRow.train_start_month,
+    trainEndMonth: configRow.train_end_month
+  };
+  const optionalFilters = [
+    ['energy_type_id', 'energyTypeId', configRow.energy_type_id],
+    ['organization_unit_id', 'organizationUnitId', configRow.organization_unit_id],
+    ['meter_device_id', 'meterDeviceId', configRow.meter_device_id]
+  ];
+  optionalFilters.forEach(([columnName, parameterName, value]) => {
+    if (value === null) return;
+    filterClauses.push(`${columnName} = @${parameterName}`);
+    filterParams[parameterName] = value;
+  });
+  return db.prepare(`SELECT id FROM energy_records
+    WHERE ${filterClauses.join(' AND ')}
+    ORDER BY id`).all(filterParams).map((row) => Number(row.id));
+}
+
+/**
+ * 为固定派生 registrar 复验 Artifact 07/12 managed source exact closure。
+ * 输入只包含 caller-owned DB、当前 demo/actor 和 P3 witness 精确实体集合，不接受摘要旁路。
+ */
+function verifyManagedImportedSourceExactClosure(input = {}) {
+  assertExactPlainObjectFields(
+    input,
+    ['actorUserId', 'configEntityPk', 'db', 'demoRunId', 'energyRecordEntityPks'],
+    'DEMO_MANAGED_SOURCE_CLOSURE_INPUT_INVALID',
+    'managed source closure verifier 只能接收固定私有字段。'
+  );
+  const db = input.db;
+  const actorUserId = Number(input.actorUserId);
+  const configEntityPk = Number(input.configEntityPk);
+  const energyRecordEntityPks = input.energyRecordEntityPks;
+  const validEnergyArray = Array.isArray(energyRecordEntityPks)
+    && !utilTypes.isProxy(energyRecordEntityPks)
+    && Object.getPrototypeOf(energyRecordEntityPks) === Array.prototype
+    && Object.getOwnPropertySymbols(energyRecordEntityPks).length === 0
+    && Object.keys(energyRecordEntityPks).length === energyRecordEntityPks.length
+    && energyRecordEntityPks.length > 0
+    && energyRecordEntityPks.every((entityPk) => Number.isSafeInteger(entityPk) && entityPk > 0)
+    && new Set(energyRecordEntityPks).size === energyRecordEntityPks.length;
+  if (!db || db.open !== true || db.inTransaction !== true
+    || typeof input.demoRunId !== 'string' || !input.demoRunId
+    || !Number.isSafeInteger(actorUserId) || actorUserId < 1
+    || !Number.isSafeInteger(configEntityPk) || configEntityPk < 1
+    || !validEnergyArray) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INPUT_INVALID',
+      'managed source closure verifier 输入值域无效。',
+      null,
+      400
+    );
+  }
+  const demoRun = requireDemoDatasetRun(db, input.demoRunId);
+  const runtime = assertDemoRuntimeEnabled({ db });
+  const energySource = readManagedSourceExecutedContext(db, {
+    runId: demoRun.runId,
+    demoRun,
+    runtimeEpoch: Number(runtime.runtimeEpoch),
+    actorUserId,
+    ...DEMO_MANAGED_DIRECT_IMPORT_BINDING
+  });
+  const predictionSource = readManagedSourceExecutedContext(db, {
+    runId: demoRun.runId,
+    demoRun,
+    runtimeEpoch: Number(runtime.runtimeEpoch),
+    actorUserId,
+    ...DEMO_PREDICTION_CONFIG_IMPORT_BINDING
+  });
+
+  const energyFile = verifyManagedSourceRetainedFile(
+    db,
+    energySource.context,
+    energySource.batchId
+  );
+  const energyFacts = verifyManagedDirectCompletedClosure(
+    { privateDb: db, pendingWitnesses: new Set() },
+    {
+      batchId: energySource.batchId,
+      contextId: energySource.context.contextId,
+      runId: demoRun.runId,
+      actorUserId,
+      previewDigest: energySource.context.previewDigest,
+      expectedContextStatus: 'executed'
+    }
+  );
+  const sortedWitnessEnergyIds = [...energyRecordEntityPks].sort((left, right) => left - right);
+
+  const predictionFile = verifyManagedSourceRetainedFile(
+    db,
+    predictionSource.context,
+    predictionSource.batchId
+  );
+  const core = getPredictionConfigManagedCoreProtocol();
+  const predictionBatch = core.getBatch(predictionSource.batchId, {
+    db,
+    includeIssues: false
+  });
+  const preview = core.rebuildPreview(
+    db,
+    predictionFile,
+    predictionBatch.originalFilename,
+    [configEntityPk]
+  );
+  core.assertBatchMatches(predictionBatch, preview, predictionFile, {
+    expectedAuditPhase: 'execute'
+  });
+  const expectedAuditIssues = core.projectAuditIssues(preview);
+  const training = readManagedMonthlyEnergyPrimaryForPrediction(
+    db,
+    predictionSource.context.contextId
+  );
+  if (training.batchId !== energySource.batchId) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'Artifact 12 训练批次没有绑定当前 Artifact 07 exact primary closure。',
+      { reason: 'training-batch-binding' },
+      409
+    );
+  }
+  const predictionFacts = readManagedPredictionConfigClosure(db, {
+    contextId: predictionSource.context.contextId,
+    runId: demoRun.runId,
+    actorUserId,
+    batchId: predictionSource.batchId,
+    trainingBatchId: training.batchId,
+    expectedContextStatus: 'executed',
+    retainedFileSha256: predictionFile.fileSha256,
+    preview,
+    expectedAuditIssues,
+    backupReason: core.backupReason,
+    backupsDir: defaultBackupsDir
+  });
+  if (predictionFacts.configId !== configEntityPk) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'Artifact 12 managed config 与 P3 completion witness 不一致。',
+      { reason: 'config-entity' },
+      409
+    );
+  }
+  const configHandler = getDemoOwnershipEntityHandler(
+    DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType
+  );
+  const configRow = configHandler.readProjection(db, configEntityPk);
+  if (!configRow || Number(configRow.source_batch_id) !== predictionSource.batchId
+    || Number(configRow.source_batch_filter_id) !== energySource.batchId
+    || configRow.status !== 'draft' || configRow.archived_at !== null) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'Artifact 12 managed config 的正式 Prediction 筛选绑定已漂移。',
+      { reason: 'config-filter-binding' },
+      409
+    );
+  }
+  const filteredEnergyIds = readManagedPredictionFilteredEnergyIds(
+    db,
+    energySource.batchId,
+    configRow
+  );
+  if (filteredEnergyIds.length === 0
+    || sha256Stable(filteredEnergyIds) !== sha256Stable(sortedWitnessEnergyIds)) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'P3 exact 训练集合与 Artifact 07 primary batch 的正式配置筛选全集不一致。',
+      {
+        batchId: energySource.batchId,
+        reason: 'energy-filtered-entity-set',
+        filteredCount: filteredEnergyIds.length,
+        witnessCount: sortedWitnessEnergyIds.length
+      },
+      409
+    );
+  }
+  if (Number(energyFacts.statistics.successCount) < filteredEnergyIds.length) {
+    throw createDemoOwnershipError(
+      'DEMO_MANAGED_SOURCE_CLOSURE_INVALID',
+      'Artifact 07 完整 ownership closure 无法覆盖正式 Prediction 训练子集。',
+      { batchId: energySource.batchId, reason: 'energy-filtered-ownership-coverage' },
+      409
+    );
+  }
+  return Object.freeze({
+    runId: demoRun.runId,
+    actorUserId,
+    energyBatchId: energySource.batchId,
+    energyContextId: energySource.context.contextId,
+    energyRecordEntityPks: Object.freeze(sortedWitnessEnergyIds),
+    energyFileSha256: energyFile.fileSha256,
+    energyContextTerminalDigest: energySource.contextTerminalDigest,
+    energyOwnershipClosureDigest: energyFacts.ownershipClosureDigest,
+    predictionBatchId: predictionSource.batchId,
+    predictionContextId: predictionSource.context.contextId,
+    configEntityPk,
+    predictionFileSha256: predictionFile.fileSha256,
+    predictionContextTerminalDigest: predictionSource.contextTerminalDigest,
+    predictionClosureDigest: predictionFacts.closureDigest
+  });
+}
+
+/** 执行 Artifact 12 单一、不可拆分 managed retained operation。 */
+async function executeManagedPredictionConfigImportOperation(state, transactionScope, intent) {
+  if (!intent || intent.authority !== DEMO_PREDICTION_CONFIG_MANAGED_OPERATION_AUTHORITY) {
+    throw createDemoOwnershipError(
+      'DEMO_PREDICTION_CONFIG_OPERATION_INTENT_INVALID',
+      'Artifact 12 managed operation intent 无效。',
+      null,
+      400
+    );
+  }
+  state.managedPredictionOperationActive = true;
+  state.managedPredictionBatchId = Number(intent.batchId);
+  state.managedPredictionActorUserId = Number(intent.actor.userId);
+  state.managedPredictionActorIp = intent.actor.ip || null;
+  const core = getPredictionConfigManagedCoreProtocol();
+  const db = state.privateDb;
+  const batchId = Number(intent.batchId);
+  const batch = core.getBatch(batchId, { db, includeIssues: false });
+  if (!batch.storedFilename) {
+    throw createDemoOwnershipError(
+      'PREDICTION_CONFIG_IMPORT_STORED_FILE_REQUIRED',
+      '预测配置批次缺少 retained upload。',
+      null,
+      400
+    );
+  }
+  const safeFile = readSafeUploadFile(
+    intent.uploadsDir || defaultUploadsDir,
+    batch.storedFilename,
+    {
+      expectedSizeBytes: Number.isSafeInteger(batch.fileSizeBytes)
+        ? batch.fileSizeBytes
+        : undefined,
+      maxSizeBytes: MAX_IMPORT_FILE_SIZE_BYTES,
+      afterFileOpen: intent.afterRetainedFileOpen
+    }
+  );
+  if (safeFile.fileSha256 !== batch.fileSha256) {
+    throw createDemoOwnershipError(
+      'PREDICTION_CONFIG_IMPORT_CURRENT_FILE_SHA256_MISMATCH',
+      '预测配置 retained upload SHA-256 与 preview 批次不一致。',
+      null,
+      400
+    );
+  }
+  const importedConfigIds = db.prepare(`SELECT id FROM prediction_configs
+    WHERE source_batch_id = ? ORDER BY id`).all(batchId).map((row) => Number(row.id));
+  const terminalReplay = batch.auditPhase === 'execute'
+    && ['completed', 'completed_with_errors'].includes(batch.status);
+  const preview = core.rebuildPreview(
+    db,
+    safeFile,
+    batch.originalFilename,
+    terminalReplay ? importedConfigIds : []
+  );
+  core.assertBatchMatches(batch, preview, safeFile, {
+    expectedAuditPhase: terminalReplay ? 'execute' : 'preview'
+  });
+  const expectedAuditIssues = core.projectAuditIssues(preview);
+  invokeManagedPredictionOperationFault(intent, 'after-retained-rebuild', {
+    batchId,
+    terminalReplay,
+    retainedFileSha256: safeFile.fileSha256
+  });
+
+  if (terminalReplay) {
+    const replay = validateDemoContextTerminalReplay({
+      db,
+      token: intent.demoContext.token,
+      userId: intent.demoContext.userId,
+      artifactKey: intent.demoContext.artifactKey,
+      handlerKey: intent.demoContext.handlerKey,
+      uploadFileSha256: safeFile.fileSha256,
+      previewDigest: preview.previewAuditDigest,
+      batchBindings: [{
+        batchId,
+        batchRole: DEMO_PREDICTION_CONFIG_IMPORT_BINDING.batchRole,
+        importType: DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType
+      }]
+    });
+    const training = readManagedMonthlyEnergyPrimaryForPrediction(
+      db,
+      replay.context.contextId,
+      state
+    );
+    invokeManagedPredictionOperationFault(intent, 'after-training-closure', {
+      batchId,
+      trainingBatchId: training.batchId,
+      terminalReplay: true
+    });
+    readManagedPredictionConfigClosure(db, {
+      contextId: replay.context.contextId,
+      runId: replay.context.runId,
+      actorUserId: intent.actor.userId,
+      batchId,
+      trainingBatchId: training.batchId,
+      expectedContextStatus: 'executed',
+      retainedFileSha256: safeFile.fileSha256,
+      preview,
+      expectedAuditIssues,
+      backupReason: core.backupReason,
+      backupsDir: intent.backupsDir || defaultBackupsDir
+    });
+    invokeManagedPredictionOperationFault(intent, 'after-final-closure', {
+      batchId,
+      terminalReplay: true
+    });
+    const replayBatch = replay.batches[0];
+    return {
+      ...replayBatch.executeResult,
+      batchId,
+      auditBatch: replayBatch.auditBatch,
+      terminalReplay: true
+    };
+  }
+
+  const managedContext = validateDemoContext({
+    ...intent.demoContext,
+    phase: 'execute',
+    uploadFileSha256: safeFile.fileSha256,
+    previewDigest: preview.previewAuditDigest,
+    db
+  });
+  const training = readManagedMonthlyEnergyPrimaryForPrediction(
+    db,
+    managedContext.contextId,
+    state
+  );
+  invokeManagedPredictionOperationFault(intent, 'after-training-closure', {
+    batchId,
+    trainingBatchId: training.batchId,
+    terminalReplay: false
+  });
+  const managedBackupRoot = intent.backupsDir || defaultBackupsDir;
+  const existingBackupNames = snapshotManagedPredictionBackupNames(managedBackupRoot);
+  const createdBackup = await intent.createBackup({
+    reason: core.backupReason,
+    skipCheckpoint: true
+  });
+  const backup = {
+    ...createdBackup,
+    requestedReason: core.backupReason
+  };
+  state.managedPredictionBackupCompensation = buildManagedPredictionBackupCompensation(
+    managedBackupRoot,
+    backup,
+    existingBackupNames
+  );
+  const publicBackup = core.projectBackup(backup);
+  if (publicBackup.reason !== core.backupReason) {
+    throw createManagedPredictionClosureError('prediction-backup-reason-invalid', {
+      expectedReason: core.backupReason,
+      actualReason: publicBackup.reason || null
+    });
+  }
+  verifyManagedPredictionBackupFile(
+    publicBackup,
+    intent.backupsDir || defaultBackupsDir,
+    core.backupReason
+  );
+  invokeManagedPredictionOperationFault(intent, 'after-backup', {
+    batchId,
+    backupName: publicBackup.backupName
+  });
+
+  const candidate = preview.candidateRows[0];
+  const rowWitness = createDemoOwnershipInsertWitness({
+    transactionScope,
+    entityType: DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType,
+    insertSql: `INSERT INTO prediction_configs
+      (source_batch_id, source_row_number, name, note, energy_type_id,
+       organization_unit_id, meter_device_id, source_batch_filter_id,
+       train_start_month, train_end_month, predict_start_month, predict_end_month,
+       algorithm, window_size, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
+    insertParams: [
+      batchId,
+      candidate.rowNumber,
+      candidate.name,
+      candidate.note ?? null,
+      candidate.energyTypeId ?? null,
+      candidate.organizationUnitId ?? null,
+      candidate.meterDeviceId ?? null,
+      training.batchId,
+      candidate.trainStartMonth,
+      candidate.trainEndMonth,
+      candidate.predictStartMonth,
+      candidate.predictEndMonth,
+      candidate.algorithm,
+      candidate.windowSize ?? null
+    ],
+    sourceBatchId: batchId,
+    sourceRowNumber: candidate.rowNumber
+  });
+  const configId = Number(rowWitness.lastInsertRowid);
+  invokeManagedPredictionOperationFault(intent, 'after-config-insert', {
+    batchId,
+    configId
+  });
+  const skippedRecords = preview.items
+    .filter((item) => item.status === 'skipped')
+    .map((item) => ({
+      entityType: DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType,
+      entityPk: null,
+      batchRole: DEMO_PREDICTION_CONFIG_IMPORT_BINDING.batchRole,
+      sourceRowNumber: item.rowNumber,
+      reason: String(item.reasonCodes || 'duplicate_skipped').slice(0, 256)
+    }));
+  const ownership = registerImportedDemoOwnershipInTransaction({
+    transactionScope,
+    demoContext: {
+      ...intent.demoContext,
+      uploadFileSha256: safeFile.fileSha256,
+      previewDigest: preview.previewAuditDigest
+    },
+    actorUserId: intent.actor.userId,
+    batchBindings: [{
+      batchId,
+      batchRole: DEMO_PREDICTION_CONFIG_IMPORT_BINDING.batchRole,
+      entityType: DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType
+    }],
+    insertedRecords: [{
+      entityType: DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType,
+      entityPk: configId,
+      batchRole: DEMO_PREDICTION_CONFIG_IMPORT_BINDING.batchRole,
+      sourceRowNumber: candidate.rowNumber,
+      rowWitness
+    }],
+    skippedRecords,
+    noInsertedRecords: false
+  });
+  if (ownership.applied !== true || ownership.mode !== 'demo'
+    || Number(ownership.registrationCount) !== 1
+    || Number(ownership.insertedCount) !== 1
+    || Number(ownership.idempotentCount) !== 0
+    || Number(ownership.relationCount) !== 0) {
+    throw createManagedPredictionClosureError('prediction-ownership-registration-incomplete', {
+      batchId
+    });
+  }
+  invokeManagedPredictionOperationFault(intent, 'after-ownership', {
+    batchId,
+    configId,
+    registrationCount: Number(ownership.registrationCount)
+  });
+
+  const importedRecord = core.getConfigById(db, configId);
+  const registry = db.prepare(`SELECT identity_digest AS identityDigest,
+      snapshot_digest AS snapshotDigest
+    FROM demo_data_registry
+    WHERE run_id = ? AND artifact_key = ? AND entity_type = ?
+      AND entity_pk = ? AND ownership_kind = 'imported' AND cleaned_at IS NULL`).get(
+    managedContext.runId,
+    DEMO_PREDICTION_CONFIG_IMPORT_BINDING.artifactKey,
+    DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType,
+    String(configId)
+  );
+  if (!registry) {
+    throw createManagedPredictionClosureError('prediction-ownership-provenance-invalid', {
+      batchId,
+      configId
+    });
+  }
+  const closureDigest = calculateManagedPredictionConfigClosureDigest({
+    runId: managedContext.runId,
+    contextId: managedContext.contextId,
+    batchId,
+    trainingBatchId: training.batchId,
+    retainedFileSha256: safeFile.fileSha256,
+    previewSignature: preview.previewSignature,
+    previewAuditDigest: preview.previewAuditDigest,
+    auditIssues: expectedAuditIssues,
+    backup: publicBackup,
+    configId,
+    identityDigest: registry.identityDigest,
+    snapshotDigest: registry.snapshotDigest
+  });
+  const ownershipSummary = {
+    ...core.projectOwnership(ownership),
+    closureDigest
+  };
+  const summary = preview.summary;
+  const resultData = {
+    executed: true,
+    dryRun: false,
+    imported: 1,
+    skipped: summary.skipped,
+    blocked: summary.blocked,
+    warnings: summary.warnings,
+    errors: summary.errors,
+    writesPredictionConfigs: true,
+    writesPredictionRuns: false,
+    writesPredictionResults: false,
+    writesEnergyRecords: false,
+    writesCarbonEmissions: false,
+    previewSignature: preview.previewSignature,
+    previewAuditDigest: preview.previewAuditDigest,
+    sourceTrainingBatchId: training.batchId,
+    expectedWouldImport: 1,
+    candidateRowIds: preview.candidateRowIds,
+    importedIds: [configId],
+    importedRecords: [importedRecord],
+    ownership: ownershipSummary,
+    backup: publicBackup,
+    note: '已从 retained upload 重建并导入唯一 draft 预测配置；训练批次由当前 run Artifact 07 可信闭包确定，未运行预测。'
+  };
+  invokeManagedPredictionOperationFault(intent, 'before-execute-audit', {
+    batchId,
+    configId,
+    resultData
+  });
+  updateExecuteAuditResult(batchId, {
+    status: summary.skipped || summary.blocked ? 'completed_with_errors' : 'completed',
+    statistics: {
+      totalRows: summary.totalRows,
+      successCount: 1,
+      failureCount: summary.blocked,
+      skippedCount: summary.skipped
+    },
+    executeResult: resultData,
+    backup: publicBackup,
+    errorSummary: summary.blocked ? '预测配置导入存在阻断记录。' : null
+  }, { db });
+  invokeManagedPredictionOperationFault(intent, 'before-operation-log', {
+    batchId,
+    configId
+  });
+  recordOperation({
+    userId: intent.actor.userId,
+    operation: 'prediction.config.import.execute',
+    targetType: 'prediction_config_import',
+    targetId: batchId,
+    detail: {
+      imported: 1,
+      writesPredictionRuns: false,
+      writesPredictionResults: false
+    },
+    ip: intent.actor.ip,
+    db
+  });
+  invokeManagedPredictionOperationFault(intent, 'after-operation-log', {
+    batchId,
+    configId
+  });
+  readManagedPredictionConfigClosure(db, {
+    contextId: managedContext.contextId,
+    runId: managedContext.runId,
+    actorUserId: intent.actor.userId,
+    batchId,
+    trainingBatchId: training.batchId,
+    expectedContextStatus: 'previewed',
+    retainedFileSha256: safeFile.fileSha256,
+    preview,
+    expectedAuditIssues,
+    backupsDir: intent.backupsDir || defaultBackupsDir
+  });
+  invokeManagedPredictionOperationFault(intent, 'before-context-cas', {
+    batchId,
+    configId,
+    resultData
+  });
+  const executedContext = markDemoContextExecutedInTransaction({
+    db,
+    ...intent.demoContext,
+    uploadFileSha256: safeFile.fileSha256,
+    previewDigest: preview.previewAuditDigest,
+    batchBindings: [{
+      batchId,
+      batchRole: DEMO_PREDICTION_CONFIG_IMPORT_BINDING.batchRole
+    }]
+  });
+  const contextTerminal = buildManagedContextTerminalFacts(
+    executedContext,
+    preview.previewSignature
+  );
+  persistManagedContextTerminalExecuteResult(db, batchId, contextTerminal);
+  invokeManagedPredictionOperationFault(intent, 'after-context-executed', {
+    batchId,
+    configId
+  });
+  readManagedPredictionConfigClosure(db, {
+    contextId: managedContext.contextId,
+    runId: managedContext.runId,
+    actorUserId: intent.actor.userId,
+    batchId,
+    trainingBatchId: training.batchId,
+    expectedContextStatus: 'executed',
+    retainedFileSha256: safeFile.fileSha256,
+    preview,
+    expectedAuditIssues,
+    backupsDir: intent.backupsDir || defaultBackupsDir
+  });
+  invokeManagedPredictionOperationFault(intent, 'after-final-closure', {
+    batchId,
+    configId,
+    terminalReplay: false
+  });
+  return {
+    ...resultData,
+    batchId,
+    auditBatch: core.getAuditSummary(batchId, { db })
+  };
+}
+
+/** 仅供 prediction service 通过非枚举协议提交 Artifact 12 完整 operation。 */
+function executeManagedPredictionConfigImportThroughProtocol(target, input = {}) {
+  assertExactPlainObjectFields(
+    input,
+    ['actor', 'backupsDir', 'batchId', 'createBackup', 'demoContext', 'faultInjector', 'uploadsDir'],
+    'DEMO_PREDICTION_CONFIG_OPERATION_INTENT_INVALID',
+    'Artifact 12 managed operation 只能包含固定字段。'
+  );
+  assertExactPlainObjectFields(
+    input.actor,
+    ['ip', 'userId'],
+    'DEMO_PREDICTION_CONFIG_OPERATION_INTENT_INVALID',
+    'Artifact 12 managed actor 字段无效。'
+  );
+  assertExactPlainObjectFields(
+    input.demoContext,
+    ['artifactKey', 'handlerKey', 'token', 'userId'],
+    'DEMO_PREDICTION_CONFIG_OPERATION_INTENT_INVALID',
+    'Artifact 12 managed context 字段无效。'
+  );
+  if (!Number.isSafeInteger(Number(input.batchId)) || Number(input.batchId) < 1
+    || !Number.isSafeInteger(Number(input.actor.userId)) || Number(input.actor.userId) < 1
+    || Number(input.actor.userId) !== Number(input.demoContext.userId)
+    || typeof input.createBackup !== 'function'
+    || (input.faultInjector !== undefined && typeof input.faultInjector !== 'function')) {
+    throw createDemoOwnershipError(
+      'DEMO_PREDICTION_CONFIG_OPERATION_INTENT_INVALID',
+      'Artifact 12 managed operation 参数无效。',
+      null,
+      400
+    );
+  }
+  return runWithDemoOwnershipTransactionAsync(target, {
+    authority: DEMO_PREDICTION_CONFIG_MANAGED_OPERATION_AUTHORITY,
+    actor: Object.freeze({
+      userId: Number(input.actor.userId),
+      ip: input.actor.ip || null
+    }),
+    afterRetainedFileOpen: undefined,
+    backupsDir: input.backupsDir || defaultBackupsDir,
+    batchId: Number(input.batchId),
+    createBackup: input.createBackup,
+    demoContext: Object.freeze({ ...input.demoContext }),
+    faultInjector: input.faultInjector,
+    uploadsDir: input.uploadsDir || defaultUploadsDir
+  });
+}
+
+/** 判断批次是否使用 Artifact 12 固定 import type，绑定漂移时也必须 fail-closed。 */
+function isManagedPredictionConfigBatch(db, batchId) {
+  if (!Number.isSafeInteger(Number(batchId)) || Number(batchId) < 1) return false;
+  const batch = db.prepare(`SELECT import_type AS importType
+    FROM import_batches WHERE id = ?`).get(Number(batchId));
+  return batch?.importType === DEMO_PREDICTION_CONFIG_IMPORT_BINDING.importType;
+}
+
+/** 判断 token 实际指向的持久 context 是否属于 Artifact 12。 */
+function isManagedPredictionConfigContext(db, demoContext = {}) {
+  if (typeof demoContext.token !== 'string' || !demoContext.token) return false;
+  const context = db.prepare(`SELECT artifact_key AS artifactKey, handler_key AS handlerKey
+    FROM demo_import_contexts WHERE token_hash = ?`).get(hashDemoContextToken(demoContext.token));
+  return context?.artifactKey === DEMO_PREDICTION_CONFIG_IMPORT_BINDING.artifactKey
+    && context?.handlerKey === DEMO_PREDICTION_CONFIG_IMPORT_BINDING.handlerKey;
+}
+
+/** Artifact 12 的 execute audit/CAS 只能在固定 managed operation authority 内推进。 */
+function requireManagedPredictionOperationForGenericMutation(scopeState, targetMatched, action) {
+  if (!targetMatched || scopeState.managedPredictionOperationActive === true) return;
+  scopeState.poisoned = true;
+  throw createDemoOwnershipError(
+    'DEMO_PREDICTION_CONFIG_OPERATION_REQUIRED',
+    'Artifact 12 execute audit 与 context terminal 只能由单一 managed operation 推进。',
+    { action },
+    409
+  );
+}
+
 /** 在 ownership 私有事务内执行固定 execute 审计 intent，禁止调用方注入 SQL 或连接。 */
 function updateDemoExecuteAuditInOwnershipTransaction(input = {}) {
   assertExactPlainObjectFields(
@@ -5145,6 +9498,11 @@ function updateDemoExecuteAuditInOwnershipTransaction(input = {}) {
     'ownership execute 审计 intent 只能包含固定字段。'
   );
   const scopeState = requireDemoOwnershipTransactionScope(input.transactionScope);
+  requireManagedPredictionOperationForGenericMutation(
+    scopeState,
+    isManagedPredictionConfigBatch(scopeState.privateDb, input.batchId),
+    'execute-audit'
+  );
   updateExecuteAuditResult(input.batchId, {
     status: input.status,
     statistics: input.statistics,
@@ -5153,6 +9511,35 @@ function updateDemoExecuteAuditInOwnershipTransaction(input = {}) {
     errorSummary: input.errorSummary
   }, { db: scopeState.privateDb });
   return getImportAuditSummary(input.batchId, { db: scopeState.privateDb });
+}
+
+/** 在 ownership 私有事务内执行固定 managed execute context 校验，不暴露 raw connection。 */
+function validateDemoContextWithOwnershipTransaction(input = {}) {
+  assertExactPlainObjectFields(
+    input,
+    ['transactionScope', 'demoContext', 'uploadFileSha256', 'previewDigest'],
+    'DEMO_OWNERSHIP_CONTEXT_VALIDATE_INTENT_INVALID',
+    'ownership context 校验 intent 只能包含固定字段。'
+  );
+  assertExactPlainObjectFields(
+    input.demoContext,
+    ['artifactKey', 'handlerKey', 'token', 'userId'],
+    'DEMO_OWNERSHIP_CONTEXT_VALIDATE_INTENT_INVALID',
+    'ownership context 校验只能使用路由提供的固定 context 字段。'
+  );
+  const scopeState = requireDemoOwnershipTransactionScope(input.transactionScope);
+  requireManagedPredictionOperationForGenericMutation(
+    scopeState,
+    isManagedPredictionConfigContext(scopeState.privateDb, input.demoContext),
+    'context-validate'
+  );
+  return validateDemoContext({
+    ...input.demoContext,
+    phase: 'execute',
+    uploadFileSha256: input.uploadFileSha256,
+    previewDigest: input.previewDigest,
+    db: scopeState.privateDb
+  });
 }
 
 /** 在 ownership 私有事务内执行固定 context CAS intent，不暴露 raw connection。 */
@@ -5170,6 +9557,11 @@ function markDemoContextExecutedWithOwnershipTransaction(input = {}) {
     'ownership context CAS 只能使用路由提供的固定 context 字段。'
   );
   const scopeState = requireDemoOwnershipTransactionScope(input.transactionScope);
+  requireManagedPredictionOperationForGenericMutation(
+    scopeState,
+    isManagedPredictionConfigContext(scopeState.privateDb, input.demoContext),
+    'context-executed-cas'
+  );
   return markDemoContextExecutedInTransaction({
     db: scopeState.privateDb,
     ...input.demoContext,
@@ -5434,15 +9826,16 @@ function getDemoOwnershipSummary(input = {}) {
   }
 }
 
-module.exports = {
+Object.assign(demoOwnershipServiceExports, {
   DEMO_CLEANUP_ENTITY_HANDLERS,
   DEMO_CLEANUP_ENTITY_ORDER,
   DEMO_OWNERSHIP_ENTITY_HANDLERS,
   DEMO_OWNERSHIP_REGISTRATION_CONNECTED,
   DEMO_OWNERSHIP_SNAPSHOT_PROJECTION_VERSION: 'demo-entity-snapshot:v1',
   createDemoOwnershipInsertWitness,
-  abortStrategyEvaluationRegistrationScopeInTransaction,
-  activateStrategyEvaluationRegistrationScopeInTransaction,
+  beginCarbonActivitySupersedeInOwnershipTransaction,
+  finalizeCarbonActivitySupersedeInOwnershipTransaction,
+  writeCarbonActivityExecuteAuditInOwnershipTransaction,
   issueStrategyEvaluationRegistrationScopeInTransaction,
   deactivateShiftDefinitionSiblingsInOwnershipTransaction,
   deactivateStrategyRuleSiblingsInOwnershipTransaction,
@@ -5451,26 +9844,46 @@ module.exports = {
   runWithDemoOwnershipTransaction,
   runWithDemoOwnershipTransactionAsync,
   buildDemoOwnershipPlan,
-  calculateDemoEntityIdentityDigest,
-  calculateDemoEntitySnapshotDigest,
   calculateRegistryWatermark,
   getDemoCleanupEntityHandler,
   getDemoOwnershipSummary,
   readDemoRegistryRows,
   registerImportedDemoOwnershipInTransaction,
   registerDerivedMeterEnergyRecordsInTransaction,
-  registerDerivedStrategyEvaluationInTransaction,
-  refreshDerivedStrategyRuleHitOwnershipInTransaction,
   updateDemoExecuteAuditInOwnershipTransaction,
-  markDemoContextExecutedWithOwnershipTransaction,
-  _test: {
-    buildDemoEntityRegistrationContract,
-    buildDemoEntitySnapshotProjection,
-    calculateDemoEntityIdentityProjectionDigest,
-    canonicalizeDemoJsonProjection,
-    getDemoOwnershipEntityHandler,
-    normalizeDigestValue,
-    normalizeIntegerEntityPk,
-    sha256Stable
+  validateDemoContextWithOwnershipTransaction,
+  markDemoContextExecutedWithOwnershipTransaction
+});
+
+Object.defineProperty(
+  demoOwnershipServiceExports,
+  DEMO_PREDICTION_CONFIG_MANAGED_PROTOCOL_SYMBOL,
+  {
+    value: Object.freeze({
+      executeManagedImport: executeManagedPredictionConfigImportThroughProtocol
+    }),
+    enumerable: false,
+    writable: false,
+    configurable: false
   }
-};
+);
+
+Object.defineProperty(
+  demoOwnershipServiceExports,
+  DEMO_OWNERSHIP_CANONICAL_INTERNAL_PROTOCOL_SYMBOL,
+  {
+    value: Object.freeze({
+      buildEntityRegistrationContract: buildDemoEntityRegistrationContract,
+      calculateEntityIdentityDigest: calculateDemoEntityIdentityDigest,
+      calculateEntitySnapshotDigest: calculateDemoEntitySnapshotDigest,
+      getEntityHandler: getDemoOwnershipEntityHandler,
+      sha256Stable,
+      verifyManagedImportedSourceExactClosure
+    }),
+    enumerable: false,
+    writable: false,
+    configurable: false
+  }
+);
+
+Object.freeze(demoOwnershipServiceExports);

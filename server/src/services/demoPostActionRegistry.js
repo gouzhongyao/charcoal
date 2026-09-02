@@ -3,8 +3,8 @@
 const crypto = require('crypto');
 const { AppError } = require('../utils/errors');
 
-// 真实领域依赖语义修正后的稳定 registry 版本；动作身份变化必须显式升级版本。
-const DEMO_POST_ACTION_REGISTRY_VERSION = 'demo-post-actions:v3';
+// Prediction 正式接入后的稳定 registry 版本；动作身份变化必须显式升级版本。
+const DEMO_POST_ACTION_REGISTRY_VERSION = 'demo-post-actions:v7';
 // registry 摘要算法固定为 SHA-256，避免不同运行期解释器生成不同身份。
 const DEMO_POST_ACTION_REGISTRY_ALGORITHM = 'sha256';
 // registry canonicalization 只允许服务端实现的稳定 JSON 规范化。
@@ -74,8 +74,8 @@ const ACTION_DEFINITIONS = [
     executePermission: 'carbon:activities:calculate',
     effectMode: 'writes-carbon-results',
     resolverVersion: 'carbon-accounting-resolver:v1',
-    executorVersion: 'carbon-accounting-executor:not-connected',
-    implementationStatus: 'not-connected',
+    executorVersion: 'carbon-accounting-executor:v1',
+    implementationStatus: 'connected',
     outputEntityTypes: ['carbon_calculation_run', 'carbon_accounting_result'],
     confirmationText: '确认执行碳核算运行',
     previewTtlMs: DEFAULT_PREVIEW_TTL_MS,
@@ -86,13 +86,13 @@ const ACTION_DEFINITIONS = [
     actionKey: 'prediction-run',
     displayName: '预测运行',
     dependencies: [],
-    requiredArtifactBindings: ['12-prediction-configs'],
+    requiredArtifactBindings: ['07-monthly-energy', '12-prediction-configs'],
     previewPermission: 'prediction:run:view',
     executePermission: 'prediction:run:create',
     effectMode: 'writes-prediction-results',
     resolverVersion: 'prediction-resolver:v1',
-    executorVersion: 'prediction-executor:not-connected',
-    implementationStatus: 'not-connected',
+    executorVersion: 'prediction-executor:v1',
+    implementationStatus: 'connected',
     outputEntityTypes: ['prediction_run', 'prediction_result'],
     confirmationText: '确认执行预测运行',
     previewTtlMs: DEFAULT_PREVIEW_TTL_MS,
@@ -103,13 +103,13 @@ const ACTION_DEFINITIONS = [
     actionKey: 'strategy-evaluation-run',
     displayName: '策略评估运行',
     dependencies: [],
-    requiredArtifactBindings: ['18-strategy-rules'],
+    requiredArtifactBindings: ['15-energy-timeseries', '18-strategy-rules'],
     previewPermission: 'energy:strategy:evaluate',
     executePermission: 'energy:strategy:run',
     effectMode: 'writes-strategy-hits',
     resolverVersion: 'strategy-evaluation-resolver:v1',
-    executorVersion: 'strategy-evaluation-executor:not-connected',
-    implementationStatus: 'not-connected',
+    executorVersion: 'strategy-evaluation-executor:v1',
+    implementationStatus: 'connected',
     outputEntityTypes: ['strategy_rule_hit'],
     confirmationText: '确认执行策略评估运行',
     previewTtlMs: DEFAULT_PREVIEW_TTL_MS,
@@ -223,8 +223,11 @@ function validateDemoPostActionRegistry() {
     visited.add(key);
   }
   ACTION_DEFINITIONS.forEach((definition) => visit(definition.actionKey));
-  if (ACTION_DEFINITIONS.filter((definition) => definition.implementationStatus === 'connected').map((definition) => definition.actionKey).join(',') !== 'meter-readings-to-energy-records,energy-flow-analysis') {
-    throw new Error('当前后置动作切片只能连接 meter-readings-to-energy-records 与 energy-flow-analysis。');
+  if (ACTION_DEFINITIONS.filter((definition) => definition.implementationStatus === 'connected').map((definition) => definition.actionKey).join(',') !== 'meter-readings-to-energy-records,carbon-accounting-run,prediction-run,strategy-evaluation-run,energy-flow-analysis') {
+    throw new Error('当前后置动作切片只能连接 meter-readings-to-energy-records、carbon-accounting-run、prediction-run、strategy-evaluation-run 与 energy-flow-analysis。');
+  }
+  if (ACTION_DEFINITIONS.filter((definition) => definition.implementationStatus === 'not-connected').map((definition) => definition.actionKey).join(',') !== 'benchmark-evaluation,energy-balance-snapshot,dashboard-refresh-check') {
+    throw new Error('当前后置动作切片只能保留 benchmark-evaluation、energy-balance-snapshot 与 dashboard-refresh-check 未连接。');
   }
   return true;
 }
@@ -284,10 +287,5 @@ module.exports = {
   getDemoPostActionRegistryIdentity,
   listDemoPostActions,
   requireDemoPostAction,
-  validateDemoPostActionRegistry,
-  _test: {
-    canonicalize,
-    calculateRegistryDigest,
-    toSafeProjection
-  }
+  validateDemoPostActionRegistry
 };

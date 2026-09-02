@@ -16,10 +16,22 @@ const backupService = require('./backupService');
 const { assertSupportedImportFile, parseImportFile } = require('./import/parser');
 const { buildEnergyTypeIndex, detectEnergyImportTemplateMismatch, validateAndNormalizeRow } = require('./import/normalization');
 const { findLedgerAssociationsForImportRecord, loadActiveLedgerIndexes } = require('./ledgerService');
+const { runWithDemoOwnershipTransaction } = require('./demoOwnershipService');
 
 const MAX_PAGE_SIZE = 500;
 const ENERGY_RECORD_IMPORT_TYPE = 'energy_record';
 const METER_READING_IMPORT_TYPE = 'meter_reading';
+// Artifact 07 managed direct 路由固定绑定，客户端不得提交 artifact、handler、batch role 或实体类型。
+const MONTHLY_ENERGY_DEMO_BINDING = Object.freeze({
+  artifactKey: '07-monthly-energy',
+  handlerKey: 'monthly-energy-import',
+  batchRole: 'primary',
+  entityType: 'energy_record'
+});
+// Artifact 07 通过 ownership wrapper 的固定 operation intent 执行，不暴露分步写协议。
+const MONTHLY_ENERGY_MANAGED_DIRECT_OPERATION = 'artifact-07-managed-direct:v1';
+// direct upload 没有公开 preview API，服务端以原文件 SHA 构造固定内部 execute digest。
+const MONTHLY_ENERGY_DIRECT_DIGEST_VERSION = 'monthly-energy-managed-direct:v1';
 // 导入批次删除备份原因用于生成可识别且受控的恢复快照。
 const IMPORT_BATCH_DELETE_BACKUP_REASON = 'import-batch-delete';
 // 导入批次删除操作编码用于持久化审计检索。
@@ -317,79 +329,50 @@ function applyProvidedFieldMapping(row, providedMapping) {
   return mappedRow;
 }
 
-function persistImportResult(db, context) {
+/** 构造默认 skip warning，普通与 managed 路径复用完全相同的错误审计语义。 */
+function buildDuplicateSkippedIssue(batchId, rowNumber, duplicateKey) {
+  return {
+    batchId,
+    rowNumber,
+    fieldName: 'duplicate_key',
+    rawValue: duplicateKey,
+    errorCode: 'DUPLICATE_SKIPPED',
+    errorReason: '默认 skip 策略已跳过与历史 active 能耗记录重复的数据。',
+    severity: 'warning'
+  };
+}
+
+/** 只执行能耗行校验、去重和实际插入；批次生命周期由调用方持有的事务包装器决定。 */
+function processEnergyImportRows(db, context, writer) {
   const {
     batchId,
     rows,
     providedFieldMapping
   } = context;
-
   const energyTypes = getActiveEnergyTypes(db);
   const energyTypeIndex = buildEnergyTypeIndex(energyTypes);
   const ledgerIndexes = loadActiveLedgerIndexes(db);
-  const insertError = db.prepare(
-    `INSERT INTO import_errors (
-       batch_id,
-       row_number,
-       field_name,
-       raw_value,
-       error_code,
-       error_reason,
-       severity
-     ) VALUES (?, ?, ?, ?, ?, ?, ?)`
-  );
   const duplicateExists = db.prepare(
     `SELECT id FROM energy_records WHERE duplicate_key = ? AND record_status = 'active' LIMIT 1`
   );
-  const insertRecord = db.prepare(
-    `INSERT INTO energy_records (
-       source_batch_id,
-       source_row_number,
-       energy_type_id,
-       organization_unit_id,
-       meter_device_id,
-       original_month,
-       normalized_month,
-       original_unit,
-       original_value,
-       normalized_unit,
-       normalized_value,
-       remark,
-       duplicate_key,
-       record_status
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
-  );
-  const updateBatch = db.prepare(
-    `UPDATE import_batches
-     SET status = ?,
-         total_rows = ?,
-         success_count = ?,
-         failure_count = ?,
-         skipped_count = ?,
-         field_mapping_json = ?,
-         started_at = COALESCE(started_at, ?),
-         finished_at = ?,
-         updated_at = ?,
-         error_summary = ?
-     WHERE id = ?`
-  );
-  const markProcessing = db.prepare(
-    `UPDATE import_batches
-     SET status = 'processing', started_at = ?, updated_at = ?
-     WHERE id = ?`
-  );
-
   let successCount = 0;
   let failureCount = 0;
   let skippedCount = 0;
   let validationErrorCount = 0;
+  const insertedRecords = [];
+  const skippedRecords = [];
   const mergedFieldMapping = { ...(providedFieldMapping || {}) };
 
-  markProcessing.run(getNow(), getNow(), batchId);
-
   if (rows.length === 0) {
-    insertError.run(batchId, 1, null, null, 'EMPTY_IMPORT_FILE', '导入文件没有可解析的数据行。', 'error');
-    updateBatch.run('failed', 0, 0, 0, 0, JSON.stringify(mergedFieldMapping), getNow(), getNow(), getNow(), '导入文件没有可解析的数据行。', batchId);
+    writer.insertIssue({
+      batchId,
+      rowNumber: 1,
+      fieldName: null,
+      rawValue: null,
+      errorCode: 'EMPTY_IMPORT_FILE',
+      errorReason: '导入文件没有可解析的数据行。',
+      severity: 'error'
+    });
     return {
       batchId,
       status: 'failed',
@@ -397,14 +380,25 @@ function persistImportResult(db, context) {
       successCount: 0,
       failureCount: 0,
       skippedCount: 0,
-      validationErrorCount: 1
+      validationErrorCount: 1,
+      fieldMapping: mergedFieldMapping,
+      errorSummary: '导入文件没有可解析的数据行。',
+      insertedRecords,
+      skippedRecords
     };
   }
 
   const templateMismatch = detectEnergyImportTemplateMismatch(rows, providedFieldMapping);
   if (templateMismatch) {
-    insertError.run(batchId, 1, null, null, templateMismatch.errorCode, templateMismatch.errorReason, 'error');
-    updateBatch.run('failed', rows.length, 0, rows.length, 0, JSON.stringify(mergedFieldMapping), getNow(), getNow(), getNow(), templateMismatch.errorReason, batchId);
+    writer.insertIssue({
+      batchId,
+      rowNumber: 1,
+      fieldName: null,
+      rawValue: null,
+      errorCode: templateMismatch.errorCode,
+      errorReason: templateMismatch.errorReason,
+      severity: 'error'
+    });
     return {
       batchId,
       status: 'failed',
@@ -412,7 +406,11 @@ function persistImportResult(db, context) {
       successCount: 0,
       failureCount: rows.length,
       skippedCount: 0,
-      validationErrorCount: 1
+      validationErrorCount: 1,
+      fieldMapping: mergedFieldMapping,
+      errorSummary: templateMismatch.errorReason,
+      insertedRecords,
+      skippedRecords
     };
   }
 
@@ -425,56 +423,70 @@ function persistImportResult(db, context) {
     if (errors.length > 0) {
       failureCount += 1;
       validationErrorCount += errors.length;
-      errors.forEach((error) => {
-        insertError.run(batchId, error.rowNumber, error.fieldName, error.rawValue, error.errorCode, error.errorReason, error.severity);
-      });
+      errors.forEach((error) => writer.insertIssue({
+        batchId,
+        rowNumber: error.rowNumber,
+        fieldName: error.fieldName,
+        rawValue: error.rawValue,
+        errorCode: error.errorCode,
+        errorReason: error.errorReason,
+        severity: error.severity
+      }));
       return;
     }
 
     if (duplicateExists.get(record.duplicateKey)) {
       skippedCount += 1;
-      insertError.run(
-        batchId,
-        rowNumber,
-        'duplicate_key',
-        record.duplicateKey,
-        'DUPLICATE_SKIPPED',
-        '默认 skip 策略已跳过与历史 active 能耗记录重复的数据。',
-        'warning'
-      );
+      writer.insertIssue(buildDuplicateSkippedIssue(batchId, rowNumber, record.duplicateKey));
+      skippedRecords.push({
+        entityType: MONTHLY_ENERGY_DEMO_BINDING.entityType,
+        entityPk: null,
+        batchRole: MONTHLY_ENERGY_DEMO_BINDING.batchRole,
+        sourceRowNumber: rowNumber,
+        reason: 'duplicate_skipped'
+      });
       return;
     }
 
+    const ledgerAssociations = findLedgerAssociationsForImportRecord(record, ledgerIndexes);
     try {
-      const ledgerAssociations = findLedgerAssociationsForImportRecord(record, ledgerIndexes);
-      insertRecord.run(
+      const insertion = writer.insertRecord({
         batchId,
-        record.sourceRowNumber,
-        record.energyTypeId,
-        ledgerAssociations.organizationUnitId,
-        ledgerAssociations.meterDeviceId,
-        record.originalMonth,
-        record.normalizedMonth,
-        record.originalUnit,
-        record.originalValue,
-        record.normalizedUnit,
-        record.normalizedValue,
-        record.remark,
-        record.duplicateKey
-      );
+        sourceRowNumber: record.sourceRowNumber,
+        energyTypeId: record.energyTypeId,
+        organizationUnitId: ledgerAssociations.organizationUnitId,
+        meterDeviceId: ledgerAssociations.meterDeviceId,
+        originalMonth: record.originalMonth,
+        normalizedMonth: record.normalizedMonth,
+        originalUnit: record.originalUnit,
+        originalValue: record.originalValue,
+        normalizedUnit: record.normalizedUnit,
+        normalizedValue: record.normalizedValue,
+        remark: record.remark,
+        duplicateKey: record.duplicateKey
+      });
       successCount += 1;
+      if (insertion && insertion.rowWitness) {
+        insertedRecords.push({
+          entityType: MONTHLY_ENERGY_DEMO_BINDING.entityType,
+          entityPk: Number(insertion.entityPk),
+          batchRole: MONTHLY_ENERGY_DEMO_BINDING.batchRole,
+          sourceRowNumber: record.sourceRowNumber,
+          rowWitness: insertion.rowWitness
+        });
+      }
     } catch (error) {
-      if (String(error.message || '').includes('ux_energy_records_active_duplicate_key')) {
+      if (writer.recoverDuplicateConstraint === true
+        && String(error.message || '').includes('ux_energy_records_active_duplicate_key')) {
         skippedCount += 1;
-        insertError.run(
-          batchId,
-          rowNumber,
-          'duplicate_key',
-          record.duplicateKey,
-          'DUPLICATE_SKIPPED',
-          '默认 skip 策略已跳过与历史 active 能耗记录重复的数据。',
-          'warning'
-        );
+        writer.insertIssue(buildDuplicateSkippedIssue(batchId, rowNumber, record.duplicateKey));
+        skippedRecords.push({
+          entityType: MONTHLY_ENERGY_DEMO_BINDING.entityType,
+          entityPk: null,
+          batchRole: MONTHLY_ENERGY_DEMO_BINDING.batchRole,
+          sourceRowNumber: rowNumber,
+          reason: 'duplicate_skipped'
+        });
         return;
       }
       throw error;
@@ -489,22 +501,6 @@ function persistImportResult(db, context) {
   if (skippedCount > 0) {
     summaryParts.push(`默认 skip 策略跳过 ${skippedCount} 行重复数据。`);
   }
-  const errorSummary = summaryParts.length > 0 ? summaryParts.join(' ') : null;
-
-  updateBatch.run(
-    status,
-    rows.length,
-    successCount,
-    failureCount,
-    skippedCount,
-    JSON.stringify(mergedFieldMapping),
-    getNow(),
-    getNow(),
-    getNow(),
-    errorSummary,
-    batchId
-  );
-
   return {
     batchId,
     status,
@@ -512,8 +508,75 @@ function persistImportResult(db, context) {
     successCount,
     failureCount,
     skippedCount,
-    validationErrorCount
+    validationErrorCount,
+    fieldMapping: mergedFieldMapping,
+    errorSummary: summaryParts.length > 0 ? summaryParts.join(' ') : null,
+    insertedRecords,
+    skippedRecords
   };
+}
+
+/** 在普通导入自有连接内保持现有 batch-before-parse 与 failed batch 持久化语义。 */
+function persistImportResult(db, context) {
+  const insertError = db.prepare(`INSERT INTO import_errors
+    (batch_id, row_number, field_name, raw_value, error_code, error_reason, severity)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`);
+  const insertRecord = db.prepare(`INSERT INTO energy_records
+    (source_batch_id, source_row_number, energy_type_id, organization_unit_id, meter_device_id,
+      original_month, normalized_month, original_unit, original_value, normalized_unit,
+      normalized_value, remark, duplicate_key, record_status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`);
+  const updateBatch = db.prepare(`UPDATE import_batches
+    SET status = ?, total_rows = ?, success_count = ?, failure_count = ?, skipped_count = ?,
+      field_mapping_json = ?, started_at = COALESCE(started_at, ?), finished_at = ?,
+      updated_at = ?, error_summary = ?
+    WHERE id = ?`);
+  db.prepare(`UPDATE import_batches SET status = 'processing', started_at = ?, updated_at = ? WHERE id = ?`)
+    .run(getNow(), getNow(), context.batchId);
+  const result = processEnergyImportRows(db, context, {
+    recoverDuplicateConstraint: true,
+    insertIssue: (issue) => insertError.run(
+      issue.batchId,
+      issue.rowNumber,
+      issue.fieldName,
+      issue.rawValue,
+      issue.errorCode,
+      issue.errorReason,
+      issue.severity
+    ),
+    insertRecord: (record) => {
+      const insertion = insertRecord.run(
+        record.batchId,
+        record.sourceRowNumber,
+        record.energyTypeId,
+        record.organizationUnitId,
+        record.meterDeviceId,
+        record.originalMonth,
+        record.normalizedMonth,
+        record.originalUnit,
+        record.originalValue,
+        record.normalizedUnit,
+        record.normalizedValue,
+        record.remark,
+        record.duplicateKey
+      );
+      return { entityPk: Number(insertion.lastInsertRowid) };
+    }
+  });
+  updateBatch.run(
+    result.status,
+    result.totalRows,
+    result.successCount,
+    result.failureCount,
+    result.skippedCount,
+    JSON.stringify(result.fieldMapping),
+    getNow(),
+    getNow(),
+    getNow(),
+    result.errorSummary,
+    result.batchId
+  );
+  return result;
 }
 
 function getImportProcessingErrorCode(error, fallback = 'IMPORT_PROCESS_FAILED') {
@@ -538,6 +601,108 @@ function markBatchFailed(db, batchId, message, errorCode = 'IMPORT_PROCESS_FAILE
   insertError.run(batchId, errorCode, message);
 }
 
+/** 以固定版本、artifact、handler 与上传原字节 SHA 构造 direct execute 内部摘要。 */
+function buildMonthlyEnergyManagedDirectDigest(fileSha256) {
+  const digest = crypto.createHash('sha256').update([
+    MONTHLY_ENERGY_DIRECT_DIGEST_VERSION,
+    MONTHLY_ENERGY_DEMO_BINDING.artifactKey,
+    MONTHLY_ENERGY_DEMO_BINDING.handlerKey,
+    fileSha256
+  ].join('\0')).digest('hex');
+  return `hmac-sha256:v1:audit:${digest}`;
+}
+
+/** 将持久批次投影回通用 direct import 响应，并标记是否为终态回放。 */
+function buildManagedDirectImportResponse(db, batchId, terminalReplay) {
+  const detail = getImportBatchDetail(db, batchId);
+  // managed 首次执行与终态回放都从持久错误表恢复真实校验错误数，避免响应摘要漂移。
+  const validationErrorCount = Number(db.prepare(`SELECT COUNT(*) AS total
+    FROM import_errors
+    WHERE batch_id = ? AND severity = 'error'`).get(batchId).total);
+  return {
+    ...detail,
+    summary: {
+      batchId: detail.id,
+      status: detail.status,
+      totalRows: detail.totalRows,
+      successCount: detail.successCount,
+      failureCount: detail.failureCount,
+      skippedCount: detail.skippedCount,
+      validationErrorCount
+    },
+    terminalReplay: terminalReplay === true
+  };
+}
+
+/**
+ * 将 Artifact 07 文件解析结果提交给 ownership wrapper 的不可拆分 operation；业务层无法触达 finalize 或 context CAS。
+ * 文件解析与 SHA 已在进入写事务前完成，operation 返回后再通过独立只读连接投影通用响应。
+ */
+function createManagedMonthlyEnergyImportFromUpload(file, context) {
+  const {
+    demoContext,
+    fileType,
+    fileSha256,
+    providedFieldMapping,
+    options
+  } = context;
+  const parsed = parseImportFile(file.path, file.originalname);
+  const previewDigest = buildMonthlyEnergyManagedDirectDigest(fileSha256);
+  const databaseLocator = openDatabase();
+  const databasePath = databaseLocator.name;
+  databaseLocator.close();
+
+  const operationResult = runWithDemoOwnershipTransaction(databasePath, {
+    operation: MONTHLY_ENERGY_MANAGED_DIRECT_OPERATION,
+    demoContext,
+    uploadFileSha256: fileSha256,
+    previewDigest,
+    fieldMapping: providedFieldMapping,
+    file: {
+      originalFilename: decodeUploadOriginalName(file.originalname),
+      storedFilename: file.filename,
+      fileType,
+      fileSizeBytes: Number(file.size),
+      fileSha256
+    },
+    faultInjector: options.managedDirectFaultInjector === undefined
+      ? null
+      : options.managedDirectFaultInjector,
+    executeBusinessRows({ batchId, db, writer }) {
+      const result = processEnergyImportRows(db, {
+        batchId,
+        rows: parsed.rows,
+        providedFieldMapping
+      }, {
+        recoverDuplicateConstraint: false,
+        insertIssue: (issue) => writer.insertIssue(issue),
+        insertRecord: (record) => writer.insertRecord(record)
+      });
+      return {
+        status: result.status,
+        totalRows: result.totalRows,
+        successCount: result.successCount,
+        failureCount: result.failureCount,
+        skippedCount: result.skippedCount,
+        validationErrorCount: result.validationErrorCount,
+        fieldMapping: result.fieldMapping,
+        errorSummary: result.errorSummary
+      };
+    }
+  });
+  const responseDb = openDatabase();
+  try {
+    return buildManagedDirectImportResponse(
+      responseDb,
+      operationResult.batchId,
+      operationResult.terminalReplay
+    );
+  } finally {
+    responseDb.close();
+  }
+}
+
+/** 通用 direct import 入口：无 context 保持 formal 语义，有 context 固定进入 Artifact 07 managed 闭包。 */
 function createImportBatchFromUpload(file, options = {}) {
   assertWritableAllowed('imports:create-batch:service');
 
@@ -560,6 +725,15 @@ function createImportBatchFromUpload(file, options = {}) {
   const fileType = assertSupportedImportFile(file.originalname);
   const providedFieldMapping = parseJsonBody(options.fieldMapping, {});
   const fileSha256 = sha256File(file.path);
+  if (options.demoContext !== null && options.demoContext !== undefined) {
+    return createManagedMonthlyEnergyImportFromUpload(file, {
+      demoContext: options.demoContext,
+      fileType,
+      fileSha256,
+      providedFieldMapping,
+      options
+    });
+  }
   const db = openDatabase();
   let batchId = null;
 

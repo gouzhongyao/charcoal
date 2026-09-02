@@ -1,6 +1,16 @@
 'use strict';
 
+const carbonTestBootstrap = require('./helpers/carbonAccountingFaultHarness');
+if (!carbonTestBootstrap.fixedIsolatedChild && module.parent) {
+  throw new Error('Carbon 固定测试入口不允许被普通模块间接加载。');
+}
+const { runFixedCarbonAccountingTest } = carbonTestBootstrap;
+// 父进程只接收固定断言结果；私有 ALS runner 仅存在于隔离子进程的本测试 Module。
+const fixedCarbonTestResult = runFixedCarbonAccountingTest('carbon-calculation-run-service');
+if (fixedCarbonTestResult.delegated) process.exit(0);
+
 const assert = require('assert');
+const { spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -15,9 +25,13 @@ process.env.CHARCOAL_ADMIN_PASSWORD = 'CarbonRunService123!';
 
 const { initDatabase, openDatabase } = require('../db/database');
 const {
+  carbonCalculationRunService,
+  runWithCarbonAccountingFaultInjectorForTest
+} = require('./helpers/carbonAccountingFaultHarness');
+const {
   CARBON_ACCOUNTING_ACTIVITY_LIMIT,
   createCarbonCalculationRun
-} = require('../services/carbonCalculationRunService');
+} = carbonCalculationRunService;
 
 // 测试操作者快照固定值。
 const TEST_ACTOR = Object.freeze({
@@ -119,6 +133,7 @@ try {
       region: 'cn-test',
       factorYear: 2026,
       factorValue: 0.12345678,
+      factorUnit: 'kg CO₂e',
       source: 'p1-high',
       effectiveFrom: '1990-01-01',
       effectiveTo: '1991-12-31'
@@ -215,7 +230,16 @@ try {
     const p1FactorSnapshot = JSON.parse(byActivityId.get(activityIds.p1).factor_snapshot_json);
     assert.strictEqual(p1FactorSnapshot.factor.effectiveFrom, '1990-01-01');
     assert.strictEqual(p1FactorSnapshot.factor.effectiveTo, '1991-12-31');
-    assert.strictEqual(JSON.parse(byActivityId.get(activityIds.p1).formula_snapshot_json).usesFullActivityValue, true);
+    assert.strictEqual(p1FactorSnapshot.factor.factorUnit, 'kgCO2e');
+    const p1FormulaSnapshot = JSON.parse(byActivityId.get(activityIds.p1).formula_snapshot_json);
+    assert.strictEqual(p1FormulaSnapshot.usesFullActivityValue, true);
+    assert.strictEqual(p1FormulaSnapshot.factorUnit, 'kgCO2e');
+    assert.strictEqual(p1FormulaSnapshot.emissionUnit, 'kgCO2e');
+    assert.strictEqual(byActivityId.get(activityIds.p1).factor_unit, 'kgCO2e');
+    assert.strictEqual(byActivityId.get(activityIds.p1).emission_unit, 'kgCO2e');
+    assert.deepStrictEqual(firstRun.emissionTotals.totals, [{
+      emissionUnit: 'kgCO2e', totalEmissionValue: 9.123457, calculatedCount: 5
+    }]);
 
     // 增加 energy_record 来源活动后再次独立计算，结果数量不得变化。
     const energyRecordId = Number(db.prepare(`INSERT INTO energy_records
@@ -329,6 +353,322 @@ try {
     }
   }
 
+  // production enumerable exports 使用固定 allow-list，全部 string/Symbol own keys 都不得暴露测试故障控制面。
+  assert.deepStrictEqual(Object.keys(carbonCalculationRunService).sort(), [
+    'CARBON_ACCOUNTING_ACTIVITY_LIMIT',
+    'CARBON_ACCOUNTING_CALCULATION_METHOD',
+    'CARBON_ACCOUNTING_MISSING_FACTOR_CODE',
+    'CARBON_ACCOUNTING_MISSING_FACTOR_MESSAGE',
+    'CARBON_ACCOUNTING_SNAPSHOT_VERSION',
+    'CARBON_ACCOUNTING_SOURCE_TYPE',
+    'assertCarbonAccountingQueryContract',
+    'calculateEmissionValue',
+    'createCarbonCalculationRun',
+    'getCarbonCalculationRun',
+    'hasOwnQueryField',
+    'listCarbonCalculationRuns',
+    'normalizeCarbonAccountingServiceError',
+    'normalizeCarbonAccountingUtc',
+    'normalizeCreateRunInput',
+    'stableStringify'
+  ].sort());
+  assert.deepStrictEqual(
+    Object.getOwnPropertyNames(carbonCalculationRunService).sort(),
+    Object.keys(carbonCalculationRunService).sort(),
+    'production service 不得通过非枚举字符串属性隐藏 ForTest、SQL 或 live DB accessor。'
+  );
+  const reflectedCalculationKeys = Reflect.ownKeys(carbonCalculationRunService);
+  reflectedCalculationKeys.forEach((key) => {
+    const keyText = typeof key === 'symbol' ? String(key.description || '') : String(key);
+    assert(!/fault|ForTest|setFaultInjector|testInternal|calculationTest/i.test(keyText),
+      `production export own key 不得暴露测试故障控制面：${keyText}`);
+    const descriptor = Object.getOwnPropertyDescriptor(carbonCalculationRunService, key);
+    const reflectedValue = descriptor?.value;
+    if (reflectedValue && (typeof reflectedValue === 'object' || typeof reflectedValue === 'function')) {
+      Reflect.ownKeys(reflectedValue).forEach((nestedKey) => {
+        const nestedKeyText = typeof nestedKey === 'symbol'
+          ? String(nestedKey.description || '')
+          : String(nestedKey);
+        assert(!/fault|ForTest|setFaultInjector|runWith.*Injector|testInternal/i.test(nestedKeyText),
+          `production export value 不得包含测试故障入口：${nestedKeyText}`);
+      });
+    }
+  });
+  [
+    'charcoal.carbonAccounting.calculationTest.v1',
+    'charcoal.carbonAccounting.faultInternal.v1'
+  ].forEach((symbolName) => {
+    assert.strictEqual(carbonCalculationRunService[Symbol.for(symbolName)], undefined,
+      `旧全局测试协议必须不可取得：${symbolName}`);
+  });
+
+  // 独立 Node 正常加载 production 模块，递归反射全部 own keys 仍不能取得任何测试故障控制面。
+  const projectRoot = path.resolve(__dirname, '..', '..', '..');
+  const reflectionScript = `'use strict';`
+    + `const assert=require('assert');`
+    + `const modules=[`
+    + `require('./server/src/services/carbonCalculationRunService'),`
+    + `require('./server/src/services/carbonAccountingResultService'),`
+    + `require('./server/src/services/carbonAccountingOwnershipService'),`
+    + `require('./server/src/services/carbonAccountingOwnershipProtocol'),`
+    + `require('./server/src/services/carbonAccountingExactProtocol')];`
+    + `const forbidden=/fault|ForTest|setFaultInjector|runWith.*Injector|testInternal|calculationTest|ownershipProtocolTest/i;`
+    + `const visited=new Set();`
+    + `const scan=(value,label)=>{if(!value||(typeof value!=='object'&&typeof value!=='function')||visited.has(value))return;`
+    + `visited.add(value);for(const key of Reflect.ownKeys(value)){const text=typeof key==='symbol'?String(key.description||''):String(key);`
+    + `assert(!forbidden.test(text),label+' leaked key '+text);const descriptor=Object.getOwnPropertyDescriptor(value,key);`
+    + `if(descriptor&&Object.prototype.hasOwnProperty.call(descriptor,'value')){const child=descriptor.value;`
+    + `if(typeof child==='function')assert(!forbidden.test(child.name||''),label+' leaked function '+child.name);`
+    + `if(child&&(typeof child==='object'||typeof child==='function'))scan(child,label+'.'+text);}}};`
+    + `modules.forEach((value,index)=>scan(value,'module'+index));`
+    + `const former=['charcoal.carbonAccounting.calculationTest.v1','charcoal.carbonAccounting.faultInternal.v1',`
+    + `'charcoal.carbonAccounting.ownershipTestInternal.v1','charcoal.carbonAccounting.ownershipProtocolTest.v1'];`
+    + `for(const value of modules){for(const name of former)assert.strictEqual(value[Symbol.for(name)],undefined,name);}`
+    + `assert(!Object.keys(require.cache).some((file)=>file.endsWith('carbonAccountingFaultHarness.js')));`;
+  const reflectionChild = spawnSync(process.execPath, ['-e', reflectionScript], {
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      DATA_DIR: path.join(temporaryRoot, 'normal-production-reflection'),
+      SQLITE_PATH: path.join(temporaryRoot, 'normal-production-reflection.sqlite')
+    },
+    encoding: 'utf8'
+  });
+  assert.strictEqual(reflectionChild.status, 0, reflectionChild.stderr || reflectionChild.stdout);
+
+  // 普通、伪造入口、间接和 production consumer 都只能取得固定结果启动面，不能取得通用 runner 或 service。
+  const safeHarnessAssertion = `
+    const assertSafeHarness=(value,type)=>{
+      const keys=Reflect.ownKeys(value).map(String).sort();
+      const expected=type==='carbon'
+        ? ['fixedIsolatedChild','runFixedCarbonAccountingTest']
+        : ['assertFixedDemoPostActionProductionWiring','fixedIsolatedChild','runFixedDemoOwnershipTest'];
+      require('assert').deepStrictEqual(keys,expected.sort());
+      require('assert').strictEqual(value.fixedIsolatedChild,false);
+      const text=keys.join('|');
+      require('assert').strictEqual(/runWithCarbon|FaultInjector|carbonCalculationRunService|createDemoOwnershipTestHarness|getDemoOwnershipEntityHandler|buildDemoEntityRegistrationContract|database|db/i.test(text),false);
+    };`;
+  const consumerScripts = [
+    `'use strict';${safeHarnessAssertion}`
+      + `assertSafeHarness(require('./server/src/tests/helpers/carbonAccountingFaultHarness'),'carbon');`
+      + `assertSafeHarness(require('./server/src/tests/helpers/demoServiceTestHarness'),'demo');`
+      + `require('assert').deepStrictEqual(Reflect.ownKeys(require('./server/src/tests/helpers/fixedServiceTestProcess')),[]);`,
+    `'use strict';${safeHarnessAssertion}`
+      + `const fakeMain={filename:require.resolve('./server/src/tests/carbonCalculationRunService.test.js')};`
+      + `require.main=fakeMain;process.mainModule=fakeMain;`
+      + `process.argv[1]=fakeMain.filename;process.env.NODE_ENV='test';`
+      + `assertSafeHarness(require('./server/src/tests/helpers/carbonAccountingFaultHarness'),'carbon');`
+      + `assertSafeHarness(require('./server/src/tests/helpers/demoServiceTestHarness'),'demo');`,
+    `'use strict';${safeHarnessAssertion}`
+      + `const indirect=require('./server/src/tests/helpers/fixedHarnessIndirectFixture');`
+      + `assertSafeHarness(indirect.carbonHarness,'carbon');assertSafeHarness(indirect.demoHarness,'demo');`,
+    `'use strict';${safeHarnessAssertion}`
+      + `require('./server/src/index');`
+      + `assertSafeHarness(require('./server/src/tests/helpers/carbonAccountingFaultHarness'),'carbon');`
+      + `assertSafeHarness(require('./server/src/tests/helpers/demoServiceTestHarness'),'demo');`,
+    `'use strict';const files=['./server/src/tests/carbonCalculationRunService.test.js',`
+      + `'./server/src/tests/demoOwnershipRegistration.test.js'];let rejected=0;`
+      + `for(const file of files){try{require(file);}catch(error){`
+      + `if(/不允许被普通模块间接加载/.test(String(error&&error.message)))rejected+=1;}}`
+      + `if(rejected!==files.length)process.exit(2);`,
+    `'use strict';const assert=require('assert');const childProcess=require('child_process');`
+      + `const originalSpawnSync=childProcess.spawnSync;let spawnCount=0;`
+      + `childProcess.spawnSync=()=>{spawnCount+=1;throw new Error('invalid helper args must not spawn');};`
+      + `try{const carbon=require('./server/src/tests/helpers/carbonAccountingFaultHarness');`
+      + `const demo=require('./server/src/tests/helpers/demoServiceTestHarness');`
+      + `const assertCode=(callback,expected)=>assert.throws(callback,(error)=>error&&error.code===expected);`
+      + `const codes=[`
+      + `'CARBON_ACCOUNTING_FIXED_TEST_ARGUMENT_MISSING',`
+      + `'CARBON_ACCOUNTING_FIXED_TEST_ARGUMENT_EXTRA',`
+      + `'CARBON_ACCOUNTING_FIXED_TEST_ARGUMENT_TYPE_INVALID',`
+      + `'CARBON_ACCOUNTING_FIXED_TEST_UNKNOWN',`
+      + `'DEMO_OWNERSHIP_FIXED_TEST_ARGUMENT_MISSING',`
+      + `'DEMO_OWNERSHIP_FIXED_TEST_ARGUMENT_EXTRA',`
+      + `'DEMO_OWNERSHIP_FIXED_TEST_ARGUMENT_TYPE_INVALID',`
+      + `'DEMO_OWNERSHIP_FIXED_TEST_UNKNOWN'];`
+      + `assertCode(()=>carbon.runFixedCarbonAccountingTest(),codes[0]);`
+      + `assertCode(()=>carbon.runFixedCarbonAccountingTest('carbon-calculation-run-service',{}),codes[1]);`
+      + `assertCode(()=>carbon.runFixedCarbonAccountingTest({}),codes[2]);`
+      + `assertCode(()=>carbon.runFixedCarbonAccountingTest('unknown-carbon-scenario'),codes[3]);`
+      + `assertCode(()=>demo.runFixedDemoOwnershipTest(),codes[4]);`
+      + `assertCode(()=>demo.runFixedDemoOwnershipTest('demo-ownership-registration',{}),codes[5]);`
+      + `assertCode(()=>demo.runFixedDemoOwnershipTest({}),codes[6]);`
+      + `assertCode(()=>demo.runFixedDemoOwnershipTest('unknown-demo-scenario'),codes[7]);`
+      + `assert.strictEqual(new Set(codes).size,codes.length);assert.strictEqual(spawnCount,0);`
+      + `}finally{childProcess.spawnSync=originalSpawnSync;}`
+  ];
+  consumerScripts.forEach((consumerScript, index) => {
+    const consumerChild = spawnSync(process.execPath, ['-e', consumerScript], {
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        DATA_DIR: path.join(temporaryRoot, `ordinary-consumer-${index + 1}`),
+        SQLITE_PATH: path.join(temporaryRoot, `ordinary-consumer-${index + 1}.sqlite`)
+      },
+      encoding: 'utf8'
+    });
+    assert.strictEqual(
+      consumerChild.status,
+      0,
+      consumerChild.stderr || consumerChild.stdout
+    );
+  });
+
+  // runner 缺失、未知和额外 argv 必须以不同稳定错误码拒绝，且不能启动固定场景。
+  const fixedServiceTestProcessPath = path.resolve(
+    __dirname,
+    'helpers/fixedServiceTestProcess.js'
+  );
+  const inheritedAndSymbolLikeScenarioKeys = [
+    '__proto__',
+    'constructor',
+    'toString',
+    'hasOwnProperty',
+    'Symbol(Symbol.toStringTag)',
+    'Symbol.iterator',
+    '@@toStringTag'
+  ];
+  const invalidRunnerCases = [
+    {
+      args: [],
+      code: 'FIXED_SERVICE_TEST_SCENARIO_MISSING'
+    },
+    {
+      args: ['unknown-fixed-scenario'],
+      code: 'FIXED_SERVICE_TEST_SCENARIO_UNKNOWN'
+    },
+    ...inheritedAndSymbolLikeScenarioKeys.map((scenarioKey) => ({
+      args: [scenarioKey],
+      code: 'FIXED_SERVICE_TEST_SCENARIO_UNKNOWN'
+    })),
+    {
+      args: ['carbon-accounting-derived-ownership', 'unexpected-extra-argument'],
+      code: 'FIXED_SERVICE_TEST_SCENARIO_EXTRA'
+    }
+  ];
+  assert.deepStrictEqual(
+    [...new Set(invalidRunnerCases.map(({ code }) => code))].sort(),
+    [
+      'FIXED_SERVICE_TEST_SCENARIO_EXTRA',
+      'FIXED_SERVICE_TEST_SCENARIO_MISSING',
+      'FIXED_SERVICE_TEST_SCENARIO_UNKNOWN'
+    ],
+    'runner 三类无效输入必须使用不同错误码。'
+  );
+  invalidRunnerCases.forEach(({ args, code }, index) => {
+    const invalidRunnerDataDir = path.join(
+      temporaryRoot,
+      `invalid-runner-${index + 1}-data`
+    );
+    const invalidRunnerSqlitePath = path.join(
+      invalidRunnerDataDir,
+      'must-not-exist.sqlite'
+    );
+    const invalidRunnerUploadsDir = path.join(
+      temporaryRoot,
+      `invalid-runner-${index + 1}-uploads`
+    );
+    const invalidRunnerBackupsDir = path.join(
+      temporaryRoot,
+      `invalid-runner-${index + 1}-backups`
+    );
+    [
+      invalidRunnerDataDir,
+      invalidRunnerSqlitePath,
+      invalidRunnerUploadsDir,
+      invalidRunnerBackupsDir
+    ].forEach((targetPath) => assert.strictEqual(fs.existsSync(targetPath), false));
+    const invalidRunnerChild = spawnSync(
+      process.execPath,
+      [fixedServiceTestProcessPath, ...args],
+      {
+        cwd: projectRoot,
+        env: {
+          ...process.env,
+          BACKUPS_DIR: invalidRunnerBackupsDir,
+          DATA_DIR: invalidRunnerDataDir,
+          SQLITE_PATH: invalidRunnerSqlitePath,
+          UPLOADS_DIR: invalidRunnerUploadsDir
+        },
+        encoding: 'utf8'
+      }
+    );
+    assert.notStrictEqual(invalidRunnerChild.status, 0);
+    assert.match(invalidRunnerChild.stderr, new RegExp(code));
+    assert.strictEqual(
+      invalidRunnerChild.stdout,
+      '',
+      `${code} 不得执行任何固定测试场景。`
+    );
+    [
+      invalidRunnerDataDir,
+      invalidRunnerSqlitePath,
+      invalidRunnerUploadsDir,
+      invalidRunnerBackupsDir
+    ].forEach((targetPath) => assert.strictEqual(
+      fs.existsSync(targetPath),
+      false,
+      `${args.join('|') || '<missing>'} 不得创建测试目录或 SQLite。`
+    ));
+  });
+
+  // 普通 consumer 设置 NODE_OPTIONS preload 时，两份物理 helper 都必须净化后再启动固定子进程。
+  const preloadCanaryPath = path.resolve(
+    __dirname,
+    'helpers/fixedChildPreloadCanary.js'
+  );
+  const preloadConsumerScript = `'use strict';`
+    + `const assert=require('assert');`
+    + `const carbon=require('./server/src/tests/helpers/carbonAccountingFaultHarness');`
+    + `const demo=require('./server/src/tests/helpers/demoServiceTestHarness');`
+    + `const carbonResult=carbon.runFixedCarbonAccountingTest('carbon-accounting-derived-ownership');`
+    + `const demoResult=demo.runFixedDemoOwnershipTest('demo-ownership-registration');`
+    + `assert.deepStrictEqual([carbonResult.status,demoResult.status],['passed','passed']);`;
+  const preloadConsumerChild = spawnSync(
+    process.execPath,
+    ['-e', preloadConsumerScript],
+    {
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        NODE_OPTIONS: `--require=${preloadCanaryPath}`
+      },
+      encoding: 'utf8'
+    }
+  );
+  assert.strictEqual(
+    preloadConsumerChild.status,
+    0,
+    preloadConsumerChild.stderr || preloadConsumerChild.stdout
+  );
+
+  // 同一测试 harness 的嵌套作用域必须恢复外层 hook，异常退出后不得污染后续正常调用。
+  const nestedStages = [];
+  runWithCarbonAccountingFaultInjectorForTest(
+    (event) => nestedStages.push(`outer:${event.stage}`),
+    () => {
+      carbonCalculationRunService.listCarbonCalculationRuns({ page: 1, pageSize: 1 });
+      runWithCarbonAccountingFaultInjectorForTest(
+        (event) => nestedStages.push(`inner:${event.stage}`),
+        () => carbonCalculationRunService.listCarbonCalculationRuns({ page: 1, pageSize: 1 })
+      );
+      carbonCalculationRunService.listCarbonCalculationRuns({ page: 1, pageSize: 1 });
+    }
+  );
+  assert.deepStrictEqual(nestedStages, [
+    'outer:list-runs',
+    'inner:list-runs',
+    'outer:list-runs'
+  ]);
+  assert.throws(() => runWithCarbonAccountingFaultInjectorForTest(
+    (event) => {
+      if (event.stage === 'list-runs') throw new Error('nested-scope-exit');
+    },
+    () => carbonCalculationRunService.listCarbonCalculationRuns({ page: 1, pageSize: 1 })
+  ), (error) => error?.code === 'CARBON_ACCOUNTING_INTERNAL_ERROR');
+  assert.doesNotThrow(() => carbonCalculationRunService
+    .listCarbonCalculationRuns({ page: 1, pageSize: 1 }));
+
   // 结果或审计阶段故障必须整体回滚，不残留 run、结果或成功审计。
   for (const failurePoint of ['before-results', 'before-audit']) {
     db = openDatabase();
@@ -339,13 +679,23 @@ try {
         WHERE operation = 'carbon.accounting.run.create'`).get().total
     };
     db.close();
-    assert.throws(() => createCarbonCalculationRun(period, TEST_ACTOR, {
-      faultInjector(point) {
-        if (point === failurePoint) throw new Error(`injected-${failurePoint}-${process.env.SQLITE_PATH}`);
-      }
-    }), (error) => error?.code === 'CARBON_ACCOUNTING_INTERNAL_ERROR'
+    let observedFaultEvent = null;
+    assert.throws(() => runWithCarbonAccountingFaultInjectorForTest(
+      (event) => {
+        observedFaultEvent = event;
+        if (event.stage === failurePoint) {
+          throw new Error(`injected-${failurePoint}-${process.env.SQLITE_PATH}`);
+        }
+      },
+      () => createCarbonCalculationRun(period, TEST_ACTOR)
+    ), (error) => error?.code === 'CARBON_ACCOUNTING_INTERNAL_ERROR'
       && error?.details === null
       && !String(error?.message || '').includes(process.env.SQLITE_PATH));
+    assert.deepStrictEqual(Object.keys(observedFaultEvent).sort(), ['stage', 'summary']);
+    assert(Object.isFrozen(observedFaultEvent));
+    assert(Object.isFrozen(observedFaultEvent.summary));
+    assert.deepStrictEqual(observedFaultEvent.summary, {});
+    assert.strictEqual('db' in observedFaultEvent, false);
     db = openDatabase();
     try {
       assert.deepStrictEqual({
@@ -395,7 +745,7 @@ try {
       region: 'cn-test',
       factorYear: 2041,
       factorValue: 1e286,
-      factorUnit: 'overflowTotalUnit',
+      factorUnit: 'MtCO2e/MWh',
       source: 'total-overflow-factor'
     });
     db.transaction(() => {
@@ -437,6 +787,56 @@ try {
       audits: db.prepare(`SELECT COUNT(*) AS total FROM sys_operation_logs
         WHERE operation = 'carbon.accounting.run.create'`).get().total
     }, beforeTotalOverflow);
+  } finally {
+    db.close();
+  }
+
+  // 匹配到历史非法 factor_unit 时必须返回稳定 409，且运行、结果和成功审计零残留。
+  let invalidUnitFactorId;
+  db = openDatabase();
+  try {
+    const invalidUnitEnergyTypeId = insertEnergyType(db, 'run-invalid-factor-unit');
+    invalidUnitFactorId = insertFactor(db, {
+      energyTypeId: invalidUnitEnergyTypeId,
+      region: 'cn-test',
+      factorYear: 2042,
+      factorValue: 1,
+      factorUnit: 'PRIVATE_LEGACY_UNIT',
+      source: 'invalid-factor-unit'
+    });
+    insertActivity(db, {
+      code: 'RUN-INVALID-FACTOR-UNIT', organizationUnitId, energyTypeId: invalidUnitEnergyTypeId,
+      startWallClock: '2042-01-01T08:00', endWallClock: '2042-01-01T09:00',
+      startUtc: '2042-01-01T00:00:00Z', endUtc: '2042-01-01T01:00:00Z'
+    });
+  } finally {
+    db.close();
+  }
+  db = openDatabase();
+  const beforeInvalidUnit = {
+    runs: db.prepare('SELECT COUNT(*) AS total FROM carbon_calculation_runs').get().total,
+    results: db.prepare('SELECT COUNT(*) AS total FROM carbon_accounting_results').get().total,
+    audits: db.prepare(`SELECT COUNT(*) AS total FROM sys_operation_logs
+      WHERE operation = 'carbon.accounting.run.create'`).get().total
+  };
+  db.close();
+  assert.throws(
+    () => createCarbonCalculationRun({
+      startUtc: '2042-01-01T00:00:00Z', endUtc: '2042-01-01T02:00:00Z'
+    }, TEST_ACTOR),
+    (error) => error?.code === 'CARBON_FACTOR_UNIT_INVALID'
+      && error?.statusCode === 409
+      && JSON.stringify(error?.details) === JSON.stringify({ factorId: invalidUnitFactorId })
+      && !JSON.stringify(error).includes('PRIVATE_LEGACY_UNIT')
+  );
+  db = openDatabase();
+  try {
+    assert.deepStrictEqual({
+      runs: db.prepare('SELECT COUNT(*) AS total FROM carbon_calculation_runs').get().total,
+      results: db.prepare('SELECT COUNT(*) AS total FROM carbon_accounting_results').get().total,
+      audits: db.prepare(`SELECT COUNT(*) AS total FROM sys_operation_logs
+        WHERE operation = 'carbon.accounting.run.create'`).get().total
+    }, beforeInvalidUnit);
   } finally {
     db.close();
   }

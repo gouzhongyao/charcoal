@@ -14,7 +14,9 @@ process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
 const {
+  CANONICAL_SCHEMA_PREDECESSOR_VERSION,
   CANONICAL_SCHEMA_VERSION,
+  buildDemoRunTurnoverPredecessorSqlOverrides,
   calculateSchemaFingerprint,
   getTableColumns,
   initDatabase,
@@ -24,148 +26,64 @@ const {
 } = require('../db/database');
 const { listDemoPostActions } = require('../services/demoPostActionRegistry');
 
-// database.js 当前未导出 predecessor 常量；该值必须与其唯一 accepted predecessor 保持同步。
-const PREDECESSOR_VERSION = '2026-08-27-formal-canonical-v2';
-const STRATEGY_RULES_OLD_COLUMNS = [
-  'id', 'rule_code', 'rule_name', 'rule_version', 'formula_version', 'metric_code',
-  'threshold_operator', 'threshold_value', 'threshold_min', 'threshold_max',
-  'threshold_unit', 'reduction_rate', 'priority', 'evidence_requirements_json',
-  'recommendation_text', 'source', 'effective_start_utc', 'effective_end_utc',
-  'source_timezone', 'status', 'created_at', 'updated_at'
-];
+// 唯一 accepted predecessor 必须与 database.js 导出的精确 v3 合同保持一致。
+const PREDECESSOR_VERSION = CANONICAL_SCHEMA_PREDECESSOR_VERSION;
 
-/** 从 schema.sql 精确提取指定 CREATE TABLE 语句，避免 predecessor 夹具复制 SQL 漂移。 */
-function extractCreateTableStatement(schemaText, tableName) {
-  const prefix = new RegExp(`CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${tableName}\\b`, 'i');
-  const match = prefix.exec(schemaText);
-  assert(match, `schema.sql 缺少 ${tableName} 建表语句。`);
-  let depth = 0;
-  let quote = null;
-  for (let index = match.index; index < schemaText.length; index += 1) {
-    const character = schemaText[index];
-    if (quote) {
-      if (character === quote) {
-        if (schemaText[index + 1] === quote) index += 1;
-        else quote = null;
-      }
-      continue;
-    }
-    if (["'", '"', '`'].includes(character)) quote = character;
-    else if (character === '(') depth += 1;
-    else if (character === ')') depth -= 1;
-    else if (character === ';' && depth === 0) return schemaText.slice(match.index, index + 1);
-  }
-  throw new Error(`${tableName} 建表语句未闭合。`);
-}
-
-/** 按顶层逗号拆分策略规则字段和表级约束，保留嵌套 CHECK 表达式。 */
-function splitSqlDefinitionClauses(definitionSql) {
-  const clauses = [];
-  let start = 0;
-  let depth = 0;
-  let quote = null;
-  for (let index = 0; index < definitionSql.length; index += 1) {
-    const character = definitionSql[index];
-    if (quote) {
-      if (character === quote) {
-        if (definitionSql[index + 1] === quote) index += 1;
-        else quote = null;
-      }
-      continue;
-    }
-    if (["'", '"', '`'].includes(character)) quote = character;
-    else if (character === '(') depth += 1;
-    else if (character === ')') depth -= 1;
-    else if (character === ',' && depth === 0) {
-      clauses.push(definitionSql.slice(start, index).trim());
-      start = index + 1;
-    }
-  }
-  clauses.push(definitionSql.slice(start).trim());
-  return clauses.filter(Boolean);
-}
-
-/** 判断策略规则字段或表级约束是否属于 v3 新增 provenance 合同。 */
-function isStrategyRulesProvenanceClause(clause) {
-  const normalized = clause.replace(/\s+/g, ' ').trim().toLowerCase();
-  return /^(source_batch_id|source_row_number)\b/i.test(clause)
-    || /^foreign key\s*\(\s*source_batch_id\s*\)/i.test(clause)
-    || (normalized.startsWith('check (')
-      && normalized.includes('source_batch_id')
-      && normalized.includes('source_row_number'));
-}
-
-/** 从当前 schema 精确生成 strategy_rules v2 predecessor 建表 SQL。 */
-function buildStrategyRulesPredecessorSql() {
-  const schemaText = fs.readFileSync(path.join(__dirname, '..', 'db', 'schema.sql'), 'utf8');
-  const canonicalSql = extractCreateTableStatement(schemaText, 'strategy_rules');
-  const bodyStart = canonicalSql.indexOf('(');
-  const bodyEnd = canonicalSql.lastIndexOf(')');
-  const clauses = splitSqlDefinitionClauses(canonicalSql.slice(bodyStart + 1, bodyEnd));
-  const removed = clauses.filter(isStrategyRulesProvenanceClause);
-  const predecessorClauses = clauses.filter((clause) => !isStrategyRulesProvenanceClause(clause));
-  assert.strictEqual(removed.length, 4, 'strategy_rules v3 provenance 必须恰好包含四个新增片段。');
-  assert(!predecessorClauses.some((clause) => /source_batch_id|source_row_number/i.test(clause)),
-    'strategy_rules v2 predecessor 不得残留 provenance 字段或约束。');
-  return `CREATE TABLE strategy_rules (\n  ${predecessorClauses.join(',\n  ')}\n);`;
-}
-
-/** 将 v3 strategy_rules 精确还原为唯一 v2 predecessor，保留历史行、索引、触发器和序列。 */
-function rebuildStrategyRulesWithoutProvenance(db) {
-  const wasForeignKeysEnabled = db.pragma('foreign_keys', { simple: true }) === 1;
-  const oldRows = db.prepare(`SELECT ${STRATEGY_RULES_OLD_COLUMNS.join(', ')} FROM strategy_rules ORDER BY id`).all();
-  const sequenceRow = db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'strategy_rules'").get();
-  const oldMaxId = oldRows.reduce((maximum, row) => Math.max(maximum, Number(row.id)), 0);
-  const preservedIndexes = db.prepare(
-    "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'strategy_rules' AND sql IS NOT NULL ORDER BY name"
-  ).all().map((row) => row.sql);
-  const preservedTriggers = db.prepare(
-    "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'strategy_rules' AND sql IS NOT NULL ORDER BY name"
-  ).all().map((row) => row.sql);
-  db.pragma('foreign_keys = OFF');
-  try {
-    db.exec('DROP TABLE IF EXISTS temp.strategy_rules__fixture');
-    db.exec('CREATE TEMP TABLE strategy_rules__fixture AS SELECT * FROM strategy_rules ORDER BY id');
-    db.exec('DROP TABLE strategy_rules');
-    db.exec(buildStrategyRulesPredecessorSql());
-    db.exec(`INSERT INTO strategy_rules (${STRATEGY_RULES_OLD_COLUMNS.join(', ')})
-      SELECT ${STRATEGY_RULES_OLD_COLUMNS.join(', ')} FROM temp.strategy_rules__fixture ORDER BY id`);
-    preservedIndexes.forEach((sql) => db.exec(sql));
-    preservedTriggers.forEach((sql) => db.exec(sql));
-    const targetSequence = Math.max(Number(sequenceRow?.seq || 0), oldMaxId);
-    if (sequenceRow) db.prepare("UPDATE sqlite_sequence SET seq = ? WHERE name = 'strategy_rules'").run(targetSequence);
-    else if (targetSequence > 0) db.prepare("INSERT INTO sqlite_sequence (name, seq) VALUES ('strategy_rules', ?)").run(targetSequence);
-    db.exec('DROP TABLE temp.strategy_rules__fixture');
-  } finally {
-    if (wasForeignKeysEnabled) db.pragma('foreign_keys = ON');
-  }
-  assert.deepStrictEqual(db.pragma('foreign_key_check'), []);
-  assert.deepStrictEqual(
-    db.prepare(`SELECT ${STRATEGY_RULES_OLD_COLUMNS.join(', ')} FROM strategy_rules ORDER BY id`).all(),
-    oldRows,
-    'strategy_rules predecessor 夹具必须逐值保留历史业务行。'
-  );
-}
-
-/** 将目标版本隔离库精确还原为只缺少 strategy_rules provenance 的唯一 v2 predecessor。 */
+/** 将目标版本隔离库精确还原为尚无 run 自动换代结构的唯一 v3 predecessor。 */
 function prepareExactPredecessor(databasePath, fingerprintOverride) {
   initDatabase({ databasePath });
+  const predecessorOverrides = buildDemoRunTurnoverPredecessorSqlOverrides();
   const db = openDatabase({ databasePath });
+  const attachedRunTriggers = db.prepare(`SELECT sql FROM sqlite_master
+    WHERE type = 'trigger' AND tbl_name = 'demo_dataset_runs' AND sql IS NOT NULL ORDER BY name`)
+    .all().map((row) => row.sql);
+  db.pragma('foreign_keys = OFF');
   try {
-    rebuildStrategyRulesWithoutProvenance(db);
-    const fingerprint = calculateSchemaFingerprint(db);
-    const trustedPredecessor = matchTrustedCanonicalSchemaProfile(db, PREDECESSOR_VERSION);
-    assert.strictEqual(trustedPredecessor.fingerprint, fingerprint,
-      'v2 fixture 必须命中 database.js strategy_rules provenance predecessor profile。');
-    db.prepare("UPDATE app_meta SET value = ? WHERE key = 'schema_version'").run(PREDECESSOR_VERSION);
-    db.prepare("UPDATE app_meta SET value = ? WHERE key = 'schema_fingerprint'").run(fingerprintOverride || fingerprint);
-    return fingerprint;
+    db.transaction(() => {
+      db.exec(`CREATE TEMP TABLE demo_dataset_runs_v4_backup AS SELECT * FROM demo_dataset_runs ORDER BY run_id;
+        CREATE TEMP TABLE demo_cleanup_runs_v4_backup AS SELECT * FROM demo_cleanup_runs ORDER BY cleanup_run_id;
+        DROP TABLE demo_cleanup_runs;
+        DROP TABLE demo_dataset_runs;`);
+      db.exec(predecessorOverrides.get('table:demo_dataset_runs:demo_dataset_runs'));
+      db.exec(`INSERT INTO demo_dataset_runs
+        (run_id, dataset_id, manifest_version, manifest_digest, status, created_by, created_at,
+          completed_at, cleanup_started_at, cleaned_at, failure_reason)
+        SELECT run_id, dataset_id, manifest_version, manifest_digest, status, created_by, created_at,
+          completed_at, cleanup_started_at, cleaned_at, failure_reason
+        FROM temp.demo_dataset_runs_v4_backup ORDER BY run_id`);
+      db.exec(predecessorOverrides.get('table:demo_cleanup_runs:demo_cleanup_runs'));
+      db.exec(`INSERT INTO demo_cleanup_runs
+        (cleanup_run_id, run_id, client_request_id, preview_digest, preview_expires_at,
+          runtime_revision, registry_watermark, candidate_count, blocker_count, summary_json,
+          confirmation_text, requested_by, status, backup_metadata_json, deleted_count,
+          already_missing_count, created_at, started_at, completed_at, failure_reason)
+        SELECT cleanup_run_id, run_id, client_request_id, preview_digest, preview_expires_at,
+          runtime_revision, registry_watermark, candidate_count, blocker_count, summary_json,
+          confirmation_text, requested_by, status, backup_metadata_json, deleted_count,
+          already_missing_count, created_at, started_at, completed_at, failure_reason
+        FROM temp.demo_cleanup_runs_v4_backup ORDER BY cleanup_run_id;
+        DROP TABLE temp.demo_cleanup_runs_v4_backup;
+        DROP TABLE temp.demo_dataset_runs_v4_backup;
+        CREATE UNIQUE INDEX ux_demo_dataset_runs_active_dataset ON demo_dataset_runs(dataset_id)
+          WHERE status IN ('active', 'completed', 'cleanup_pending', 'cleaning');
+        CREATE INDEX idx_demo_dataset_runs_status_created ON demo_dataset_runs(status, created_at DESC);
+        CREATE INDEX idx_demo_cleanup_runs_status_created ON demo_cleanup_runs(status, created_at DESC);`);
+      attachedRunTriggers.forEach((sql) => db.exec(sql));
+      const fingerprint = calculateSchemaFingerprint(db);
+      const trustedPredecessor = matchTrustedCanonicalSchemaProfile(db, PREDECESSOR_VERSION);
+      assert.strictEqual(trustedPredecessor.fingerprint, fingerprint,
+        'v3 fixture 必须命中 database.js run 自动换代 predecessor profile。');
+      db.prepare("UPDATE app_meta SET value = ? WHERE key = 'schema_version'").run(PREDECESSOR_VERSION);
+      db.prepare("UPDATE app_meta SET value = ? WHERE key = 'schema_fingerprint'").run(fingerprintOverride || fingerprint);
+    }).immediate();
+    return calculateSchemaFingerprint(db);
   } finally {
+    db.pragma('foreign_keys = ON');
     db.close();
   }
 }
 
-/** 向 v2 strategy_rules predecessor 写入显式规则 ID 及其入向 hit 外键夹具。 */
+/** 向精确 v3 predecessor 写入显式策略规则 ID 及其入向 hit 外键夹具。 */
 function insertPopulatedStrategyRuleHitFixture(db, suffix) {
   const ruleId = 142;
   const ruleCode = `POST-ACTION-STRATEGY-${suffix}`;
@@ -297,7 +215,7 @@ function rebuildBalanceTablesWithoutImportSources(db) {
   assert.deepStrictEqual(db.pragma('foreign_key_check'), []);
 }
 
-/** 构造平衡来源列经 ALTER 补齐且 strategy_rules provenance 缺失的真实 v2 predecessor。 */
+/** 构造平衡来源列经 ALTER 补齐的精确 v3 predecessor，并保留策略规则关联夹具。 */
 function prepareAlteredEnergyBalancePredecessor(databasePath, options = {}) {
   prepareExactPredecessor(databasePath);
   const db = openDatabase({ databasePath });
@@ -458,13 +376,13 @@ try {
     assert.strictEqual(
       db.prepare('SELECT COUNT(*) AS count FROM strategy_rules WHERE id = ?').get(alteredBalanceFixture.strategyFixture.ruleId).count,
       1,
-      'energy-balance ALTER + strategy predecessor 组合迁移必须保留显式策略规则。'
+      'energy-balance ALTER + run turnover predecessor 组合迁移必须保留显式策略规则。'
     );
     assert.strictEqual(
       db.prepare('SELECT COUNT(*) AS count FROM strategy_rule_hits WHERE strategy_rule_id = ?')
         .get(alteredBalanceFixture.strategyFixture.ruleId).count,
       1,
-      'energy-balance ALTER + strategy predecessor 组合迁移必须保留策略命中入向外键行。'
+      'energy-balance ALTER + run turnover predecessor 组合迁移必须保留策略命中入向外键行。'
     );
     assert.deepStrictEqual(
       db.prepare('SELECT source_batch_id AS sourceBatchId, source_row_number AS sourceRowNumber FROM strategy_rules WHERE id = ?')
@@ -519,7 +437,7 @@ try {
     db.close();
   }
 
-  // ALTER predecessor 同步登记无关索引后仍必须 fail-closed，且不得放宽 v2 predecessor profile。
+  // ALTER predecessor 同步登记无关索引后仍必须 fail-closed，且不得放宽精确 v3 predecessor profile。
   const alteredBalanceDriftPath = path.join(tmpDir, 'altered-balance-drift.sqlite');
   const alteredBalanceDrift = prepareAlteredEnergyBalancePredecessor(
     alteredBalanceDriftPath,
@@ -584,10 +502,10 @@ try {
     assert.strictEqual(
       db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name IN ('demo_post_action_runs', 'demo_post_action_outputs')").get().count,
       2,
-      'v2 predecessor 原有后置动作表必须保持不变。'
+      'v3 predecessor 原有后置动作表必须保持不变。'
     );
-    assert(!getTableColumns(db, 'strategy_rules').includes('source_batch_id'),
-      '完整性失败后 strategy_rules provenance 迁移必须回滚。');
+    assert(!getTableColumns(db, 'demo_dataset_runs').includes('superseded_at'),
+      '完整性失败后 run 自动换代结构迁移必须回滚。');
     assert.strictEqual(
       db.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value,
       PREDECESSOR_VERSION

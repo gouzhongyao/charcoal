@@ -1,10 +1,105 @@
 import { download, request, requestWithHeaders } from '@/api/http';
 
 const DEMO_CONTEXT_STORAGE_PREFIX = 'charcoal.demoContext.v2';
+/** managed artifact 下载响应中的 run 复用标记响应头。 */
+const DEMO_RUN_REUSED_HEADER = 'x-demo-run-reused';
+/** managed artifact 下载响应中的自动换代标记响应头。 */
+const DEMO_RUN_AUTO_SUPERSEDED_HEADER = 'x-demo-run-auto-superseded';
+/** managed artifact 下载响应中的前序 run 身份响应头。 */
+const DEMO_RUN_SUPERSEDED_FROM_HEADER = 'x-demo-run-superseded-from';
+/** managed artifact 下载响应中的最新 runtime epoch 响应头。 */
+const DEMO_RUNTIME_EPOCH_HEADER = 'x-demo-runtime-epoch';
 
 /** 规范化演示 context 身份字段，避免同一 storage key 出现多种字符串表示。 */
 function normalizeContextIdentity(value) {
   return String(value || '').trim();
+}
+
+/** 按大小写不敏感规则读取下载响应头，兼容普通对象与 AxiosHeaders。 */
+function readDemoResponseHeader(headers, headerName) {
+  if (!headers || !headerName) return '';
+  if (typeof headers.get === 'function') {
+    const headerValue = headers.get(headerName);
+    if (headerValue !== null && headerValue !== undefined) return String(headerValue).trim();
+  }
+  const expectedName = String(headerName).toLowerCase();
+  const matchedEntry = Object.entries(headers).find(([name]) => String(name).toLowerCase() === expectedName);
+  return matchedEntry ? String(matchedEntry[1] ?? '').trim() : '';
+}
+
+/** 只接受服务端稳定 true 标记，其他值一律按 false 处理。 */
+function readDemoTrueHeader(headers, headerName) {
+  return readDemoResponseHeader(headers, headerName).toLowerCase() === 'true';
+}
+
+/** 从显式 prepare 响应或 managed 下载稳定响应头中提取 run 换代摘要。 */
+export function readDemoRunTurnover(result) {
+  const responseData = result?.data && typeof result.data === 'object' ? result.data : null;
+  const payload = responseData?.data && typeof responseData.data === 'object' ? responseData.data : (responseData || result || {});
+  const turnover = payload?.turnover && typeof payload.turnover === 'object' ? payload.turnover : {};
+  const oldRun = turnover.previousRun && typeof turnover.previousRun === 'object' ? turnover.previousRun : {};
+  const newRun = turnover.successorRun && typeof turnover.successorRun === 'object' ? turnover.successorRun : {};
+  const responseRun = payload?.activeRun && typeof payload.activeRun === 'object'
+    ? payload.activeRun : (payload?.run && typeof payload.run === 'object' ? payload.run : payload);
+  const headerAutoSuperseded = readDemoTrueHeader(result?.headers, DEMO_RUN_AUTO_SUPERSEDED_HEADER);
+  return {
+    performed: headerAutoSuperseded || turnover.performed === true,
+    reused: readDemoTrueHeader(result?.headers, DEMO_RUN_REUSED_HEADER) || payload?.reused === true || turnover.reused === true,
+    oldRunId: readDemoResponseHeader(result?.headers, DEMO_RUN_SUPERSEDED_FROM_HEADER)
+      || normalizeContextIdentity(oldRun.runId),
+    newRunId: readDemoResponseHeader(result?.headers, 'x-demo-run-id')
+      || normalizeContextIdentity(newRun.runId || responseRun?.runId || result?.demo?.runId),
+    oldManifestVersion: normalizeContextIdentity(oldRun.manifestVersion),
+    newManifestVersion: normalizeContextIdentity(newRun.manifestVersion || responseRun?.manifestVersion || result?.demo?.manifestVersion),
+    runtimeEpoch: readDemoResponseHeader(result?.headers, DEMO_RUNTIME_EPOCH_HEADER)
+      || String(turnover.runtimeAfter?.runtimeEpoch ?? payload?.runtimeEpoch ?? '')
+  };
+}
+
+/** 构造不包含 manifest digest 的 run 自动换代成功提示。 */
+export function formatDemoRunTurnoverSuccessMessage(turnover, actionLabel) {
+  const oldRunId = normalizeContextIdentity(turnover?.oldRunId) || '—';
+  const newRunId = normalizeContextIdentity(turnover?.newRunId) || '—';
+  const oldManifestVersion = normalizeContextIdentity(turnover?.oldManifestVersion);
+  const newManifestVersion = normalizeContextIdentity(turnover?.newManifestVersion);
+  const oldManifestText = oldManifestVersion ? `（manifest ${oldManifestVersion}）` : '';
+  const newManifestText = newManifestVersion ? `（manifest ${newManifestVersion}）` : '';
+  return `${String(actionLabel || 'active run 自动换代成功')}：旧 run ${oldRunId}${oldManifestText} → 新 run ${newRunId}${newManifestText}。`;
+}
+
+/** 判断异步响应是否仍属于当前最新请求。 */
+export function isLatestDemoRequest(requestId, latestRequestId) {
+  return Number.isInteger(requestId) && requestId > 0 && requestId === latestRequestId;
+}
+
+/** 判断异步响应是否仍属于最新请求及当前 active run。 */
+export function isLatestDemoRunRequest(requestId, latestRequestId, requestRunId, currentRunId) {
+  return isLatestDemoRequest(requestId, latestRequestId)
+    && normalizeContextIdentity(requestRunId) !== ''
+    && normalizeContextIdentity(requestRunId) === normalizeContextIdentity(currentRunId);
+}
+
+/** 判断 cleanup 查询响应是否仍属于最新动作及当前期望展示身份。 */
+export function isLatestDemoCleanupResultRequest(requestGeneration, latestGeneration, requestCleanupRunId, expectedCleanupRunId) {
+  return isLatestDemoRequest(requestGeneration, latestGeneration)
+    && normalizeContextIdentity(requestCleanupRunId) !== ''
+    && normalizeContextIdentity(requestCleanupRunId) === normalizeContextIdentity(expectedCleanupRunId);
+}
+
+/** 判断三类 cleanup 动作是否均无在途请求，避免 execute 成功收敛被后发查询抢占。 */
+export function canStartDemoCleanupAction(options = {}) {
+  return options.previewLoading !== true
+    && options.executeLoading !== true
+    && options.statusLoading !== true;
+}
+
+/** 判断 active run 是否处于 cleaning 阻断期，并兼容旧版换代阻断 state。 */
+export function isDemoCleanupInProgressBlocked(options = {}) {
+  const runStatus = normalizeContextIdentity(options.activeRunStatus).toLowerCase();
+  const compatibilityState = normalizeContextIdentity(options.activeRunCompatibility?.state).toLowerCase();
+  return runStatus === 'cleaning'
+    || compatibilityState === 'cleanup-in-progress-blocked'
+    || compatibilityState === 'manifest-turnover-blocked';
 }
 
 /** 将 context 身份字段编码为无歧义的 storage key 片段。 */
@@ -139,6 +234,37 @@ export function clearDemoContextIfTokenMatches(artifactKey, handlerKey, issuedTo
   return true;
 }
 
+/** 按 predecessor run 定向清理旧 context，并用 token CAS 保留 successor 或并发新签发值。 */
+export function clearDemoContextsForRun(runId, storage) {
+  const normalizedRunId = normalizeContextIdentity(runId);
+  const contextStorage = resolveDemoContextStorage(storage);
+  if (!normalizedRunId || !contextStorage) return 0;
+  const keys = [];
+  try {
+    for (let index = 0; index < contextStorage.length; index += 1) {
+      const key = contextStorage.key(index);
+      if (key?.startsWith(`${DEMO_CONTEXT_STORAGE_PREFIX}:`)) keys.push(key);
+    }
+  } catch {
+    return 0;
+  }
+  let clearedCount = 0;
+  for (const key of keys) {
+    try {
+      const candidate = JSON.parse(contextStorage.getItem(key) || 'null');
+      const artifactKey = normalizeContextIdentity(candidate?.artifactKey);
+      const handlerKey = normalizeContextIdentity(candidate?.handlerKey);
+      const token = normalizeContextIdentity(candidate?.token);
+      if (normalizeContextIdentity(candidate?.runId) !== normalizedRunId) continue;
+      if (!artifactKey || !handlerKey || key !== contextStorageKey(artifactKey, handlerKey)) continue;
+      if (clearDemoContextIfTokenMatches(artifactKey, handlerKey, token, contextStorage)) clearedCount += 1;
+    } catch {
+      // 单个损坏条目不应阻断其他 predecessor context 的安全清理。
+    }
+  }
+  return clearedCount;
+}
+
 /** 为显式 demo-aware API 请求构造共享 Axios config 字段。 */
 export function demoContextRequestConfig(artifactKey, handlerKey, storage) {
   const contextStorage = resolveDemoContextStorage(storage);
@@ -176,7 +302,10 @@ export async function downloadManagedDemoArtifact(config, fallbackName, storage,
     metadata,
     contextStorage
   );
-  return { ...result, demoContextStored: replacement.ok };
+  const turnover = readDemoRunTurnover(result);
+  const clearedPredecessorContextCount = turnover.performed === true
+    ? clearDemoContextsForRun(turnover.oldRunId, contextStorage) : 0;
+  return { ...result, demoContextStored: replacement.ok, turnover, clearedPredecessorContextCount };
 }
 
 /** 计算浏览器文件 SHA-256；能力拒绝或异常时返回空值并安全降级为正式导入。 */
@@ -268,6 +397,24 @@ export function downloadDemoStandardTemplate(template, format = 'xlsx') {
   return download({ url: route }, fallbackName);
 }
 
+/** 按运行期、授权、生命周期和服务端换代投影判断 catalog artifact 是否允许发起下载。 */
+export function canDownloadDemoCatalogArtifact(options = {}) {
+  const lifecycle = String(options.artifact?.downloadLifecycle || '').trim();
+  if (options.downloadCapable !== true || options.downloadAllowed !== true) return false;
+  if (options.runtimeAvailable !== true || options.runtimeEnabled !== true) return false;
+  if (lifecycle === 'stateless-formal-import') return true;
+  if (lifecycle !== 'managed-context-auto-runtime' || options.contextIssueCapable !== true) return false;
+  if (options.hasActiveRun !== true) return true;
+  const runStatus = String(options.activeRunStatus || '').trim().toLowerCase();
+  const compatibility = options.activeRunCompatibility && typeof options.activeRunCompatibility === 'object'
+    ? options.activeRunCompatibility : {};
+  const compatibilityState = String(compatibility.state || '').trim().toLowerCase();
+  if (isDemoCleanupInProgressBlocked({ activeRunStatus: runStatus, activeRunCompatibility: compatibility })) return false;
+  if (compatibility.manifestCompatible === true && compatibility.writeEligible === true) return true;
+  if (compatibilityState === 'manifest-turnover-pending') return compatibility.turnoverEligible === true;
+  return false;
+}
+
 /** 按服务端 catalog 声明的生命周期下载 artifact，未知生命周期保持关闭。 */
 export function downloadDemoCatalogArtifact(artifact, format = 'xlsx', storage) {
   const safeFormat = format === 'csv' ? 'csv' : 'xlsx';
@@ -297,6 +444,57 @@ export function prepareDemoRun() {
 
 /** 兼容既有调用方的显式 run 准备别名。 */
 export const ensureDemoRun = prepareDemoRun;
+
+/** 严格读取后置动作请求必填文本；空白值在发起请求前直接拒绝。 */
+function requireDemoPostActionRequestText(value, fieldName, preserveWhitespace = false) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(`演示后置动作请求必须提供${fieldName}。`);
+  }
+  return preserveWhitespace ? value : value.trim();
+}
+
+/** 获取服务端安全投影的演示后置动作 registry。 */
+export function getDemoPostActionRegistry() {
+  return request({ url: '/system/demo-data/post-actions', method: 'get' });
+}
+
+/** 为指定 run 和服务端 registry 动作生成严格预演。 */
+export function previewDemoPostAction(runId, actionKey, clientRequestId) {
+  const normalizedRunId = requireDemoPostActionRequestText(runId, 'runId');
+  const normalizedActionKey = requireDemoPostActionRequestText(actionKey, 'actionKey');
+  const normalizedClientRequestId = requireDemoPostActionRequestText(clientRequestId, 'clientRequestId');
+  return request({
+    url: `/system/demo-data/runs/${encodeURIComponent(normalizedRunId)}/post-actions/${encodeURIComponent(normalizedActionKey)}/preview`,
+    method: 'post',
+    data: { clientRequestId: normalizedClientRequestId }
+  });
+}
+
+/** 执行服务端已持久化且仍有效的后置动作预演。 */
+export function executeDemoPostAction(actionRunId, payload = {}) {
+  const normalizedActionRunId = requireDemoPostActionRequestText(actionRunId, 'actionRunId');
+  const normalizedClientRequestId = requireDemoPostActionRequestText(payload?.clientRequestId, 'clientRequestId');
+  const normalizedPreviewDigest = requireDemoPostActionRequestText(payload?.previewDigest, 'previewDigest');
+  const confirmationText = requireDemoPostActionRequestText(payload?.confirmationText, 'confirmationText', true);
+  return request({
+    url: `/system/demo-data/post-action-runs/${encodeURIComponent(normalizedActionRunId)}/execute`,
+    method: 'post',
+    data: {
+      clientRequestId: normalizedClientRequestId,
+      previewDigest: normalizedPreviewDigest,
+      confirmationText
+    }
+  });
+}
+
+/** 查询当前操作者所属的后置动作运行状态。 */
+export function getDemoPostActionRun(actionRunId) {
+  const normalizedActionRunId = requireDemoPostActionRequestText(actionRunId, 'actionRunId');
+  return request({
+    url: `/system/demo-data/post-action-runs/${encodeURIComponent(normalizedActionRunId)}`,
+    method: 'get'
+  });
+}
 
 /** 读取指定演示 run 的 ownership 汇总。 */
 export function getDemoOwnershipSummary(runId) {

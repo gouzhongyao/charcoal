@@ -164,6 +164,70 @@ function disableDemoRuntimeAfterCleanup(input = {}) {
   };
 }
 
+/** 将严格 runtime 行投影为换代合同所需的 generation 快照。 */
+function mapRuntimeGeneration(row) {
+  const canonicalRow = assertCanonicalRuntimeRow(row);
+  return {
+    enabled: canonicalRow.enabled === 1,
+    runtimeEpoch: canonicalRow.runtimeEpoch,
+    revision: canonicalRow.revision
+  };
+}
+
+/** 在调用方事务内提升 manifest 换代 generation，保持 runtime 开启并写入独立审计。 */
+function advanceDemoRuntimeForManifestTurnover(input = {}) {
+  const actorUserId = validateActorUserId(input.actorUserId);
+  const actorIp = input.actorIp ? String(input.actorIp) : null;
+  const previousRunId = String(input.previousRunId || '').trim();
+  const successorRunId = String(input.successorRunId || '').trim();
+  const db = input.db;
+  if (!db || db.inTransaction !== true) {
+    throw new Error('manifest run 换代提升 runtime 必须位于调用方 IMMEDIATE 事务内。');
+  }
+  if (!previousRunId || !successorRunId || previousRunId === successorRunId) {
+    throw badRequest('manifest run 换代的旧/新 run 身份无效。', {
+      code: 'INVALID_DEMO_RUNTIME_TURNOVER_RUN_ID'
+    });
+  }
+  const current = assertCanonicalRuntimeRow(readRuntimeSettingRow(db));
+  if (current.enabled !== 1) {
+    throw new Error('manifest run 换代时演示 runtime 必须保持开启。');
+  }
+  const updatedAt = new Date().toISOString();
+  const updateResult = db.prepare(`UPDATE demo_runtime_settings
+    SET enabled = 1, runtime_epoch = runtime_epoch + 1, revision = revision + 1,
+      updated_by = ?, updated_at = ?, change_reason = 'manifest_run_superseded'
+    WHERE id = ? AND revision = ?`).run(
+    actorUserId,
+    updatedAt,
+    DEMO_RUNTIME_SETTINGS_ID,
+    current.revision
+  );
+  if (updateResult.changes !== 1) {
+    throw new Error('manifest run 换代提升 runtime generation 失败。');
+  }
+  const next = assertCanonicalRuntimeRow(readRuntimeSettingRow(db));
+  db.prepare(`INSERT INTO sys_operation_logs
+    (user_id, operation, target_type, target_id, detail_json, ip, created_at)
+    VALUES (?, 'system.demo.runtime.manifest-supersede', 'demo_runtime_settings', ?, ?, ?, ?)`).run(
+    actorUserId,
+    String(DEMO_RUNTIME_SETTINGS_ID),
+    JSON.stringify({
+      previousRunId,
+      successorRunId,
+      runtimeBefore: mapRuntimeGeneration(current),
+      runtimeAfter: mapRuntimeGeneration(next),
+      changeReason: 'manifest_run_superseded'
+    }),
+    actorIp,
+    updatedAt
+  );
+  return {
+    before: mapRuntimeGeneration(current),
+    after: mapRuntimeGeneration(next)
+  };
+}
+
 /**
  * 从指定连接读取单行运行期设置。
  * @param {object} db SQLite 数据库连接。
@@ -355,6 +419,7 @@ function normalizeDemoRuntimeAfterRestore(actor = {}, options = {}) {
 module.exports = {
   CLEANUP_CONFIRMATION_TEXT,
   DATABASE_RESTORE_SAFETY_REASON,
+  advanceDemoRuntimeForManifestTurnover,
   disableDemoRuntimeAfterCleanup,
   LEGACY_CLAIM_CONFIRMATION_TEXT,
   getDemoCapabilities,

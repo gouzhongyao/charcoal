@@ -6,7 +6,7 @@
       <el-form-item label="开始月份"><el-date-picker v-model="draftFilters.normalizedMonthStart" type="month" value-format="YYYY-MM" format="YYYY-MM" :editable="true" placeholder="开始月份" /></el-form-item>
       <el-form-item label="结束月份"><el-date-picker v-model="draftFilters.normalizedMonthEnd" type="month" value-format="YYYY-MM" format="YYYY-MM" :editable="true" placeholder="结束月份" /></el-form-item>
       <el-form-item label="能源类型"><el-select v-model="draftFilters.energyTypeCode" clearable placeholder="全部能源类型"><el-option v-for="item in energyTypes" :key="item.code" :label="`${item.name}（${item.code}）`" :value="item.code" /></el-select></el-form-item>
-      <el-form-item label="组织"><el-input v-model.trim="draftFilters.organization" clearable placeholder="精确组织名称" /></el-form-item>
+      <el-form-item label="用能单元编码（精确）"><el-input v-model.trim="draftFilters.organizationUnitCode" clearable placeholder="例如 QL-ACTUAL-PARK 或 QL-PARK" /></el-form-item>
       <el-form-item label="字符搜索"><el-input v-model.trim="draftFilters.keyword" clearable placeholder="能源、组织、仪表或备注" /></el-form-item>
     </ManagementToolbar>
 
@@ -109,7 +109,7 @@ import { executeLedgerBackfill, exportEnergyRecords, exportLedgerBackfillPreview
 import { aggregateMonthlyTrend, buildEnergyFilters, ENERGY_TYPE_COLORS, fixedEnergyTypeBreakdown, ledgerAssociationLabel, numberValue } from '@/utils/energyStatistics';
 import { hasPermi } from '@/utils/permission';
 
-const emptyFilters = () => ({ normalizedMonthStart: '', normalizedMonthEnd: '', energyTypeCode: '', organization: '', keyword: '' });
+const emptyFilters = () => ({ normalizedMonthStart: '', normalizedMonthEnd: '', energyTypeCode: '', organizationUnitCode: '', keyword: '' });
 const draftFilters = ref(emptyFilters()); const appliedFilters = ref(emptyFilters());
 const energyTypes = ref([]); const energyTypesError = ref(''); const summary = ref({}); const trendRows = ref([]); const breakdownRows = ref([]); const records = ref([]); const pagination = ref({ total: 0 });
 const loading = ref(false); const summaryError = ref(''); const trendError = ref(''); const breakdownError = ref(''); const recordsError = ref('');

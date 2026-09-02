@@ -12,12 +12,16 @@ const {
   getDemoArtifactRegistration,
   listDemoArtifactRegistrations
 } = require('./demoArtifactRegistry');
+const {
+  DEMO_ACTUAL_ENERGY_ORGANIZATION,
+  DEMO_ACTUAL_ENERGY_ROWS
+} = require('./demoActualEnergyFixture');
 
 // Dataset 身份与版本固定进入 run/context 契约，治理语义变化时必须提升 manifest version。
 const DEMO_DATASET_ID = 'qinglan-park-v1';
-const DEMO_MANIFEST_VERSION = '1.4.0';
+const DEMO_MANIFEST_VERSION = '1.7.0';
 const DEMO_CANONICALIZATION_VERSION = 'canonical-json-v1';
-// 天坤集团演示数据统一采用稳定业务前缀，不使用数据库自增 ID。
+// 演示数据统一采用稳定业务前缀，不使用数据库自增 ID。
 const DEMO_PARK_CODE_PREFIX = 'QL-';
 // 演示数据的来源时区统一显式声明为 IANA 时区。
 const DEMO_PARK_SOURCE_TIME_ZONE = 'Asia/Shanghai';
@@ -67,7 +71,10 @@ function createArtifact(definition) {
 
 // 天坤集团固定下载顺序同时表达父子台账、配置、时序和计算模型依赖。
 const DEMO_PARK_ARTIFACTS = Object.freeze([
-  createArtifact({ artifactKey: '01-organization-root', order: 1, name: '用能单元根级', templateType: 'organization-units', formats: ['xlsx', 'csv'], requiredPermission: 'ledger:units:import', targetPage: '基础台账/组织管理', targetRoute: '/ledger/organization', postAction: '导入并确认根级园区组织已启用。', dependencies: [], rows: [['QL-PARK', '天坤集团', '', '', 'enterprise', 86000, 10, 'active', '天坤集团演示根级']] }),
+  createArtifact({ artifactKey: '01-organization-root', order: 1, name: '用能单元根级', templateType: 'organization-units', formats: ['xlsx', 'csv'], requiredPermission: 'ledger:units:import', targetPage: '基础台账/组织管理', targetRoute: '/ledger/organization', postAction: '导入并确认天坤集团与实际能耗样例企业两个独立根级组织均已启用。', dependencies: [], rows: [
+    ['QL-PARK', '天坤集团', '', '', 'enterprise', 86000, 10, 'active', '天坤集团演示根级'],
+    [DEMO_ACTUAL_ENERGY_ORGANIZATION.code, DEMO_ACTUAL_ENERGY_ORGANIZATION.name, '', '', 'enterprise', '', 15, 'active', '实际月度能耗样例企业；与天坤集团组织和联动事实相互独立']
+  ] }),
   createArtifact({ artifactKey: '02-organization-departments', order: 2, name: '用能单元部门与车间', templateType: 'organization-units', formats: ['xlsx', 'csv'], requiredPermission: 'ledger:units:import', targetPage: '基础台账/组织管理', targetRoute: '/ledger/organization', postAction: '导入后核对父级路径和启用状态。', dependencies: ['01-organization-root'], rows: [
     ['QL-ENERGY', '能源管理部', 'QL-PARK', '天坤集团', 'department', 1800, 20, 'active', '能源管理部门'],
     ['QL-WORKSHOP-A', '精密制造一车间', 'QL-PARK', '天坤集团', 'workshop', 26000, 30, 'active', '主要生产车间'],
@@ -95,7 +102,7 @@ const DEMO_PARK_ARTIFACTS = Object.freeze([
     ['QL-PU-PRECISION', '精密零件产能单元', '2026-08', 1320, 't', 'upload', '天坤集团演示产量'],
     ['QL-PU-ASSEMBLY', '成套设备产能单元', '2026-07', 86, '台', 'upload', '天坤集团演示产量']
   ] }),
-  createArtifact({ artifactKey: '07-monthly-energy', order: 7, name: '月度能耗与预测历史', templateType: 'energy-records', coveredTemplateTypes: ['energy-records', 'prediction-history'], formats: ['xlsx', 'csv'], requiredPermission: 'imports:create', targetPage: '能耗管理/能耗数据导入', targetRoute: '/imports', postAction: '创建导入批次；2026-01 至 2026-07 园区电力仅作为预测历史，2026-08 园区电力结算实际绑定 QL-M-ELEC-PARK，直接用于预算和强度分析；artifact 08 同表抄表预演遇同月同表直接事实时受控 conflict 跳过，conflict 为正常受控跳过，不视为错误。', dependencies: ['03-organization-process-equipment', '04-meters'], rows: [
+  createArtifact({ artifactKey: '07-monthly-energy', order: 7, name: '月度能耗与实际历史', templateType: 'energy-records', coveredTemplateTypes: ['energy-records', 'prediction-history'], formats: ['xlsx', 'csv'], requiredPermission: 'imports:create', targetPage: '能耗管理/能耗数据导入', targetRoute: '/imports', postAction: '创建导入批次；保留天坤集团现有预测、预算、抄表联动的 11 条事实，并追加实际能耗样例企业 QL-ACTUAL-PARK 的 59 条历史实际；实际样例企业无计量器具关联，下载后普通上传即执行，重复记录按 skip 处理；2026-08 天坤集团园区总表 QL-M-ELEC-PARK conflict 及后续联动边界保持不变，conflict 为正常受控跳过，不视为错误。', dependencies: ['01-organization-root', '03-organization-process-equipment', '04-meters'], rows: [
     ['2026-01', 'electricity', 368000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '预测训练历史'],
     ['2026-02', 'electricity', 376000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '预测训练历史'],
     ['2026-03', 'electricity', 389000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '预测训练历史'],
@@ -106,7 +113,8 @@ const DEMO_PARK_ARTIFACTS = Object.freeze([
     ['2026-07', 'natural_gas', 18600, 'm3', 'QL-UTILITY', 'QL-M-GAS-UTILITY', '动力站天然气'],
     ['2026-08', 'electricity', 458000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '园区电费结算实际；与 artifact 08 园区总表抄表用量一致，不由抄表自动派生'],
     ['2026-08', 'natural_gas', 19300, 'm3', 'QL-UTILITY', 'QL-M-GAS-UTILITY', '动力站天然气结算实际'],
-    ['2026-08', 'electricity', 138000, 'kWh', 'QL-WORKSHOP-A', '', '一车间结算实际；用于单位产品能耗']
+    ['2026-08', 'electricity', 138000, 'kWh', 'QL-WORKSHOP-A', '', '一车间结算实际；用于单位产品能耗'],
+    ...DEMO_ACTUAL_ENERGY_ROWS
   ] }),
   createArtifact({ artifactKey: '08-meter-readings-2026-08', order: 8, name: '2026-08 抄表演示', templateType: 'meter-readings', formats: ['xlsx', 'csv'], requiredPermission: 'ledger:readings:import', targetPage: '基础台账/计量抄表', targetRoute: '/ledger/meter-readings', postAction: '导入后仅形成抄表记录；QL-M-ELEC-PARK 园区总表用量与 artifact 07 同月同表直接结算事实一致，受控生成预演应以 conflict 正常跳过且不视为错误；CNC 分表仍应形成 wouldGenerate 候选，不自动写入能耗记录。', dependencies: ['04-meters'], rows: [
     ['2026-08-01', 'QL-M-ELEC-PARK', '园区总进线电表', 1250000, 1708000, 1, '', 'kWh', '天坤集团', '458000 kWh 与直接结算实际一致；受控生成预演应 conflict 跳过，不自动进入月度能耗'],

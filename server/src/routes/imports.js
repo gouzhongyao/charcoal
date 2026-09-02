@@ -1,11 +1,17 @@
+const fs = require('fs');
 const express = require('express');
+const { openDatabase } = require('../db/database');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticate } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { assertWritableAllowed } = require('../services/maintenanceState');
-const { normalizeUploadError, uploadImportFile } = require('../middleware/upload');
-const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
+const {
+  cleanupUploadedImportFile,
+  normalizeUploadError,
+  uploadImportFile
+} = require('../middleware/upload');
+const { monthlyEnergyManagedDirectPreflight } = require('../middleware/demoContext');
 const { getImportContract } = require('../services/contractService');
 const {
   assertImportBatchDomainPermission,
@@ -39,6 +45,40 @@ function getImportFileContentType(fileType) {
   return 'application/octet-stream';
 }
 
+/** 记录 Artifact 07 孤立上传清理失败；日志不得包含 context token 或文件内容。 */
+function logMonthlyEnergyUploadCleanupFailure(file, reason, error = null) {
+  console.warn('[imports] Artifact 07 managed upload cleanup failed', {
+    reason,
+    storedFilename: file?.filename || null,
+    errorCode: error?.code || null
+  });
+}
+
+/** 仅删除没有 import_batches 引用的本次上传文件；查询失败时 fail-safe 保留并记录。 */
+function cleanupUnreferencedMonthlyEnergyUpload(file, reason) {
+  if (!file?.filename) {
+    const cleaned = cleanupUploadedImportFile(file);
+    if (!cleaned && file?.path) logMonthlyEnergyUploadCleanupFailure(file, reason);
+    return cleaned;
+  }
+  let db;
+  try {
+    db = openDatabase();
+    const references = Number(db.prepare(`SELECT COUNT(*) AS total
+      FROM import_batches WHERE stored_filename = ?`).get(file.filename)?.total || 0);
+    if (references > 0) return false;
+    const fileExists = Boolean(file.path && fs.existsSync(file.path));
+    const cleaned = cleanupUploadedImportFile(file);
+    if (!cleaned && fileExists) logMonthlyEnergyUploadCleanupFailure(file, reason);
+    return cleaned;
+  } catch (error) {
+    logMonthlyEnergyUploadCleanupFailure(file, `${reason}:reference-check`, error);
+    return false;
+  } finally {
+    if (db?.open) db.close();
+  }
+}
+
 router.get('/contract', authenticate, requirePermission('imports:view'), (req, res) => {
   sendSuccess(res, getImportContract(), { meta: { contractOnly: false } });
 });
@@ -49,10 +89,13 @@ router.get('/batches', authenticate, requirePermission('imports:view'), asyncHan
   sendSuccess(res, result.rows, { meta: { pagination: result.pagination } });
 }));
 
-router.post('/batches', authenticate, requirePermission('imports:create'), requireWritable('imports:create-batch'), rejectUnconnectedDemoContext, (req, res, next) => {
+router.post('/batches', authenticate, requirePermission('imports:create'), requireWritable('imports:create-batch'), monthlyEnergyManagedDirectPreflight, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const normalizedUploadError = normalizeUploadError(uploadError);
     if (normalizedUploadError) {
+      if (req.demoContext) {
+        cleanupUnreferencedMonthlyEnergyUpload(req.file, 'managed-upload-error');
+      }
       next(normalizedUploadError);
       return;
     }
@@ -62,13 +105,22 @@ router.post('/batches', authenticate, requirePermission('imports:create'), requi
         assertWritableAllowed('imports:create-batch:after-upload');
         return createImportBatchFromUpload(req.file, {
           duplicateStrategy: req.body.duplicateStrategy || 'skip',
-          fieldMapping: req.body.fieldMapping
+          fieldMapping: req.body.fieldMapping,
+          demoContext: req.demoContext
         });
       })
       .then((batch) => {
+        if (req.demoContext && batch.terminalReplay === true) {
+          cleanupUnreferencedMonthlyEnergyUpload(req.file, 'terminal-replay');
+        }
         sendSuccess(res, batch, { statusCode: 201 });
       })
-      .catch(next);
+      .catch((error) => {
+        if (req.demoContext) {
+          cleanupUnreferencedMonthlyEnergyUpload(req.file, 'managed-import-error');
+        }
+        next(error);
+      });
   });
 });
 

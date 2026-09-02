@@ -25,6 +25,16 @@ process.env.PREDICTION_IMPORT_HMAC_SECRET = 'demo-park-prediction-secret-2026';
 process.env.NODE_ENV = 'test';
 
 const { initDatabase, openDatabase } = require('../db/database');
+const { toggleDemoRuntime } = require('../services/demoRuntimeService');
+const { getOrCreateActiveDemoDatasetRun } = require('../services/demoRunService');
+const { createDemoContext, sha256Buffer } = require('../services/demoContextService');
+const { getDemoArtifactRegistration } = require('../services/demoArtifactRegistry');
+const { requireDemoPostAction } = require('../services/demoPostActionRegistry');
+const {
+  executeDemoPostAction,
+  getDemoPostActionStatus,
+  previewDemoPostAction
+} = require('../services/demoPostActionService');
 const {
   DEMO_PARK_ARTIFACTS,
   generateDemoParkArtifact,
@@ -55,13 +65,14 @@ const {
   getEnergyBudgetExecutionComparison
 } = require('../services/energyBudgetService');
 const {
+  CARBON_FACTOR_IMPORT_CONFIRM_TEXT,
   calculateCarbonEmissions,
   createCarbonFactorImportPreviewFromUpload,
   executeCarbonFactorImport
 } = require('../services/carbonAccountingService');
 const {
+  PREDICTION_CONFIG_IMPORT_CONFIRM_TEXT,
   createPredictionConfigImportPreviewFromUpload,
-  createPredictionRun,
   executePredictionConfigImport,
   getPredictionRun
 } = require('../services/predictionService');
@@ -164,16 +175,10 @@ const processedArtifactKeys = [];
 // 保存每项首次导入结果，便于最终覆盖断言。
 const importResults = new Map();
 
-/** 将动态 artifact 写入隔离上传目录并返回 Multer 风格对象。 */
-function createArtifactUpload(artifactKey, suffix = 'initial', options = {}) {
+/** 将动态 artifact 原始下载字节写入隔离上传目录并返回 Multer 风格对象。 */
+function createArtifactUpload(artifactKey, suffix = 'initial') {
   const generated = generateDemoParkArtifact(artifactKey, 'xlsx');
-  let buffer = generated.buffer;
-  if (options.sourceBatchId !== undefined) {
-    const workbook = XLSX.read(buffer, { type: 'buffer' });
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    sheet.F2 = { t: 'n', v: Number(options.sourceBatchId) };
-    buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-  }
+  const buffer = generated.buffer;
   const storedFilename = `${artifactKey}-${suffix}.xlsx`;
   const filePath = path.join(temporaryUploadsDir, storedFilename);
   fs.writeFileSync(filePath, buffer);
@@ -182,6 +187,46 @@ function createArtifactUpload(artifactKey, suffix = 'initial', options = {}) {
     filename: storedFilename,
     size: buffer.length,
     path: filePath
+  };
+}
+
+/** 生成不会与正式导入或另一个顺序场景重复的 artifact 15/18 managed 变体。 */
+function createManagedStrategyArtifactUpload(artifactKey, variant) {
+  const variantConfig = {
+    forward: { date: '2026-08-02', suffix: 'FORWARD', label: '正序' },
+    reverse: { date: '2026-08-03', suffix: 'REVERSE', label: '逆序' }
+  }[variant];
+  if (!variantConfig) throw new Error(`不支持 managed strategy variant：${variant}`);
+  const generated = generateDemoParkArtifact(artifactKey, 'xlsx');
+  const workbook = XLSX.read(generated.buffer, { type: 'buffer' });
+  const sheetName = workbook.SheetNames[0];
+  const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
+    header: 1,
+    blankrows: false
+  });
+  if (artifactKey === '15-energy-timeseries') {
+    rows.slice(1).forEach((row) => {
+      row[3] = String(row[3]).replace('2026-08-01', variantConfig.date);
+      row[4] = String(row[4]).replace('2026-08-01', variantConfig.date);
+      row[9] = `${row[9]}:managed:${variant}`;
+    });
+  } else if (artifactKey === '18-strategy-rules') {
+    rows[1][0] = `QL-STRATEGY-PEAK-MANAGED-${variantConfig.suffix}`;
+    rows[1][1] = `峰段能耗偏高提醒（managed ${variantConfig.label}）`;
+  } else {
+    throw new Error(`不支持 managed strategy artifact：${artifactKey}`);
+  }
+  workbook.Sheets[sheetName] = XLSX.utils.aoa_to_sheet(rows);
+  const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+  const storedFilename = `${artifactKey}-managed-${variant}.xlsx`;
+  const filePath = path.join(temporaryUploadsDir, storedFilename);
+  fs.writeFileSync(filePath, buffer);
+  return {
+    originalname: storedFilename,
+    filename: storedFilename,
+    size: buffer.length,
+    path: filePath,
+    buffer
   };
 }
 
@@ -236,6 +281,502 @@ function getAnalysisOptions(db, actor) {
     actorUserId: actor.userId,
     actorIp: actor.ip
   };
+}
+
+/** 为 manifest artifact 创建绑定同一 active run 的正式 managed context。 */
+function createManagedDemoImportContext(db, actor, demoRun, artifact, file) {
+  assert(demoRun && demoRun.runId, `${artifact.artifactKey} managed 导入必须绑定 active demo run。`);
+  const registration = getDemoArtifactRegistration(artifact.artifactKey);
+  const context = createDemoContext({
+    db,
+    userId: actor.userId,
+    runId: demoRun.runId,
+    artifactKey: artifact.artifactKey,
+    handlerKey: registration.handlerKey,
+    artifactFileSha256: sha256Buffer(fs.readFileSync(file.path))
+  });
+  return {
+    context,
+    demoContext: {
+      token: context.token,
+      userId: actor.userId,
+      artifactKey: artifact.artifactKey,
+      handlerKey: registration.handlerKey
+    }
+  };
+}
+
+/** 读取 Carbon connected 生命周期的业务、ownership、output 与审计计数。 */
+function readCarbonConnectedState(db, runId) {
+  return {
+    calculationRuns: Number(db.prepare('SELECT COUNT(*) AS total FROM carbon_calculation_runs').get().total),
+    accountingResults: Number(db.prepare('SELECT COUNT(*) AS total FROM carbon_accounting_results').get().total),
+    domainAudits: Number(db.prepare("SELECT COUNT(*) AS total FROM sys_operation_logs WHERE operation = 'carbon.accounting.run.create'").get().total),
+    derivedOwnership: Number(db.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+      WHERE run_id = ? AND ownership_kind = 'derived' AND cleaned_at IS NULL`).get(runId).total),
+    relations: Number(db.prepare('SELECT COUNT(*) AS total FROM demo_data_relations WHERE run_id = ?').get(runId).total),
+    outputs: Number(db.prepare('SELECT COUNT(*) AS total FROM demo_post_action_outputs').get().total),
+    actionRuns: Number(db.prepare(`SELECT COUNT(*) AS total FROM demo_post_action_runs
+      WHERE run_id = ? AND action_key = 'carbon-accounting-run'`).get(runId).total),
+    previewAudits: Number(db.prepare(`SELECT COUNT(*) AS total FROM sys_operation_logs
+      WHERE operation = 'system.demo.post-action.preview' AND detail_json LIKE '%carbon-accounting-run%'`).get().total),
+    executeAudits: Number(db.prepare(`SELECT COUNT(*) AS total FROM sys_operation_logs
+      WHERE operation = 'system.demo.post-action.execute' AND detail_json LIKE '%carbon-accounting-run%'`).get().total)
+  };
+}
+
+/** 断言 Carbon connected 公共 DTO 不暴露私有摘要或内部载荷。 */
+function assertCarbonConnectedPublicDtoSafe(value) {
+  assert.strictEqual(
+    /privateDigest|privateScopeDigest|PRIVATE_SENTINEL|SELECT \* FROM private_table/i.test(JSON.stringify(value)),
+    false,
+    'Carbon connected 公共 DTO 不得泄漏私有摘要、SQL 或内部哨兵。'
+  );
+}
+
+/** 在 29 项正式导入后执行真实 Carbon connected post-action，并验证输出追溯与 replay 幂等。 */
+function runCarbonConnectedPostAction(db, actor, demoRun) {
+  const definition = requireDemoPostAction('carbon-accounting-run');
+  assert.deepStrictEqual({
+    implementationStatus: definition.implementationStatus,
+    resolverVersion: definition.resolverVersion,
+    executorVersion: definition.executorVersion
+  }, {
+    implementationStatus: 'connected',
+    resolverVersion: 'carbon-accounting-resolver:v1',
+    executorVersion: 'carbon-accounting-executor:v1'
+  });
+
+  const importedFactorRows = db.prepare(`SELECT CAST(entity_pk AS INTEGER) AS entityPk
+    FROM demo_data_registry WHERE run_id = ? AND artifact_key = '11-carbon-factors'
+      AND entity_type = 'carbon_factor' AND ownership_kind = 'imported' AND cleaned_at IS NULL
+    ORDER BY registry_id`).all(demoRun.runId);
+  const importedActivityRows = db.prepare(`SELECT CAST(entity_pk AS INTEGER) AS entityPk
+    FROM demo_data_registry WHERE run_id = ? AND artifact_key = '27-carbon-activities'
+      AND entity_type = 'carbon_activity_record' AND ownership_kind = 'imported' AND cleaned_at IS NULL
+    ORDER BY registry_id`).all(demoRun.runId);
+  assert(importedFactorRows.length > 0, 'Carbon connected 必须取得 artifact 11 的真实 imported ownership。');
+  assert(importedActivityRows.length > 0, 'Carbon connected 必须取得 artifact 27 的真实 imported ownership。');
+  const importedFactorIds = new Set(importedFactorRows.map((row) => Number(row.entityPk)));
+  const importedActivityIds = importedActivityRows.map((row) => Number(row.entityPk)).sort((a, b) => a - b);
+  const unownedFactorIds = new Set(db.prepare(`SELECT id FROM carbon_factors
+    WHERE id NOT IN (SELECT CAST(entity_pk AS INTEGER) FROM demo_data_registry
+      WHERE run_id = ? AND entity_type = 'carbon_factor' AND ownership_kind = 'imported'
+        AND cleaned_at IS NULL)`).all(demoRun.runId).map((row) => Number(row.id)));
+  const unownedActivityIds = new Set(db.prepare(`SELECT id FROM carbon_activity_records
+    WHERE id NOT IN (SELECT CAST(entity_pk AS INTEGER) FROM demo_data_registry
+      WHERE run_id = ? AND entity_type = 'carbon_activity_record' AND ownership_kind = 'imported'
+        AND cleaned_at IS NULL)`).all(demoRun.runId).map((row) => Number(row.id)));
+
+  const clientRequestId = 'demo-park-carbon-connected';
+  const stateBeforePreview = readCarbonConnectedState(db, demoRun.runId);
+  const preview = previewDemoPostAction({
+    db,
+    runId: demoRun.runId,
+    actionKey: 'carbon-accounting-run',
+    actorUserId: actor.userId,
+    actorIp: actor.ip,
+    body: { clientRequestId }
+  });
+  assert.strictEqual(preview.status, 'previewed');
+  assert.strictEqual(preview.blocker, null);
+  assert.deepStrictEqual(preview.input.sources, ['11-carbon-factors', '27-carbon-activities']);
+  assert.strictEqual(preview.input.factorCount, importedFactorIds.size);
+  assert.strictEqual(preview.input.activityCount, importedActivityIds.length);
+  assert.strictEqual(preview.input.expectedRunCount, 1);
+  assert.strictEqual(preview.input.expectedResultCount, importedActivityIds.length);
+  assert.strictEqual(preview.input.expectedOutputCount, importedActivityIds.length + 1);
+  assert.strictEqual(
+    preview.input.calculatedCount + preview.input.factorMissingCount,
+    importedActivityIds.length
+  );
+  assert.strictEqual(preview.result, null);
+  assert.strictEqual(preview.outputCount, 0);
+  assert.deepStrictEqual(preview.outputs, []);
+  assertCarbonConnectedPublicDtoSafe(preview);
+  assert.deepStrictEqual(readCarbonConnectedState(db, demoRun.runId), {
+    ...stateBeforePreview,
+    actionRuns: stateBeforePreview.actionRuns + 1,
+    previewAudits: stateBeforePreview.previewAudits + 1
+  }, 'Carbon connected preview 只能新增 action run 与 preview audit。');
+
+  const persistedInput = JSON.parse(db.prepare(`SELECT input_json AS inputJson
+    FROM demo_post_action_runs WHERE action_run_id = ?`).get(preview.actionRunId).inputJson);
+  assert.deepStrictEqual({
+    actionKey: persistedInput.publicProjectionActionKey,
+    resolverVersion: persistedInput.publicProjectionResolverVersion,
+    executorVersion: persistedInput.publicProjectionExecutorVersion,
+    projectionVersion: persistedInput.publicProjectionVersion
+  }, {
+    actionKey: 'carbon-accounting-run',
+    resolverVersion: 'carbon-accounting-resolver:v1',
+    executorVersion: 'carbon-accounting-executor:v1',
+    projectionVersion: 1
+  });
+
+  const stateBeforeExecute = readCarbonConnectedState(db, demoRun.runId);
+  const succeeded = executeDemoPostAction({
+    db,
+    actionRunId: preview.actionRunId,
+    actorUserId: actor.userId,
+    actorIp: actor.ip,
+    body: {
+      clientRequestId,
+      previewDigest: preview.previewDigest,
+      confirmationText: definition.confirmationText
+    }
+  });
+  assert.strictEqual(succeeded.status, 'succeeded');
+  assert.strictEqual(succeeded.blocker, null);
+  assert.strictEqual(succeeded.outputCount, importedActivityIds.length + 1);
+  assert.strictEqual(succeeded.outputs.length, succeeded.outputCount);
+  assert.strictEqual(succeeded.result.runCount, 1);
+  assert.strictEqual(succeeded.result.resultCount, importedActivityIds.length);
+  assert.strictEqual(succeeded.result.outputCount, succeeded.outputCount);
+  assert.strictEqual(
+    succeeded.result.calculatedCount + succeeded.result.factorMissingCount,
+    importedActivityIds.length
+  );
+  assertCarbonConnectedPublicDtoSafe(succeeded);
+
+  const persistedOutputs = db.prepare(`SELECT output_entity_type AS outputEntityType,
+      output_entity_id AS outputEntityId FROM demo_post_action_outputs
+    WHERE action_run_id = ? ORDER BY output_id`).all(preview.actionRunId);
+  const calculationRunOutputs = persistedOutputs.filter((output) => output.outputEntityType === 'carbon_calculation_run');
+  assert.strictEqual(calculationRunOutputs.length, 1);
+  const calculationRunId = Number(calculationRunOutputs[0].outputEntityId);
+  const calculationRun = db.prepare(`SELECT id, status, result_count AS resultCount
+    FROM carbon_calculation_runs WHERE id = ?`).get(calculationRunId);
+  assert.deepStrictEqual(calculationRun, {
+    id: calculationRunId,
+    status: 'completed',
+    resultCount: importedActivityIds.length
+  });
+  const resultRows = db.prepare(`SELECT id, activity_record_id AS activityRecordId,
+      carbon_factor_id AS carbonFactorId, status FROM carbon_accounting_results
+    WHERE calculation_run_id = ? ORDER BY id`).all(calculationRunId);
+  assert.deepStrictEqual(
+    resultRows.map((row) => Number(row.activityRecordId)).sort((a, b) => a - b),
+    importedActivityIds,
+    'Carbon connected 结果必须精确覆盖 artifact 27 imported ownership。'
+  );
+  resultRows.forEach((row) => {
+    assert.strictEqual(unownedActivityIds.has(Number(row.activityRecordId)), false,
+      'Carbon connected 不得吸收未归属 activity 哨兵。');
+    if (row.carbonFactorId !== null) {
+      assert.strictEqual(importedFactorIds.has(Number(row.carbonFactorId)), true,
+        'calculated 结果必须只引用 artifact 11 imported factor。');
+      assert.strictEqual(unownedFactorIds.has(Number(row.carbonFactorId)), false,
+        'Carbon connected 不得吸收未归属 factor 哨兵。');
+    }
+  });
+  const expectedOutputFacts = [
+    `carbon_calculation_run:${calculationRunId}`,
+    ...resultRows.map((row) => `carbon_accounting_result:${row.id}`)
+  ].sort();
+  assert.deepStrictEqual(
+    persistedOutputs.map((output) => `${output.outputEntityType}:${output.outputEntityId}`).sort(),
+    expectedOutputFacts
+  );
+  assert.deepStrictEqual(
+    succeeded.outputs.map((output) => output.outputEntityType).sort(),
+    persistedOutputs.map((output) => output.outputEntityType).sort(),
+    'Carbon connected 公共 outputs 类型与基数必须对应真实持久化 outputs。'
+  );
+  // 公共 calculation run outputs 只验证稳定类型与白名单引用，不读取内部实体 ID。
+  const publicCalculationRunOutputs = succeeded.outputs.filter(
+    (output) => output.outputEntityType === 'carbon_calculation_run'
+  );
+  // 公共 accounting result outputs 与持久化结果保持类型基数一致，并逐项验证安全引用。
+  const publicAccountingResultOutputs = succeeded.outputs.filter(
+    (output) => output.outputEntityType === 'carbon_accounting_result'
+  );
+  assert.strictEqual(publicCalculationRunOutputs.length, 1);
+  assert.strictEqual(publicAccountingResultOutputs.length, resultRows.length);
+  assert.deepStrictEqual(
+    Object.keys(publicCalculationRunOutputs[0].outputRef).sort(),
+    [
+      'activityCount',
+      'calculatedCount',
+      'endUtc',
+      'factorMissingCount',
+      'resultCount',
+      'runCode',
+      'startUtc',
+      'status'
+    ],
+    'Carbon connected calculation run 公共引用必须保持递归显式白名单。'
+  );
+  assert.deepStrictEqual({
+    status: publicCalculationRunOutputs[0].outputRef.status,
+    activityCount: publicCalculationRunOutputs[0].outputRef.activityCount,
+    resultCount: publicCalculationRunOutputs[0].outputRef.resultCount,
+    calculatedCount: publicCalculationRunOutputs[0].outputRef.calculatedCount,
+    factorMissingCount: publicCalculationRunOutputs[0].outputRef.factorMissingCount
+  }, {
+    status: 'completed',
+    activityCount: importedActivityIds.length,
+    resultCount: resultRows.length,
+    calculatedCount: succeeded.result.calculatedCount,
+    factorMissingCount: succeeded.result.factorMissingCount
+  });
+  publicAccountingResultOutputs.forEach((output) => {
+    assert(output.outputRef && typeof output.outputRef === 'object' && !Array.isArray(output.outputRef),
+      'Carbon connected accounting result 公共 output 必须包含安全引用。');
+    assert.deepStrictEqual(
+      Object.keys(output.outputRef).sort(),
+      ['emissionUnit', 'emissionValue', 'missingReason', 'status'],
+      'Carbon connected accounting result 公共引用必须保持递归显式白名单。'
+    );
+    assert(['calculated', 'factor_missing'].includes(output.outputRef.status),
+      'Carbon connected accounting result 公共引用必须保留稳定业务状态。');
+  });
+  const derivedFacts = db.prepare(`SELECT entity_type AS entityType, entity_pk AS entityPk
+    FROM demo_data_registry WHERE run_id = ? AND ownership_kind = 'derived' AND cleaned_at IS NULL
+    ORDER BY registry_id`).all(demoRun.runId)
+    .map((row) => `${row.entityType}:${row.entityPk}`).sort();
+  assert.deepStrictEqual(derivedFacts, expectedOutputFacts,
+    'Carbon connected derived ownership 必须精确对应真实 outputs。');
+
+  const relationRows = db.prepare(`SELECT relation_type AS relationType,
+      source.entity_type AS sourceEntityType, source.entity_pk AS sourceEntityPk,
+      target.entity_type AS targetEntityType, target.entity_pk AS targetEntityPk
+    FROM demo_data_relations relation
+    JOIN demo_data_registry source ON source.registry_id = relation.from_registry_id
+    JOIN demo_data_registry target ON target.registry_id = relation.to_registry_id
+    WHERE relation.run_id = ? ORDER BY relation.relation_id`).all(demoRun.runId);
+  const expectedRelations = [];
+  resultRows.forEach((row) => {
+    expectedRelations.push(
+      `contains:carbon_calculation_run:${calculationRunId}->carbon_accounting_result:${row.id}`,
+      `generated_from:carbon_accounting_result:${row.id}->carbon_activity_record:${row.activityRecordId}`
+    );
+    if (row.status === 'calculated') {
+      expectedRelations.push(
+        `uses_factor:carbon_accounting_result:${row.id}->carbon_factor:${row.carbonFactorId}`
+      );
+    }
+  });
+  assert.deepStrictEqual(
+    relationRows.map((row) => `${row.relationType}:${row.sourceEntityType}:${row.sourceEntityPk}`
+      + `->${row.targetEntityType}:${row.targetEntityPk}`).sort(),
+    expectedRelations.sort(),
+    'Carbon connected relation 必须精确连接 calculation run、results 与 imported inputs。'
+  );
+  assert.deepStrictEqual(readCarbonConnectedState(db, demoRun.runId), {
+    ...stateBeforeExecute,
+    calculationRuns: stateBeforeExecute.calculationRuns + 1,
+    accountingResults: stateBeforeExecute.accountingResults + resultRows.length,
+    domainAudits: stateBeforeExecute.domainAudits + 1,
+    derivedOwnership: stateBeforeExecute.derivedOwnership + expectedOutputFacts.length,
+    relations: stateBeforeExecute.relations + expectedRelations.length,
+    outputs: stateBeforeExecute.outputs + expectedOutputFacts.length,
+    executeAudits: stateBeforeExecute.executeAudits + 1
+  });
+
+  const status = getDemoPostActionStatus({
+    db,
+    actionRunId: preview.actionRunId,
+    actorUserId: actor.userId
+  });
+  assert.deepStrictEqual(status, succeeded);
+  const stateBeforeReplay = readCarbonConnectedState(db, demoRun.runId);
+  const replayedPreview = previewDemoPostAction({
+    db,
+    runId: demoRun.runId,
+    actionKey: 'carbon-accounting-run',
+    actorUserId: actor.userId,
+    body: { clientRequestId }
+  });
+  const replayedExecute = executeDemoPostAction({
+    db,
+    actionRunId: preview.actionRunId,
+    actorUserId: actor.userId,
+    body: {
+      clientRequestId,
+      previewDigest: preview.previewDigest,
+      confirmationText: definition.confirmationText
+    }
+  });
+  assert.deepStrictEqual(replayedPreview, succeeded);
+  assert.deepStrictEqual(replayedExecute, succeeded);
+  assert.deepStrictEqual(readCarbonConnectedState(db, demoRun.runId), stateBeforeReplay,
+    'Carbon connected terminal replay 不得重复写入业务、ownership、relation、output 或审计。');
+  return {
+    actionRunId: preview.actionRunId,
+    calculationRunId,
+    resultCount: resultRows.length,
+    outputCount: expectedOutputFacts.length,
+    relationCount: expectedRelations.length
+  };
+}
+
+/** 读取当前 managed strategy run 的业务治理计数，供重复 execute 前后精确比较。 */
+function readManagedStrategyRunState(db, runId) {
+  return {
+    timeseriesOwnership: Number(db.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+      WHERE run_id = ? AND artifact_key = '15-energy-timeseries'
+        AND entity_type = 'energy_timeseries' AND ownership_kind = 'imported'
+        AND cleaned_at IS NULL`).get(runId).total),
+    ruleOwnership: Number(db.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+      WHERE run_id = ? AND artifact_key = '18-strategy-rules'
+        AND entity_type = 'strategy_rule' AND ownership_kind = 'imported'
+        AND cleaned_at IS NULL`).get(runId).total),
+    relations: Number(db.prepare('SELECT COUNT(*) AS total FROM demo_data_relations WHERE run_id = ?').get(runId).total),
+    evaluations: Number(db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total),
+    hits: Number(db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total)
+  };
+}
+
+/** 在 full integration 中按指定顺序验证 managed artifact 15/18 的跨导入闭包和重复 execute 幂等。 */
+async function runManagedStrategyInputIntegration(db, actor, order, label, variant) {
+  if (!['forward', 'reverse'].includes(variant)) {
+    throw new Error(`${label} 必须声明 forward 或 reverse managed variant。`);
+  }
+  assert.deepStrictEqual([...order].sort(), [
+    '15-energy-timeseries',
+    '18-strategy-rules'
+  ].sort(), `${label} 必须只验证 artifact 15/18 两种顺序。`);
+  toggleDemoRuntime({ enabled: true, actorUserId: actor.userId });
+  const run = getOrCreateActiveDemoDatasetRun({ actorUserId: actor.userId });
+  const artifactContext = (artifactKey, context) => ({
+    token: context.token,
+    userId: actor.userId,
+    artifactKey,
+    handlerKey: getDemoArtifactRegistration(artifactKey).handlerKey
+  });
+  const executeManagedArtifact = async (artifactKey, suffix) => {
+    const file = createManagedStrategyArtifactUpload(artifactKey, variant);
+    const context = createDemoContext({
+      db,
+      userId: actor.userId,
+      runId: run.runId,
+      artifactKey,
+      handlerKey: getDemoArtifactRegistration(artifactKey).handlerKey,
+      artifactFileSha256: sha256Buffer(file.buffer)
+    });
+    const demoContext = artifactContext(artifactKey, context);
+    const options = { ...getAnalysisOptions(db, actor), demoContext };
+    const preview = artifactKey === '15-energy-timeseries'
+      ? previewEnergyTimeseriesImport(file, options)
+      : previewStrategyRuleImport(file, options);
+    const relationCountBeforeExecute = Number(db.prepare(`SELECT COUNT(*) AS total
+      FROM demo_data_relations WHERE run_id = ?`).get(run.runId).total);
+    const executed = artifactKey === '15-energy-timeseries'
+      ? await executeEnergyTimeseriesImport(buildAnalysisExecuteBody(preview), options)
+      : await executeStrategyRuleImport(buildAnalysisExecuteBody(preview), options);
+    assert.strictEqual(db.prepare('SELECT status FROM demo_import_contexts WHERE context_id = ?')
+      .get(context.contextId).status, 'executed', `${label} ${suffix} context 必须完成 CAS。`);
+    return { context, preview, executed, relationCountBeforeExecute };
+  };
+
+  const strategyRunCountsBefore = {
+    evaluations: Number(db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total),
+    hits: Number(db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total)
+  };
+  const firstImport = await executeManagedArtifact(order[0], 'first');
+  assert.strictEqual(firstImport.relationCountBeforeExecute, 0,
+    `${label} 首个 artifact 执行前不得存在策略输入关系。`);
+  assert.strictEqual(firstImport.executed.ownership.relationCount, 0,
+    `${label} 首个 artifact 尚无 counterpart 时不得生成不完整策略输入关系。`);
+
+  const secondImport = await executeManagedArtifact(order[1], 'second');
+  const expectedRelationCount = Number(db.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+    WHERE run_id = ? AND artifact_key = '15-energy-timeseries'
+      AND entity_type = 'energy_timeseries' AND ownership_kind = 'imported' AND cleaned_at IS NULL`).get(run.runId).total)
+    * Number(db.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+      WHERE run_id = ? AND artifact_key = '18-strategy-rules'
+        AND entity_type = 'strategy_rule' AND ownership_kind = 'imported' AND cleaned_at IS NULL`).get(run.runId).total);
+  assert.strictEqual(secondImport.relationCountBeforeExecute, 0,
+    `${label} counterpart execute 前 preview 不得预先补写策略输入关系。`);
+  assert.strictEqual(secondImport.executed.ownership.relationCount, expectedRelationCount,
+    `${label} 第二个 artifact execute 必须生成完整 T × R 闭包。`);
+
+  const relationRows = db.prepare(`SELECT relation.relation_type AS relationType,
+      source.artifact_key AS sourceArtifactKey, source.entity_type AS sourceEntityType,
+      source.entity_pk AS sourceEntityPk, target.artifact_key AS targetArtifactKey,
+      target.entity_type AS targetEntityType, target.entity_pk AS targetEntityPk,
+      source.ownership_kind AS sourceOwnershipKind, target.ownership_kind AS targetOwnershipKind,
+      relation.run_id AS relationRunId, source.run_id AS sourceRunId, target.run_id AS targetRunId
+    FROM demo_data_relations relation
+    JOIN demo_data_registry source ON source.registry_id = relation.from_registry_id
+    JOIN demo_data_registry target ON target.registry_id = relation.to_registry_id
+    WHERE relation.run_id = ? AND source.run_id = ? AND target.run_id = ?
+    ORDER BY relation.relation_id`).all(run.runId, run.runId, run.runId);
+  assert.strictEqual(relationRows.length, expectedRelationCount,
+    `${label} relation 数量必须等于完整 T × R 基数。`);
+  const expectedRelationPairs = new Set();
+  const timeseriesEntityPks = db.prepare(`SELECT entity_pk AS entityPk FROM demo_data_registry
+    WHERE run_id = ? AND artifact_key = '15-energy-timeseries' AND entity_type = 'energy_timeseries'
+      AND ownership_kind = 'imported' AND cleaned_at IS NULL ORDER BY registry_id`).all(run.runId)
+    .map((row) => String(row.entityPk));
+  const ruleEntityPks = db.prepare(`SELECT entity_pk AS entityPk FROM demo_data_registry
+    WHERE run_id = ? AND artifact_key = '18-strategy-rules' AND entity_type = 'strategy_rule'
+      AND ownership_kind = 'imported' AND cleaned_at IS NULL ORDER BY registry_id`).all(run.runId)
+    .map((row) => String(row.entityPk));
+  timeseriesEntityPks.forEach((timeseriesEntityPk) => ruleEntityPks.forEach((ruleEntityPk) => {
+    expectedRelationPairs.add(`${timeseriesEntityPk}->${ruleEntityPk}`);
+  }));
+  const actualRelationPairs = new Set();
+  relationRows.forEach((relation) => {
+    assert.deepStrictEqual({
+      relationType: relation.relationType,
+      sourceArtifactKey: relation.sourceArtifactKey,
+      sourceEntityType: relation.sourceEntityType,
+      targetArtifactKey: relation.targetArtifactKey,
+      targetEntityType: relation.targetEntityType,
+      sourceOwnershipKind: relation.sourceOwnershipKind,
+      targetOwnershipKind: relation.targetOwnershipKind,
+      relationRunId: relation.relationRunId,
+      sourceRunId: relation.sourceRunId,
+      targetRunId: relation.targetRunId
+    }, {
+      relationType: 'uses_config',
+      sourceArtifactKey: '15-energy-timeseries',
+      sourceEntityType: 'energy_timeseries',
+      targetArtifactKey: '18-strategy-rules',
+      targetEntityType: 'strategy_rule',
+      sourceOwnershipKind: 'imported',
+      targetOwnershipKind: 'imported',
+      relationRunId: run.runId,
+      sourceRunId: run.runId,
+      targetRunId: run.runId
+    });
+    actualRelationPairs.add(`${relation.sourceEntityPk}->${relation.targetEntityPk}`);
+  });
+  assert.deepStrictEqual(actualRelationPairs, expectedRelationPairs,
+    `${label} relation 必须精确覆盖每个时序到每个规则的方向闭包。`);
+  assert.deepStrictEqual({
+    evaluations: Number(db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total),
+    hits: Number(db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total)
+  }, strategyRunCountsBefore, `${label} managed ownership 不得创建 strategy run 或 hit。`);
+
+  // 使用相同 managed 文件创建全 skipped execute，验证两条执行路径均返回既有闭包且不新增事实。
+  const stateBeforeDuplicates = readManagedStrategyRunState(db, run.runId);
+  for (const artifactKey of order) {
+    const duplicate = await executeManagedArtifact(artifactKey, 'duplicate');
+    assert.strictEqual(duplicate.preview.expectedWouldImport, 0,
+      `${label} ${artifactKey} duplicate preview 必须全部 skip。`);
+    assert.strictEqual(duplicate.executed.imported, 0);
+    assert.strictEqual(duplicate.executed.ownership.noInsertedRecords, true);
+    assert.strictEqual(duplicate.executed.ownership.relationCount, expectedRelationCount,
+      `${label} ${artifactKey} duplicate execute 必须返回既有完整闭包。`);
+    assert.deepStrictEqual(readManagedStrategyRunState(db, run.runId), stateBeforeDuplicates,
+      `${label} ${artifactKey} duplicate execute 不得新增业务、ownership、relation、run 或 hit。`);
+  }
+  return {
+    run,
+    order: [...order],
+    timeseriesCount: timeseriesEntityPks.length,
+    ruleCount: ruleEntityPks.length,
+    relationCount: expectedRelationCount
+  };
+}
+
+/** 将已完成的 managed strategy 测试 run 标记为 cleaned，以便隔离验证相反导入顺序。 */
+function markManagedStrategyRunCleaned(db, runId) {
+  db.prepare(`UPDATE demo_dataset_runs SET status = 'cleaned', cleaned_at = ?
+    WHERE run_id = ? AND status = 'active'`).run(new Date().toISOString(), runId);
 }
 
 /** 返回四项正式无状态导入服务所需的隔离数据库、原文件目录和操作者。 */
@@ -640,8 +1181,22 @@ async function importArtifact(artifact, file, context) {
       return executeProductionOutputImport(buildLegacyExecuteBody(preview));
     }
     case '07-monthly-energy': {
-      const result = createImportBatchFromUpload(file, { duplicateStrategy: 'skip' });
+      const managed = createManagedDemoImportContext(db, actor, context.demoRun, artifact, file);
+      const result = createImportBatchFromUpload(file, {
+        duplicateStrategy: 'skip',
+        demoContext: managed.demoContext
+      });
       assertImmediateImport(result, artifact.artifactKey);
+      assert.strictEqual(result.terminalReplay, false);
+      assert.strictEqual(db.prepare(`SELECT COUNT(*) AS total FROM demo_data_registry
+        WHERE run_id = ? AND artifact_key = '07-monthly-energy'
+          AND entity_type = 'energy_record' AND source_batch_id = ?
+          AND ownership_kind = 'imported' AND cleaned_at IS NULL`).get(
+        context.demoRun.runId,
+        result.id
+      ).total, result.summary.successCount);
+      assert.strictEqual(db.prepare(`SELECT status FROM demo_import_contexts
+        WHERE context_id = ?`).get(managed.context.contextId).status, 'executed');
       context.monthlyEnergyBatchId = Number(result.id);
       assert(Number.isSafeInteger(context.monthlyEnergyBatchId), '07 月度能耗导入批次详情必须返回真实 id。');
       assert.strictEqual(Number(result.summary.batchId), context.monthlyEnergyBatchId, '07 月度能耗 summary.batchId 必须与批次详情 id 一致。');
@@ -654,6 +1209,44 @@ async function importArtifact(artifact, file, context) {
         importType: 'energy_record',
         successCount: artifact.rows.length
       });
+      // artifact 07 首次导入必须写入 70 条，其中实际样例企业独立形成 59 条无仪表历史事实。
+      const actualEnergySummary = db.prepare(`SELECT COUNT(*) AS total,
+          MIN(er.normalized_month) AS minMonth,
+          MAX(er.normalized_month) AS maxMonth,
+          SUM(CASE WHEN er.meter_device_id IS NULL THEN 1 ELSE 0 END) AS withoutMeter
+        FROM energy_records er
+        JOIN organization_units ou ON ou.id = er.organization_unit_id
+        WHERE er.source_batch_id = ?
+          AND er.record_status = 'active'
+          AND ou.unit_code = 'QL-ACTUAL-PARK'`).get(context.monthlyEnergyBatchId);
+      assert.deepStrictEqual(actualEnergySummary, {
+        total: 59,
+        minMonth: '2024-03',
+        maxMonth: '2026-03',
+        withoutMeter: 59
+      });
+      const linkedEnergyCount = Number(db.prepare(`SELECT COUNT(*) AS total
+        FROM energy_records er
+        JOIN organization_units ou ON ou.id = er.organization_unit_id
+        WHERE er.source_batch_id = ?
+          AND er.record_status = 'active'
+          AND ou.unit_code <> 'QL-ACTUAL-PARK'`).get(context.monthlyEnergyBatchId).total);
+      assert.strictEqual(linkedEnergyCount, 11, '天坤集团原 11 条预测、预算和抄表联动事实必须保持不变。');
+      const actualEnergyTypeCounts = db.prepare(`SELECT et.code, COUNT(*) AS total
+        FROM energy_records er
+        JOIN energy_types et ON et.id = er.energy_type_id
+        JOIN organization_units ou ON ou.id = er.organization_unit_id
+        WHERE er.source_batch_id = ?
+          AND er.record_status = 'active'
+          AND ou.unit_code = 'QL-ACTUAL-PARK'
+        GROUP BY et.code
+        ORDER BY et.code`).all(context.monthlyEnergyBatchId);
+      assert.deepStrictEqual(actualEnergyTypeCounts, [
+        { code: 'diesel', total: 2 },
+        { code: 'electricity', total: 25 },
+        { code: 'natural_gas', total: 7 },
+        { code: 'water', total: 25 }
+      ]);
       return result;
     }
     case '08-meter-readings-2026-08': {
@@ -675,16 +1268,50 @@ async function importArtifact(artifact, file, context) {
       return executeEnergyBudgetImport(buildLegacyExecuteBody(preview));
     }
     case '11-carbon-factors': {
-      const preview = createCarbonFactorImportPreviewFromUpload(file);
+      const managed = createManagedDemoImportContext(db, actor, context.demoRun, artifact, file);
+      const options = {
+        ...getFormalImportOptions(db, actor),
+        demoContext: managed.demoContext
+      };
+      const preview = createCarbonFactorImportPreviewFromUpload(file, options);
       assert(preview.summary.wouldImport > 0);
-      return executeCarbonFactorImport(buildLegacyExecuteBody(preview));
+      const result = await executeCarbonFactorImport({
+        batchId: preview.batchId,
+        confirmText: CARBON_FACTOR_IMPORT_CONFIRM_TEXT,
+        requireBackup: true,
+        acknowledgeSkippedRisks: true
+      }, options);
+      assert.strictEqual(result.imported, preview.summary.wouldImport);
+      assert.strictEqual(result.ownership.registrationCount, result.imported);
+      assert.strictEqual(db.prepare(`SELECT status FROM demo_import_contexts
+        WHERE context_id = ?`).get(managed.context.contextId).status, 'executed');
+      return result;
     }
     case '12-prediction-configs': {
       assert(Number.isSafeInteger(context.monthlyEnergyBatchId), '预测配置导入前必须取得 artifact 07 的真实批次 ID。');
-      const preview = createPredictionConfigImportPreviewFromUpload(file);
-      assert(preview.summary.wouldImport > 0);
-      assert.strictEqual(Number(preview.candidateRows[0].sourceBatchFilterId), context.monthlyEnergyBatchId);
-      return executePredictionConfigImport(buildLegacyExecuteBody(preview));
+      const managed = createManagedDemoImportContext(db, actor, context.demoRun, artifact, file);
+      const options = {
+        ...getFormalImportOptions(db, actor),
+        demoContext: managed.demoContext
+      };
+      const preview = createPredictionConfigImportPreviewFromUpload(file, options);
+      assert.strictEqual(preview.summary.wouldImport, 1);
+      assert.strictEqual(preview.candidateRows[0].sourceBatchFilterId, null, 'Artifact 12 文件不得携带或猜测 Artifact 07 自增批次。');
+      const result = await executePredictionConfigImport({
+        batchId: preview.batchId,
+        confirmText: PREDICTION_CONFIG_IMPORT_CONFIRM_TEXT,
+        requireBackup: true,
+        acknowledgeSkippedRisks: true
+      }, options);
+      assert.strictEqual(result.imported, 1);
+      assert.strictEqual(result.sourceTrainingBatchId, context.monthlyEnergyBatchId);
+      assert.strictEqual(result.importedRecords[0].sourceBatchId, preview.batchId);
+      assert.strictEqual(result.importedRecords[0].sourceBatchFilterId, context.monthlyEnergyBatchId);
+      assert.strictEqual(result.importedRecords[0].status, 'draft');
+      assert.strictEqual(result.ownership.registrationCount, 1);
+      assert.strictEqual(db.prepare(`SELECT status FROM demo_import_contexts
+        WHERE context_id = ?`).get(managed.context.contextId).status, 'executed');
+      return result;
     }
     case '13-shift-definitions': {
       const preview = previewShiftDefinitionImport(file, analysisOptions);
@@ -799,7 +1426,11 @@ async function importArtifact(artifact, file, context) {
       return result;
     }
     case '27-carbon-activities': {
-      const options = getFormalImportOptions(db, actor);
+      const managed = createManagedDemoImportContext(db, actor, context.demoRun, artifact, file);
+      const options = {
+        ...getFormalImportOptions(db, actor),
+        demoContext: managed.demoContext
+      };
       const before = {
         records: Number(db.prepare('SELECT COUNT(*) AS total FROM carbon_activity_records').get().total),
         runs: Number(db.prepare('SELECT COUNT(*) AS total FROM carbon_calculation_runs').get().total),
@@ -823,11 +1454,14 @@ async function importArtifact(artifact, file, context) {
         acknowledgeSkippedRisks: true
       }, options);
       assert.strictEqual(result.imported, 2);
+      assert.strictEqual(result.ownership.registrationCount, 2);
       assert.strictEqual(Number(db.prepare('SELECT COUNT(*) AS total FROM carbon_activity_records').get().total), before.records + 2);
       assert.strictEqual(Number(db.prepare('SELECT COUNT(*) AS total FROM carbon_calculation_runs').get().total), before.runs);
       assert.strictEqual(Number(db.prepare('SELECT COUNT(*) AS total FROM carbon_accounting_results').get().total), before.results);
       assert.strictEqual(Number(db.prepare('SELECT COUNT(*) AS total FROM carbon_emissions').get().total), before.emissions);
       assertFormalAuditAndBackup(db, preview.batchId, 'carbon_activity', 'carbon.activity.import', file);
+      assert.strictEqual(db.prepare(`SELECT status FROM demo_import_contexts
+        WHERE context_id = ?`).get(managed.context.contextId).status, 'executed');
       return result;
     }
     case '28-carbon-emission-report': {
@@ -948,10 +1582,10 @@ async function verifyDuplicateImports(context) {
   }, {
     batchId: Number(organizationResult.id),
     status: 'completed_with_errors',
-    totalRows: 1,
+    totalRows: 2,
     successCount: 0,
     failureCount: 0,
-    skippedCount: 1
+    skippedCount: 2
   });
 
   const energyResult = createImportBatchFromUpload(
@@ -968,10 +1602,10 @@ async function verifyDuplicateImports(context) {
   }, {
     batchId: Number(energyResult.id),
     status: 'completed_with_errors',
-    totalRows: 11,
+    totalRows: 70,
     successCount: 0,
     failureCount: 0,
-    skippedCount: 11
+    skippedCount: 70
   });
 
   const budgetPreview = createEnergyBudgetImportPreviewFromUpload(createArtifactUpload('10-energy-budgets', 'duplicate'));
@@ -1197,7 +1831,7 @@ async function verifyDuplicateImports(context) {
 }
 
 /** 主动验证抄表非联动边界，并执行核算、预测、分析、策略、对标、能流、平衡和中控断言。 */
-function runDerivedOperations(db, actor, monthlyEnergyBatchId) {
+function runDerivedOperations(db, actor, demoRun, monthlyEnergyBatchId) {
   const energyCountBeforePreview = Number(db.prepare("SELECT COUNT(*) AS total FROM energy_records WHERE record_status = 'active'").get().total);
   const generatedPreview = getMeterReadingEnergyRecordGenerationPreview({
     monthStart: '2026-08',
@@ -1259,11 +1893,12 @@ function runDerivedOperations(db, actor, monthlyEnergyBatchId) {
   const energyCountAfterPreview = Number(db.prepare("SELECT COUNT(*) AS total FROM energy_records WHERE record_status = 'active'").get().total);
   assert.strictEqual(energyCountAfterPreview, energyCountBeforePreview, 'P0 仅验证抄表转能耗候选，不执行后置写入。');
 
-  const carbonResult = calculateCarbonEmissions({
+  const legacyFormalCarbonResult = calculateCarbonEmissions({
       normalizedMonthStart: '2026-06',
       normalizedMonthEnd: '2026-08'
     });
-    assert(carbonResult.calculatedCount > 0, '碳核算必须产生真实 calculated 结果。');
+    assert(legacyFormalCarbonResult.calculatedCount > 0,
+      'legacy/formal 碳排放计算必须保持独立验收价值，不得冒充 connected post-action。');
 
     const predictionConfig = db.prepare(
       `SELECT pc.id, pc.organization_unit_id AS organizationUnitId,
@@ -1297,36 +1932,106 @@ function runDerivedOperations(db, actor, monthlyEnergyBatchId) {
       predictStartMonth: '2026-08',
       predictEndMonth: '2026-10'
     });
-    const predictionRun = createPredictionRun({
-      name: '天坤集团电力趋势预测验收运行',
-      note: '按已导入预测配置的筛选口径主动运行',
-      energyTypeCode: 'electricity',
-      organizationUnitId: predictionConfig.organizationUnitId,
-      meterDeviceId: predictionConfig.meterDeviceId,
-      sourceBatchId: monthlyEnergyBatchId,
-      trainStartMonth: '2026-01',
-      trainEndMonth: '2026-07',
-      predictStartMonth: '2026-08',
-      predictEndMonth: '2026-10',
-      algorithm: 'moving_average',
-      windowSize: 3
+    const predictionDefinition = requireDemoPostAction('prediction-run');
+    const predictionClientRequestId = 'demo-park-full-prediction-v7';
+    const predictionPreview = previewDemoPostAction({
+      db,
+      runId: demoRun.runId,
+      actionKey: 'prediction-run',
+      actorUserId: actor.userId,
+      actorIp: actor.ip,
+      body: { clientRequestId: predictionClientRequestId }
     });
-    assert(predictionRun && predictionRun.run && predictionRun.summary, `预测运行必须返回 run + summary 固定结构：${JSON.stringify(predictionRun)}`);
-    const predictionRunId = Number(predictionRun.run.id);
-    assert(Number.isSafeInteger(predictionRunId), `预测运行 run.id 必须是安全整数：${JSON.stringify(predictionRun)}`);
+    assert.strictEqual(predictionPreview.status, 'previewed', JSON.stringify(predictionPreview));
+    assert.strictEqual(predictionPreview.blocker, null);
+    assert.strictEqual(predictionPreview.input.algorithm, 'moving_average');
+    assert.strictEqual(predictionPreview.input.trainingRecordCount, 7);
+    assert.strictEqual(predictionPreview.input.expectedResultCount, 3);
+    assert.deepStrictEqual(predictionPreview.outputs, []);
+    const predictionSucceeded = executeDemoPostAction({
+      db,
+      actionRunId: predictionPreview.actionRunId,
+      actorUserId: actor.userId,
+      actorIp: actor.ip,
+      body: {
+        clientRequestId: predictionClientRequestId,
+        previewDigest: predictionPreview.previewDigest,
+        confirmationText: predictionDefinition.confirmationText
+      }
+    });
+    assert.strictEqual(predictionSucceeded.status, 'succeeded', JSON.stringify(predictionSucceeded));
     assert.deepStrictEqual({
-      runId: Number(predictionRun.run.id),
-      runStatus: predictionRun.run.status,
-      runResultCount: predictionRun.run.resultCount,
-      summaryStatus: predictionRun.summary.status,
-      summaryResultCount: predictionRun.summary.resultCount
+      resultStatus: predictionSucceeded.result.status,
+      resultCount: predictionSucceeded.result.resultCount,
+      outputCount: predictionSucceeded.outputCount,
+      outputTypes: predictionSucceeded.outputs.map((output) => output.outputEntityType)
     }, {
-      runId: predictionRunId,
-      runStatus: 'completed',
-      runResultCount: 3,
-      summaryStatus: 'completed',
-      summaryResultCount: 3
+      resultStatus: 'completed',
+      resultCount: 3,
+      outputCount: 4,
+      outputTypes: ['prediction_run', 'prediction_result', 'prediction_result', 'prediction_result']
     });
+    assert(predictionSucceeded.outputs.every((output) => output.outputRef !== null));
+    const predictionActionIdentity = db.prepare(`SELECT registry_version AS registryVersion,
+        registry_digest AS registryDigest, resolver_version AS resolverVersion,
+        executor_version AS executorVersion, input_json AS inputJson
+      FROM demo_post_action_runs WHERE action_run_id = ?`).get(predictionPreview.actionRunId);
+    assert.deepStrictEqual({
+      registryVersion: predictionActionIdentity.registryVersion,
+      registryDigest: predictionActionIdentity.registryDigest,
+      resolverVersion: predictionActionIdentity.resolverVersion,
+      executorVersion: predictionActionIdentity.executorVersion
+    }, {
+      registryVersion: 'demo-post-actions:v7',
+      registryDigest: '70d980ad87156784f137b6bcbc072faebd8577bf4427b4581ac5ee623735e01a',
+      resolverVersion: 'prediction-resolver:v1',
+      executorVersion: 'prediction-executor:v1'
+    });
+    const predictionProjectionMarker = JSON.parse(predictionActionIdentity.inputJson);
+    assert.deepStrictEqual({
+      actionKey: predictionProjectionMarker.publicProjectionActionKey,
+      resolverVersion: predictionProjectionMarker.publicProjectionResolverVersion,
+      executorVersion: predictionProjectionMarker.publicProjectionExecutorVersion,
+      projectionVersion: predictionProjectionMarker.publicProjectionVersion
+    }, {
+      actionKey: 'prediction-run',
+      resolverVersion: 'prediction-resolver:v1',
+      executorVersion: 'prediction-executor:v1',
+      projectionVersion: 1
+    });
+    const predictionStatus = getDemoPostActionStatus({
+      db,
+      actionRunId: predictionPreview.actionRunId,
+      actorUserId: actor.userId
+    });
+    assert.deepStrictEqual(predictionStatus, predictionSucceeded);
+    assert.deepStrictEqual(previewDemoPostAction({
+      db,
+      runId: demoRun.runId,
+      actionKey: 'prediction-run',
+      actorUserId: actor.userId,
+      actorIp: actor.ip,
+      body: { clientRequestId: predictionClientRequestId }
+    }), predictionSucceeded);
+    assert.deepStrictEqual(executeDemoPostAction({
+      db,
+      actionRunId: predictionPreview.actionRunId,
+      actorUserId: actor.userId,
+      actorIp: actor.ip,
+      body: {
+        clientRequestId: predictionClientRequestId,
+        previewDigest: predictionPreview.previewDigest,
+        confirmationText: predictionDefinition.confirmationText
+      }
+    }), predictionSucceeded);
+    const predictionRunOutput = db.prepare(`SELECT output_entity_id AS outputEntityId
+      FROM demo_post_action_outputs
+      WHERE action_run_id = ? AND output_entity_type = 'prediction_run'`).get(
+      predictionPreview.actionRunId
+    );
+    assert(predictionRunOutput, 'Prediction public execute 必须持久化 prediction_run output。');
+    const predictionRunId = Number(predictionRunOutput.outputEntityId);
+    assert(Number.isSafeInteger(predictionRunId) && predictionRunId > 0);
     const predictionDetail = getPredictionRun(predictionRunId);
     assert.strictEqual(predictionDetail.status, 'completed', `预测运行失败：${JSON.stringify(predictionDetail)}`);
     assert.strictEqual(predictionDetail.resultCount, 3);
@@ -1339,6 +2044,59 @@ function runDerivedOperations(db, actor, monthlyEnergyBatchId) {
     assert.strictEqual(Number(predictionDetail.parameters.filters.organizationUnitId), Number(predictionConfig.organizationUnitId));
     assert.strictEqual(Number(predictionDetail.parameters.filters.meterDeviceId), Number(predictionConfig.meterDeviceId));
     assert.strictEqual(Number(predictionDetail.parameters.filters.sourceBatchId), Number(monthlyEnergyBatchId));
+    const predictionOwnershipRows = db.prepare(`SELECT entity_type AS entityType, entity_pk AS entityPk
+      FROM demo_data_registry
+      WHERE run_id = ? AND ownership_kind = 'derived' AND cleaned_at IS NULL
+        AND entity_type IN ('prediction_run', 'prediction_result')
+      ORDER BY entity_type, CAST(entity_pk AS INTEGER)`).all(demoRun.runId);
+    assert.strictEqual(predictionOwnershipRows.filter((row) => row.entityType === 'prediction_run').length, 1);
+    assert.strictEqual(predictionOwnershipRows.filter((row) => row.entityType === 'prediction_result').length, 3);
+    assert.strictEqual(
+      predictionOwnershipRows.find((row) => row.entityType === 'prediction_run').entityPk,
+      String(predictionRunId)
+    );
+    const predictionRelations = db.prepare(`SELECT relation.relation_type AS relationType,
+        source.entity_type AS sourceEntityType, target.entity_type AS targetEntityType,
+        source.entity_pk AS sourceEntityPk, target.entity_pk AS targetEntityPk
+      FROM demo_data_relations relation
+      JOIN demo_data_registry source ON source.registry_id = relation.from_registry_id
+      JOIN demo_data_registry target ON target.registry_id = relation.to_registry_id
+      WHERE relation.run_id = ? AND source.entity_type = 'prediction_run'
+        AND source.entity_pk = ?
+      ORDER BY relation.relation_type, target.entity_type, CAST(target.entity_pk AS INTEGER)`).all(
+      demoRun.runId,
+      String(predictionRunId)
+    );
+    assert.deepStrictEqual(
+      Object.fromEntries(['contains', 'uses_config', 'generated_from'].map((relationType) => [
+        relationType,
+        predictionRelations.filter((relation) => relation.relationType === relationType).length
+      ])),
+      { contains: 3, uses_config: 1, generated_from: 7 }
+    );
+    assert(predictionRelations.filter((relation) => relation.relationType === 'contains')
+      .every((relation) => relation.sourceEntityType === 'prediction_run'
+        && relation.targetEntityType === 'prediction_result'));
+    assert(predictionRelations.filter((relation) => relation.relationType === 'uses_config')
+      .every((relation) => relation.sourceEntityType === 'prediction_run'
+        && relation.targetEntityType === 'prediction_config'
+        && relation.targetEntityPk === String(predictionConfig.id)));
+    assert(predictionRelations.filter((relation) => relation.relationType === 'generated_from')
+      .every((relation) => relation.sourceEntityType === 'prediction_run'
+        && relation.targetEntityType === 'energy_record'));
+    const predictionClosureBlocked = previewDemoPostAction({
+      db,
+      runId: demoRun.runId,
+      actionKey: 'prediction-run',
+      actorUserId: actor.userId,
+      actorIp: actor.ip,
+      body: { clientRequestId: 'demo-park-full-prediction-v7-closure-blocked' }
+    });
+    assert.strictEqual(predictionClosureBlocked.status, 'blocked');
+    assert.strictEqual(
+      predictionClosureBlocked.blocker.code,
+      'DEMO_PREDICTION_ACTIVE_DERIVED_CLOSURE_EXISTS'
+    );
 
     const monthlyAnalysis = getMonthlyConsumptionAnalysis({
       startMonth: '2026-06',
@@ -1684,7 +2442,7 @@ function runDerivedOperations(db, actor, monthlyEnergyBatchId) {
 
     return {
       generatedPreview,
-      carbonResult,
+      legacyFormalCarbonResult,
       predictionDetail,
       monthlyAnalysis,
       loadSummary,
@@ -1732,17 +2490,20 @@ function runDerivedOperations(db, actor, monthlyEnergyBatchId) {
     ).run();
     assert.strictEqual(Number(unrelatedBatch.lastInsertRowid), 1);
     const actor = getTestActor(db);
+    toggleDemoRuntime({ enabled: true, actorUserId: actor.userId });
+    const demoRun = db.transaction(() => getOrCreateActiveDemoDatasetRun({
+      db,
+      actorUserId: actor.userId
+    })).immediate();
     const context = {
       db,
       actor,
+      demoRun,
       analysisOptions: getAnalysisOptions(db, actor)
     };
 
     for (const artifact of DEMO_PARK_ARTIFACTS) {
-      const uploadOptions = artifact.artifactKey === '12-prediction-configs'
-        ? { sourceBatchId: context.monthlyEnergyBatchId }
-        : {};
-      const file = createArtifactUpload(artifact.artifactKey, 'initial', uploadOptions);
+      const file = createArtifactUpload(artifact.artifactKey, 'initial');
       const result = await importArtifact(artifact, file, context);
       processedArtifactKeys.push(artifact.artifactKey);
       importResults.set(artifact.artifactKey, result);
@@ -1755,9 +2516,36 @@ function runDerivedOperations(db, actor, monthlyEnergyBatchId) {
     );
     assert.strictEqual(importResults.size, 29);
 
+    const carbonConnected = runCarbonConnectedPostAction(db, actor, demoRun);
+    assert(carbonConnected.outputCount > 0, 'Carbon connected post-action 必须产生非空可追溯 output。');
+    const derived = await runDerivedOperations(db, actor, demoRun, context.monthlyEnergyBatchId);
+    assert(derived.legacyFormalCarbonResult.calculatedCount > 0);
     await verifyDuplicateImports(context);
-    const derived = await runDerivedOperations(db, actor, context.monthlyEnergyBatchId);
-    assert(derived.carbonResult.calculatedCount > 0);
+    markManagedStrategyRunCleaned(db, demoRun.runId);
+    const managedStrategyForward = await runManagedStrategyInputIntegration(
+      db,
+      actor,
+      ['15-energy-timeseries', '18-strategy-rules'],
+      'managed strategy 正序',
+      'forward'
+    );
+    assert.strictEqual(
+      managedStrategyForward.relationCount,
+      managedStrategyForward.timeseriesCount * managedStrategyForward.ruleCount
+    );
+    markManagedStrategyRunCleaned(db, managedStrategyForward.run.runId);
+
+    const managedStrategyReverse = await runManagedStrategyInputIntegration(
+      db,
+      actor,
+      ['18-strategy-rules', '15-energy-timeseries'],
+      'managed strategy 逆序',
+      'reverse'
+    );
+    assert.strictEqual(
+      managedStrategyReverse.relationCount,
+      managedStrategyReverse.timeseriesCount * managedStrategyReverse.ruleCount
+    );
     assert.deepStrictEqual(db.pragma('foreign_key_check'), [], '隔离库外键检查必须为空。');
 
     console.log(JSON.stringify({
@@ -1767,7 +2555,8 @@ function runDerivedOperations(db, actor, monthlyEnergyBatchId) {
       blockedArtifactKeys: [],
       completedOperations: [
         'meter-reading-energy-generation-preview-only',
-        'carbon-accounting',
+        'carbon-connected-post-action',
+        'legacy-formal-carbon-accounting',
         'prediction-run',
         'monthly-consumption-analysis',
         'load-summary-and-curve',
@@ -1776,6 +2565,7 @@ function runDerivedOperations(db, actor, monthlyEnergyBatchId) {
         'device-state-analysis',
         'peak-contribution-analysis',
         'strategy-preview-and-run',
+        'managed-strategy-input-closure',
         'benchmark-evaluation-ranking-and-qualification',
         'energy-flow-analysis',
         'energy-balance-snapshot-and-suggestions',

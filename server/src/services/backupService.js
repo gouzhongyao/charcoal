@@ -27,6 +27,7 @@ const BACKUP_REASONS = new Set([
   'energy-analysis-import',
   'carbon-activity-import',
   'carbon-emission-report-import',
+  'prediction-config-import',
   'import-batch-delete'
 ]);
 const REQUIRED_BACKUP_SCHEMA = {

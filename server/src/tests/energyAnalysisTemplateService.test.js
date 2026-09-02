@@ -256,6 +256,21 @@ function createSingleSheetWorkbook(sheetName, matrix) {
 }
 
 /**
+ * 创建保留原始 UTC 文本的 CSV Buffer，避免模板生成器先格式化测试输入。
+ * @param {string[]} headers 中文标题。
+ * @param {Array<Array<*>>} rows 原始数据行。
+ * @returns {Buffer} UTF-8 BOM CSV Buffer。
+ */
+function createRawCsvBuffer(headers, rows) {
+  // 测试单元格统一双引号转义，确保 CSV 与 XLSX 使用完全相同的原始合同样本。
+  const escapeCell = (value) => `"${String(value ?? '').replace(/"/g, '""')}"`;
+  const csvText = [headers, ...rows]
+    .map((row) => row.map(escapeCell).join(','))
+    .join('\n');
+  return Buffer.from(`﻿${csvText}\n`, 'utf8');
+}
+
+/**
  * 定位测试 XLSX 的 ZIP 中央目录结束记录。
  * @param {Buffer} buffer XLSX Buffer。
  * @returns {number} EOCD 偏移量。
@@ -500,14 +515,20 @@ assert.strictEqual(parsedUserVisibleTimeseriesCsv.valid, true);
 assert.strictEqual(parsedUserVisibleTimeseriesCsv.sheets[0].rows[0].startUtc, '2026-07-14T16:00:00Z');
 assert.strictEqual(parsedUserVisibleTimeseriesCsv.sheets[0].rows[0].endUtc, '2026-07-14T16:15:00Z');
 
-// 历史 ISO 继续兼容；非法日历和非零毫秒不得被模板解析器静默修复或截断。
+// 历史 ISO 与 .000Z 继续兼容；模板边界必须把两者统一折叠为内部 Z 秒精度。
 const historicalIsoWorkbook = createSingleSheetWorkbook('能耗时序', [
   EXPECTED_SINGLE_SHEET_TEMPLATES['energy-timeseries'].headers,
-  userVisibleTimeseriesRows[0]
+  userVisibleTimeseriesRows[0],
+  ['electricity', 'OU-002', 'M-002', '2026-07-14T17:00:00.000Z', '2026-07-14T17:15:00.000Z',
+    'Asia/Shanghai', 15, 'kWh', 18.5, 'historical-zero-millisecond', 'upload']
 ]);
 const historicalIsoResult = parseEnergyAnalysisTemplateWorkbook('energy-timeseries', historicalIsoWorkbook);
 assert.strictEqual(historicalIsoResult.valid, true);
 assert.strictEqual(historicalIsoResult.sheets[0].rows[0].startUtc, '2026-07-14T16:00:00Z');
+assert.strictEqual(historicalIsoResult.sheets[0].rows[1].startUtc, '2026-07-14T17:00:00Z');
+assert.strictEqual(historicalIsoResult.sheets[0].rows[1].endUtc, '2026-07-14T17:15:00Z');
+
+// XLSX 中的非法日历和非零毫秒必须分别保留稳定 UTC 错误码，不得收敛为通用类型错误。
 const invalidUtcWorkbook = createSingleSheetWorkbook('能耗时序', [
   EXPECTED_SINGLE_SHEET_TEMPLATES['energy-timeseries'].headers,
   ['electricity', 'OU-001', 'M-001', '2026-02-29 16:00:00', '2026-07-14T16:15:00.001Z',
@@ -515,9 +536,47 @@ const invalidUtcWorkbook = createSingleSheetWorkbook('能耗时序', [
 ]);
 const invalidUtcResult = parseEnergyAnalysisTemplateWorkbook('energy-timeseries', invalidUtcWorkbook);
 assert.strictEqual(invalidUtcResult.valid, false);
-assert.strictEqual(invalidUtcResult.blockingIssues.filter(
-  (issue) => issue.code === 'INVALID_TEMPLATE_CELL_TYPE' && ['startUtc', 'endUtc'].includes(issue.key)
-).length, 2);
+assert.deepStrictEqual(
+  invalidUtcResult.blockingIssues
+    .filter((issue) => ['startUtc', 'endUtc'].includes(issue.key))
+    .map((issue) => [issue.key, issue.code]),
+  [
+    ['startUtc', 'STRICT_UTC_INPUT_INVALID'],
+    ['endUtc', 'STRICT_UTC_INPUT_PRECISION_INVALID']
+  ]
+);
+assert(invalidUtcResult.blockingIssues.find(
+  (issue) => issue.key === 'endUtc'
+).message.includes('只允许秒精度'));
+
+// CSV 与 XLSX 共用相同 UTC 精度合同，非零毫秒必须安全投影稳定错误码。
+const invalidUtcCsv = createRawCsvBuffer(
+  EXPECTED_SINGLE_SHEET_TEMPLATES['energy-timeseries'].headers,
+  [[
+    'electricity', 'OU-001', 'M-001', '2026-07-14T16:00:00.123Z', '2026-07-14T16:15:00Z',
+    'Asia/Shanghai', 15, 'kWh', 25.5, 'invalid-csv-millisecond', 'upload'
+  ]]
+);
+const invalidUtcCsvResult = parseEnergyAnalysisTemplateBuffer(
+  'energy-timeseries',
+  invalidUtcCsv,
+  'energy-timeseries-invalid-utc.csv'
+);
+assert.strictEqual(invalidUtcCsvResult.valid, false);
+assert(invalidUtcCsvResult.blockingIssues.some(
+  (issue) => issue.key === 'startUtc' && issue.code === 'STRICT_UTC_INPUT_PRECISION_INVALID'
+));
+
+// 真正空白的 UTC 单元格不是类型错误，模板层保留 null 供领域必填校验处理。
+const blankUtcWorkbook = createSingleSheetWorkbook('能耗时序', [
+  EXPECTED_SINGLE_SHEET_TEMPLATES['energy-timeseries'].headers,
+  ['electricity', 'OU-001', 'M-001', '', '2026-07-14 16:15:00',
+    'Asia/Shanghai', 15, 'kWh', 25.5, 'blank-start', 'upload']
+]);
+const blankUtcResult = parseEnergyAnalysisTemplateWorkbook('energy-timeseries', blankUtcWorkbook);
+assert.strictEqual(blankUtcResult.valid, true);
+assert.strictEqual(blankUtcResult.sheets[0].rows[0].startUtc, null);
+assert.strictEqual(blankUtcResult.sheets[0].rows[0].endUtc, '2026-07-14T16:15:00Z');
 
 // 三类多工作表模板只支持 XLSX，必须精确包含各自冻结的两张中文工作表。
 Object.entries(EXPECTED_MULTI_SHEET_TEMPLATES).forEach(([templateId, expected]) => {

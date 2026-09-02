@@ -1,15 +1,22 @@
 const assert = require('assert');
 const {
   PREDICTION_RESULT_SORT_COLUMNS,
+  PREDICTION_ROUNDING_DIGITS,
   PREDICTION_SORT_COLUMNS,
   addMonths,
+  buildPredictionConfidenceFacts,
   computeLinearTrendForecast,
   computeMovingAverageForecast,
+  formatPredictionForecastMethodNote,
   generateMonthSequence,
   normalizeMonth,
+  isPredictionRoundedValue,
   normalizePredictionAlgorithm,
   normalizePredictionStatus,
   normalizeSort,
+  parsePredictionForecastMethodNote,
+  roundPredictionValue,
+  roundSignedPredictionValue,
   resolveMovingAverageRequiredHistoryMonths,
   summarizeHistorySufficiency,
   validatePredictionRange
@@ -108,9 +115,186 @@ assert.strictEqual(linearTrend[1].predictedValue, 180);
 assert.strictEqual(linearTrend[0].confidenceLow, 136);
 assert.strictEqual(linearTrend[0].confidenceHigh, 184);
 assert.match(linearTrend[0].methodNote, /线性趋势/);
+assert.match(linearTrend[0].methodNote, /slope=20/);
+const descendingLinearTrend = computeLinearTrendForecast(
+  [{ month: '2026-01', value: 2 }, { month: '2026-02', value: 1 }, { month: '2026-03', value: 0 }],
+  ['2026-04']
+);
+assert.strictEqual(descendingLinearTrend[0].predictedValue, 0);
+assert.match(descendingLinearTrend[0].methodNote, /slope=-1/);
+assert.match(descendingLinearTrend[0].methodNote, /负值，已按业务口径截断为 0/);
+const flatLinearTrend = computeLinearTrendForecast(
+  [{ month: '2026-01', value: 5 }, { month: '2026-02', value: 5 }, { month: '2026-03', value: 5 }],
+  ['2026-04']
+);
+assert.strictEqual(flatLinearTrend[0].predictedValue, 5);
+assert.match(flatLinearTrend[0].methodNote, /slope=0/);
 assert.throws(
   () => computeLinearTrendForecast([{ month: '2026-01', value: 100 }, { month: '2026-02', value: 120 }], ['2026-03']),
   (error) => error.code === 'BAD_REQUEST' && error.details.code === 'INSUFFICIENT_HISTORY_FOR_LINEAR_TREND'
+);
+
+// formatter/parser 对两种算法、signed slope、clamp 与能源/单位后缀执行表驱动闭环。
+[
+  {
+    name: 'moving-average',
+    fact: {
+      algorithm: 'moving_average',
+      windowSize: 3,
+      sampleCount: null,
+      signedSlope: null,
+      clampedToZero: false
+    },
+    expected: {
+      algorithm: 'moving_average',
+      windowSize: 3,
+      sampleCount: null,
+      signedSlope: null,
+      clampedToZero: false,
+      energyTypeCode: 'electricity',
+      canonicalUnit: 'kWh'
+    },
+    expectedMethodNote: '轻量移动平均：使用最近 3 个历史/预测月份滚动平均；confidenceLevel=low，仅作趋势参考。 能源类型=electricity，单位=kWh。'
+  },
+  {
+    name: 'linear-positive',
+    fact: {
+      algorithm: 'linear_trend',
+      windowSize: null,
+      sampleCount: 4,
+      signedSlope: 10.123456,
+      clampedToZero: false
+    },
+    expected: {
+      algorithm: 'linear_trend',
+      windowSize: null,
+      sampleCount: 4,
+      signedSlope: 10.123456,
+      clampedToZero: false,
+      energyTypeCode: 'electricity',
+      canonicalUnit: 'kWh'
+    },
+    expectedMethodNote: '轻量线性趋势：基于 4 个历史月份做一元线性外推，slope=10.123456；confidenceLevel=low，仅作趋势参考。 能源类型=electricity，单位=kWh。'
+  },
+  {
+    name: 'linear-negative-clamped',
+    fact: {
+      algorithm: 'linear_trend',
+      windowSize: null,
+      sampleCount: 3,
+      signedSlope: -1,
+      clampedToZero: true
+    },
+    expected: {
+      algorithm: 'linear_trend',
+      windowSize: null,
+      sampleCount: 3,
+      signedSlope: -1,
+      clampedToZero: true,
+      energyTypeCode: 'water',
+      canonicalUnit: 'm3'
+    },
+    expectedMethodNote: '轻量线性趋势：基于 3 个历史月份做一元线性外推，slope=-1；confidenceLevel=low，仅作趋势参考；趋势外推出现负值，已按业务口径截断为 0。 能源类型=water，单位=m3。'
+  }
+].forEach((testCase) => {
+  const options = {
+    energyTypeCode: testCase.expected.energyTypeCode,
+    canonicalUnit: testCase.expected.canonicalUnit
+  };
+  const methodNote = formatPredictionForecastMethodNote(testCase.fact, options);
+  assert.strictEqual(
+    methodNote,
+    testCase.expectedMethodNote,
+    `${testCase.name} formatter 必须保持固定完整 method-note 字面量。`
+  );
+  assert.deepStrictEqual(
+    parsePredictionForecastMethodNote(methodNote),
+    testCase.expected,
+    `${testCase.name} formatter/parser 必须原样闭环。`
+  );
+});
+[
+  '',
+  '轻量移动平均：使用最近 3 个历史/预测月份滚动平均；confidenceLevel=high，仅作趋势参考。 能源类型=electricity，单位=kWh。',
+  '轻量线性趋势：基于 4 个历史月份做一元线性外推，slope=10.1234567；confidenceLevel=low，仅作趋势参考。 能源类型=electricity，单位=kWh。',
+  '轻量线性趋势：基于 2 个历史月份做一元线性外推，slope=1；confidenceLevel=low，仅作趋势参考。 能源类型=electricity，单位=kWh。'
+].forEach((methodNote) => {
+  assert.strictEqual(parsePredictionForecastMethodNote(methodNote), null);
+});
+
+// 两种算法 confidence 与六位舍入/负值截断共享唯一表驱动合同。
+[
+  {
+    algorithm: 'moving_average',
+    predictedValue: 113.333333,
+    expected: {
+      confidenceLowMultiplier: 0.9,
+      confidenceHighMultiplier: 1.1,
+      confidenceLow: 102,
+      confidenceHigh: 124.666666
+    }
+  },
+  {
+    algorithm: 'linear_trend',
+    predictedValue: 160,
+    expected: {
+      confidenceLowMultiplier: 0.85,
+      confidenceHighMultiplier: 1.15,
+      confidenceLow: 136,
+      confidenceHigh: 184
+    }
+  }
+].forEach((testCase) => {
+  const confidence = buildPredictionConfidenceFacts(
+    testCase.algorithm,
+    testCase.predictedValue
+  );
+  Object.entries(testCase.expected).forEach(([fieldName, expectedValue]) => {
+    assert.strictEqual(confidence[fieldName], expectedValue);
+  });
+});
+assert.strictEqual(PREDICTION_ROUNDING_DIGITS, 6);
+[
+  { raw: 1.2345674, rounded: 1.234567, signed: 1.234567 },
+  { raw: 1.2345675, rounded: 1.234568, signed: 1.234568 },
+  { raw: -1.25, rounded: 0, signed: -1.25 },
+  { raw: -0, rounded: 0, signed: 0 }
+].forEach((testCase) => {
+  assert.strictEqual(roundPredictionValue(testCase.raw), testCase.rounded);
+  assert.strictEqual(roundSignedPredictionValue(testCase.raw), testCase.signed);
+  assert.strictEqual(isPredictionRoundedValue(testCase.rounded, { nonNegative: true }), true);
+});
+assert.strictEqual(isPredictionRoundedValue(1.0000001), false);
+assert.strictEqual(isPredictionRoundedValue(-1, { nonNegative: true }), false);
+
+// 非 finite、隐式文本数值和算法中间溢出必须受控阻断，不能静默生成 0。
+assert.throws(
+  () => roundPredictionValue(Number.POSITIVE_INFINITY),
+  (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PREDICTION_NUMERIC_INTEGRITY_ERROR'
+);
+assert.throws(
+  () => computeMovingAverageForecast([
+    { month: '2026-01', value: Number.MAX_VALUE / 2 },
+    { month: '2026-02', value: Number.MAX_VALUE / 2 },
+    { month: '2026-03', value: Number.MAX_VALUE / 2 }
+  ], ['2026-04'], { windowSize: 3 }),
+  (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PREDICTION_NUMERIC_INTEGRITY_ERROR'
+);
+assert.throws(
+  () => computeLinearTrendForecast([
+    { month: '2026-01', value: Number.MAX_VALUE / 2 },
+    { month: '2026-02', value: Number.MAX_VALUE / 2 },
+    { month: '2026-03', value: Number.MAX_VALUE / 2 }
+  ], ['2026-04']),
+  (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PREDICTION_NUMERIC_INTEGRITY_ERROR'
+);
+assert.throws(
+  () => computeMovingAverageForecast([
+    { month: '2026-01', value: '100' },
+    { month: '2026-02', value: 110 },
+    { month: '2026-03', value: 120 }
+  ], ['2026-04'], { windowSize: 3 }),
+  (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PREDICTION_NUMERIC_INTEGRITY_ERROR'
 );
 
 assert.strictEqual(normalizePredictionAlgorithm(undefined), 'moving_average');
@@ -159,6 +343,66 @@ assert.strictEqual(payload.filters.sourceBatchId, 9);
 assert.strictEqual(payload.windowSize, 2);
 assert.strictEqual(payload.requiredHistoryMonths, 3);
 assert.deepStrictEqual(payload.predictionMonths, ['2026-04']);
+
+// 0、空串和冲突别名必须进入显式校验，不能被 falsey 合并为缺省。
+[
+  { sourceBatchId: 0 },
+  { organizationUnitId: 0 },
+  { meterDeviceId: 0 },
+  { windowSize: 0 }
+].forEach((override) => {
+  assert.throws(
+    () => normalizePredictionPayload({
+      ...payload,
+      ...override,
+      trainStartMonth: '2026-01',
+      trainEndMonth: '2026-03',
+      predictStartMonth: '2026-04',
+      predictEndMonth: '2026-04'
+    }),
+    (error) => error.code === 'BAD_REQUEST' && error.details.code === 'INVALID_POSITIVE_INTEGER'
+  );
+});
+assert.throws(
+  () => normalizePredictionPayload({
+    trainStartMonth: '2026-01',
+    train_start_month: '2026-02',
+    trainEndMonth: '2026-03',
+    predictStartMonth: '2026-04',
+    predictEndMonth: '2026-04'
+  }),
+  (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PREDICTION_ALIAS_CONFLICT'
+);
+assert.throws(
+  () => normalizePredictionPayload({
+    sourceBatchId: 9,
+    source_batch_id: 10,
+    trainStartMonth: '2026-01',
+    trainEndMonth: '2026-03',
+    predictStartMonth: '2026-04',
+    predictEndMonth: '2026-04'
+  }),
+  (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PREDICTION_ALIAS_CONFLICT'
+);
+assert.throws(
+  () => normalizePredictionPayload({
+    sourceBatchId: '',
+    trainStartMonth: '2026-01',
+    trainEndMonth: '2026-03',
+    predictStartMonth: '2026-04',
+    predictEndMonth: '2026-04'
+  }),
+  (error) => error.code === 'BAD_REQUEST' && error.details.code === 'PREDICTION_EMPTY_ALIAS_VALUE'
+);
+assert.strictEqual(normalizePredictionPayload({
+  sourceBatchId: '9',
+  source_batch_id: 9,
+  trainStartMonth: '2026-01',
+  train_start_month: '2026-01',
+  trainEndMonth: '2026-03',
+  predictStartMonth: '2026-04',
+  predictEndMonth: '2026-04'
+}).filters.sourceBatchId, 9);
 
 const historyWhere = buildHistoryWhere(payload);
 assert.strictEqual(historyWhere.whereSql.includes('et.code = @energyTypeCode'), true);

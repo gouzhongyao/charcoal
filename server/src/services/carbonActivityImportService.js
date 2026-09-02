@@ -27,6 +27,12 @@ const {
   normalizeUserVisibleWallClockMinuteInput
 } = require('../utils/userVisibleDateTime');
 const { convertSourceWallClockRangeToUtc, isValidIanaTimezone } = require('./sourceWallClockService');
+const {
+  beginCarbonActivitySupersedeInOwnershipTransaction,
+  createDemoOwnershipInsertWitness,
+  finalizeCarbonActivitySupersedeInOwnershipTransaction,
+  writeCarbonActivityExecuteAuditInOwnershipTransaction
+} = require('./demoOwnershipService');
 
 // ZIP 中央目录和本地文件头签名用于 SheetJS 解压前的资源预检。
 const ZIP_SIGNATURES = Object.freeze({
@@ -763,55 +769,117 @@ function insertCarbonActivityOperationLog(db, actor = {}, operation, targetId, d
 }
 
 /** 在锁内事务中执行替代和新事实写入，不写任何 N5-B 计算表。 */
-function insertCarbonActivityImportCandidates({ db, batchId, candidateRows, options = {} }) {
-  const now = new Date().toISOString();
-  const insert = db.prepare(`INSERT INTO carbon_activity_records
-    (source_type, source_batch_id, source_row_number, activity_code, activity_code_key,
-     supersedes_activity_id, emission_scope, activity_category, activity_category_key,
-     organization_unit_id, energy_type_id, start_wall_clock, end_wall_clock, source_timezone,
-     start_utc, end_utc, activity_value, activity_unit, factor_region, source_reference,
-     evidence_reference, note, duplicate_key, record_status, created_by, created_at, updated_at)
-    VALUES ('independent_activity', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`);
+function insertCarbonActivityImportCandidates({ db, transactionScope, batchId, candidateRows, options = {} }) {
+  const managedMode = Boolean(transactionScope && options.demoContext);
   const importedItems = [];
-  candidateRows.forEach((row) => {
+  candidateRows.forEach((row, index) => {
+    if (typeof options.beforeInsertCandidate === 'function') {
+      options.beforeInsertCandidate({ row, index, db });
+    }
+    const now = new Date().toISOString();
+    let supersedeWitness = null;
     if (row.supersedesActivityId) {
-      const supersedeResult = db.prepare(`UPDATE carbon_activity_records
-        SET record_status = 'superseded', superseded_by_activity_id = id, updated_at = ?
-        WHERE id = ? AND source_type = 'independent_activity' AND record_status = 'active'`)
-        .run(now, row.supersedesActivityId);
-      if (supersedeResult.changes !== 1) {
-        throw badRequest('待替代独立碳活动已变化，请重新预演。', {
-          code: 'CARBON_ACTIVITY_SUPERSEDED_TARGET_STALE',
-          rowNumber: row.rowNumber
+      if (managedMode) {
+        supersedeWitness = beginCarbonActivitySupersedeInOwnershipTransaction({
+          transactionScope,
+          demoContext: options.demoContext,
+          targetActivityId: row.supersedesActivityId,
+          uploadFileSha256: options.demoUploadFileSha256,
+          previewDigest: options.demoPreviewDigest,
+          updatedAt: now
         });
+      } else {
+        const supersedeResult = db.prepare(`UPDATE carbon_activity_records
+          SET record_status = 'superseded', superseded_by_activity_id = id, updated_at = ?
+          WHERE id = ? AND source_type = 'independent_activity' AND record_status = 'active'`)
+          .run(now, row.supersedesActivityId);
+        if (supersedeResult.changes !== 1) {
+          throw badRequest('待替代独立碳活动已变化，请重新预演。', {
+            code: 'CARBON_ACTIVITY_SUPERSEDED_TARGET_STALE',
+            rowNumber: row.rowNumber
+          });
+        }
       }
     }
-    const result = insert.run(
-      batchId, row.rowNumber, row.activityCode, row.activityCodeKey, row.supersedesActivityId || null,
-      row.emissionScope, row.activityCategory, row.activityCategoryKey, row.organizationUnitId,
-      row.energyTypeId, row.startWallClock, row.endWallClock, row.sourceTimezone, row.startUtc,
-      row.endUtc, row.activityValue, row.activityUnit, row.factorRegion, row.sourceReference,
-      row.evidenceReference, row.note, row.duplicateKey, options.actor?.userId || null, now, now
-    );
-    const activityId = Number(result.lastInsertRowid);
+    const insertSql = `INSERT INTO carbon_activity_records
+      (source_type, source_batch_id, source_row_number, activity_code, activity_code_key,
+       supersedes_activity_id, emission_scope, activity_category, activity_category_key,
+       organization_unit_id, energy_type_id, start_wall_clock, end_wall_clock, source_timezone,
+       start_utc, end_utc, activity_value, activity_unit, factor_region, source_reference,
+       evidence_reference, note, duplicate_key, record_status, created_by, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    const insertParams = [
+      'independent_activity', batchId, row.rowNumber, row.activityCode, row.activityCodeKey,
+      row.supersedesActivityId || null, row.emissionScope, row.activityCategory,
+      row.activityCategoryKey, row.organizationUnitId, row.energyTypeId, row.startWallClock,
+      row.endWallClock, row.sourceTimezone, row.startUtc, row.endUtc, row.activityValue,
+      row.activityUnit, row.factorRegion, row.sourceReference, row.evidenceReference, row.note,
+      row.duplicateKey, 'active', options.actor?.userId || null, now, now
+    ];
+    const rowWitness = managedMode
+      ? createDemoOwnershipInsertWitness({
+        transactionScope,
+        entityType: 'carbon_activity_record',
+        insertParams,
+        insertSql,
+        sourceBatchId: batchId,
+        sourceRowNumber: row.rowNumber
+      })
+      : null;
+    const result = managedMode ? rowWitness : db.prepare(insertSql).run(...insertParams);
+    const activityId = Number(managedMode ? rowWitness.lastInsertRowid : result.lastInsertRowid);
     if (row.supersedesActivityId) {
-      db.prepare(`UPDATE carbon_activity_records
-        SET superseded_by_activity_id = ?, updated_at = ?
-        WHERE id = ? AND record_status = 'superseded' AND superseded_by_activity_id = id`)
-        .run(activityId, now, row.supersedesActivityId);
+      if (managedMode) {
+        finalizeCarbonActivitySupersedeInOwnershipTransaction({
+          transactionScope,
+          supersedeWitness,
+          newActivityId: activityId,
+          updatedAt: now
+        });
+      } else {
+        const linkResult = db.prepare(`UPDATE carbon_activity_records
+          SET superseded_by_activity_id = ?, updated_at = ?
+          WHERE id = ? AND record_status = 'superseded' AND superseded_by_activity_id = id`)
+          .run(activityId, now, row.supersedesActivityId);
+        if (linkResult.changes !== 1) {
+          throw badRequest('待替代独立碳活动完成链接时已变化。', {
+            code: 'CARBON_ACTIVITY_SUPERSEDED_TARGET_STALE',
+            rowNumber: row.rowNumber
+          });
+        }
+      }
     }
-    importedItems.push({ activityId, activityCode: row.activityCode, rowNumber: row.rowNumber });
+    importedItems.push({
+      id: activityId,
+      activityId,
+      activityCode: row.activityCode,
+      rowNumber: row.rowNumber,
+      candidateRowId: row.candidateRowId,
+      sourceRowNumber: row.rowNumber,
+      ...(rowWitness ? { rowWitness } : {})
+    });
+    if (typeof options.afterInsertCandidate === 'function') {
+      options.afterInsertCandidate({ row, index, activityId, db });
+    }
   });
-  insertCarbonActivityOperationLog(db, options.actor || {}, 'carbon.activity.import.execute', batchId, {
-    batchId,
-    imported: importedItems.length,
-    activityIds: importedItems.map((item) => item.activityId)
-  });
-  return {
-    imported: importedItems.length,
-    importedIds: importedItems.map((item) => item.activityId),
-    importedItems
-  };
+  const activityIds = importedItems.map((item) => item.activityId);
+  if (managedMode) {
+    writeCarbonActivityExecuteAuditInOwnershipTransaction({
+      transactionScope,
+      actorUserId: options.actor?.userId ?? options.demoContext.userId,
+      actorIp: options.actor?.ip || null,
+      batchId,
+      activityIds,
+      createdAt: new Date().toISOString()
+    });
+  } else {
+    insertCarbonActivityOperationLog(db, options.actor || {}, 'carbon.activity.import.execute', batchId, {
+      batchId,
+      imported: importedItems.length,
+      activityIds
+    });
+  }
+  return { imported: importedItems.length, importedIds: activityIds, importedItems };
 }
 
 /** 在共享 preview 事务中持久化领域操作审计。 */
@@ -829,7 +897,15 @@ const CARBON_ACTIVITY_IMPORT_DESCRIPTOR = Object.freeze({
   domainName: '独立碳活动',
   buildPreview: buildCarbonActivityImportPreview,
   persistPreviewAudit: persistCarbonActivityPreviewAudit,
-  insertCandidates: insertCarbonActivityImportCandidates
+  insertCandidates: insertCarbonActivityImportCandidates,
+  demoOwnership: Object.freeze({
+    artifactKey: '27-carbon-activities',
+    batchRole: 'primary',
+    entityType: 'carbon_activity_record',
+    expectedImportType: 'carbon_activity',
+    // artifact 27 失败时必须保留可重试 preview，不允许在 ownership 事务外改写失败审计。
+    failureAuditPolicy: 'rollback-only'
+  })
 });
 
 /** 创建独立碳活动受控预演。 */

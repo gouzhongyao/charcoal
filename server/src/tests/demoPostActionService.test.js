@@ -23,17 +23,108 @@ const {
   calculateDemoEntitySnapshotDigest,
   DEMO_OWNERSHIP_ENTITY_HANDLERS
 } = require('../services/demoOwnershipService');
+const demoPostActionService = require('../services/demoPostActionService');
 const {
   executeDemoPostAction,
   getDemoPostActionStatus,
-  previewDemoPostAction,
-  _test: postActionTest
-} = require('../services/demoPostActionService');
+  previewDemoPostAction
+} = demoPostActionService;
+const demoPostActionPrimitives = require('../services/demoPostActionServicePrimitives');
+const {
+  assertStrictBody,
+  stableDigest
+} = demoPostActionPrimitives;
+const demoServiceTestHarness = require('./helpers/demoServiceTestHarness');
+const {
+  assertFixedDemoPostActionProductionWiring
+} = demoServiceTestHarness;
 
-assert.strictEqual(Object.prototype.hasOwnProperty.call(postActionTest, 'PRIVATE_ACTION_ADAPTERS'), false,
-  '测试出口不得暴露私有 action adapter。');
-assert.strictEqual(Object.prototype.hasOwnProperty.call(postActionTest, 'PRIVATE_ACTION_EXECUTORS'), false,
-  '测试出口不得暴露私有动作执行器。');
+assert.deepStrictEqual(Reflect.ownKeys(demoServiceTestHarness).map(String).sort(), [
+  'assertFixedDemoPostActionProductionWiring',
+  'fixedIsolatedChild',
+  'runFixedDemoOwnershipTest'
+].sort());
+assert.deepStrictEqual(Reflect.ownKeys(demoPostActionPrimitives).sort(), [
+  'assertStrictBody',
+  'stableDigest'
+].sort());
+assert.strictEqual(Object.isFrozen(demoPostActionPrimitives), true,
+  'post-action 共享 pure module exports 必须冻结。');
+assert.strictEqual(Object.prototype.hasOwnProperty.call(demoServiceTestHarness, 'PRIVATE_ACTION_ADAPTERS'), false,
+  'assertion-only harness 不得暴露私有 action adapter。');
+assert.strictEqual(Object.prototype.hasOwnProperty.call(demoServiceTestHarness, 'PRIVATE_ACTION_EXECUTORS'), false,
+  'assertion-only harness 不得暴露私有动作执行器。');
+assert.deepStrictEqual(assertFixedDemoPostActionProductionWiring(), {
+  commonJsIdentity: true,
+  primitivesFrozen: true,
+  serviceLoaded: true
+});
+
+// copy 即使复用相同函数值，也不能替代 production canonical core 真实依赖的 CommonJS record。
+const postActionServicePath = require.resolve('../services/demoPostActionService');
+const postActionCanonicalServicePath = require.resolve(
+  '../services/demoPostActionCanonicalService'
+);
+const postActionPrimitivesPath = require.resolve('../services/demoPostActionServicePrimitives');
+const productionServiceRecord = require.cache[postActionServicePath];
+const productionCanonicalServiceRecord = require.cache[postActionCanonicalServicePath];
+const productionPrimitivesRecord = require.cache[postActionPrimitivesPath];
+const copiedPrimitives = require('./helpers/demoPostActionPrimitivesCopyFixture');
+const copiedPrimitivesPath = require.resolve('./helpers/demoPostActionPrimitivesCopyFixture');
+const copiedPrimitivesRecord = require.cache[copiedPrimitivesPath];
+assert.notStrictEqual(copiedPrimitivesRecord, productionPrimitivesRecord);
+assert.notStrictEqual(copiedPrimitives, demoPostActionPrimitives);
+assert.strictEqual(copiedPrimitives.stableDigest, stableDigest,
+  'copy canary 保持相同函数值以证明 module record identity 才是 wiring 边界。');
+require.cache[postActionPrimitivesPath] = copiedPrimitivesRecord;
+assert.throws(
+  () => assertFixedDemoPostActionProductionWiring(),
+  (error) => error?.code === 'DEMO_POST_ACTION_PRODUCTION_WIRING_INVALID'
+);
+require.cache[postActionPrimitivesPath] = productionPrimitivesRecord;
+productionPrimitivesRecord.loaded = false;
+assert.throws(
+  () => assertFixedDemoPostActionProductionWiring(),
+  (error) => error?.code === 'DEMO_POST_ACTION_PRODUCTION_WIRING_INVALID'
+);
+productionPrimitivesRecord.loaded = true;
+const replacedCanonicalServiceRecord = {
+  ...productionCanonicalServiceRecord,
+  children: [...productionCanonicalServiceRecord.children],
+  exports: productionCanonicalServiceRecord.exports,
+  loaded: true
+};
+require.cache[postActionCanonicalServicePath] = replacedCanonicalServiceRecord;
+assert.throws(
+  () => assertFixedDemoPostActionProductionWiring(),
+  (error) => error?.code === 'DEMO_POST_ACTION_PRODUCTION_WIRING_INVALID'
+);
+require.cache[postActionCanonicalServicePath] = productionCanonicalServiceRecord;
+productionCanonicalServiceRecord.loaded = false;
+assert.throws(
+  () => assertFixedDemoPostActionProductionWiring(),
+  (error) => error?.code === 'DEMO_POST_ACTION_PRODUCTION_WIRING_INVALID'
+);
+productionCanonicalServiceRecord.loaded = true;
+const replacedServiceRecord = {
+  ...productionServiceRecord,
+  children: [...productionServiceRecord.children],
+  exports: productionServiceRecord.exports,
+  loaded: true
+};
+require.cache[postActionServicePath] = replacedServiceRecord;
+assert.throws(
+  () => assertFixedDemoPostActionProductionWiring(),
+  (error) => error?.code === 'DEMO_POST_ACTION_PRODUCTION_WIRING_INVALID'
+);
+require.cache[postActionServicePath] = productionServiceRecord;
+productionServiceRecord.loaded = false;
+assert.throws(
+  () => assertFixedDemoPostActionProductionWiring(),
+  (error) => error?.code === 'DEMO_POST_ACTION_PRODUCTION_WIRING_INVALID'
+);
+productionServiceRecord.loaded = true;
+assert.strictEqual(assertFixedDemoPostActionProductionWiring().commonJsIdentity, true);
 
 /** 为动态非 QL 编码的能流模型建立完整 run/context/batch/ownership/relation 证据。 */
 function seedOwnedEnergyFlow(db, run) {
@@ -186,7 +277,7 @@ function snapshotReadOnlyBusinessTables(db) {
     'carbon_emission_report_items',
     'carbon_emission_report_summaries'
   ];
-  return postActionTest.stableDigest(Object.fromEntries(tableNames.map((tableName) => [
+  return stableDigest(Object.fromEntries(tableNames.map((tableName) => [
     tableName,
     db.prepare(`SELECT * FROM ${tableName} ORDER BY rowid`).all()
   ])));
@@ -464,23 +555,32 @@ try {
   initDatabase();
   toggleDemoRuntime({ enabled: true, actorUserId: 1 });
   const run = getOrCreateActiveDemoDatasetRun({ actorUserId: 1 });
+  const unconnectedActions = listDemoPostActions()
+    .filter((action) => action.implementationStatus === 'not-connected');
+  assert.deepStrictEqual(unconnectedActions.map((action) => action.actionKey), [
+    'benchmark-evaluation',
+    'energy-balance-snapshot',
+    'dashboard-refresh-check'
+  ]);
+  assert.deepStrictEqual(unconnectedActions.map((action) => action.dependencies), Array(3).fill([]));
+  const blockedDefinition = unconnectedActions[0];
   const preview = previewDemoPostAction({
     runId: run.runId,
-    actionKey: 'prediction-run',
+    actionKey: blockedDefinition.actionKey,
     body: { clientRequestId: 'service-blocked-1' },
     actorUserId: 1
   });
   assert.strictEqual(preview.status, 'blocked');
-  assert.deepStrictEqual(listDemoPostActions().filter((action) => action.implementationStatus === 'not-connected')
-    .map((action) => action.dependencies), Array(6).fill([]));
   assert.strictEqual(preview.blocker.code, 'ACTION_HANDLER_NOT_CONNECTED');
-  assert.deepStrictEqual(preview.input, { requiredArtifactBindings: ['12-prediction-configs'] });
-  assert.deepStrictEqual(preview.blocker.requiredArtifactBindings, ['12-prediction-configs']);
+  assert.deepStrictEqual(preview.input, {
+    requiredArtifactBindings: blockedDefinition.requiredArtifactBindings
+  });
+  assert.deepStrictEqual(preview.blocker.requiredArtifactBindings, blockedDefinition.requiredArtifactBindings);
   assert.strictEqual(preview.outputCount, 0);
   assertSafePublicActionProjection(preview);
   const repeated = previewDemoPostAction({
     runId: run.runId,
-    actionKey: 'prediction-run',
+    actionKey: blockedDefinition.actionKey,
     body: { clientRequestId: 'service-blocked-1' },
     actorUserId: 1
   });
@@ -492,8 +592,7 @@ try {
   } finally {
     db.close();
   }
-  listDemoPostActions().filter((action) => action.implementationStatus === 'not-connected'
-    && action.actionKey !== 'prediction-run').forEach((action, index) => {
+  unconnectedActions.slice(1).forEach((action, index) => {
     const blockedAction = previewDemoPostAction({
       runId: run.runId,
       actionKey: action.actionKey,
@@ -511,7 +610,7 @@ try {
       body: {
         clientRequestId: 'service-blocked-1',
         previewDigest: preview.previewDigest,
-        confirmationText: '确认执行预测运行'
+        confirmationText: blockedDefinition.confirmationText
       },
       actorUserId: 1
     }),
@@ -541,7 +640,7 @@ try {
       && JSON.stringify(error.details.fields) === JSON.stringify(['adapter', 'inputEntityIds', 'modelId', 'modulePath', 'sql'])
   );
   assert.throws(
-    () => postActionTest.assertStrictBody({ clientRequestId: 'x', sql: 'SELECT 1' }, ['clientRequestId'], 'preview'),
+    () => assertStrictBody({ clientRequestId: 'x', sql: 'SELECT 1' }, ['clientRequestId'], 'preview'),
     (error) => error.code === 'BAD_REQUEST' && error.details.code === 'DEMO_POST_ACTION_BODY_FIELD_UNKNOWN'
   );
   assert.throws(
@@ -550,7 +649,7 @@ try {
       body: {
         clientRequestId: 'service-blocked-1',
         previewDigest: preview.previewDigest,
-        confirmationText: '确认执行预测运行',
+        confirmationText: blockedDefinition.confirmationText,
         outputIds: ['forbidden']
       },
       actorUserId: 1

@@ -12,6 +12,11 @@ const {
 const { requireDemoArtifactHandler } = require('../services/demoArtifactRegistry');
 
 const DEMO_CONTEXT_HEADER = 'x-demo-context';
+// Artifact 07 direct route 固定绑定，禁止从 body、query 或 URL 接受治理标识。
+const MONTHLY_ENERGY_MANAGED_DIRECT_BINDING = Object.freeze({
+  artifactKey: '07-monthly-energy',
+  handlerKey: 'monthly-energy-import'
+});
 
 /** 从 rawHeaders 大小写不敏感统计并提取唯一 X-Demo-Context，拒绝 Node/Express 合并后的重复头。 */
 function readRawDemoContextHeader(req) {
@@ -46,6 +51,34 @@ function rejectUnconnectedDemoContext(req, _res, next) {
       '该导入能力尚未接入演示 context，已拒绝以避免降级为正式导入。',
       { statusCode: 409 }
     );
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * Artifact 07 direct 路由预检：无 header 保持正式导入，有 header 时只组装服务端固定 intent。
+ * 完整 actor/runtime/run/manifest/SHA/state 校验在 Multer 后的 caller-owned 写事务内二次完成。
+ */
+function monthlyEnergyManagedDirectPreflight(req, _res, next) {
+  try {
+    requireDemoArtifactHandler(
+      MONTHLY_ENERGY_MANAGED_DIRECT_BINDING.artifactKey,
+      MONTHLY_ENERGY_MANAGED_DIRECT_BINDING.handlerKey
+    );
+    const token = readRawDemoContextHeader(req);
+    if (!token) {
+      req.demoContext = null;
+      next();
+      return;
+    }
+    req.demoContext = Object.freeze({
+      token,
+      userId: req.user.id,
+      artifactKey: MONTHLY_ENERGY_MANAGED_DIRECT_BINDING.artifactKey,
+      handlerKey: MONTHLY_ENERGY_MANAGED_DIRECT_BINDING.handlerKey
+    });
+    next();
   } catch (error) {
     next(error);
   }
@@ -147,6 +180,7 @@ module.exports = {
   bindDemoPreviewResult,
   demoContextPreflight,
   markDemoExecuteResult,
+  monthlyEnergyManagedDirectPreflight,
   readRawDemoContextHeader,
   rejectUnconnectedDemoContext,
   validateDemoPreviewUpload

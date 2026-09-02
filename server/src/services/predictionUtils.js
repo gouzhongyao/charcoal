@@ -3,6 +3,17 @@ const { badRequest } = require('../utils/errors');
 const MONTH_PATTERN = /^(\d{4})-(0[1-9]|1[0-2])$/;
 const SUPPORTED_PREDICTION_ALGORITHMS = Object.freeze(['moving_average', 'linear_trend']);
 const PREDICTION_RUN_STATUSES = Object.freeze(['pending', 'running', 'completed', 'failed', 'cancelled', 'archived']);
+// 预测结果统一执行六位小数舍入，P3 witness 与 P4 handler 必须复用同一合同。
+const PREDICTION_ROUNDING_DIGITS = 6;
+// 低置信度区间使用固定算法倍率，禁止持久化阶段或 ownership 阶段自行解释。
+const PREDICTION_CONFIDENCE_RULES = Object.freeze({
+  moving_average: Object.freeze({ lowMultiplier: 0.9, highMultiplier: 1.1 }),
+  linear_trend: Object.freeze({ lowMultiplier: 0.85, highMultiplier: 1.15 })
+});
+// 方法说明中的能源编码只接受现有业务稳定编码字符集。
+const PREDICTION_METHOD_ENERGY_CODE_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+// 方法说明中的 canonical unit 禁止使用结构分隔符或控制字符。
+const PREDICTION_METHOD_UNIT_PATTERN = /^[^，。=\r\n\p{Cc}]{1,64}$/u;
 const PREDICTION_SORT_COLUMNS = Object.freeze({
   createdAt: 'pr.created_at',
   completedAt: 'pr.completed_at',
@@ -99,8 +110,8 @@ function normalizePositiveInteger(value, fieldName, options = {}) {
     });
   }
   const numberValue = Number.parseInt(text, 10);
-  const min = options.min || 1;
-  const max = options.max || Number.MAX_SAFE_INTEGER;
+  const min = options.min ?? 1;
+  const max = options.max ?? Number.MAX_SAFE_INTEGER;
   if (!Number.isSafeInteger(numberValue) || numberValue < min || numberValue > max) {
     throw badRequest(`${fieldName} 必须是 ${min}-${max} 范围内的正整数。`, {
       code: 'INVALID_POSITIVE_INTEGER',
@@ -192,7 +203,7 @@ function validatePredictionRange({ trainStartMonth, trainEndMonth, predictStartM
 }
 
 function summarizeHistorySufficiency(points = [], trainMonths = [], options = {}) {
-  const minHistoryMonths = options.minHistoryMonths || 3;
+  const minHistoryMonths = options.minHistoryMonths ?? 3;
   const availableMonthSet = new Set(points.map((point) => point.month));
   const missingMonths = trainMonths.filter((month) => !availableMonthSet.has(month));
   const sampleMonths = availableMonthSet.size;
@@ -216,28 +227,202 @@ function summarizeHistorySufficiency(points = [], trainMonths = [], options = {}
   };
 }
 
-function roundPredictionValue(value) {
-  if (!Number.isFinite(value)) {
-    return 0;
+/** 拒绝预测算法中的非 number、非有限或不允许的负数，禁止隐式转换和静默丢弃。 */
+function requireFinitePredictionNumber(value, stage, options = {}) {
+  if (typeof value !== 'number' || !Number.isFinite(value)
+    || (options.nonNegative === true && value < 0)) {
+    throw badRequest('预测算法遇到无效或非有限数值，已阻断结果生成。', {
+      code: 'PREDICTION_NUMERIC_INTEGRITY_ERROR',
+      stage,
+      valueType: typeof value,
+      nonNegativeRequired: options.nonNegative === true
+    });
   }
-  return Math.max(0, Math.round(value * 1000000) / 1000000);
+  return value;
+}
+
+/** 执行有限数加法并在中间值溢出时立即阻断。 */
+function addFinitePredictionNumbers(left, right, stage) {
+  const result = requireFinitePredictionNumber(left, `${stage}.left`)
+    + requireFinitePredictionNumber(right, `${stage}.right`);
+  return requireFinitePredictionNumber(result, stage);
+}
+
+/** 执行有限数乘法并在中间值溢出时立即阻断。 */
+function multiplyFinitePredictionNumbers(left, right, stage) {
+  const result = requireFinitePredictionNumber(left, `${stage}.left`)
+    * requireFinitePredictionNumber(right, `${stage}.right`);
+  return requireFinitePredictionNumber(result, stage);
+}
+
+/** 对有符号预测诊断值执行有限六位舍入，不应用业务非负截断。 */
+function roundSignedPredictionValue(value) {
+  const finiteValue = requireFinitePredictionNumber(value, 'signedRound.input');
+  const scale = 10 ** PREDICTION_ROUNDING_DIGITS;
+  const scaledValue = multiplyFinitePredictionNumbers(finiteValue, scale, 'signedRound.scale');
+  const rounded = requireFinitePredictionNumber(Math.round(scaledValue) / scale, 'signedRound.result');
+  return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+/** 对预测结果执行有限六位舍入，并按业务口径截断有限负值。 */
+function roundPredictionValue(value) {
+  return Math.max(0, roundSignedPredictionValue(value));
+}
+
+/** 校验持久预测数值已经符合统一六位舍入合同。 */
+function isPredictionRoundedValue(value, options = {}) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return false;
+  if (options.nonNegative === true && value < 0) return false;
+  return roundSignedPredictionValue(value) === value;
+}
+
+/** 读取算法固定 confidence 倍率。 */
+function getPredictionConfidenceRule(algorithm) {
+  const normalizedAlgorithm = normalizePredictionAlgorithm(algorithm);
+  return PREDICTION_CONFIDENCE_RULES[normalizedAlgorithm];
+}
+
+/** 根据预测值和算法倍率重建六位舍入后的 confidence 事实。 */
+function buildPredictionConfidenceFacts(algorithm, predictedValue) {
+  const normalizedPredictedValue = requireFinitePredictionNumber(
+    predictedValue,
+    'forecastFacts.predictedValue',
+    { nonNegative: true }
+  );
+  const rule = getPredictionConfidenceRule(algorithm);
+  const confidenceLowRaw = multiplyFinitePredictionNumbers(
+    normalizedPredictedValue,
+    rule.lowMultiplier,
+    'forecastFacts.confidenceLowRaw'
+  );
+  const confidenceHighRaw = multiplyFinitePredictionNumbers(
+    normalizedPredictedValue,
+    rule.highMultiplier,
+    'forecastFacts.confidenceHighRaw'
+  );
+  return Object.freeze({
+    confidenceLowMultiplier: rule.lowMultiplier,
+    confidenceHighMultiplier: rule.highMultiplier,
+    confidenceLowRaw,
+    confidenceHighRaw,
+    confidenceLow: roundPredictionValue(confidenceLowRaw),
+    confidenceHigh: roundPredictionValue(confidenceHighRaw)
+  });
+}
+
+/** 校验并格式化 forecast fact 的固定方法说明，不允许自由文本拼接。 */
+function formatPredictionForecastMethodNote(forecastFact, options = {}) {
+  if (!forecastFact || typeof forecastFact !== 'object' || Array.isArray(forecastFact)) {
+    throw badRequest('Prediction forecast fact 必须是固定对象。', {
+      code: 'PREDICTION_FORECAST_FACT_INVALID'
+    });
+  }
+  const algorithm = normalizePredictionAlgorithm(forecastFact.algorithm);
+  let note = '';
+  if (algorithm === 'moving_average') {
+    if (!Number.isSafeInteger(forecastFact.windowSize)
+      || forecastFact.windowSize < 2 || forecastFact.windowSize > 12) {
+      throw badRequest('Prediction moving average forecast fact 的 windowSize 无效。', {
+        code: 'PREDICTION_FORECAST_FACT_INVALID'
+      });
+    }
+    note = `轻量移动平均：使用最近 ${forecastFact.windowSize} 个历史/预测月份滚动平均；confidenceLevel=low，仅作趋势参考。`;
+  } else {
+    if (!Number.isSafeInteger(forecastFact.sampleCount) || forecastFact.sampleCount < 3
+      || !isPredictionRoundedValue(forecastFact.signedSlope)
+      || typeof forecastFact.clampedToZero !== 'boolean') {
+      throw badRequest('Prediction linear trend forecast fact 的样本、斜率或截断事实无效。', {
+        code: 'PREDICTION_FORECAST_FACT_INVALID'
+      });
+    }
+    const clampNotice = forecastFact.clampedToZero
+      ? '；趋势外推出现负值，已按业务口径截断为 0'
+      : '';
+    note = `轻量线性趋势：基于 ${forecastFact.sampleCount} 个历史月份做一元线性外推，slope=${forecastFact.signedSlope}；confidenceLevel=low，仅作趋势参考${clampNotice}。`;
+  }
+  const hasEnergyTypeCode = Object.prototype.hasOwnProperty.call(options, 'energyTypeCode');
+  const hasCanonicalUnit = Object.prototype.hasOwnProperty.call(options, 'canonicalUnit');
+  if (hasEnergyTypeCode !== hasCanonicalUnit) {
+    throw badRequest('Prediction 方法说明能源编码与单位必须同时提供。', {
+      code: 'PREDICTION_FORECAST_FACT_INVALID'
+    });
+  }
+  if (!hasEnergyTypeCode) return note;
+  if (typeof options.energyTypeCode !== 'string'
+    || !PREDICTION_METHOD_ENERGY_CODE_PATTERN.test(options.energyTypeCode)
+    || typeof options.canonicalUnit !== 'string'
+    || !PREDICTION_METHOD_UNIT_PATTERN.test(options.canonicalUnit)) {
+    throw badRequest('Prediction 方法说明能源编码或 canonical unit 无效。', {
+      code: 'PREDICTION_FORECAST_FACT_INVALID'
+    });
+  }
+  return `${note} 能源类型=${options.energyTypeCode}，单位=${options.canonicalUnit}。`;
+}
+
+/** 从正式方法说明提取结构事实，并通过 formatter 原样重建以拒绝宽松文本。 */
+function parsePredictionForecastMethodNote(methodNote) {
+  if (typeof methodNote !== 'string' || methodNote.length === 0) return null;
+  const movingMatch = /^轻量移动平均：使用最近 ([2-9]|1[0-2]) 个历史\/预测月份滚动平均；confidenceLevel=low，仅作趋势参考。 能源类型=([A-Za-z][A-Za-z0-9_-]{0,63})，单位=([^，。=\r\n\p{Cc}]{1,64})。$/u.exec(methodNote);
+  if (movingMatch) {
+    const parsed = {
+      algorithm: 'moving_average',
+      windowSize: Number(movingMatch[1]),
+      sampleCount: null,
+      signedSlope: null,
+      clampedToZero: false,
+      energyTypeCode: movingMatch[2],
+      canonicalUnit: movingMatch[3]
+    };
+    return formatPredictionForecastMethodNote(parsed, parsed) === methodNote
+      ? Object.freeze(parsed)
+      : null;
+  }
+  const linearMatch = /^轻量线性趋势：基于 ([1-9]\d*) 个历史月份做一元线性外推，slope=(-?(?:0|[1-9]\d*)(?:\.\d{1,6})?(?:e[+-]?\d+)?)；confidenceLevel=low，仅作趋势参考(；趋势外推出现负值，已按业务口径截断为 0)?。 能源类型=([A-Za-z][A-Za-z0-9_-]{0,63})，单位=([^，。=\r\n\p{Cc}]{1,64})。$/u.exec(methodNote);
+  if (!linearMatch) return null;
+  const signedSlope = Number(linearMatch[2]);
+  const parsed = {
+    algorithm: 'linear_trend',
+    windowSize: null,
+    sampleCount: Number(linearMatch[1]),
+    signedSlope,
+    clampedToZero: Boolean(linearMatch[3]),
+    energyTypeCode: linearMatch[4],
+    canonicalUnit: linearMatch[5]
+  };
+  if (!Number.isSafeInteger(parsed.sampleCount) || parsed.sampleCount < 3
+    || !isPredictionRoundedValue(signedSlope)) return null;
+  return formatPredictionForecastMethodNote(parsed, parsed) === methodNote
+    ? Object.freeze(parsed)
+    : null;
 }
 
 function average(values) {
   if (values.length === 0) {
     return 0;
   }
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
+  const sum = values.reduce((total, value, index) => (
+    addFinitePredictionNumbers(total, requireFinitePredictionNumber(value, `average.value.${index}`), 'average.sum')
+  ), 0);
+  return requireFinitePredictionNumber(sum / values.length, 'average.result');
 }
 
 function resolveMovingAverageRequiredHistoryMonths(windowSize = 3) {
-  return Math.max(3, windowSize || 3);
+  return Math.max(3, windowSize ?? 3);
+}
+
+/** 从 points 提取严格有限且非负的历史值，不做 Number 转换或 filter 丢弃。 */
+function readPredictionPointValues(points, stage) {
+  return points.map((point, index) => requireFinitePredictionNumber(
+    point?.value,
+    `${stage}.point.${index}`,
+    { nonNegative: true }
+  ));
 }
 
 function computeMovingAverageForecast(points = [], predictionMonths = [], options = {}) {
-  const windowSize = options.windowSize || 3;
+  const windowSize = options.windowSize ?? 3;
   const requiredHistoryMonths = resolveMovingAverageRequiredHistoryMonths(windowSize);
-  const values = points.map((point) => Number(point.value)).filter((value) => Number.isFinite(value));
+  const values = readPredictionPointValues(points, 'movingAverage.history');
   if (values.length < requiredHistoryMonths) {
     throw badRequest('移动平均历史样本不足，无法生成预测结果。', {
       code: 'INSUFFICIENT_HISTORY_FOR_MOVING_AVERAGE',
@@ -250,20 +435,37 @@ function computeMovingAverageForecast(points = [], predictionMonths = [], option
   const workingValues = [...values];
   return predictionMonths.map((targetMonth) => {
     const recentValues = workingValues.slice(-windowSize);
-    const predictedValue = roundPredictionValue(average(recentValues));
+    const rawPredictedValue = average(recentValues);
+    const predictedValue = roundPredictionValue(rawPredictedValue);
     workingValues.push(predictedValue);
+    const confidence = buildPredictionConfidenceFacts('moving_average', predictedValue);
+    const forecastFact = {
+      algorithm: 'moving_average',
+      windowSize,
+      sampleCount: null,
+      signedSlope: null,
+      clampedToZero: false
+    };
     return {
       targetMonth,
+      rawPredictedValue,
       predictedValue,
-      confidenceLow: roundPredictionValue(predictedValue * 0.9),
-      confidenceHigh: roundPredictionValue(predictedValue * 1.1),
-      methodNote: `轻量移动平均：使用最近 ${windowSize} 个历史/预测月份滚动平均；confidenceLevel=low，仅作趋势参考。`
+      confidenceLow: confidence.confidenceLow,
+      confidenceHigh: confidence.confidenceHigh,
+      methodNote: formatPredictionForecastMethodNote(forecastFact),
+      roundingDigits: PREDICTION_ROUNDING_DIGITS,
+      sourceValues: recentValues,
+      confidenceLowMultiplier: confidence.confidenceLowMultiplier,
+      confidenceHighMultiplier: confidence.confidenceHighMultiplier,
+      confidenceLowRaw: confidence.confidenceLowRaw,
+      confidenceHighRaw: confidence.confidenceHighRaw,
+      ...forecastFact
     };
   });
 }
 
 function computeLinearTrendForecast(points = [], predictionMonths = []) {
-  const values = points.map((point) => Number(point.value)).filter((value) => Number.isFinite(value));
+  const values = readPredictionPointValues(points, 'linearTrend.history');
   if (values.length < 3) {
     throw badRequest('线性趋势历史样本不足，无法生成预测结果。', {
       code: 'INSUFFICIENT_HISTORY_FOR_LINEAR_TREND',
@@ -273,38 +475,73 @@ function computeLinearTrendForecast(points = [], predictionMonths = []) {
   }
 
   const n = values.length;
-  const xAverage = (n - 1) / 2;
+  const xAverage = requireFinitePredictionNumber((n - 1) / 2, 'linearTrend.xAverage');
   const yAverage = average(values);
-  const denominator = values.reduce((sum, _value, index) => sum + ((index - xAverage) ** 2), 0);
+  const denominator = values.reduce((sum, _value, index) => {
+    const centeredIndex = requireFinitePredictionNumber(index - xAverage, 'linearTrend.denominator.center');
+    const square = multiplyFinitePredictionNumbers(centeredIndex, centeredIndex, 'linearTrend.denominator.square');
+    return addFinitePredictionNumbers(sum, square, 'linearTrend.denominator.sum');
+  }, 0);
+  const numerator = values.reduce((sum, value, index) => {
+    const centeredIndex = requireFinitePredictionNumber(index - xAverage, 'linearTrend.numerator.x');
+    const centeredValue = requireFinitePredictionNumber(value - yAverage, 'linearTrend.numerator.y');
+    const product = multiplyFinitePredictionNumbers(centeredIndex, centeredValue, 'linearTrend.numerator.product');
+    return addFinitePredictionNumbers(sum, product, 'linearTrend.numerator.sum');
+  }, 0);
   const slope = denominator === 0
     ? 0
-    : values.reduce((sum, value, index) => sum + ((index - xAverage) * (value - yAverage)), 0) / denominator;
-  const intercept = yAverage - slope * xAverage;
+    : requireFinitePredictionNumber(numerator / denominator, 'linearTrend.slope');
+  const slopeAtAverage = multiplyFinitePredictionNumbers(slope, xAverage, 'linearTrend.intercept.product');
+  const intercept = requireFinitePredictionNumber(yAverage - slopeAtAverage, 'linearTrend.intercept');
 
   return predictionMonths.map((targetMonth, predictionIndex) => {
-    const rawPrediction = intercept + slope * (n + predictionIndex);
-    const clamped = roundPredictionValue(rawPrediction);
-    const clampNotice = rawPrediction < 0 ? '；趋势外推出现负值，已按业务口径截断为 0' : '';
+    const targetIndex = n + predictionIndex;
+    const trendValue = multiplyFinitePredictionNumbers(slope, targetIndex, 'linearTrend.prediction.product');
+    const rawPrediction = addFinitePredictionNumbers(intercept, trendValue, 'linearTrend.prediction.raw');
+    const predictedValue = roundPredictionValue(rawPrediction);
+    const confidence = buildPredictionConfidenceFacts('linear_trend', predictedValue);
+    const forecastFact = {
+      algorithm: 'linear_trend',
+      windowSize: null,
+      sampleCount: n,
+      signedSlope: roundSignedPredictionValue(slope),
+      clampedToZero: rawPrediction < 0
+    };
     return {
       targetMonth,
-      predictedValue: clamped,
-      confidenceLow: roundPredictionValue(clamped * 0.85),
-      confidenceHigh: roundPredictionValue(clamped * 1.15),
-      methodNote: `轻量线性趋势：基于 ${n} 个历史月份做一元线性外推，slope=${roundPredictionValue(slope)}；confidenceLevel=low，仅作趋势参考${clampNotice}。`
+      targetIndex,
+      sourceValues: values,
+      intercept,
+      rawSlope: slope,
+      rawPredictedValue: rawPrediction,
+      predictedValue,
+      confidenceLow: confidence.confidenceLow,
+      confidenceHigh: confidence.confidenceHigh,
+      methodNote: formatPredictionForecastMethodNote(forecastFact),
+      roundingDigits: PREDICTION_ROUNDING_DIGITS,
+      confidenceLowMultiplier: confidence.confidenceLowMultiplier,
+      confidenceHighMultiplier: confidence.confidenceHighMultiplier,
+      confidenceLowRaw: confidence.confidenceLowRaw,
+      confidenceHighRaw: confidence.confidenceHighRaw,
+      ...forecastFact
     };
   });
 }
 
 function detectHistoryWarnings(points = []) {
-  const values = points.map((point) => Number(point.value)).filter((value) => Number.isFinite(value));
+  const values = readPredictionPointValues(points, 'historyWarnings');
   if (values.length < 2) {
     return [];
   }
-  const max = Math.max(...values);
-  const min = Math.min(...values);
+  const max = values.reduce((current, value) => Math.max(current, value), values[0]);
+  const min = values.reduce((current, value) => Math.min(current, value), values[0]);
   const avg = average(values);
   const warnings = [];
-  if (avg > 0 && (max - min) / avg > 1) {
+  const range = requireFinitePredictionNumber(max - min, 'historyWarnings.range');
+  const relativeRange = avg > 0
+    ? requireFinitePredictionNumber(range / avg, 'historyWarnings.relativeRange')
+    : 0;
+  if (relativeRange > 1) {
     warnings.push('历史数据波动较大，轻量预测结果不宜作为高精度承诺。');
   }
   return warnings;
@@ -313,32 +550,39 @@ function detectHistoryWarnings(points = []) {
 function buildForecast(points = [], predictionMonths = [], options = {}) {
   const algorithm = normalizePredictionAlgorithm(options.algorithm);
   if (algorithm === 'moving_average') {
-    return computeMovingAverageForecast(points, predictionMonths, { windowSize: options.windowSize || 3 });
+    return computeMovingAverageForecast(points, predictionMonths, { windowSize: options.windowSize ?? 3 });
   }
   return computeLinearTrendForecast(points, predictionMonths);
 }
 
 module.exports = {
   MONTH_PATTERN,
+  PREDICTION_CONFIDENCE_RULES,
   PREDICTION_RESULT_SORT_COLUMNS,
+  PREDICTION_ROUNDING_DIGITS,
   PREDICTION_RUN_STATUSES,
   PREDICTION_SORT_COLUMNS,
   SUPPORTED_PREDICTION_ALGORITHMS,
   addMonths,
   buildForecast,
+  buildPredictionConfidenceFacts,
   compareMonths,
   computeLinearTrendForecast,
   computeMovingAverageForecast,
   countMonthsInclusive,
   detectHistoryWarnings,
+  formatPredictionForecastMethodNote,
   generateMonthSequence,
+  isPredictionRoundedValue,
   normalizeMonth,
   normalizePositiveInteger,
   normalizePredictionAlgorithm,
   normalizePredictionStatus,
   normalizeSort,
   normalizeText,
+  parsePredictionForecastMethodNote,
   roundPredictionValue,
+  roundSignedPredictionValue,
   resolveMovingAverageRequiredHistoryMonths,
   summarizeHistorySufficiency,
   validatePredictionRange

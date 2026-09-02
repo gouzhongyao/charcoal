@@ -308,9 +308,7 @@ async function assertUnconnectedCase(server, adminToken, testCase) {
       productionUnit: formalExecuteBody,
       productionOutput: buildBlockedExecuteBody('确认导入月度产量'),
       generation: buildBlockedExecuteBody('确认导入发电记录'),
-      budget: buildBlockedExecuteBody('确认导入能源预算'),
-      carbon: buildBlockedExecuteBody('确认导入碳排放因子'),
-      prediction: buildBlockedExecuteBody('确认导入预测配置')
+      budget: buildBlockedExecuteBody('确认导入能源预算')
     };
     // execute 断言只证明在领域 handler 前阻断；Express 应用级 express.json 已在路由前解析，本测试不声称阻断位于其之前。
     const matrix = [
@@ -322,16 +320,11 @@ async function assertUnconnectedCase(server, adminToken, testCase) {
       { name: '产能单元 artifact 05 execute', kind: 'json', pathname: '/api/production/units/import/execute', body: blockedExecuteBodies.productionUnit, businessTables: ['production_units'] },
       { name: '月度产量 artifact 06 preview', kind: 'multipart', artifactKey: '06-production-outputs', pathname: '/api/production/outputs/import/preview', businessTables: ['production_output_records'] },
       { name: '月度产量 artifact 06 execute', kind: 'json', pathname: '/api/production/outputs/import/execute', body: blockedExecuteBodies.productionOutput, businessTables: ['production_output_records'] },
-      { name: '月度能耗 artifact 07 direct', kind: 'multipart', artifactKey: '07-monthly-energy', pathname: '/api/imports/batches', businessTables: ['energy_records'] },
       { name: '计量抄表 artifact 08 direct', kind: 'multipart', artifactKey: '08-meter-readings-2026-08', pathname: '/api/meter-readings/import', businessTables: ['meter_reading_records'] },
       { name: '发电记录 artifact 09 preview', kind: 'multipart', artifactKey: '09-generation-records', pathname: '/api/generation/records/import/preview', businessTables: ['generation_records'] },
       { name: '发电记录 artifact 09 execute', kind: 'json', pathname: '/api/generation/records/import/execute', body: blockedExecuteBodies.generation, businessTables: ['generation_records'] },
       { name: '能源预算 artifact 10 preview', kind: 'multipart', artifactKey: '10-energy-budgets', pathname: '/api/energy-budgets/import/preview', businessTables: ['energy_budgets'] },
-      { name: '能源预算 artifact 10 execute', kind: 'json', pathname: '/api/energy-budgets/import/execute', body: blockedExecuteBodies.budget, businessTables: ['energy_budgets'] },
-      { name: '碳因子 artifact 11 preview', kind: 'multipart', artifactKey: '11-carbon-factors', pathname: '/api/carbon/factors/import/preview', businessTables: ['carbon_factors'] },
-      { name: '碳因子 artifact 11 execute', kind: 'json', pathname: '/api/carbon/factors/import/execute', body: blockedExecuteBodies.carbon, businessTables: ['carbon_factors'] },
-      { name: '预测配置 artifact 12 preview', kind: 'multipart', artifactKey: '12-prediction-configs', pathname: '/api/predictions/configs/import/preview', businessTables: ['prediction_configs', 'prediction_runs', 'prediction_results'] },
-      { name: '预测配置 artifact 12 execute', kind: 'json', pathname: '/api/predictions/configs/import/execute', body: blockedExecuteBodies.prediction, businessTables: ['prediction_configs', 'prediction_runs', 'prediction_results'] }
+      { name: '能源预算 artifact 10 execute', kind: 'json', pathname: '/api/energy-budgets/import/execute', body: blockedExecuteBodies.budget, businessTables: ['energy_budgets'] }
     ];
 
     for (const testCase of matrix) {

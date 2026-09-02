@@ -951,25 +951,6 @@ function assertLegacyContextMigration() {
       phase: 'preview'
     }), (error) => error.code === 'DEMO_CONTEXT_BINDING_MISMATCH');
 
-    const conflictDb = openDatabase();
-    try {
-      conflictDb.prepare('UPDATE demo_dataset_runs SET manifest_digest = ? WHERE run_id = ?')
-        .run('f'.repeat(64), firstRun.runId);
-    } finally {
-      conflictDb.close();
-    }
-    assert.throws(
-      () => getOrCreateActiveDemoDatasetRun({ actorUserId: 1 }),
-      (error) => error.code === 'DEMO_ACTIVE_RUN_MANIFEST_CONFLICT'
-    );
-    const repairDb = openDatabase();
-    try {
-      repairDb.prepare('UPDATE demo_dataset_runs SET manifest_digest = ? WHERE run_id = ?')
-        .run(getDemoParkManifestDigest(), firstRun.runId);
-    } finally {
-      repairDb.close();
-    }
-
     server = await new Promise((resolve) => {
       const instance = app.listen(0, '127.0.0.1', () => resolve(instance));
     });
@@ -988,6 +969,103 @@ function assertLegacyContextMigration() {
     });
     const systemOnlyToken = systemOnlyLogin.body.data.token;
 
+    // manifest 一致但处于 cleaning 的 run 必须保持 GET 可读、通用写入口阻断且 managed 下载不签 context。
+    const cleaningSetupDb = openDatabase();
+    let cleaningStateBefore;
+    try {
+      cleaningSetupDb.prepare("UPDATE demo_dataset_runs SET status = 'cleaning' WHERE run_id = ?")
+        .run(firstRun.runId);
+      cleaningStateBefore = {
+        runCount: cleaningSetupDb.prepare('SELECT COUNT(*) AS total FROM demo_dataset_runs').get().total,
+        contextCount: cleaningSetupDb.prepare('SELECT COUNT(*) AS total FROM demo_import_contexts').get().total,
+        auditCount: cleaningSetupDb.prepare('SELECT COUNT(*) AS total FROM sys_operation_logs').get().total,
+        runtime: cleaningSetupDb.prepare(`SELECT enabled, runtime_epoch AS runtimeEpoch,
+          revision FROM demo_runtime_settings WHERE id = 1`).get()
+      };
+    } finally {
+      cleaningSetupDb.close();
+    }
+    const cleaningManifestResponse = await request(
+      server,
+      'GET',
+      '/api/templates/demo-park/manifest',
+      { token: adminToken }
+    );
+    assert.strictEqual(cleaningManifestResponse.status, 200);
+    assert.strictEqual(cleaningManifestResponse.body.data.run.runId, firstRun.runId);
+    assert.strictEqual(cleaningManifestResponse.body.data.activeRunCompatibility.state,
+      'cleanup-in-progress-blocked');
+    assert.strictEqual(cleaningManifestResponse.body.data.activeRunCompatibility.manifestCompatible, true);
+    assert.strictEqual(cleaningManifestResponse.body.data.activeRunCompatibility.turnoverEligible, false);
+    assert.strictEqual(cleaningManifestResponse.body.data.activeRunCompatibility.writeEligible, false);
+    assert.strictEqual(cleaningManifestResponse.body.data.activeRunCompatibility.retryable, true);
+    assert.strictEqual(cleaningManifestResponse.headers['x-demo-context'], undefined);
+    const cleaningStatusResponse = await request(
+      server,
+      'GET',
+      '/api/system/demo-data/status',
+      { token: adminToken }
+    );
+    assert.strictEqual(cleaningStatusResponse.status, 200);
+    assert.strictEqual(cleaningStatusResponse.body.data.activeRunCompatibility.state,
+      'cleanup-in-progress-blocked');
+    assert.strictEqual(cleaningStatusResponse.body.data.activeRunCompatibility.writeEligible, false);
+    assert.strictEqual(cleaningStatusResponse.body.data.activeRunCompatibility.retryable, true);
+    const cleaningCatalogResponse = await request(
+      server,
+      'GET',
+      '/api/system/demo-data/catalog',
+      { token: adminToken }
+    );
+    assert.strictEqual(cleaningCatalogResponse.status, 200);
+    assert.strictEqual(cleaningCatalogResponse.body.data.activeRunCompatibility.state,
+      'cleanup-in-progress-blocked');
+    assert.strictEqual(cleaningCatalogResponse.body.data.activeRunCompatibility.turnoverEligible, false);
+    const cleaningOwnershipResponse = await request(
+      server,
+      'GET',
+      `/api/system/demo-data/runs/${firstRun.runId}/ownership-summary`,
+      { token: adminToken }
+    );
+    assert.strictEqual(cleaningOwnershipResponse.status, 200, JSON.stringify(cleaningOwnershipResponse.body));
+    assert.strictEqual(cleaningOwnershipResponse.body.data.compatibility.state,
+      'cleanup-in-progress-blocked');
+    assert.strictEqual(cleaningOwnershipResponse.body.data.cleanupWriteEligible, false);
+    const cleaningRunResponse = await request(
+      server,
+      'POST',
+      '/api/system/demo-data/run',
+      { token: adminToken, body: {} }
+    );
+    assert.strictEqual(cleaningRunResponse.status, 409, JSON.stringify(cleaningRunResponse.body));
+    assert.strictEqual(cleaningRunResponse.body.error.code, 'DEMO_RUN_CLEANUP_IN_PROGRESS');
+    assert.strictEqual(cleaningRunResponse.body.error.details.retryable, true);
+    const cleaningDownloadResponse = await request(
+      server,
+      'GET',
+      '/api/templates/demo-park/13-shift-definitions.xlsx',
+      { token: adminToken }
+    );
+    assert.strictEqual(cleaningDownloadResponse.status, 409, JSON.stringify(cleaningDownloadResponse.body));
+    assert.strictEqual(cleaningDownloadResponse.body.error.code, 'DEMO_RUN_CLEANUP_IN_PROGRESS');
+    assert.strictEqual(cleaningDownloadResponse.body.error.details.retryable, true);
+    assert.strictEqual(cleaningDownloadResponse.headers['x-demo-context'], undefined);
+    const cleaningVerifyDb = openDatabase();
+    try {
+      assert.deepStrictEqual({
+        runCount: cleaningVerifyDb.prepare('SELECT COUNT(*) AS total FROM demo_dataset_runs').get().total,
+        contextCount: cleaningVerifyDb.prepare('SELECT COUNT(*) AS total FROM demo_import_contexts').get().total,
+        auditCount: cleaningVerifyDb.prepare('SELECT COUNT(*) AS total FROM sys_operation_logs').get().total,
+        runtime: cleaningVerifyDb.prepare(`SELECT enabled, runtime_epoch AS runtimeEpoch,
+          revision FROM demo_runtime_settings WHERE id = 1`).get()
+      }, cleaningStateBefore);
+      cleaningVerifyDb.prepare(`UPDATE demo_dataset_runs
+        SET status = 'active', manifest_digest = ? WHERE run_id = ?`)
+        .run('f'.repeat(64), firstRun.runId);
+    } finally {
+      cleaningVerifyDb.close();
+    }
+
     const contextsBeforeManifest = openDatabase();
     let contextCountBeforeManifest;
     try {
@@ -998,6 +1076,10 @@ function assertLegacyContextMigration() {
     const manifestResponse = await request(server, 'GET', '/api/templates/demo-park/manifest', { token: adminToken });
     assert.strictEqual(manifestResponse.status, 200);
     assert.strictEqual(manifestResponse.body.data.datasetId, DEMO_DATASET_ID);
+    assert.strictEqual(manifestResponse.body.data.run.runId, firstRun.runId);
+    assert.strictEqual(manifestResponse.body.data.activeRunCompatibility.state, 'manifest-turnover-pending');
+    assert.strictEqual(manifestResponse.body.data.activeRunCompatibility.turnoverEligible, true);
+    assert.strictEqual(manifestResponse.body.data.activeRunCompatibility.writeEligible, false);
     assert.strictEqual(manifestResponse.headers['x-demo-context'], undefined, 'manifest 不得签发 context');
     const contextsAfterManifest = openDatabase();
     try {
@@ -1017,6 +1099,9 @@ function assertLegacyContextMigration() {
     const headerNames = [
       'x-demo-dataset-id',
       'x-demo-run-id',
+      'x-demo-run-reused',
+      'x-demo-run-auto-superseded',
+      'x-demo-runtime-epoch',
       'x-demo-artifact-key',
       'x-demo-handler-key',
       'x-demo-manifest-version',
@@ -1025,19 +1110,46 @@ function assertLegacyContextMigration() {
       'x-demo-context'
     ];
     headerNames.forEach((headerName) => assert(downloadResponse.headers[headerName], `下载缺少 ${headerName}`));
+    assert.strictEqual(downloadResponse.headers['x-demo-run-reused'], 'false');
+    assert.strictEqual(downloadResponse.headers['x-demo-run-auto-superseded'], 'true');
+    assert.strictEqual(downloadResponse.headers['x-demo-run-superseded-from'], firstRun.runId);
+    assert.notStrictEqual(downloadResponse.headers['x-demo-run-id'], firstRun.runId);
+    const downloadRuntimeEpoch = Number(downloadResponse.headers['x-demo-runtime-epoch']);
+    assert(Number.isSafeInteger(downloadRuntimeEpoch) && downloadRuntimeEpoch >= 1);
     assert.strictEqual(downloadResponse.headers['x-demo-artifact-sha256'], sha256Buffer(downloadResponse.buffer));
     const downloadedToken = downloadResponse.headers['x-demo-context'];
     const downloadContextDb = openDatabase();
     try {
-      const row = downloadContextDb.prepare('SELECT token_hash AS tokenHash FROM demo_import_contexts WHERE token_hash = ?')
+      const row = downloadContextDb.prepare(`SELECT token_hash AS tokenHash, run_id AS runId,
+          runtime_epoch AS runtimeEpoch
+        FROM demo_import_contexts WHERE token_hash = ?`)
         .get(hashDemoContextToken(downloadedToken));
       assert(row);
       assert.notStrictEqual(row.tokenHash, downloadedToken);
+      assert.strictEqual(row.runId, downloadResponse.headers['x-demo-run-id']);
+      assert.strictEqual(row.runtimeEpoch, downloadRuntimeEpoch);
+      const predecessor = downloadContextDb.prepare(`SELECT status, successor_run_id AS successorRunId,
+          supersede_reason AS supersedeReason, supersede_trigger AS supersedeTrigger
+        FROM demo_dataset_runs WHERE run_id = ?`).get(firstRun.runId);
+      assert.deepStrictEqual(predecessor, {
+        status: 'superseded',
+        successorRunId: row.runId,
+        supersedeReason: 'manifest_run_superseded',
+        supersedeTrigger: 'managed-artifact-download'
+      });
       const auditText = JSON.stringify(downloadContextDb.prepare('SELECT detail_json AS detailJson FROM sys_operation_logs').all());
       assert(!auditText.includes(downloadedToken), 'context 明文不得进入审计 details');
     } finally {
       downloadContextDb.close();
     }
+
+    const reusedDownloadResponse = await request(server, 'GET', '/api/templates/demo-park/13-shift-definitions.xlsx', { token: adminToken });
+    assert.strictEqual(reusedDownloadResponse.status, 200);
+    assert.strictEqual(reusedDownloadResponse.headers['x-demo-run-id'], downloadResponse.headers['x-demo-run-id']);
+    assert.strictEqual(reusedDownloadResponse.headers['x-demo-run-reused'], 'true');
+    assert.strictEqual(reusedDownloadResponse.headers['x-demo-run-auto-superseded'], 'false');
+    assert.strictEqual(reusedDownloadResponse.headers['x-demo-run-superseded-from'], undefined);
+    assert.strictEqual(reusedDownloadResponse.headers['x-demo-runtime-epoch'], String(downloadRuntimeEpoch));
 
     const bodyReassociate = await request(server, 'POST', '/api/system/demo-data/contexts/reassociate', {
       token: adminToken,

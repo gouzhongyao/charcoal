@@ -21,7 +21,8 @@ const {
   executeDeviceStateImport,
   executeShiftScheduleImport,
   previewDeviceStateImport,
-  previewShiftScheduleImport
+  previewShiftScheduleImport,
+  validateDeviceStateDatabaseSecondRange
 } = require('../services/energyOperationsImportService');
 
 // 排班冻结模板的中文列顺序。
@@ -680,8 +681,27 @@ function testShiftDomainRules(db, options) {
   assert.strictEqual(alignmentInvalidPreview.summary.blocked, 5, '秒、毫秒、错误自然日、无关墙钟和跨多日都必须阻断。');
   assert.strictEqual(
     alignmentInvalidPreview.items.filter((item) => item.issues.some((issue) => issue.code === 'SHIFT_SCHEDULE_DEFINITION_ALIGNMENT_MISMATCH')).length,
-    5
+    4,
+    '合法秒精度但未落在整分钟的记录进入排班对齐；非零毫秒必须在模板边界提前阻断。'
   );
+  const millisecondAlignmentIssues = alignmentInvalidPreview.items.find(
+    (item) => item.sourceRowNumber === 3
+  ).issues;
+  assert.deepStrictEqual(
+    millisecondAlignmentIssues.map((issue) => issue.code),
+    ['STRICT_UTC_INPUT_PRECISION_INVALID'],
+    '非零毫秒只保留明确精度错误，不得级联为必填、通用 UTC 或排班对齐错误。'
+  );
+
+  const blankStartFile = writeCsvUpload('shift-blank-start.csv', SHIFT_HEADERS, [createValidShiftRow({
+    '排班开始时间（UTC）': '',
+    来源标识: 'blank-start-required'
+  })]);
+  const blankStartPreview = previewShiftScheduleImport(blankStartFile, options);
+  assert.strictEqual(blankStartPreview.summary.blocked, 1);
+  assert(blankStartPreview.auditIssues.some(
+    (issue) => issue.fieldName === 'scheduleStartUtc' && issue.code === 'REQUIRED_FIELD_MISSING'
+  ), '真正空白的必填 UTC 字段必须继续报告必填错误。');
 
   const exactFile = writeCsvUpload('shift-file-exact.csv', SHIFT_HEADERS, [
     createValidShiftRow({
@@ -824,7 +844,7 @@ async function testDeviceDomainRules(db, options) {
     'DEVICE_ORGANIZATION_TYPE_INVALID',
     'METER_ORGANIZATION_MISMATCH',
     'INVALID_DEVICE_STATE',
-    'INVALID_START_UTC',
+    'STRICT_UTC_INPUT_INVALID',
     'METER_DEVICE_REQUIRED_BY_SCHEMA'
   ].forEach((code) => assert(invalidCodes.has(code), `设备状态校验必须包含 ${code}。`));
   assert.strictEqual(invalidPreview.summary.blocked, invalidRows.length);
@@ -836,11 +856,17 @@ async function testDeviceDomainRules(db, options) {
   })]);
   const beforeSameSecondCount = countRecords(db, 'device_state_records');
   const sameDatabaseSecondPreview = previewDeviceStateImport(sameDatabaseSecondFile, options);
-  assert.strictEqual(sameDatabaseSecondPreview.summary.blocked, 1, '同一 Unix 整秒内的设备状态区间必须在 preview 阶段阻断。');
-  assert.strictEqual(sameDatabaseSecondPreview.candidateRows.length, 0, '数据库秒级无效区间不得进入候选。');
-  assert(sameDatabaseSecondPreview.auditIssues.some(
-    (issue) => issue.code === 'DEVICE_STATE_INTERVAL_EMPTY_AT_DATABASE_SECOND_PRECISION'
-  ));
+  assert.strictEqual(sameDatabaseSecondPreview.summary.blocked, 1, '非零毫秒必须在用户文件 UTC 精度边界阻断。');
+  assert.strictEqual(sameDatabaseSecondPreview.candidateRows.length, 0, '精度无效区间不得进入候选。');
+  assert.strictEqual(sameDatabaseSecondPreview.auditIssues.filter(
+    (issue) => issue.code === 'STRICT_UTC_INPUT_PRECISION_INVALID'
+  ).length, 2);
+  ['REQUIRED_FIELD_MISSING', 'INVALID_START_UTC', 'INVALID_END_UTC', 'DEVICE_STATE_INTERVAL_EMPTY_AT_DATABASE_SECOND_PRECISION']
+    .forEach((code) => assert.strictEqual(
+      sameDatabaseSecondPreview.auditIssues.some((issue) => issue.code === code),
+      false,
+      `非零毫秒模板错误不得级联为 ${code}。`
+    ));
   let sameSecondBackupCalls = 0;
   const sameSecondExecuteCode = await captureErrorCode(() => executeDeviceStateImport(
     createExecuteBody(sameDatabaseSecondPreview),
@@ -853,8 +879,19 @@ async function testDeviceDomainRules(db, options) {
     }
   ));
   assert.strictEqual(sameSecondExecuteCode, 'ENERGY_ANALYSIS_IMPORT_EMPTY_CANDIDATES_REJECTED');
-  assert.strictEqual(sameSecondBackupCalls, 0, '无有效候选的秒级区间不得进入备份。');
-  assert.strictEqual(countRecords(db, 'device_state_records'), beforeSameSecondCount, '秒级无效区间必须零业务写入。');
+  assert.strictEqual(sameSecondBackupCalls, 0, '无有效候选的精度错误不得进入备份。');
+  assert.strictEqual(countRecords(db, 'device_state_records'), beforeSameSecondCount, '精度错误必须零业务写入。');
+
+  const databaseSecondDefenseIssues = validateDeviceStateDatabaseSecondRange({
+    rowNumber: 2,
+    startUtc: '2026-12-05T00:00:00.100Z',
+    endUtc: '2026-12-05T00:00:00.900Z'
+  });
+  assert.deepStrictEqual(
+    databaseSecondDefenseIssues.map((issue) => issue.code),
+    ['DEVICE_STATE_INTERVAL_EMPTY_AT_DATABASE_SECOND_PRECISION'],
+    '数据库整秒防御保留为独立纯函数合同，不得通过放宽正式文件导入来触达。'
+  );
 
   const crossDatabaseSecondFile = writeCsvUpload('device-cross-database-second.csv', DEVICE_HEADERS, [createValidDeviceRow({
     '开始时间（UTC）': '2026-12-05T00:00:00.900Z',
@@ -862,17 +899,12 @@ async function testDeviceDomainRules(db, options) {
     来源标识: 'device-cross-database-second'
   })]);
   const crossDatabaseSecondPreview = previewDeviceStateImport(crossDatabaseSecondFile, options);
-  assert.strictEqual(crossDatabaseSecondPreview.summary.wouldImport, 1, '跨 Unix 整秒且实际不足一秒的区间必须与 schema 一致保持可导入。');
-  const crossDatabaseSecondResult = await executeDeviceStateImport(createExecuteBody(crossDatabaseSecondPreview), options);
-  assert.strictEqual(crossDatabaseSecondResult.imported, 1);
-  const insertedCrossSecond = db.prepare(
-    `SELECT start_utc AS startUtc, end_utc AS endUtc
-     FROM device_state_records WHERE source_batch_id = ?`
-  ).get(crossDatabaseSecondPreview.batchId);
-  assert.deepStrictEqual(insertedCrossSecond, {
-    startUtc: '2026-12-05T00:00:00.900Z',
-    endUtc: '2026-12-05T00:00:01.100Z'
-  });
+  assert.strictEqual(crossDatabaseSecondPreview.summary.blocked, 1, '即使跨 Unix 整秒，用户文件中的非零毫秒仍必须阻断。');
+  assert.strictEqual(crossDatabaseSecondPreview.summary.wouldImport, 0);
+  assert.strictEqual(crossDatabaseSecondPreview.candidateRows.length, 0);
+  assert.strictEqual(crossDatabaseSecondPreview.auditIssues.filter(
+    (issue) => issue.code === 'STRICT_UTC_INPUT_PRECISION_INVALID'
+  ).length, 2);
 
   const explicitUnknownWithGap = writeCsvUpload('device-explicit-unknown-gap.csv', DEVICE_HEADERS, [
     createValidDeviceRow({

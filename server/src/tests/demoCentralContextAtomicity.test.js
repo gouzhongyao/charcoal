@@ -475,7 +475,16 @@ async function assertSingleShiftPostInsertFailureRollback(db, input) {
         createBackup: createIsolatedBackup,
         demoContext: projectDemoContext(context)
       }),
-      (error) => error.details?.code === 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED'
+      (error) => {
+        assert.strictEqual(
+          error.details?.code,
+          input.expectedErrorCode || 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED'
+        );
+        if (input.expectedCauseCode) {
+          assert.strictEqual(error.details?.causeCode, input.expectedCauseCode);
+        }
+        return true;
+      }
     );
   } finally {
     if (failureAuditFault) failureAuditFault.restore();
@@ -569,13 +578,14 @@ async function testStrategyRuleOperationAuditRollback(db) {
   assert.strictEqual(snapshotAuditBatch(db, preview.batchId).batch.audit_phase, 'preview');
 }
 
-/** 验证 artifact 13 batch link 重建失败时业务与操作审计整体回滚。 */
+/** 验证 artifact 13 preview batch link 缺失时 fail-closed 且不尝试重建或写业务。 */
 async function testSingleExecuteBatchLinkRollback(db) {
   await assertSingleShiftPostInsertFailureRollback(db, {
-    label: 'artifact 13 batch link 失败',
+    label: 'artifact 13 batch link 缺失',
     suffix: 'batch-link-failure',
     triggerName: 'test_shift_batch_link_failure',
     removePreviewLink: true,
+    expectedCauseCode: 'DEMO_OWNERSHIP_IMPORT_BATCH_CONFLICT',
     createTriggerSql: ({ context }) => `CREATE TRIGGER test_shift_batch_link_failure
       BEFORE INSERT ON demo_run_import_batches
       FOR EACH ROW WHEN NEW.context_id = '${context.contextId.replace(/'/g, "''")}'
@@ -589,6 +599,7 @@ async function testSingleExecuteRegistryRollback(db) {
     label: 'artifact 13 registry 失败',
     suffix: 'registry-failure',
     triggerName: 'test_shift_registry_failure',
+    expectedCauseCode: 'DEMO_OWNERSHIP_REGISTRY_WRITE_FAILED',
     createTriggerSql: () => `CREATE TRIGGER test_shift_registry_failure
       BEFORE INSERT ON demo_data_registry
       FOR EACH ROW WHEN NEW.artifact_key = '13-shift-definitions'

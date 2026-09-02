@@ -1,5 +1,43 @@
 'use strict';
 
+// 服务导出壳在任何依赖加载前绑定到当前 Module，阻止初始化窗口整体替换 require.cache exports。
+const energyStrategyEvaluationExports = {};
+// 使用稳定 Proxy 壳绕开 Node 23 循环加载器对普通 exports 原型的临时改写。
+const energyStrategyEvaluationExportsProxy = new Proxy(energyStrategyEvaluationExports, {});
+Object.defineProperty(module, 'exports', {
+  value: energyStrategyEvaluationExportsProxy,
+  enumerable: true,
+  writable: false,
+  configurable: false
+});
+
+// 协议依赖的函数声明在模块初始化首段固定，供协议 linker 在任一加载顺序下捕获同一函数对象。
+Object.entries({
+  assertEnergyStrategyExactScopeCapability,
+  bindEnergyStrategyRegistrationScopeCapability,
+  getStrategyRuleHitWithDb,
+  insertOperationLogWithDb,
+  parseEvidenceRequirements
+}).forEach(([fieldName, handler]) => {
+  Object.defineProperty(energyStrategyEvaluationExports, fieldName, {
+    value: handler,
+    enumerable: true,
+    writable: false,
+    configurable: false
+  });
+});
+// witness consumer 仅以固定 Symbol 属性提供给协议 linker，常规业务 exports 不公开登记或消费入口。
+Object.defineProperty(
+  energyStrategyEvaluationExports,
+  Symbol.for('charcoal.energyStrategy.consumeWitness.v1'),
+  {
+    value: consumeEnergyStrategyEvaluationWitnessForOwnership,
+    enumerable: false,
+    writable: false,
+    configurable: false
+  }
+);
+
 const crypto = require('crypto');
 const database = require('../db/database');
 const { AppError, badRequest, notFound } = require('../utils/errors');
@@ -61,6 +99,8 @@ const EXACT_STRATEGY_SCOPE_CAPABILITY_METADATA = new WeakMap();
 const STRATEGY_REGISTRATION_SCOPE_BINDINGS = new WeakMap();
 // completion witness 的真实来源集合和返回快照只保存在私有 WeakMap 中。
 const STRATEGY_COMPLETION_WITNESS_STATE = new WeakMap();
+// registrar authority 仅在 evaluator 固定调用链中传递，公开调用无法伪造或读取。
+const STRATEGY_OWNERSHIP_REGISTRAR_AUTHORITY = Object.freeze({});
 // evaluator 与 ownership scope 使用同一组规范领域字段，禁止隐式扩大来源窗口。
 const STRATEGY_DOMAIN_BINDING_FIELDS = Object.freeze([
   'meterDeviceId',
@@ -70,6 +110,30 @@ const STRATEGY_DOMAIN_BINDING_FIELDS = Object.freeze([
   'endUtc',
   'sourceTimeZone'
 ]);
+
+// ownership 初始化会读取以下稳定常量；在加载内部协议前固定到服务导出壳。
+Object.defineProperties(energyStrategyEvaluationExports, {
+  SUPPORTED_FORMULA_VERSION: {
+    value: SUPPORTED_FORMULA_VERSION,
+    enumerable: true,
+    writable: false,
+    configurable: false
+  },
+  SUPPORTED_METRIC_CODES: {
+    value: SUPPORTED_METRIC_CODES,
+    enumerable: true,
+    writable: false,
+    configurable: false
+  }
+});
+const { energyStrategyOwnershipProtocol } = require('./energyStrategyOwnershipProtocol');
+// 业务 helper 只捕获协议模块初始化期创建的冻结 wrapper，不再读取 ownership 当前 exports。
+const calculateDemoEntityIdentityDigestForStrategy =
+  energyStrategyOwnershipProtocol.calculateIdentityDigest;
+const calculateDemoEntitySnapshotDigestForStrategy =
+  energyStrategyOwnershipProtocol.calculateSnapshotDigest;
+const refreshDerivedStrategyRuleHitOwnershipForStrategy =
+  energyStrategyOwnershipProtocol.refreshRuleHitOwnership;
 
 /**
  * 判断值是否为非数组普通对象。
@@ -167,23 +231,20 @@ function cloneFrozenStrategyWitnessSnapshot(value) {
 }
 
 /**
- * 由 ownership issue 入口绑定 opaque registration scope 与原始 exact scope。
- * confirm/abort 闭包保留在私有 WeakMap，公共 scope 本身不携带任何数据。
+ * 由 ownership issue 入口绑定 opaque registration scope 与 exact scope。
+ * 绑定只保存在 evaluator 私有 WeakMap，公共 scope 本身不携带连接或领域数据。
  */
 function bindEnergyStrategyRegistrationScopeCapability(input = {}) {
   assertExactStrategyProtocolFields(
     input,
-    ['db', 'registrationScope', 'exactScope', 'domainBinding', 'confirmActive', 'prepareRegistrar', 'abort'],
+    ['db', 'registrationScope', 'exactScope', 'domainBinding'],
     'ENERGY_STRATEGY_REGISTRATION_SCOPE_BINDING_INVALID',
     '策略评价 registration scope 私有绑定字段无效。'
   );
   assertEnergyStrategyExactScopeCapability(input.exactScope, input.db);
   if (!input.db || typeof input.db.prepare !== 'function'
     || !input.registrationScope || typeof input.registrationScope !== 'object'
-    || !Object.isFrozen(input.registrationScope)
-    || typeof input.confirmActive !== 'function'
-    || typeof input.prepareRegistrar !== 'function'
-    || typeof input.abort !== 'function') {
+    || !Object.isFrozen(input.registrationScope)) {
     throw badRequest('策略评价 registration scope 私有绑定无效。', {
       code: 'ENERGY_STRATEGY_REGISTRATION_SCOPE_BINDING_INVALID'
     });
@@ -203,36 +264,16 @@ function bindEnergyStrategyRegistrationScopeCapability(input = {}) {
     db: input.db,
     exactScope: input.exactScope,
     domainBindingDigest: stableStringify(input.domainBinding),
-    confirmActive: input.confirmActive,
-    prepareRegistrar: input.prepareRegistrar,
-    abort: input.abort,
     status: 'issued'
   });
   return input.registrationScope;
 }
 
-/** 将绑定的 registration scope 标记为已释放 guard 且可进入 evaluator 写入阶段。 */
-function markEnergyStrategyRegistrationScopeActive(registrationScope) {
-  const binding = registrationScope && typeof registrationScope === 'object'
-    ? STRATEGY_REGISTRATION_SCOPE_BINDINGS.get(registrationScope)
-    : null;
-  if (!binding || binding.status !== 'evaluating') {
-    throw badRequest('策略评价 registration scope 不能进入 active 状态。', {
-      code: 'ENERGY_STRATEGY_REGISTRATION_SCOPE_STATE_INVALID'
-    });
-  }
-  binding.status = 'active';
+/** 返回模块初始化期间已捕获的 ownership 闭包协议，不再读取对端 require/cache exports。 */
+function getEnergyStrategyOwnershipProtocol() {
+  return energyStrategyOwnershipProtocol;
 }
 
-/** 将 registration scope 标记为失败，阻止任何后续 evaluator 或 registrar 重放。 */
-function markEnergyStrategyRegistrationScopeFailed(registrationScope) {
-  const binding = registrationScope && typeof registrationScope === 'object'
-    ? STRATEGY_REGISTRATION_SCOPE_BINDINGS.get(registrationScope)
-    : null;
-  if (binding && binding.status !== 'completed') binding.status = 'failed';
-}
-
-/** 规范并确认 evaluator 本次调用满足受控 completion witness 全部门禁。 */
 function requireControlledStrategyEvaluationContext(
   normalizedOptions,
   db,
@@ -240,24 +281,32 @@ function requireControlledStrategyEvaluationContext(
   exactScope,
   domainBinding
 ) {
-  const controlledFields = [
-    'registrationScope',
+  const hasRegistrationScope = Object.prototype.hasOwnProperty.call(
+    normalizedOptions,
+    'registrationScope'
+  );
+  const retiredControlledFields = [
+    'registrarCapability',
     'beforeEvaluationWrite',
     'onCompletedEvaluation'
   ];
-  const presentFields = controlledFields.filter((fieldName) => (
+  const hasRetiredControlledField = retiredControlledFields.some((fieldName) => (
     Object.prototype.hasOwnProperty.call(normalizedOptions, fieldName)
   ));
-  if (presentFields.length === 0) return null;
-  if (presentFields.length !== controlledFields.length
+  if (!hasRegistrationScope && !hasRetiredControlledField) return null;
+  const allowedFields = ['actorUserId', 'db', 'exactRequired', 'exactScope', 'registrationScope'];
+  const actualFields = Object.keys(normalizedOptions).sort();
+  const normalizedAllowedFields = [...allowedFields].sort();
+  if (!hasRegistrationScope
+    || hasRetiredControlledField
+    || actualFields.length !== normalizedAllowedFields.length
+    || actualFields.some((fieldName, index) => fieldName !== normalizedAllowedFields[index])
     || shouldOwnWriteTransaction
     || normalizedOptions.exactRequired !== true
-    || !exactScope
-    || typeof normalizedOptions.beforeEvaluationWrite !== 'function'
-    || typeof normalizedOptions.onCompletedEvaluation !== 'function') {
-    throw badRequest('策略评价受控来源链必须同时提供 caller transaction、exact capability、registration scope 和同步 callbacks。', {
-      code: 'ENERGY_STRATEGY_CONTROLLED_CONTEXT_REQUIRED',
-      presentFields
+    || !exactScope) {
+    throw badRequest('策略评价受控调用只允许 db、actorUserId、exactRequired、exactScope 和 registrationScope。', {
+      code: 'ENERGY_STRATEGY_CONTROLLED_OPTIONS_INVALID',
+      actualFields
     });
   }
   assertEnergyStrategyExactScopeCapability(normalizedOptions.exactScope, db);
@@ -271,44 +320,30 @@ function requireControlledStrategyEvaluationContext(
     });
   }
   if (binding.db !== db) {
-    binding.status = 'failed';
-    try { binding.abort(); } catch (_abortError) { /* 原始 wrong-db 错误优先。 */ }
     throw badRequest('策略评价 registration scope 与 evaluator SQLite 连接不一致。', {
       code: 'ENERGY_STRATEGY_REGISTRATION_SCOPE_DATABASE_MISMATCH'
     });
   }
   if (binding.exactScope !== normalizedOptions.exactScope) {
     binding.status = 'failed';
-    try { binding.abort(); } catch (_abortError) { /* 原始 exact identity 错误优先。 */ }
     throw badRequest('策略评价 registration scope 与 evaluator exact scope 对象身份不一致。', {
       code: 'ENERGY_STRATEGY_REGISTRATION_SCOPE_EXACT_MISMATCH'
     });
   }
   if (binding.domainBindingDigest !== stableStringify(domainBinding)) {
     binding.status = 'failed';
-    try { binding.abort(); } catch (_abortError) { /* 原始 domain binding 错误优先。 */ }
     throw badRequest('策略评价 registration scope 与 evaluator 领域绑定不一致。', {
       code: 'ENERGY_STRATEGY_REGISTRATION_SCOPE_DOMAIN_MISMATCH'
     });
   }
+  // 在任何 preview、任意 SAVEPOINT 或业务 SQL 前一次性领取原始 scope。
   binding.status = 'evaluating';
   return {
     registrationScope,
     binding,
-    beforeEvaluationWrite: normalizedOptions.beforeEvaluationWrite,
-    onCompletedEvaluation: normalizedOptions.onCompletedEvaluation,
-    domainBinding
+    domainBinding,
+    ownershipProtocol: getEnergyStrategyOwnershipProtocol()
   };
-}
-
-/** 执行私有同步 callback，并拒绝 Promise 或 thenable 返回值。 */
-function invokeSynchronousStrategyCallback(callback, args, code, message) {
-  const result = callback(...args);
-  if (result && (typeof result === 'object' || typeof result === 'function')
-    && typeof result.then === 'function') {
-    throw badRequest(message, { code });
-  }
-  return result;
 }
 
 /** 生成空冻结 completion witness，并将真实来源集合写入私有 WeakMap。 */
@@ -327,21 +362,29 @@ function createStrategyEvaluationCompletionWitness(state) {
     domainBinding: cloneFrozenStrategyWitnessSnapshot(state.domainBinding),
     runSnapshot: cloneFrozenStrategyWitnessSnapshot(state.runSnapshot),
     hitSnapshots: cloneFrozenStrategyWitnessSnapshot(state.hitSnapshots),
+    operationAuditId: state.operationAuditId,
+    operationAuditSnapshot: cloneFrozenStrategyWitnessSnapshot(state.operationAuditSnapshot),
     status: 'issued'
   });
   return evaluationWitness;
 }
 
 /**
- * 严格一次性消费 completion witness；普通复制、JSON clone、错库和重放均拒绝。
+ * 仅允许 evaluator 固定 ownership registrar 通过私有 authority 一次性消费 completion witness。
+ * 公开直接调用、clone、JSON clone、错库、错 scope 和重放均 fail-closed。
  */
-function consumeEnergyStrategyEvaluationCompletionWitness(input = {}) {
+function consumeEnergyStrategyEvaluationWitnessForOwnership(input = {}) {
   assertExactStrategyProtocolFields(
     input,
-    ['db', 'registrationScope', 'exactScope', 'evaluationWitness'],
+    ['registrarAuthority', 'db', 'registrationScope', 'evaluationWitness'],
     'ENERGY_STRATEGY_COMPLETION_WITNESS_INPUT_INVALID',
-    '策略评价 completion witness consume 只能接收固定 capability 字段。'
+    '策略评价 ownership witness consume 只能接收固定私有协议字段。'
   );
+  if (input.registrarAuthority !== STRATEGY_OWNERSHIP_REGISTRAR_AUTHORITY) {
+    throw badRequest('策略评价 ownership registrar authority 无效。', {
+      code: 'ENERGY_STRATEGY_OWNERSHIP_REGISTRAR_AUTHORITY_REQUIRED'
+    });
+  }
   const witnessState = input.evaluationWitness && typeof input.evaluationWitness === 'object'
     ? STRATEGY_COMPLETION_WITNESS_STATE.get(input.evaluationWitness)
     : null;
@@ -355,32 +398,43 @@ function consumeEnergyStrategyEvaluationCompletionWitness(input = {}) {
       code: 'ENERGY_STRATEGY_COMPLETION_WITNESS_REPLAY'
     });
   }
-  if (input.db !== witnessState.db || input.db.inTransaction !== true) {
+  const binding = input.registrationScope && typeof input.registrationScope === 'object'
+    ? STRATEGY_REGISTRATION_SCOPE_BINDINGS.get(input.registrationScope)
+    : null;
+  if (!binding || binding.status !== 'active'
+    || binding.db !== input.db
+    || witnessState.db !== input.db) {
+    witnessState.status = 'failed';
+    throw badRequest('策略评价 completion witness 与原 SQLite 连接对象身份不一致。', {
+      code: 'ENERGY_STRATEGY_COMPLETION_WITNESS_DATABASE_MISMATCH'
+    });
+  }
+  if (witnessState.registrationScope !== input.registrationScope
+    || witnessState.exactScope !== binding.exactScope) {
+    witnessState.status = 'failed';
+    throw badRequest('策略评价 completion witness 与 registration/exact scope 对象身份不一致。', {
+      code: 'ENERGY_STRATEGY_COMPLETION_WITNESS_BINDING_MISMATCH'
+    });
+  }
+  if (input.db.inTransaction !== true) {
     witnessState.status = 'failed';
     throw badRequest('策略评价 completion witness 必须在原 caller transaction 中消费。', {
       code: 'ENERGY_STRATEGY_COMPLETION_WITNESS_TRANSACTION_MISMATCH'
     });
   }
-  if (input.registrationScope !== witnessState.registrationScope
-    || input.exactScope !== witnessState.exactScope) {
-    witnessState.status = 'failed';
-    throw badRequest('策略评价 completion witness 与 registration/exact capability 对象身份不一致。', {
-      code: 'ENERGY_STRATEGY_COMPLETION_WITNESS_BINDING_MISMATCH'
-    });
-  }
   witnessState.status = 'consumed';
-  return Object.freeze({
+  return cloneFrozenStrategyWitnessSnapshot({
     evaluationRunId: witnessState.evaluationRunId,
-    hitIds: Object.freeze([...witnessState.hitIds]),
-    strategyRuleIds: Object.freeze([...witnessState.strategyRuleIds]),
-    sourceTimeseriesIds: Object.freeze([...witnessState.sourceTimeseriesIds]),
+    hitIds: witnessState.hitIds,
+    strategyRuleIds: witnessState.strategyRuleIds,
+    sourceTimeseriesIds: witnessState.sourceTimeseriesIds,
     sourceBatchIds: witnessState.sourceBatchIds,
     sourceDigests: witnessState.sourceDigests,
     domainBinding: witnessState.domainBinding,
     runSnapshot: witnessState.runSnapshot,
     hitSnapshots: witnessState.hitSnapshots,
-    registrationScope: witnessState.registrationScope,
-    exactScope: witnessState.exactScope
+    operationAuditId: witnessState.operationAuditId,
+    operationAuditSnapshot: witnessState.operationAuditSnapshot
   });
 }
 
@@ -850,14 +904,12 @@ function calculateExactStrategyRuleDigests(rule) {
   const entityPk = String(Number(rule.id));
   const snapshot = buildExactStrategyRuleSnapshotFields(rule);
   try {
-    // 延迟读取 ownership 服务，避免模块初始化阶段形成循环依赖。
-    const {
-      calculateDemoEntityIdentityDigest,
-      calculateDemoEntitySnapshotDigest
-    } = require('./demoOwnershipService');
-    // 固定 ownership helper 同时执行公式、指标、阈值、evidence、枚举和时间值域校验。
-    const snapshotDigest = calculateDemoEntitySnapshotDigest(entityType, entityPk, snapshot);
-    const identityDigest = calculateDemoEntityIdentityDigest(entityType, entityPk);
+    const snapshotDigest = calculateDemoEntitySnapshotDigestForStrategy(
+      entityType,
+      entityPk,
+      snapshot
+    );
+    const identityDigest = calculateDemoEntityIdentityDigestForStrategy(entityType, entityPk);
     return { identityDigest, snapshotDigest };
   } catch (error) {
     if (typeof error?.code === 'string' && error.code.startsWith('DEMO_OWNERSHIP_')) {
@@ -1821,6 +1873,49 @@ function insertStrategyRuleHit(db, evaluationRunId, evaluation, preview, nowUtc)
  * @param {object} audit 审计上下文和详情。
  * @returns {number} 操作日志 ID。
  */
+/** 读取策略评价 operation audit 的固定持久投影，拒绝把可变整行暴露给 witness。 */
+function readStrategyOperationAuditWithDb(db, operationLogId) {
+  const row = db.prepare(`SELECT id AS id, user_id AS userId, operation AS operation,
+      target_type AS targetType, target_id AS targetId, detail_json AS detailJson,
+      ip AS ip, created_at AS createdAt
+    FROM sys_operation_logs WHERE id = ?`).get(operationLogId);
+  if (!row) return null;
+  let detail;
+  try {
+    detail = row.detailJson === null ? null : JSON.parse(row.detailJson);
+  } catch (_error) {
+    throw new AppError(
+      'ENERGY_STRATEGY_OPERATION_AUDIT_INVALID',
+      '策略评价 operation audit detail_json 不是有效固定 JSON。',
+      { statusCode: 409 }
+    );
+  }
+  return {
+    id: Number(row.id),
+    userId: row.userId === null ? null : Number(row.userId),
+    operation: row.operation,
+    targetType: row.targetType,
+    targetId: row.targetId,
+    detail,
+    ip: row.ip,
+    createdAt: row.createdAt
+  };
+}
+
+/** 根据 evaluator 固定审计输入构造应当持久化的 audit projection。 */
+function buildStrategyOperationAuditSnapshot(operationLogId, audit) {
+  return {
+    id: Number(operationLogId),
+    userId: audit.userId === undefined || audit.userId === null ? null : Number(audit.userId),
+    operation: audit.operation,
+    targetType: audit.targetType || null,
+    targetId: audit.targetId === undefined || audit.targetId === null ? null : String(audit.targetId),
+    detail: sanitizeAuditDetail(audit.detail),
+    ip: audit.ip || null,
+    createdAt: audit.createdAt
+  };
+}
+
 function insertOperationLogWithDb(db, audit) {
   const result = db.prepare(
     `INSERT INTO sys_operation_logs (
@@ -1886,6 +1981,47 @@ function createStrategyEvaluationSavepointName() {
   return `energy_strategy_exact_${crypto.randomBytes(12).toString('hex')}`;
 }
 
+/** 私有 SAVEPOINT 恢复异常时完整回滚，完整回滚仍失败则关闭连接。 */
+function failClosedStrategyTransaction(db) {
+  let fullRollbackError = null;
+  let closeError = null;
+  try {
+    if (db.inTransaction === true) db.exec('ROLLBACK');
+  } catch (error) {
+    fullRollbackError = error;
+  }
+  if (fullRollbackError) {
+    try {
+      db.close();
+    } catch (error) {
+      closeError = error;
+    }
+  }
+  return { fullRollbackError, closeError };
+}
+
+/** 回滚 evaluator 私有 SAVEPOINT；ROLLBACK TO 失败时绝不继续 RELEASE。 */
+function recoverStrategyEvaluationSavepoint(db, savepointName) {
+  let rollbackError = null;
+  let releaseError = null;
+  try {
+    db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+  } catch (error) {
+    rollbackError = error;
+  }
+  if (!rollbackError) {
+    try {
+      db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+    } catch (error) {
+      releaseError = error;
+    }
+  }
+  const failClosed = rollbackError || releaseError
+    ? failClosedStrategyTransaction(db)
+    : { fullRollbackError: null, closeError: null };
+  return { rollbackError, releaseError, ...failClosed };
+}
+
 /** 为 caller-owned strategy review 生成不受调用方输入影响的私有 SAVEPOINT 名称。 */
 function createStrategyReviewSavepointName() {
   return `energy_strategy_review_${crypto.randomBytes(12).toString('hex')}`;
@@ -1910,6 +2046,8 @@ function runEnergyStrategyEvaluation(input, options = {}) {
   let shouldUseExactSavepoint = false;
   const domainBinding = buildStrategyDomainBinding(normalizedInput);
   let controlledContext = null;
+  // exact metadata 在首条业务写入前消费并固定，后续 witness 只复用该连接绑定快照。
+  let exactMetadata = null;
   let completionWitness = null;
   let ownedWriteTransactionActive = false;
   let exactSavepointName = null;
@@ -1940,6 +2078,14 @@ function runEnergyStrategyEvaluation(input, options = {}) {
         exactScope: normalizedOptions.exactScope,
         ...(normalizedOptions.exactRequired === true ? { exactRequired: true } : {})
       });
+      if (controlledContext) {
+        exactMetadata = getEnergyStrategyExactScopeMetadata(preview, { db });
+        if (!exactMetadata || !exactMetadata.timeseries || !exactMetadata.strategyRules) {
+          throw badRequest('策略评价受控完成见证缺少服务端 exact metadata。', {
+            code: 'ENERGY_STRATEGY_COMPLETION_WITNESS_METADATA_REQUIRED'
+          });
+        }
+      }
       if (shouldUseExactSavepoint && !controlledContext) {
         exactSavepointName = createStrategyEvaluationSavepointName();
         db.exec(`SAVEPOINT ${exactSavepointName}`);
@@ -1947,24 +2093,22 @@ function runEnergyStrategyEvaluation(input, options = {}) {
       }
     }
     if (controlledContext) {
-      invokeSynchronousStrategyCallback(
-        controlledContext.beforeEvaluationWrite,
-        [controlledContext.registrationScope],
-        'ENERGY_STRATEGY_BEFORE_WRITE_CALLBACK_ASYNC',
-        '策略评价 beforeEvaluationWrite 必须同步完成。'
-      );
-      if (controlledContext.binding.status !== 'active') {
-        throw badRequest('策略评价 beforeEvaluationWrite 未激活原始 registration scope。', {
+      const activatedScope = controlledContext.ownershipProtocol.activate({
+        db,
+        registrationScope: controlledContext.registrationScope,
+        actorUserId: normalizedOptions.actorUserId
+      });
+      if (activatedScope !== controlledContext.registrationScope
+        || controlledContext.binding.status !== 'evaluating') {
+        controlledContext.binding.status = 'failed';
+        throw badRequest('策略评价 ownership 固定协议未激活原始 registration scope。', {
           code: 'ENERGY_STRATEGY_REGISTRATION_SCOPE_NOT_ACTIVATED'
         });
       }
-      // 激活回调返回后先释放预写 marker，确保 scope 没有跨越已结束或替换的 caller transaction。
-      controlledContext.binding.confirmActive();
+      controlledContext.binding.status = 'active';
       exactSavepointName = createStrategyEvaluationSavepointName();
       db.exec(`SAVEPOINT ${exactSavepointName}`);
       exactSavepointActive = true;
-      // registrar marker 必须嵌套在 evaluator 私有 SAVEPOINT 内，失败时由 evaluator 整体回滚。
-      controlledContext.binding.prepareRegistrar();
     }
     const runCode = createStrategyRunCode();
     const nowUtc = new Date().toISOString();
@@ -2034,7 +2178,7 @@ function runEnergyStrategyEvaluation(input, options = {}) {
       evaluationRunId
     );
     const hits = hitIds.map((hitId) => getStrategyRuleHitWithDb(db, hitId));
-    const operationLogId = writeOperationAuditWithDb(db, options, {
+    const operationAudit = {
       operation: 'energy.strategy.run',
       targetType: 'energy_strategy',
       targetId: evaluationRunId,
@@ -2044,7 +2188,33 @@ function runEnergyStrategyEvaluation(input, options = {}) {
         hitIds
       },
       createdAt: completedAt
-    });
+    };
+    const controlledOperationAudit = controlledContext
+      ? {
+        ...operationAudit,
+        userId: normalizedOptions.actorUserId,
+        ip: null
+      }
+      : null;
+    const operationLogId = controlledContext
+      ? insertOperationLogWithDb(db, controlledOperationAudit)
+      : writeOperationAuditWithDb(db, options, operationAudit);
+    let operationAuditSnapshot = null;
+    if (controlledContext) {
+      const expectedAuditSnapshot = buildStrategyOperationAuditSnapshot(
+        operationLogId,
+        controlledOperationAudit
+      );
+      operationAuditSnapshot = readStrategyOperationAuditWithDb(db, operationLogId);
+      if (!operationAuditSnapshot
+        || stableStringify(operationAuditSnapshot) !== stableStringify(expectedAuditSnapshot)) {
+        throw new AppError(
+          'ENERGY_STRATEGY_OPERATION_AUDIT_MISMATCH',
+          '策略评价 operation audit 与固定审计合同不一致。',
+          { statusCode: 409, details: { operationLogId } }
+        );
+      }
+    }
     const response = {
       contractVersion: preview.contractVersion,
       formulaVersion: preview.formulaVersion,
@@ -2083,12 +2253,6 @@ function runEnergyStrategyEvaluation(input, options = {}) {
       }
     };
     if (controlledContext) {
-      const exactMetadata = getEnergyStrategyExactScopeMetadata(preview, { db });
-      if (!exactMetadata || !exactMetadata.timeseries || !exactMetadata.strategyRules) {
-        throw badRequest('策略评价受控完成见证缺少服务端 exact metadata。', {
-          code: 'ENERGY_STRATEGY_COMPLETION_WITNESS_METADATA_REQUIRED'
-        });
-      }
       completionWitness = createStrategyEvaluationCompletionWitness({
         db,
         registrationScope: controlledContext.registrationScope,
@@ -2108,17 +2272,28 @@ function runEnergyStrategyEvaluation(input, options = {}) {
         },
         domainBinding,
         runSnapshot: response.run,
-        hitSnapshots: response.hits
+        hitSnapshots: response.hits,
+        operationAuditId: operationLogId,
+        operationAuditSnapshot
       });
-      invokeSynchronousStrategyCallback(
-        controlledContext.onCompletedEvaluation,
-        [controlledContext.registrationScope, completionWitness],
-        'ENERGY_STRATEGY_COMPLETED_CALLBACK_ASYNC',
-        '策略评价 onCompletedEvaluation 必须同步完成。'
-      );
-      if (!isStrategyEvaluationCompletionWitnessConsumed(completionWitness)) {
-        throw badRequest('策略评价 completion witness 必须在同步 registrar callback 中消费。', {
-          code: 'ENERGY_STRATEGY_COMPLETION_WITNESS_NOT_CONSUMED'
+      const registrarReceipt = controlledContext.ownershipProtocol.register({
+        registrarAuthority: STRATEGY_OWNERSHIP_REGISTRAR_AUTHORITY,
+        db,
+        registrationScope: controlledContext.registrationScope,
+        evaluationWitness: completionWitness
+      });
+      const receiptVerified = controlledContext.ownershipProtocol.verifyReceipt({
+        registrarAuthority: STRATEGY_OWNERSHIP_REGISTRAR_AUTHORITY,
+        db,
+        registrationScope: controlledContext.registrationScope,
+        evaluationWitness: completionWitness,
+        receipt: registrarReceipt
+      });
+      if (receiptVerified !== true
+        || !isStrategyEvaluationCompletionWitnessConsumed(completionWitness)
+        || controlledContext.binding.status !== 'active') {
+        throw badRequest('策略评价 registrar receipt 和 completion witness 必须由固定 ownership 协议同步验证。', {
+          code: 'ENERGY_STRATEGY_OWNERSHIP_RECEIPT_NOT_VERIFIED'
         });
       }
       controlledContext.binding.status = 'completed';
@@ -2136,20 +2311,11 @@ function runEnergyStrategyEvaluation(input, options = {}) {
     let failure = error;
     failStrategyEvaluationCompletionWitness(completionWitness);
     if (exactSavepointActive) {
-      let rollbackFailure = null;
-      let releaseFailure = null;
-      try {
-        db.exec(`ROLLBACK TO SAVEPOINT ${exactSavepointName}`);
-      } catch (recoveryError) {
-        rollbackFailure = recoveryError;
-      }
-      try {
-        db.exec(`RELEASE SAVEPOINT ${exactSavepointName}`);
-      } catch (recoveryError) {
-        releaseFailure = recoveryError;
-      }
+      const recovery = db.inTransaction === true
+        ? recoverStrategyEvaluationSavepoint(db, exactSavepointName)
+        : { rollbackError: null, releaseError: null, fullRollbackError: null, closeError: null };
       exactSavepointActive = false;
-      if (rollbackFailure || releaseFailure) {
+      if (recovery.rollbackError || recovery.releaseError || recovery.fullRollbackError || recovery.closeError) {
         failure = new AppError(
           'ENERGY_STRATEGY_SAVEPOINT_RECOVERY_FAILED',
           '策略评价私有 SAVEPOINT 恢复失败，禁止继续提交外层事务。',
@@ -2157,16 +2323,22 @@ function runEnergyStrategyEvaluation(input, options = {}) {
             statusCode: 500,
             details: {
               originalCode: error.code || error.details?.code || null,
-              rollbackCode: rollbackFailure?.code || null,
-              releaseCode: releaseFailure?.code || null
+              rollbackCode: recovery.rollbackError?.code || null,
+              releaseCode: recovery.releaseError?.code || null,
+              fullRollbackCode: recovery.fullRollbackError?.code || null,
+              closeCode: recovery.closeError?.code || null
             }
           }
         );
       }
     }
-    if (controlledContext && controlledContext.binding.status !== 'completed') {
+    if (controlledContext && controlledContext.binding.status !== 'completed'
+      && db.inTransaction === true) {
       try {
-        controlledContext.binding.abort();
+        controlledContext.ownershipProtocol.abort({
+          db,
+          registrationScope: controlledContext.registrationScope
+        });
       } catch (abortError) {
         failure = new AppError(
           'ENERGY_STRATEGY_REGISTRATION_SCOPE_RECOVERY_FAILED',
@@ -2180,6 +2352,8 @@ function runEnergyStrategyEvaluation(input, options = {}) {
           }
         );
       }
+    }
+    if (controlledContext && controlledContext.binding.status !== 'completed') {
       controlledContext.binding.status = 'failed';
     }
     if (ownedWriteTransactionActive && db.inTransaction === true) {
@@ -2192,7 +2366,13 @@ function runEnergyStrategyEvaluation(input, options = {}) {
     }
     throw failure;
   } finally {
-    if (shouldCloseDatabase) db.close();
+    if (shouldCloseDatabase) {
+      try {
+        db.close();
+      } catch (_closeError) {
+        // fail-closed 恢复可能已经关闭连接，不覆盖业务错误。
+      }
+    }
   }
 }
 
@@ -2312,8 +2492,10 @@ function updateStrategyRuleHitStatus(hitId, input, options = {}) {
       normalizedHitId
     );
     const updated = getStrategyRuleHitWithDb(db, normalizedHitId);
-    const { refreshDerivedStrategyRuleHitOwnershipInTransaction } = require('./demoOwnershipService');
-    refreshDerivedStrategyRuleHitOwnershipInTransaction({ db, hitId: normalizedHitId });
+    refreshDerivedStrategyRuleHitOwnershipForStrategy({
+      db,
+      hitId: normalizedHitId
+    });
     writeOperationAuditWithDb(db, options, {
       operation: 'energy.strategy.hit.review',
       targetType: 'energy_strategy',
@@ -2336,18 +2518,29 @@ function updateStrategyRuleHitStatus(hitId, input, options = {}) {
     }
     return updated;
   } catch (error) {
-    if (reviewSavepointActive && db.inTransaction === true) {
-      try {
-        db.exec(`ROLLBACK TO SAVEPOINT ${reviewSavepointName}`);
-      } catch (_rollbackToSavepointError) {
-        // 保留原始错误，外层事务生命周期仍由调用方持有。
-      }
-      try {
-        db.exec(`RELEASE SAVEPOINT ${reviewSavepointName}`);
-      } catch (_releaseSavepointError) {
-        // 保留原始错误，外层事务生命周期仍由调用方持有。
-      }
+    let failure = error;
+    if (reviewSavepointActive) {
+      const recovery = db.inTransaction === true
+        ? recoverStrategyEvaluationSavepoint(db, reviewSavepointName)
+        : { rollbackError: null, releaseError: null, fullRollbackError: null, closeError: null };
       reviewSavepointActive = false;
+      if (recovery.rollbackError || recovery.releaseError
+        || recovery.fullRollbackError || recovery.closeError) {
+        failure = new AppError(
+          'ENERGY_STRATEGY_REVIEW_SAVEPOINT_RECOVERY_FAILED',
+          '策略命中复核 SAVEPOINT 恢复失败，禁止继续提交外层事务。',
+          {
+            statusCode: 500,
+            details: {
+              originalCode: error.code || error.details?.code || null,
+              rollbackCode: recovery.rollbackError?.code || null,
+              releaseCode: recovery.releaseError?.code || null,
+              fullRollbackCode: recovery.fullRollbackError?.code || null,
+              closeCode: recovery.closeError?.code || null
+            }
+          }
+        );
+      }
     }
     if (ownedWriteTransactionActive && db.inTransaction === true) {
       try {
@@ -2357,37 +2550,28 @@ function updateStrategyRuleHitStatus(hitId, input, options = {}) {
       }
       ownedWriteTransactionActive = false;
     }
-    throw error;
+    throw failure;
   } finally {
     if (shouldCloseDatabase) db.close();
   }
 }
 
-module.exports = {
+Object.assign(energyStrategyEvaluationExports, {
   DEFAULT_MAX_EVIDENCE_ITEMS,
   MAX_EVIDENCE_ITEMS,
   MAX_RULE_CODES,
   MAX_STRATEGY_REVIEW_NOTE_LENGTH,
   MAX_STRATEGY_RULES,
   STRATEGY_HIT_STATUS_TRANSITIONS,
-  SUPPORTED_FORMULA_VERSION,
-  SUPPORTED_METRIC_CODES,
-  assertEnergyStrategyExactScopeCapability,
-  bindEnergyStrategyRegistrationScopeCapability,
   buildEnergyStrategyExactScope,
-  markEnergyStrategyRegistrationScopeActive,
-  markEnergyStrategyRegistrationScopeFailed,
-  consumeEnergyStrategyEvaluationCompletionWitness,
   createDataSummaryDigest,
   getEnergyStrategyExactScopeMetadata,
-  getStrategyRuleHitWithDb,
-  insertOperationLogWithDb,
   mapStrategyRuleHitRow,
   normalizeRuleCodes,
   normalizeStrategyHitStatusInput,
-  parseEvidenceRequirements,
   previewEnergyStrategies,
   runEnergyStrategyEvaluation,
   stableStringify,
   updateStrategyRuleHitStatus
-};
+});
+Object.freeze(energyStrategyEvaluationExports);

@@ -98,11 +98,17 @@ function buildUnavailableActiveRunProjection() {
       readable: false,
       readOnly: true,
       writeEligible: false,
+      turnoverEligible: false,
+      retryable: false,
       state: 'unavailable',
       code: 'DEMO_ACTIVE_RUN_PROJECTION_UNAVAILABLE',
       manifestCompatible: false,
       historical: false,
-      active: false
+      active: false,
+      expectedManifestVersion: null,
+      expectedManifestDigest: null,
+      actualManifestVersion: null,
+      actualManifestDigest: null
     }
   };
 }
@@ -166,7 +172,11 @@ router.get('/catalog', authenticate, requirePermission('system:demo:download'), 
 }));
 
 router.post('/run', authenticate, requirePermission('system:demo:download'), requireWritable('system:demo:download'), asyncHandler(async (req, res) => {
-  sendSuccess(res, getOrCreateActiveDemoDatasetRun({ actorUserId: req.user.id }));
+  sendSuccess(res, getOrCreateActiveDemoDatasetRun({
+    actorUserId: req.user.id,
+    actorIp: req.ip,
+    trigger: 'explicit-run-prepare'
+  }));
 }));
 
 router.get('/post-actions', authenticate, requirePermission('system:demo:view'), asyncHandler(async (_req, res) => {
@@ -200,8 +210,8 @@ router.get('/runs/:runId/ownership-summary', authenticate, requirePermission('sy
   try {
     sendSuccess(res, getDemoOwnershipSummary({ runId: req.params.runId }));
   } catch (error) {
-    // 历史或 manifest 冲突 run 只读可见，但不得降级为任何 context/ownership 写入资格。
-    if (error?.code !== 'DEMO_RUN_INVALID') throw error;
+    // 历史、manifest 冲突或 cleaning run 只读可见，但不得降级为任何 context/ownership 写入资格。
+    if (!['DEMO_RUN_INVALID', 'DEMO_RUN_CLEANUP_IN_PROGRESS'].includes(error?.code)) throw error;
     const projection = readDemoDatasetRunProjection({ runId: req.params.runId });
     if (!projection.compatibility.readable || projection.compatibility.writeEligible) throw error;
     sendSuccess(res, getReadableDemoOwnershipSummary({ runId: req.params.runId }));
@@ -299,5 +309,7 @@ router.post('/contexts/reassociate/:artifactKey/:handlerKey', authenticate, requ
     }).catch(next).finally(() => cleanupUploadedImportFile(req.file));
   });
 });
+
+router._test = Object.freeze({ buildUnavailableActiveRunProjection });
 
 module.exports = router;

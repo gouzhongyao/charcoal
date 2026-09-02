@@ -44,7 +44,7 @@ try {
     'dashboard:view', 'imports:view', 'energy:records:view', 'energy:budget:view',
     'ledger:units:view', 'ledger:meters:view', 'ledger:readings:view',
     'ledger:production-unit:view', 'ledger:production-output:view', 'ledger:generation:view',
-    'ledger:suppliers:view', 'carbon:emissions:view', 'carbon:factors:view',
+    'ledger:suppliers:view', 'carbon:emissions:view', 'carbon:factors:view', 'carbon:factor:import',
     'prediction:config:view', 'prediction:run:view', 'prediction:result:view', 'system:backup:view'
   ].forEach((permissionCode) => assert(adminProfile.permissions.includes(permissionCode), `超级管理员应拥有 ${permissionCode}`));
   const adminMenus = getUserMenus(signedIn.user.id);

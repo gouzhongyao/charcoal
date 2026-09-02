@@ -1253,7 +1253,7 @@ async function testArtifact19DemoOwnershipBoundaries(db, baseOptions) {
     ...baseOptions,
     demoContext: { ...invalidContext, token: invalidToken }
   }));
-  assert.strictEqual(invalidContextError.details.code, 'ENERGY_ANALYSIS_IMPORT_TRANSACTION_FAILED');
+  assert.strictEqual(invalidContextError.details.code, 'DEMO_CONTEXT_NOT_FOUND');
   assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM energy_conversion_factors WHERE factor_code = 'DEMO-OWNERSHIP-CONTEXT-INVALID'").get().total, 0);
   assert.strictEqual(db.prepare('SELECT COUNT(*) AS total FROM demo_data_registry WHERE source_batch_id = ?').get(invalidContextPreview.batchId).total, 0);
   const invalidContextTokenHash = crypto.createHash('sha256').update(invalidContext.token, 'utf8').digest('hex');

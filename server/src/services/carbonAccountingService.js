@@ -1,16 +1,21 @@
 const crypto = require('crypto');
 const XLSX = require('xlsx');
-const { openDatabase } = require('../db/database');
-const { badRequest, notFound } = require('../utils/errors');
+const { openDatabase, uploadsDir: defaultUploadsDir } = require('../db/database');
+const { AppError, badRequest, notFound } = require('../utils/errors');
 const backupService = require('./backupService');
+const {
+  normalizeCarbonEmissionUnit
+} = require('./carbonEmissionUnitContract');
 const {
   createPreviewAuditBatch,
   getImportAuditBatchDetail,
   getImportAuditSummary,
   replaceImportAuditIssues,
+  replaceImportAuditIssuesWithDatabase,
   updateExecuteAuditResult
 } = require('./importAuditService');
-const { assertSupportedImportFile, parseImportFile } = require('./import/parser');
+const { assertSupportedImportFile, parseImportBuffer, parseImportFile } = require('./import/parser');
+const { readSafeUploadFile } = require('./energyAnalysisImportCore');
 const {
   buildEnergyRecordWhere,
   buildPaginationMeta,
@@ -47,6 +52,17 @@ const CARBON_FACTOR_IMPORT_BACKUP_REASON = 'carbon-factor-import';
 const CARBON_FACTOR_IMPORT_SIGNATURE_PREFIX = 'hmac-sha256:v1';
 const CARBON_FACTOR_IMPORT_AUDIT_DIGEST_PREFIX = 'hmac-sha256:v1:audit';
 const CARBON_FACTOR_IMPORT_HMAC_SECRET_META_KEY = 'carbon_factor_import_hmac_secret';
+
+/** 延迟加载 demo context 服务，避免模板生成依赖反向形成模块初始化环。 */
+function getCarbonFactorDemoContextService() {
+  return require('./demoContextService');
+}
+
+/** 延迟加载 demo ownership 服务，避免模板生成依赖反向形成模块初始化环。 */
+function getCarbonFactorDemoOwnershipService() {
+  return require('./demoOwnershipService');
+}
+
 // 碳因子内部 API 契约字段保持稳定，不与用户可见模板标题混用。
 const CARBON_FACTOR_FIELDS = Object.freeze(['energyTypeCode', 'region', 'factorYear', 'unit', 'factorValue', 'factorUnit', 'source', 'sourceUrl', 'effectiveFrom', 'effectiveTo', 'status']);
 // 碳因子模板与文件导出使用中文用户标题。
@@ -108,6 +124,46 @@ function firstDefined(source, keys) {
   return undefined;
 }
 
+/** 按字段自有属性读取 camelCase/snake_case 输入，显式 null 不得当作缺失。 */
+function readOwnFactorField(source, keys) {
+  for (const key of keys) {
+    if (source && Object.prototype.hasOwnProperty.call(source, key)) {
+      return { present: true, field: key, value: source[key] };
+    }
+  }
+  return { present: false, field: keys[0], value: undefined };
+}
+
+/** 把正式单位输入错误映射为稳定 400，details 不回显原值。 */
+function createCarbonEmissionUnitInputError(field, reason) {
+  return new AppError('CARBON_EMISSION_UNIT_INVALID', '碳排放单位不符合正式合同。', {
+    statusCode: 400,
+    details: { field, reason }
+  });
+}
+
+/** 把历史持久化因子单位错误映射为稳定 409，details 仅保留因子标识。 */
+function createCarbonFactorUnitPersistedError(factorId) {
+  return new AppError('CARBON_FACTOR_UNIT_INVALID', '已持久化碳因子的排放单位不符合正式合同。', {
+    statusCode: 409,
+    details: Number.isSafeInteger(Number(factorId)) ? { factorId: Number(factorId) } : null
+  });
+}
+
+/** 规范化正式写入单位，字段缺失时仅由调用方显式决定是否采用默认值。 */
+function normalizeFactorUnitInput(value, field = 'factorUnit') {
+  const normalized = normalizeCarbonEmissionUnit(value);
+  if (!normalized.ok) throw createCarbonEmissionUnitInputError(field, normalized.reason);
+  return normalized.value;
+}
+
+/** 规范化已持久化因子单位；非法历史值不得继续参与计算或静默默认。 */
+function normalizePersistedCarbonFactorUnit(factor) {
+  const normalized = normalizeCarbonEmissionUnit(factor?.factorUnit);
+  if (!normalized.ok) throw createCarbonFactorUnitPersistedError(factor?.id);
+  return normalized.value;
+}
+
 function escapeLike(value) {
   return String(value).replace(/[\\%_]/g, '\\$&');
 }
@@ -128,6 +184,12 @@ function normalizeFactorStatus(value) {
 
 function normalizeFactorPayload(payload = {}, options = {}) {
   const existing = options.existing || {};
+  const factorUnitField = readOwnFactorField(payload, ['factorUnit', 'factor_unit']);
+  const factorUnit = factorUnitField.present
+    ? normalizeFactorUnitInput(factorUnitField.value)
+    : Object.prototype.hasOwnProperty.call(existing, 'factorUnit')
+      ? normalizePersistedCarbonFactorUnit(existing)
+      : DEFAULT_EMISSION_UNIT;
   const status = normalizeFactorStatus(firstDefined(payload, ['status']));
   const suppliedIsActive = normalizeBooleanFlag(firstDefined(payload, ['isActive', 'is_active']), 'isActive');
   if (status && suppliedIsActive !== undefined && (status === 'active' ? 1 : 0) !== suppliedIsActive) {
@@ -148,7 +210,7 @@ function normalizeFactorPayload(payload = {}, options = {}) {
     factorYear,
     unit: normalizeText(firstDefined(payload, ['unit'])) || existing.unit,
     factorValue,
-    factorUnit: normalizeText(firstDefined(payload, ['factorUnit', 'factor_unit'])) || existing.factorUnit || DEFAULT_EMISSION_UNIT,
+    factorUnit,
     source: normalizeText(firstDefined(payload, ['source'])) || existing.source,
     sourceUrl: Object.prototype.hasOwnProperty.call(payload, 'sourceUrl') || Object.prototype.hasOwnProperty.call(payload, 'source_url')
       ? normalizeText(firstDefined(payload, ['sourceUrl', 'source_url']))
@@ -355,14 +417,17 @@ function calculateCarbonEmissions(payload = {}) {
       selection.rows.forEach((record) => {
         const factorYear = extractYearFromMonth(record.normalizedMonth);
         const match = selectBestCarbonFactor(record, listCandidateFactors(db, record, region, factorYear), { region, factorYear });
+        const canonicalFactor = match.factor
+          ? { ...match.factor, factorUnit: normalizePersistedCarbonFactorUnit(match.factor) }
+          : null;
         db.prepare(`UPDATE carbon_emissions SET status = 'superseded', note = COALESCE(note || char(10), '') || @supersededNote WHERE energy_record_id = @energyRecordId AND calculation_method = @calculationMethod AND status <> 'superseded'`).run({ energyRecordId: record.id, calculationMethod, supersededNote: `由 ${getNow()} 重新计算标记为 superseded。` });
-        if (!match.factor) {
+        if (!canonicalFactor) {
           db.prepare(`INSERT INTO carbon_emissions (energy_record_id, carbon_factor_id, calculation_method, calculation_basis, factor_value, activity_value, activity_unit, emission_value, emission_unit, status, note) VALUES (@energyRecordId, NULL, @calculationMethod, @calculationBasis, NULL, @activityValue, @activityUnit, NULL, @emissionUnit, 'factor_missing', @note)`).run({ energyRecordId: record.id, calculationMethod, calculationBasis: 'normalized_value * factor_value', activityValue: record.normalizedValue, activityUnit: record.normalizedUnit, emissionUnit: DEFAULT_EMISSION_UNIT, note: buildMissingNote(match.missing) });
           missingFactors.push(match.missing); return;
         }
-        const emissionValue = calculateEmissionValue(record.normalizedValue, match.factor.factorValue);
-        db.prepare(`INSERT INTO carbon_emissions (energy_record_id, carbon_factor_id, calculation_method, calculation_basis, factor_value, activity_value, activity_unit, emission_value, emission_unit, status, note) VALUES (@energyRecordId, @carbonFactorId, @calculationMethod, @calculationBasis, @factorValue, @activityValue, @activityUnit, @emissionValue, @emissionUnit, 'calculated', @note)`).run({ energyRecordId: record.id, carbonFactorId: match.factor.id, calculationMethod, calculationBasis: `${record.normalizedValue} ${record.normalizedUnit} * ${match.factor.factorValue} ${match.factor.factorUnit}/${match.factor.unit}`, factorValue: match.factor.factorValue, activityValue: record.normalizedValue, activityUnit: record.normalizedUnit, emissionValue, emissionUnit: match.factor.factorUnit || DEFAULT_EMISSION_UNIT, note: `匹配碳因子：id=${match.factor.id}, region=${match.factor.region}, factorYear=${match.factor.factorYear || 'generic'}, source=${match.factor.source}` });
-        calculated.push({ energyRecordId: record.id, carbonFactorId: match.factor.id, emissionValue, emissionUnit: match.factor.factorUnit || DEFAULT_EMISSION_UNIT });
+        const emissionValue = calculateEmissionValue(record.normalizedValue, canonicalFactor.factorValue);
+        db.prepare(`INSERT INTO carbon_emissions (energy_record_id, carbon_factor_id, calculation_method, calculation_basis, factor_value, activity_value, activity_unit, emission_value, emission_unit, status, note) VALUES (@energyRecordId, @carbonFactorId, @calculationMethod, @calculationBasis, @factorValue, @activityValue, @activityUnit, @emissionValue, @emissionUnit, 'calculated', @note)`).run({ energyRecordId: record.id, carbonFactorId: canonicalFactor.id, calculationMethod, calculationBasis: `${record.normalizedValue} ${record.normalizedUnit} * ${canonicalFactor.factorValue} ${canonicalFactor.factorUnit}/${canonicalFactor.unit}`, factorValue: canonicalFactor.factorValue, activityValue: record.normalizedValue, activityUnit: record.normalizedUnit, emissionValue, emissionUnit: canonicalFactor.factorUnit, note: `匹配碳因子：id=${canonicalFactor.id}, region=${canonicalFactor.region}, factorYear=${canonicalFactor.factorYear || 'generic'}, source=${canonicalFactor.source}` });
+        calculated.push({ energyRecordId: record.id, carbonFactorId: canonicalFactor.id, emissionValue, emissionUnit: canonicalFactor.factorUnit });
       });
       return { calculationMethod, region, filters: selection.filters, limit: selection.limit, totalRecords: selection.rows.length, calculatedCount: calculated.length, missingFactorCount: missingFactors.length, calculated, missingFactors };
     })();
@@ -449,26 +514,27 @@ function exportCarbonEmissions(query = {}) { const db = openDatabase(); try { re
 function stableStringify(value) { if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`; if (value && typeof value === 'object') return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`; return JSON.stringify(value); }
 function timingSafeEqualText(actual, expected) { const left = Buffer.from(String(actual || ''), 'utf8'); const right = Buffer.from(String(expected || ''), 'utf8'); return left.length === right.length && crypto.timingSafeEqual(left, right); }
 function projectBackupMetadata(backup = {}) { return ['backupName', 'reason', 'method', 'sizeBytes', 'createdAt', 'updatedAt', 'sha256', 'requestedReason'].reduce((result, key) => { if (backup[key] !== undefined) result[key] = backup[key]; return result; }, {}); }
-function getCarbonFactorImportHmacSecret() {
+function getCarbonFactorImportHmacSecret(providedDb = null) {
   const configured = normalizeText(process.env.CARBON_FACTOR_IMPORT_HMAC_SECRET) || normalizeText(process.env.CHARCOAL_HMAC_SECRET) || normalizeText(process.env.APP_SECRET); if (configured) return configured;
-  const db = openDatabase(); try { const saved = db.prepare('SELECT value FROM app_meta WHERE key = ?').get(CARBON_FACTOR_IMPORT_HMAC_SECRET_META_KEY); if (normalizeText(saved?.value)) return saved.value; const generated = crypto.randomBytes(32).toString('hex'); db.prepare(`INSERT INTO app_meta (key, value, updated_at) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) ON CONFLICT(key) DO NOTHING`).run(CARBON_FACTOR_IMPORT_HMAC_SECRET_META_KEY, generated); return db.prepare('SELECT value FROM app_meta WHERE key = ?').get(CARBON_FACTOR_IMPORT_HMAC_SECRET_META_KEY).value; } finally { db.close(); }
+  const ownedDb = !providedDb; const db = providedDb || openDatabase(); try { const saved = db.prepare('SELECT value FROM app_meta WHERE key = ?').get(CARBON_FACTOR_IMPORT_HMAC_SECRET_META_KEY); if (normalizeText(saved?.value)) return saved.value; const generated = crypto.randomBytes(32).toString('hex'); db.prepare(`INSERT INTO app_meta (key, value, updated_at) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) ON CONFLICT(key) DO NOTHING`).run(CARBON_FACTOR_IMPORT_HMAC_SECRET_META_KEY, generated); return db.prepare('SELECT value FROM app_meta WHERE key = ?').get(CARBON_FACTOR_IMPORT_HMAC_SECRET_META_KEY).value; } finally { if (ownedDb) db.close(); }
 }
-function hmacJson(value) { return crypto.createHmac('sha256', getCarbonFactorImportHmacSecret()).update(stableStringify(value)).digest('hex'); }
+function hmacJson(value, secret) { return crypto.createHmac('sha256', secret || getCarbonFactorImportHmacSecret()).update(stableStringify(value)).digest('hex'); }
 function normalizeHeaderName(value) { return String(value || '').trim().replace(/[\s_\-\/\\:：()（）]/g, '').toLowerCase(); }
 function mapCarbonFactorImportFields(row = {}) { const mapped = {}; const fieldMapping = {}; Object.entries(row).forEach(([header, value]) => { const normalizedHeader = normalizeHeaderName(header); const field = Object.entries(CARBON_FACTOR_IMPORT_ALIASES).find(([, aliases]) => aliases.map(normalizeHeaderName).includes(normalizedHeader))?.[0]; if (field && (!Object.prototype.hasOwnProperty.call(mapped, field) || !normalizeText(mapped[field]))) { mapped[field] = value; fieldMapping[field] = header; } }); return { mapped, fieldMapping }; }
 function createCarbonFactorImportIssue(rowNumber, fieldName, rawValue, code, message, severity = 'error') { return { rowNumber, fieldName, rawValue: rawValue === undefined || rawValue === null ? null : String(rawValue), code, message, severity }; }
 
 function normalizeCarbonFactorImportCandidate(row = {}) {
   const status = normalizeFactorStatus(row.status) || 'active';
-  return { candidateRowId: normalizeText(row.candidateRowId), rowNumber: Number(row.rowNumber), energyTypeId: Number(row.energyTypeId), energyTypeCode: normalizeText(row.energyTypeCode), region: normalizeRegion(row.region), factorYear: row.factorYear === null || row.factorYear === undefined || row.factorYear === '' ? null : Number(row.factorYear), unit: normalizeText(row.unit), factorValue: Number(row.factorValue), factorUnit: normalizeText(row.factorUnit) || DEFAULT_EMISSION_UNIT, source: normalizeText(row.source), sourceUrl: normalizeText(row.sourceUrl), effectiveFrom: normalizeText(row.effectiveFrom), effectiveTo: normalizeText(row.effectiveTo), status };
+  const factorUnit = normalizeFactorUnitInput(row.factorUnit);
+  return { candidateRowId: normalizeText(row.candidateRowId), rowNumber: Number(row.rowNumber), energyTypeId: Number(row.energyTypeId), energyTypeCode: normalizeText(row.energyTypeCode), region: normalizeRegion(row.region), factorYear: row.factorYear === null || row.factorYear === undefined || row.factorYear === '' ? null : Number(row.factorYear), unit: normalizeText(row.unit), factorValue: Number(row.factorValue), factorUnit, source: normalizeText(row.source), sourceUrl: normalizeText(row.sourceUrl), effectiveFrom: normalizeText(row.effectiveFrom), effectiveTo: normalizeText(row.effectiveTo), status };
 }
 function buildCarbonFactorImportSignaturePayload(input = {}) { const candidateRows = (input.candidateRows || []).map(normalizeCarbonFactorImportCandidate).sort((a, b) => a.rowNumber - b.rowNumber); return { operation: 'carbon-factor-import', importType: CARBON_FACTOR_IMPORT_TYPE, duplicateStrategy: 'skip', targetTable: 'carbon_factors', confirmText: CARBON_FACTOR_IMPORT_CONFIRM_TEXT, requireBackup: true, candidateRowIds: candidateRows.map((row) => row.rowNumber), candidateRows }; }
-function buildCarbonFactorImportPreviewSignature(input = {}) { return `${CARBON_FACTOR_IMPORT_SIGNATURE_PREFIX}:${hmacJson(buildCarbonFactorImportSignaturePayload(input))}`; }
+function buildCarbonFactorImportPreviewSignature(input = {}, secret) { return `${CARBON_FACTOR_IMPORT_SIGNATURE_PREFIX}:${hmacJson(buildCarbonFactorImportSignaturePayload(input), secret)}`; }
 function normalizeCarbonFactorImportAudit(preview = {}) { return { summary: preview.summary || {}, items: (preview.items || []).map((item) => ({ rowNumber: Number(item.rowNumber), status: item.status, reasonCodes: item.reasonCodes, reasonText: item.reasonText, reasons: item.reasons || [] })) }; }
-function buildCarbonFactorImportPreviewAuditDigest(preview = {}) { return `${CARBON_FACTOR_IMPORT_AUDIT_DIGEST_PREFIX}:${hmacJson(normalizeCarbonFactorImportAudit(preview))}`; }
+function buildCarbonFactorImportPreviewAuditDigest(preview = {}, secret) { return `${CARBON_FACTOR_IMPORT_AUDIT_DIGEST_PREFIX}:${hmacJson(normalizeCarbonFactorImportAudit(preview), secret)}`; }
 function factorImportKey(row) { return `${row.energyTypeId} ${row.region} ${row.factorYear === null ? '' : row.factorYear} ${row.unit} ${row.source}`; }
 
-function buildCarbonFactorImportPreviewWithDb(db, rows = []) {
+function buildCarbonFactorImportPreviewWithDb(db, rows = [], options = {}) {
   const types = new Map(db.prepare('SELECT id, code, name, standard_unit AS standardUnit, is_active AS isActive FROM energy_types').all().map((item) => [item.code, item]));
   const existing = new Set(db.prepare('SELECT energy_type_id AS energyTypeId, region, factor_year AS factorYear, unit, source FROM carbon_factors').all().map(factorImportKey));
   const seen = new Set(); const fieldMapping = {}; const items = [];
@@ -479,7 +545,10 @@ function buildCarbonFactorImportPreviewWithDb(db, rows = []) {
     else { energyType = types.get(energyTypeCode); if (!energyType) reasons.push(createCarbonFactorImportIssue(rowNumber, 'energyTypeCode', energyTypeCode, 'UNKNOWN_ENERGY_TYPE', '未找到匹配能源类型，导入不会自动创建能源类型。')); else if (Number(energyType.isActive) !== 1) reasons.push(createCarbonFactorImportIssue(rowNumber, 'energyTypeCode', energyTypeCode, 'INACTIVE_ENERGY_TYPE', '碳因子的能源类型必须为 active 状态。')); }
     try { factorYear = normalizeYear(mapped.factorYear, 'factorYear'); } catch (error) { reasons.push(createCarbonFactorImportIssue(rowNumber, 'factorYear', mapped.factorYear, error.details?.code || 'INVALID_YEAR', error.message)); }
     try { factorValue = normalizePositiveNumber(mapped.factorValue, 'factorValue'); } catch (error) { reasons.push(createCarbonFactorImportIssue(rowNumber, 'factorValue', mapped.factorValue, error.details?.code || 'INVALID_POSITIVE_NUMBER', error.message)); }
-    const region = normalizeRegion(mapped.region); const unit = normalizeText(mapped.unit); const source = normalizeText(mapped.source); const factorUnit = normalizeText(mapped.factorUnit) || DEFAULT_EMISSION_UNIT; let status = normalizeText(mapped.status) || 'active';
+    const region = normalizeRegion(mapped.region); const unit = normalizeText(mapped.unit); const source = normalizeText(mapped.source); let factorUnit = null; let status = normalizeText(mapped.status) || 'active';
+    const normalizedFactorUnit = normalizeCarbonEmissionUnit(mapped.factorUnit);
+    if (normalizedFactorUnit.ok) factorUnit = normalizedFactorUnit.value;
+    else reasons.push(createCarbonFactorImportIssue(rowNumber, 'factorUnit', null, 'CARBON_EMISSION_UNIT_INVALID', 'factorUnit / 排放单位不符合正式合同。'));
     if (!unit) reasons.push(createCarbonFactorImportIssue(rowNumber, 'unit', mapped.unit, 'REQUIRED_FIELD_MISSING', 'unit / 单位为必填项。'));
     if (!source) reasons.push(createCarbonFactorImportIssue(rowNumber, 'source', mapped.source, 'REQUIRED_FIELD_MISSING', 'source / 来源为必填项。'));
     if (['true', '1'].includes(status)) status = 'active'; if (['false', '0'].includes(status)) status = 'inactive';
@@ -493,20 +562,394 @@ function buildCarbonFactorImportPreviewWithDb(db, rows = []) {
   const summary = { totalRows: items.length, wouldImport: items.filter((item) => item.status === 'wouldImport').length, skipped: items.filter((item) => item.status === 'skipped').length, blocked: items.filter((item) => item.status === 'blocked').length, warnings: items.reduce((count, item) => count + item.warnings.length, 0), errors: items.reduce((count, item) => count + item.errors.length, 0) };
   const candidateRows = items.filter((item) => item.wouldImport).map((item) => ({ candidateRowId: `carbon-factor:${item.rowNumber}`, rowNumber: item.rowNumber, energyTypeId: item.energyTypeId, energyTypeCode: item.energyTypeCode, region: item.region, factorYear: item.factorYear, unit: item.unit, factorValue: Number(item.factorValue), factorUnit: item.factorUnit, source: item.source, sourceUrl: item.sourceUrl, effectiveFrom: item.effectiveFrom, effectiveTo: item.effectiveTo, status: item.factorStatus }));
   const preview = { dryRun: true, previewOnly: true, writesCarbonFactors: false, writesCarbonEmissions: false, persistsImportBatch: true, duplicateStrategy: 'skip', confirmText: CARBON_FACTOR_IMPORT_CONFIRM_TEXT, backupReason: CARBON_FACTOR_IMPORT_BACKUP_REASON, fieldMapping, summary, candidateRowIds: candidateRows.map((item) => item.rowNumber), candidateRows, items, notices: ['preview 不写入 carbon_factors 或 carbon_emissions；上传 preview 仅持久化统一导入审计批次和行级 error/warning。', 'execute 必须提供固定确认文本、previewSignature、候选行、acknowledgeSkippedRisks=true 和 requireBackup=true；签名或数据变化时拒绝写入。', '重复碳因子默认 skip 并保留 warning，不覆盖、不删除既有因子；停用因子不改变历史排放记录。'] };
-  preview.previewAudit = normalizeCarbonFactorImportAudit(preview); preview.previewAuditDigest = buildCarbonFactorImportPreviewAuditDigest(preview); preview.previewSignature = buildCarbonFactorImportPreviewSignature(preview); return preview;
+  const secret = options.secret || getCarbonFactorImportHmacSecret(db);
+  preview.previewAudit = normalizeCarbonFactorImportAudit(preview); preview.previewAuditDigest = buildCarbonFactorImportPreviewAuditDigest(preview, secret); preview.previewSignature = buildCarbonFactorImportPreviewSignature(preview, secret); return preview;
 }
 
-function buildCarbonFactorImportPreviewFromRows(rows = []) { const db = openDatabase(); try { return buildCarbonFactorImportPreviewWithDb(db, rows); } finally { db.close(); } }
+function buildCarbonFactorImportPreviewFromRows(rows = []) { const db = openDatabase(); try { return buildCarbonFactorImportPreviewWithDb(db, rows, { secret: getCarbonFactorImportHmacSecret(db) }); } finally { db.close(); } }
 function collectCarbonFactorImportAuditIssues(preview) { return (preview.items || []).flatMap((item) => (item.reasons || []).filter((reason) => ['error', 'warning'].includes(reason.severity)).map((reason) => ({ ...reason, rowNumber: item.rowNumber }))); }
-function createCarbonFactorImportPreviewFromUpload(file) {
+
+/** 打开碳因子导入使用的数据库；测试可显式指定隔离 SQLite 路径。 */
+function openCarbonFactorImportDatabase(options = {}) {
+  if (options.db) return { db: options.db, owned: false };
+  return {
+    db: openDatabase(options.databasePath ? { databasePath: options.databasePath } : {}),
+    owned: true
+  };
+}
+
+/** 从上传根目录安全读取 retained upload；managed context 禁止退回不受控路径读取。 */
+function readCarbonFactorPreviewUpload(file, options = {}) {
+  assertSupportedImportFile(file.originalname);
+  if (file.filename) {
+    const safeFile = readSafeUploadFile(options.uploadsDir || defaultUploadsDir, file.filename, {
+      expectedSizeBytes: Number.isSafeInteger(file.size) ? file.size : undefined,
+      maxSizeBytes: options.maxFileSizeBytes
+    });
+    return { ...safeFile, parsed: parseImportBuffer(safeFile.buffer, file.originalname) };
+  }
+  if (options.demoContext) {
+    throw badRequest('managed 碳因子 preview 必须保留上传目录内的原始文件。', {
+      code: 'CARBON_FACTOR_IMPORT_RETAINED_UPLOAD_REQUIRED'
+    });
+  }
+  const parsed = parseImportFile(file.path, file.originalname);
+  return { filePath: file.path, sizeBytes: file.size, fileSha256: null, buffer: null, parsed };
+}
+
+/** 创建碳因子 preview，并在 managed 模式下原子绑定 context、批次角色和文件摘要。 */
+function createCarbonFactorImportPreviewFromUpload(file, options = {}) {
   if (!file) throw badRequest('请使用 multipart/form-data 上传字段名为 file 的碳因子表格文件。', { code: 'IMPORT_FILE_REQUIRED', fieldName: 'file' });
-  assertSupportedImportFile(file.originalname); const parsed = parseImportFile(file.path, file.originalname); const preview = buildCarbonFactorImportPreviewFromRows(parsed.rows || []);
-  const audit = createPreviewAuditBatch({ importType: CARBON_FACTOR_IMPORT_TYPE, originalFilename: file.originalname, storedFilename: file.filename || null, filePath: file.path, fileType: String(file.originalname).split('.').pop().toLowerCase(), fileSizeBytes: file.size, duplicateStrategy: 'skip', fieldMapping: preview.fieldMapping, previewSignature: preview.previewSignature, previewAuditDigest: preview.previewAuditDigest, auditContext: { confirmText: preview.confirmText, backupReason: preview.backupReason, summary: preview.summary, candidateRowIds: preview.candidateRowIds, candidateRows: preview.candidateRows, previewAudit: preview.previewAudit, previewAuditDigest: preview.previewAuditDigest, notices: preview.notices }, statistics: { totalRows: preview.summary.totalRows, successCount: preview.summary.wouldImport, failureCount: preview.summary.blocked, skippedCount: preview.summary.skipped } });
-  replaceImportAuditIssues(audit.id, collectCarbonFactorImportAuditIssues(preview)); const auditBatch = getImportAuditSummary(audit.id); return { ...preview, batchId: auditBatch.id, auditBatch, persistsImportBatch: true };
+  const upload = readCarbonFactorPreviewUpload(file, options);
+  const databaseContext = openCarbonFactorImportDatabase(options);
+  try {
+    const createPreview = () => {
+      const secret = getCarbonFactorImportHmacSecret(databaseContext.db);
+      const preview = buildCarbonFactorImportPreviewWithDb(databaseContext.db, upload.parsed.rows || [], { secret });
+      const audit = createPreviewAuditBatch({
+        importType: CARBON_FACTOR_IMPORT_TYPE,
+        originalFilename: file.originalname,
+        storedFilename: file.filename || null,
+        filePath: upload.filePath,
+        fileType: upload.parsed.fileType,
+        fileSizeBytes: upload.sizeBytes,
+        fileSha256: upload.fileSha256,
+        duplicateStrategy: 'skip',
+        fieldMapping: preview.fieldMapping,
+        previewSignature: preview.previewSignature,
+        previewAuditDigest: preview.previewAuditDigest,
+        auditContext: {
+          confirmText: preview.confirmText,
+          backupReason: preview.backupReason,
+          summary: preview.summary,
+          candidateRowIds: preview.candidateRowIds,
+          candidateRows: preview.candidateRows,
+          previewAudit: preview.previewAudit,
+          previewAuditDigest: preview.previewAuditDigest,
+          notices: preview.notices
+        },
+        statistics: {
+          totalRows: preview.summary.totalRows,
+          successCount: preview.summary.wouldImport,
+          failureCount: preview.summary.blocked,
+          skippedCount: preview.summary.skipped
+        }
+      }, { db: databaseContext.db });
+      replaceImportAuditIssuesWithDatabase(databaseContext.db, audit.id, collectCarbonFactorImportAuditIssues(preview));
+      if (options.demoContext) {
+        const { bindDemoContextPreviewInTransaction } = getCarbonFactorDemoContextService();
+        bindDemoContextPreviewInTransaction({
+          db: databaseContext.db,
+          ...options.demoContext,
+          uploadFileSha256: upload.fileSha256,
+          previewDigest: preview.previewAuditDigest,
+          batchBindings: [{ batchId: audit.id, batchRole: 'primary' }]
+        });
+      }
+      const auditBatch = getImportAuditSummary(audit.id, { db: databaseContext.db });
+      return { ...preview, batchId: auditBatch.id, auditBatch, persistsImportBatch: true };
+    };
+    if (databaseContext.db.inTransaction) return createPreview();
+    return databaseContext.db.transaction(createPreview).immediate();
+  } finally {
+    if (databaseContext.owned) databaseContext.db.close();
+  }
 }
 function assertSameCarbonFactorCandidates(actual, expected, code) { const left = (actual || []).map(normalizeCarbonFactorImportCandidate).sort((a, b) => a.rowNumber - b.rowNumber); const right = (expected || []).map(normalizeCarbonFactorImportCandidate).sort((a, b) => a.rowNumber - b.rowNumber); if (stableStringify(left) !== stableStringify(right)) throw badRequest('候选行与最新预演不一致，请重新 preview 后执行。', { code, actual: left, expected: right }); }
 
-async function executeCarbonFactorImportInternal(body = {}) {
+/** 校验 managed execute 只接收服务端恢复原文件所需的最小固定字段。 */
+function normalizeManagedCarbonFactorExecuteRequest(body = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw badRequest('碳因子 managed execute 请求体必须是对象。', { code: 'CARBON_FACTOR_IMPORT_EXECUTE_BODY_INVALID' });
+  }
+  const allowedFields = new Set(['batchId', 'confirmText', 'requireBackup', 'acknowledgeSkippedRisks']);
+  const extraFields = Object.keys(body).filter((fieldName) => !allowedFields.has(fieldName));
+  if (extraFields.length > 0) {
+    throw badRequest('碳因子 managed execute 仅允许固定确认字段。', {
+      code: 'CARBON_FACTOR_IMPORT_EXECUTE_FIELDS_INVALID',
+      extraFields: extraFields.sort()
+    });
+  }
+  const batchId = normalizePositiveInteger(body.batchId, 'batchId');
+  if (body.confirmText !== CARBON_FACTOR_IMPORT_CONFIRM_TEXT
+    || body.requireBackup !== true || body.acknowledgeSkippedRisks !== true) {
+    throw badRequest('碳因子 managed execute 必须确认固定文案、备份和跳过风险。', {
+      code: 'CARBON_FACTOR_IMPORT_CONFIRMATION_INVALID',
+      expectedConfirmText: CARBON_FACTOR_IMPORT_CONFIRM_TEXT
+    });
+  }
+  return { batchId };
+}
+
+/** 校验 retained upload、审计批次和锁内重算 preview 属于同一可信事实。 */
+function assertManagedCarbonFactorBatchMatches(batch, preview, safeFile) {
+  if (batch.importType !== CARBON_FACTOR_IMPORT_TYPE
+    || batch.auditPhase !== 'preview'
+    || !['completed', 'completed_with_errors'].includes(batch.status)
+    || batch.fileSha256 !== safeFile.fileSha256
+    || Number(batch.fileSizeBytes) !== safeFile.sizeBytes
+    || !timingSafeEqualText(batch.previewSignature, preview.previewSignature)
+    || !timingSafeEqualText(batch.previewAuditDigest, preview.previewAuditDigest)
+    || batch.auditContext?.confirmText !== CARBON_FACTOR_IMPORT_CONFIRM_TEXT
+    || !timingSafeEqualText(batch.auditContext?.previewAuditDigest, preview.previewAuditDigest)) {
+    throw badRequest('碳因子批次、原文件或最新预演事实不一致。', {
+      code: 'CARBON_FACTOR_IMPORT_MANAGED_BATCH_MISMATCH'
+    });
+  }
+  assertSameCarbonFactorCandidates(
+    batch.auditContext?.candidateRows,
+    preview.candidateRows,
+    'CARBON_FACTOR_IMPORT_MANAGED_CANDIDATE_ROWS_MISMATCH'
+  );
+  if (stableStringify(batch.auditContext?.candidateRowIds || []) !== stableStringify(preview.candidateRowIds)) {
+    throw badRequest('碳因子批次候选行标识与最新预演不一致。', {
+      code: 'CARBON_FACTOR_IMPORT_MANAGED_CANDIDATE_IDS_MISMATCH'
+    });
+  }
+  if (preview.summary.wouldImport < 1) {
+    throw badRequest('当前碳因子预演没有可执行候选。', {
+      code: 'CARBON_FACTOR_IMPORT_NO_EXECUTABLE_CANDIDATES'
+    });
+  }
+}
+
+/** 将碳因子可空字段规范化为 SQLite 与 ownership witness 都接受的基础值。 */
+function normalizeCarbonFactorNullableSqliteBinding(value) {
+  return value === undefined ? null : value;
+}
+
+/** 构造碳因子唯一 INSERT 参数，保证正式写入与 managed witness 使用同一规范化结果。 */
+function buildCarbonFactorInsertParams(row, sourceBatchId, sourceRowNumber) {
+  return [
+    normalizeCarbonFactorNullableSqliteBinding(sourceBatchId),
+    normalizeCarbonFactorNullableSqliteBinding(sourceRowNumber),
+    row.energyTypeId,
+    row.region,
+    normalizeCarbonFactorNullableSqliteBinding(row.factorYear),
+    row.unit,
+    row.factorValue,
+    row.factorUnit,
+    row.source,
+    normalizeCarbonFactorNullableSqliteBinding(row.sourceUrl),
+    normalizeCarbonFactorNullableSqliteBinding(row.effectiveFrom),
+    normalizeCarbonFactorNullableSqliteBinding(row.effectiveTo),
+    row.status === 'active' ? 1 : 0
+  ];
+}
+
+/** 将 ownership 内部结果投影为 execute 审计可公开保存的固定摘要。 */
+function projectCarbonFactorOwnershipSummary(ownership = {}) {
+  const toCount = (value) => Number.isSafeInteger(Number(value)) && Number(value) >= 0 ? Number(value) : 0;
+  return {
+    applied: ownership.applied === true,
+    mode: ownership.mode === 'demo' ? 'demo' : 'unknown',
+    noInsertedRecords: ownership.noInsertedRecords === true,
+    registrationCount: toCount(ownership.registrationCount),
+    insertedCount: toCount(ownership.insertedCount),
+    idempotentCount: toCount(ownership.idempotentCount),
+    skippedCount: toCount(ownership.skippedCount),
+    relationCount: toCount(ownership.relationCount)
+  };
+}
+
+/** 执行 artifact 11 的 managed context 导入链路。 */
+async function executeManagedCarbonFactorImport(body = {}, options = {}) {
+  const request = normalizeManagedCarbonFactorExecuteRequest(body);
+  const { validateDemoContextTerminalReplay } = getCarbonFactorDemoContextService();
+  const {
+    createDemoOwnershipInsertWitness,
+    markDemoContextExecutedWithOwnershipTransaction,
+    registerImportedDemoOwnershipInTransaction,
+    runWithDemoOwnershipTransactionAsync,
+    updateDemoExecuteAuditInOwnershipTransaction,
+    validateDemoContextWithOwnershipTransaction
+  } = getCarbonFactorDemoOwnershipService();
+  const demoContext = options.demoContext;
+  if (!demoContext || options.actor?.userId !== undefined
+    && options.actor.userId !== demoContext.userId) {
+    throw badRequest('碳因子导入 actor 与 managed context 用户不一致。', {
+      code: 'CARBON_FACTOR_IMPORT_ACTOR_MISMATCH'
+    });
+  }
+  const databaseContext = openCarbonFactorImportDatabase(options);
+  try {
+    const batch = getImportAuditBatchDetail(request.batchId, { db: databaseContext.db, includeIssues: false });
+    if (!batch.storedFilename) {
+      throw badRequest('碳因子批次缺少 retained upload。', {
+        code: 'CARBON_FACTOR_IMPORT_STORED_FILE_REQUIRED'
+      });
+    }
+    const safeFile = readSafeUploadFile(options.uploadsDir || defaultUploadsDir, batch.storedFilename, {
+      expectedSizeBytes: Number.isSafeInteger(batch.fileSizeBytes) ? batch.fileSizeBytes : undefined,
+      maxSizeBytes: options.maxFileSizeBytes
+    });
+    if (safeFile.fileSha256 !== batch.fileSha256) {
+      throw badRequest('碳因子 retained upload SHA-256 与 preview 批次不一致。', {
+        code: 'CARBON_FACTOR_IMPORT_CURRENT_FILE_SHA256_MISMATCH'
+      });
+    }
+    if (batch.auditPhase === 'execute' && ['completed', 'completed_with_errors'].includes(batch.status)) {
+      const replay = validateDemoContextTerminalReplay({
+        db: databaseContext.db,
+        token: demoContext.token,
+        userId: demoContext.userId,
+        artifactKey: demoContext.artifactKey,
+        handlerKey: demoContext.handlerKey,
+        uploadFileSha256: safeFile.fileSha256,
+        previewDigest: batch.previewAuditDigest,
+        batchBindings: [{ batchId: request.batchId, batchRole: 'primary', importType: CARBON_FACTOR_IMPORT_TYPE }]
+      });
+      const replayBatch = replay.batches[0];
+      return {
+        ...replayBatch.executeResult,
+        persistsImportBatch: true,
+        batchId: request.batchId,
+        auditBatch: replayBatch.auditBatch,
+        terminalReplay: true
+      };
+    }
+    const parsed = parseImportBuffer(safeFile.buffer, batch.originalFilename);
+    const secret = getCarbonFactorImportHmacSecret(databaseContext.db);
+    const initialPreview = buildCarbonFactorImportPreviewWithDb(databaseContext.db, parsed.rows || [], { secret });
+    assertManagedCarbonFactorBatchMatches(batch, initialPreview, safeFile);
+
+    return await runWithDemoOwnershipTransactionAsync(databaseContext.db, async (transactionScope, transactionDb) => {
+      const latestBatch = getImportAuditBatchDetail(request.batchId, { db: transactionDb, includeIssues: false });
+      const latestPreview = buildCarbonFactorImportPreviewWithDb(transactionDb, parsed.rows || [], { secret });
+      assertManagedCarbonFactorBatchMatches(latestBatch, latestPreview, safeFile);
+      validateDemoContextWithOwnershipTransaction({
+        transactionScope,
+        demoContext: {
+          token: demoContext.token,
+          userId: demoContext.userId,
+          artifactKey: demoContext.artifactKey,
+          handlerKey: demoContext.handlerKey
+        },
+        uploadFileSha256: safeFile.fileSha256,
+        previewDigest: latestPreview.previewAuditDigest
+      });
+
+      const createBackup = options.createBackup || backupService.createBackup;
+      const backup = {
+        ...(await createBackup({ reason: CARBON_FACTOR_IMPORT_BACKUP_REASON, skipCheckpoint: true })),
+        requestedReason: CARBON_FACTOR_IMPORT_BACKUP_REASON
+      };
+      const publicBackup = projectBackupMetadata(backup);
+      const insertSql = `INSERT INTO carbon_factors
+        (source_batch_id, source_row_number, energy_type_id, region, factor_year, unit,
+         factor_value, factor_unit, source, source_url, effective_from, effective_to, is_active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+      const insertedRecords = [];
+      const importedRecords = [];
+      latestPreview.candidateRows.forEach((row, index) => {
+        if (typeof options.beforeManagedInsertCandidate === 'function') {
+          options.beforeManagedInsertCandidate({ index, row, transactionDb });
+        }
+        const rowWitness = createDemoOwnershipInsertWitness({
+          transactionScope,
+          entityType: 'carbon_factor',
+          insertSql,
+          insertParams: buildCarbonFactorInsertParams(
+            row,
+            request.batchId,
+            row.rowNumber
+          ),
+          sourceBatchId: request.batchId,
+          sourceRowNumber: row.rowNumber
+        });
+        const entityPk = Number(rowWitness.lastInsertRowid);
+        insertedRecords.push({
+          entityType: 'carbon_factor',
+          entityPk,
+          batchRole: 'primary',
+          sourceRowNumber: row.rowNumber,
+          rowWitness
+        });
+        importedRecords.push(getFactorById(transactionDb, entityPk));
+      });
+      if (typeof options.beforeManagedOwnershipRegistration === 'function') {
+        options.beforeManagedOwnershipRegistration({ transactionDb, insertedRecords });
+      }
+      const skippedRecords = latestPreview.items.filter((item) => item.status === 'skipped').map((item) => ({
+        entityType: 'carbon_factor',
+        entityPk: null,
+        batchRole: 'primary',
+        sourceRowNumber: item.rowNumber,
+        reason: String(item.reasonCodes || 'duplicate_skipped').slice(0, 256)
+      }));
+      const ownership = registerImportedDemoOwnershipInTransaction({
+        transactionScope,
+        demoContext: {
+          ...demoContext,
+          uploadFileSha256: safeFile.fileSha256,
+          previewDigest: latestPreview.previewAuditDigest
+        },
+        actorUserId: demoContext.userId,
+        batchBindings: [{ batchId: request.batchId, batchRole: 'primary', entityType: 'carbon_factor' }],
+        insertedRecords,
+        skippedRecords,
+        noInsertedRecords: insertedRecords.length === 0
+      });
+      const summary = latestPreview.summary;
+      const resultData = {
+        executed: true,
+        dryRun: false,
+        writesCarbonFactors: true,
+        writesCarbonEmissions: false,
+        persistsImportBatch: true,
+        imported: importedRecords.length,
+        skipped: summary.skipped,
+        blocked: summary.blocked,
+        warnings: summary.warnings,
+        errors: summary.errors,
+        previewSignature: latestPreview.previewSignature,
+        previewAuditDigest: latestPreview.previewAuditDigest,
+        expectedWouldImport: latestPreview.candidateRows.length,
+        candidateRowIds: latestPreview.candidateRowIds,
+        importedIds: importedRecords.map((row) => row.id),
+        importedRecords,
+        ownership: projectCarbonFactorOwnershipSummary(ownership),
+        backup: publicBackup,
+        note: '已从 retained upload 原始字节重放并写入碳因子；只登记本次真实 INSERT 的 managed ownership，不写入 carbon_emissions。'
+      };
+      const auditSummary = updateDemoExecuteAuditInOwnershipTransaction({
+        transactionScope,
+        batchId: request.batchId,
+        status: summary.skipped || summary.blocked ? 'completed_with_errors' : 'completed',
+        statistics: {
+          totalRows: summary.totalRows,
+          successCount: importedRecords.length,
+          failureCount: summary.blocked,
+          skippedCount: summary.skipped
+        },
+        executeResult: resultData,
+        backup,
+        errorSummary: summary.blocked ? '碳因子导入存在阻断记录。' : null
+      });
+      if (typeof options.beforeManagedContextExecuted === 'function') {
+        options.beforeManagedContextExecuted({ transactionDb, resultData });
+      }
+      markDemoContextExecutedWithOwnershipTransaction({
+        transactionScope,
+        demoContext: {
+          token: demoContext.token,
+          userId: demoContext.userId,
+          artifactKey: demoContext.artifactKey,
+          handlerKey: demoContext.handlerKey
+        },
+        uploadFileSha256: safeFile.fileSha256,
+        previewDigest: latestPreview.previewAuditDigest,
+        batchBindings: [{ batchId: request.batchId, batchRole: 'primary' }]
+      });
+      return { ...resultData, batchId: request.batchId, auditBatch: auditSummary };
+    });
+  } finally {
+    if (databaseContext.owned) databaseContext.db.close();
+  }
+}
+
+async function executeCarbonFactorImportInternal(body = {}, options = {}) {
+  if (options.demoContext) return executeManagedCarbonFactorImport(body, options);
   const fail = (message, code) => { throw badRequest(message, { code }); };
   if (normalizeText(body.confirmText) !== CARBON_FACTOR_IMPORT_CONFIRM_TEXT) fail('确认文本不匹配，已拒绝导入碳因子。', 'CARBON_FACTOR_IMPORT_CONFIRM_TEXT_MISMATCH');
   if (body.acknowledgeSkippedRisks !== true) fail('必须确认已知晓重复、冲突和无效记录会被跳过。', 'CARBON_FACTOR_IMPORT_SKIPPED_RISKS_ACK_REQUIRED');
@@ -532,7 +975,14 @@ async function executeCarbonFactorImportInternal(body = {}) {
       if (!timingSafeEqualText(body.previewSignature, latest.previewSignature) || latest.summary.wouldImport !== candidates.length) fail('写入前碳因子数据已变化，请重新 preview 后执行。', 'CARBON_FACTOR_IMPORT_EXPIRED_PREVIEW');
       assertSameCarbonFactorCandidates(latest.candidateRows, body.candidateRows, 'CARBON_FACTOR_IMPORT_CANDIDATE_ROWS_MISMATCH');
       const insert = writeDb.prepare(`INSERT INTO carbon_factors (source_batch_id, source_row_number, energy_type_id, region, factor_year, unit, factor_value, factor_unit, source, source_url, effective_from, effective_to, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-      const importedRecords = latest.candidateRows.map((row) => { const inserted = insert.run(auditBatch?.id || null, auditBatch ? row.rowNumber : null, row.energyTypeId, row.region, row.factorYear, row.unit, row.factorValue, row.factorUnit, row.source, row.sourceUrl, row.effectiveFrom, row.effectiveTo, row.status === 'active' ? 1 : 0); return getFactorById(writeDb, inserted.lastInsertRowid); });
+      const importedRecords = latest.candidateRows.map((row) => {
+        const inserted = insert.run(...buildCarbonFactorInsertParams(
+          row,
+          auditBatch?.id,
+          auditBatch ? row.rowNumber : undefined
+        ));
+        return getFactorById(writeDb, inserted.lastInsertRowid);
+      });
       const resultData = { executed: true, dryRun: false, writesCarbonFactors: true, writesCarbonEmissions: false, persistsImportBatch: Boolean(auditBatch), imported: importedRecords.length, skipped: auditBatch?.auditContext?.summary?.skipped ?? 0, blocked: auditBatch?.auditContext?.summary?.blocked ?? 0, warnings: auditBatch?.auditContext?.summary?.warnings ?? 0, errors: auditBatch?.auditContext?.summary?.errors ?? 0, previewSignature: latest.previewSignature, previewAuditDigest: latest.previewAuditDigest, expectedWouldImport: candidates.length, candidateRowIds: latest.candidateRowIds, importedIds: importedRecords.map((row) => row.id), importedRecords, backup: publicBackup, note: '已按最新 preview 的 wouldImport 候选写入碳因子；重复、冲突和无效行保持 skip，不覆盖、不删除既有因子；不写入 carbon_emissions。' };
       if (!auditBatch) return resultData;
       const updated = updateExecuteAuditResult(auditBatch.id, { status: resultData.skipped || resultData.blocked ? 'completed_with_errors' : 'completed', statistics: { totalRows: auditBatch.totalRows, successCount: resultData.imported, failureCount: resultData.blocked, skippedCount: resultData.skipped }, executeResult: resultData, backup }, { db: writeDb });
@@ -541,7 +991,7 @@ async function executeCarbonFactorImportInternal(body = {}) {
   } finally { writeDb.close(); }
 }
 function markCarbonFactorImportAuditFailure(body = {}, error) { try { if (!body.batchId) return; const batchId = normalizePositiveInteger(body.batchId, 'batchId'); const batch = getImportAuditBatchDetail(batchId, { includeIssues: false }); if (batch.importType !== CARBON_FACTOR_IMPORT_TYPE || (batch.auditPhase === 'execute' && ['completed', 'completed_with_errors'].includes(batch.status))) return; updateExecuteAuditResult(batchId, { status: 'failed', statistics: { totalRows: Number(batch.totalRows || 0), successCount: 0, failureCount: Number(batch.failureCount || 0), skippedCount: Number(batch.skippedCount || 0) }, executeResult: { executed: false, writesCarbonFactors: false, writesCarbonEmissions: false, errorCode: error?.details?.code || error?.code || 'CARBON_FACTOR_IMPORT_EXECUTE_FAILED', errorMessage: error?.message || '碳因子导入执行失败。' }, backup: null, errorSummary: error?.message || '碳因子导入执行失败。' }); } catch (_) { /* 审计失败不得掩盖原始拒绝原因。 */ } }
-async function executeCarbonFactorImport(body = {}) { try { return await executeCarbonFactorImportInternal(body); } catch (error) { markCarbonFactorImportAuditFailure(body, error); throw error; } }
+async function executeCarbonFactorImport(body = {}, options = {}) { try { return await executeCarbonFactorImportInternal(body, options); } catch (error) { if (!options.demoContext) markCarbonFactorImportAuditFailure(body, error); throw error; } }
 
 function getCarbonManagementContract() {
   return {

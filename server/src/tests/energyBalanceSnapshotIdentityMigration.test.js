@@ -241,6 +241,14 @@ function assertCanonicalInitializationMigration() {
     // 迁移完成后登记指纹必须精确匹配实际结构，供后续启动继续 fail-closed 校验。
     const registeredFingerprint = canonicalDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_fingerprint'").get().value;
     assert.strictEqual(registeredFingerprint, calculateSchemaFingerprint(canonicalDb));
+    assert.deepStrictEqual(
+      canonicalDb.prepare('PRAGMA quick_check').all().map((row) => Object.values(row)[0]),
+      ['ok']
+    );
+    assert.deepStrictEqual(
+      canonicalDb.prepare('PRAGMA integrity_check').all().map((row) => Object.values(row)[0]),
+      ['ok']
+    );
     assert.deepStrictEqual(canonicalDb.pragma('foreign_key_check'), []);
   } finally {
     canonicalDb.close();
@@ -258,7 +266,9 @@ function assertCanonicalInitializationRejectsUnrelatedSchemaDrift() {
   let driftFingerprint;
   try {
     rebuildBalanceTablesWithoutImportSources(driftDb);
-    driftDb.exec(`CREATE INDEX idx_energy_balance_boundaries_unexpected
+    driftDb.exec(`ALTER TABLE energy_balance_boundaries ADD COLUMN unexpected_note TEXT;
+      CREATE TABLE energy_balance_unexpected_object (id INTEGER PRIMARY KEY);
+      CREATE INDEX idx_energy_balance_boundaries_unexpected
         ON energy_balance_boundaries(boundary_name);
       CREATE TRIGGER trg_energy_balance_boundaries_unexpected
       AFTER UPDATE ON energy_balance_boundaries
@@ -278,13 +288,18 @@ function assertCanonicalInitializationRejectsUnrelatedSchemaDrift() {
     () => initDatabase({ databasePath: driftDatabasePath }),
     (error) => error?.code === 'SCHEMA_FINGERPRINT_MISMATCH'
       && error?.details?.profileStage === 'legacy'
-      && error.details.issues.some((issue) => issue.includes('unexpected:'))
+      && error.details.issues.some((issue) => issue.includes('changed:table:energy_balance_boundaries'))
+      && error.details.issues.some((issue) => issue.includes('unexpected:table:energy_balance_unexpected_object'))
+      && error.details.issues.some((issue) => issue.includes('unexpected:index:idx_energy_balance_boundaries_unexpected'))
+      && error.details.issues.some((issue) => issue.includes('unexpected:trigger:trg_energy_balance_boundaries_unexpected'))
   );
 
   driftDb = openDatabase({ databasePath: driftDatabasePath });
   try {
     // 失败事务不得补列、建来源索引或重新登记 fingerprint。
     assert(!getTableColumns(driftDb, 'energy_balance_boundaries').includes('source_batch_id'));
+    assert(getTableColumns(driftDb, 'energy_balance_boundaries').includes('unexpected_note'));
+    assert(driftDb.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'energy_balance_unexpected_object'").get());
     assert(!getTableColumns(driftDb, 'energy_balance_items').includes('source_row_number'));
     assert.strictEqual(
       driftDb.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_energy_balance_boundaries_source'").get(),
@@ -301,6 +316,103 @@ function assertCanonicalInitializationRejectsUnrelatedSchemaDrift() {
     assert.strictEqual(calculateSchemaFingerprint(driftDb), driftFingerprint);
   } finally {
     driftDb.close();
+  }
+}
+
+/** 验证伪造 metadata fingerprint 不能绕过精确 legacy profile admission。 */
+function assertCanonicalInitializationRejectsForgedMetadataFingerprint() {
+  // metadata 负向场景使用独立隔离文件，避免污染其他迁移断言。
+  const forgedDatabasePath = path.join(tmpDir, 'canonical-balance-source-forged-metadata.sqlite');
+  initDatabase({ databasePath: forgedDatabasePath });
+  // predecessor 连接用于记录实际结构指纹并写入一个不同的合法格式伪造值。
+  let forgedDb = openDatabase({ databasePath: forgedDatabasePath });
+  let actualFingerprint;
+  let forgedFingerprint;
+  try {
+    rebuildBalanceTablesWithoutImportSources(forgedDb);
+    actualFingerprint = calculateSchemaFingerprint(forgedDb);
+    forgedFingerprint = actualFingerprint === 'f'.repeat(64) ? 'e'.repeat(64) : 'f'.repeat(64);
+    forgedDb.prepare(`UPDATE app_meta
+      SET value = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      WHERE key = 'schema_fingerprint'`).run(forgedFingerprint);
+  } finally {
+    forgedDb.close();
+  }
+
+  assert.throws(
+    () => initDatabase({ databasePath: forgedDatabasePath }),
+    (error) => error?.code === 'SCHEMA_FINGERPRINT_MISMATCH'
+      && error?.details?.profileStage === 'legacy-admission'
+      && error.details.metadataFingerprint === forgedFingerprint
+      && error.details.actual === actualFingerprint
+  );
+
+  forgedDb = openDatabase({ databasePath: forgedDatabasePath });
+  try {
+    assert(!getTableColumns(forgedDb, 'energy_balance_boundaries').includes('source_batch_id'));
+    assert(!getTableColumns(forgedDb, 'energy_balance_items').includes('source_row_number'));
+    assert.strictEqual(
+      forgedDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_fingerprint'").get().value,
+      forgedFingerprint
+    );
+    assert.strictEqual(calculateSchemaFingerprint(forgedDb), actualFingerprint);
+  } finally {
+    forgedDb.close();
+  }
+}
+
+/** 验证提交前外键检查故障会回滚补列、对象创建和 metadata 更新。 */
+function assertCanonicalInitializationRollsBackMigrationFailure() {
+  // 故障回滚场景使用独立隔离文件，并仅注入与平衡表无关的业务行外键违规。
+  const rollbackDatabasePath = path.join(tmpDir, 'canonical-balance-source-rollback.sqlite');
+  initDatabase({ databasePath: rollbackDatabasePath });
+  // predecessor 连接用于构造可完成平衡迁移、但会在最终外键检查中失败的数据。
+  let rollbackDb = openDatabase({ databasePath: rollbackDatabasePath });
+  let predecessorFingerprint;
+  try {
+    rebuildBalanceTablesWithoutImportSources(rollbackDb);
+    rollbackDb.pragma('foreign_keys = OFF');
+    rollbackDb.prepare(`INSERT INTO sys_user_roles (user_id, role_id, created_at)
+      VALUES (987654, 987655, '2026-08-28T00:00:00.000Z')`).run();
+    rollbackDb.pragma('foreign_keys = ON');
+    predecessorFingerprint = calculateSchemaFingerprint(rollbackDb);
+    rollbackDb.prepare(`UPDATE app_meta
+      SET value = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      WHERE key = 'schema_fingerprint'`).run(predecessorFingerprint);
+  } finally {
+    rollbackDb.close();
+  }
+
+  assert.throws(
+    () => initDatabase({ databasePath: rollbackDatabasePath }),
+    (error) => error?.code === 'SQLITE_FOREIGN_KEY_CHECK_FAILED'
+      && error.details.foreignKeyViolations.some((violation) => violation.table === 'sys_user_roles')
+  );
+
+  rollbackDb = openDatabase({ databasePath: rollbackDatabasePath });
+  try {
+    assert(!getTableColumns(rollbackDb, 'energy_balance_boundaries').includes('source_batch_id'));
+    assert(!getTableColumns(rollbackDb, 'energy_balance_items').includes('source_row_number'));
+    assert.strictEqual(
+      rollbackDb.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_energy_balance_boundaries_source'").get(),
+      undefined
+    );
+    assert.strictEqual(
+      rollbackDb.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_energy_balance_boundaries_source_insert'").get(),
+      undefined
+    );
+    assert.strictEqual(
+      rollbackDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_fingerprint'").get().value,
+      predecessorFingerprint
+    );
+    assert.strictEqual(calculateSchemaFingerprint(rollbackDb), predecessorFingerprint);
+    assert.deepStrictEqual(
+      rollbackDb.prepare(`SELECT user_id AS userId, role_id AS roleId, created_at AS createdAt
+        FROM sys_user_roles WHERE user_id = 987654 AND role_id = 987655`).get(),
+      { userId: 987654, roleId: 987655, createdAt: '2026-08-28T00:00:00.000Z' }
+    );
+  } finally {
+    rollbackDb.close();
   }
 }
 
@@ -376,6 +488,8 @@ function run() {
   }
   assertCanonicalInitializationMigration();
   assertCanonicalInitializationRejectsUnrelatedSchemaDrift();
+  assertCanonicalInitializationRejectsForgedMetadataFingerprint();
+  assertCanonicalInitializationRollsBackMigrationFailure();
   console.log('energyBalanceSnapshotIdentityMigration tests passed');
 }
 

@@ -9,6 +9,10 @@ const MANUAL_ROOT = path.join(PROJECT_ROOT, 'docs', '使用说明书');
 const MANUAL_INDEX_PATH = path.join(MANUAL_ROOT, 'README.md');
 // 天坤集团完整演示主步骤用于校验首次演示入口和 29 项清单完整性。
 const PROJECT_STEPS_PATH = path.join(MANUAL_ROOT, '项目使用步骤.md');
+// 系统演示数据管理正文用于校验 active run 自动换代的正式用户合同。
+const DEMO_DATA_MANUAL_PATH = path.join(MANUAL_ROOT, '19-系统演示数据管理.md');
+// 根级演示操作说明用于校验外部演示入口链接和当前身份口径。
+const ROOT_DEMO_GUIDE_PATH = path.join(PROJECT_ROOT, '项目演示操作说明.md');
 // 通用操作正文用于独立校验用户可见日期时间与内部技术格式分层合同。
 const COMMON_OPERATIONS_MANUAL_PATH = path.join(MANUAL_ROOT, '03-导航权限与通用操作.md');
 // 功能覆盖矩阵用于校验动态页面和特殊页面覆盖情况。
@@ -19,8 +23,14 @@ const ROUTER_PATH = path.join(PROJECT_ROOT, 'client', 'src', 'router', 'index.js
 const SUPPLIER_MANUAL_PATH = path.join(MANUAL_ROOT, '08-基础台账.md');
 // 碳核算正文路径用于校验独立活动、运行、双来源防双计和 N6/N7 报告冻结契约。
 const CARBON_MANUAL_PATH = path.join(MANUAL_ROOT, '09-碳核算.md');
-// 通用导入正文路径用于校验独立活动与 N6/N7 报告受控 execute 安全边界。
+// 通用导入正文路径用于校验独立活动、N6/N7 报告和演示下载生命周期边界。
 const IMPORT_AUDIT_MANUAL_PATH = path.join(MANUAL_ROOT, '05-通用导入与批次审计.md');
+// 用能预算正文路径用于校验 artifact 10 单独采用 stateless 正式导入。
+const BUDGET_MANUAL_PATH = path.join(MANUAL_ROOT, '07-用能预算.md');
+// 预测管理正文路径用于校验 artifact 12 的托管下载与修改后正式导入边界。
+const PREDICTION_MANUAL_PATH = path.join(MANUAL_ROOT, '10-预测管理.md');
+// 备份恢复正文路径用于校验当前 canonical schema 与精确 predecessor 边界。
+const BACKUP_MAINTENANCE_MANUAL_PATH = path.join(MANUAL_ROOT, '12-备份恢复与维护态.md');
 // 说明书变更记录路径用于校验 N5 finding、N6 收尾和 N7-B 文档闭环状态。
 const CHANGELOG_PATH = path.join(MANUAL_ROOT, '维护附录', '变更记录.md');
 // code-helper 受控区块标识用于确认长期规则索引写在区块外。
@@ -50,6 +60,7 @@ const requiredManualFiles = [
   '16-能效对标.md',
   '17-能流分析.md',
   '18-能效平衡与优化.md',
+  '19-系统演示数据管理.md',
   '维护附录/功能覆盖矩阵.md',
   '维护附录/变更记录.md'
 ];
@@ -79,7 +90,11 @@ const demoParkArtifactKeys = [
   '22-energy-flow-models',
   '23-energy-flow-nodes',
   '24-energy-flow-edges',
-  '25-energy-balance-configs'
+  '25-energy-balance-configs',
+  '26-suppliers',
+  '27-carbon-activities',
+  '28-carbon-emission-report',
+  '29-ghg-report'
 ];
 // 侧边栏模块总览章节路径用于限定新增总览的主题完整性校验。
 const SIDEBAR_OVERVIEW_PATH = path.join(MANUAL_ROOT, '00-侧边栏模块总览与数据链路.md');
@@ -741,6 +756,113 @@ function verifyProjectSteps() {
 }
 
 /**
+ * 校验 active run manifest 自动换代在十份 current 用户合同中保持一致。
+ */
+function verifyDemoRunTurnoverManualContract() {
+  // 自动换代文档合同使用 current 正向标识，允许明确历史章节保留旧版本和旧状态名称。
+  const turnoverDocumentContracts = [
+    {
+      label: '项目使用步骤.md',
+      path: PROJECT_STEPS_PATH,
+      groups: [
+        { label: 'manifest 与生命周期', allOf: ['version `1.7.0`', '01—06、08—10、26、28、29', '07、11、12、13—25、27'] },
+        { label: 'cleaning 与自动换代', allOf: ['`manifest-turnover-pending`', '`cleanup-in-progress-blocked`', '`writeEligible=false`', '`retryable=true`', '409 `DEMO_RUN_CLEANUP_IN_PROGRESS`', '不签发 context', '`transaction().immediate()`'] },
+        { label: '下载响应头', allOf: ['`X-Demo-Run-Id`', '`X-Demo-Run-Auto-Superseded`', '`X-Demo-Run-Superseded-From`', '`X-Demo-Runtime-Epoch`'] }
+      ]
+    },
+    {
+      label: '19-系统演示数据管理.md',
+      path: DEMO_DATA_MANUAL_PATH,
+      groups: [
+        { label: 'manifest 与生命周期', allOf: ['version `1.7.0`', 'artifact 01—06、08—10、26、28、29', 'artifact 07、11、12、13—25、27'] },
+        { label: 'cleaning 写阻断', allOf: ['`cleanup-in-progress-blocked`', '`writeEligible=false`', '`retryable=true`', 'HTTP 409 `DEMO_RUN_CLEANUP_IN_PROGRESS`', '不签发 context'] },
+        { label: '换代 DTO', allOf: ['`previousRun`', '`successorRun`', '`runtimeBefore`', '`runtimeAfter`', '`revokedContextCount`', '`supersededCleanupPreviewCount`'] },
+        { label: '历史只读与 schema', allOf: ['`historical-superseded`', '`2026-08-30-formal-canonical-v4`', '`2026-08-28-formal-canonical-v3`'] }
+      ]
+    },
+    {
+      label: '项目演示操作说明.md',
+      path: ROOT_DEMO_GUIDE_PATH,
+      groups: [
+        { label: '权威身份', allOf: ['version：`1.7.0`', '`demo-post-actions:v6`', '以源码和权威状态文档为准'] },
+        { label: '生命周期与 cleaning', allOf: ['01—06、08—10、26、28、29', '07、11、12、13—25、27', '`manifest-turnover-pending`', '`cleanup-in-progress-blocked`', '`writeEligible=false`', '`retryable=true`', '409 `DEMO_RUN_CLEANUP_IN_PROGRESS`', '不签发 context'] },
+        { label: '前端并发清理', allOf: ['token CAS', 'predecessor', 'successor'] }
+      ]
+    },
+    {
+      label: '功能覆盖矩阵.md',
+      path: COVERAGE_MATRIX_PATH,
+      groups: [
+        { label: 'manifest 与生命周期', allOf: ['manifestVersion=`1.7.0`', '01—06、08—10、26、28、29 stateless', '07、11、12、13—25、27 managed'] },
+        { label: 'cleaning 写阻断', allOf: ['manifest mismatch 且状态允许换代时投影 `manifest-turnover-pending`', '`cleaning` 无论 manifest 是否兼容都投影 `cleanup-in-progress-blocked`、`writeEligible=false`、`retryable=true`', '`cleaning` 时显式 prepare 与 managed 下载均返回可重试 HTTP 409 `DEMO_RUN_CLEANUP_IN_PROGRESS` 且不签发 context'] },
+        { label: 'current schema', allOf: ['`2026-08-30-formal-canonical-v4`', '精确 predecessor `2026-08-28-formal-canonical-v3`'] }
+      ]
+    },
+    {
+      label: '变更记录.md',
+      path: CHANGELOG_PATH,
+      groups: [
+        { label: 'manifest 与生命周期', allOf: ['manifest version 为 `1.7.0`', '07、11、12、13—25、27', '01—06、08—10、26、28、29'] },
+        { label: 'cleaning 写阻断', allOf: ['`manifest-turnover-pending`', '`cleanup-in-progress-blocked`', '`writeEligible=false`', '`retryable=true`', 'HTTP 409 `DEMO_RUN_CLEANUP_IN_PROGRESS`', '不签发 context'] },
+        { label: 'current schema', allOf: ['Canonical schema 当前为 `2026-08-30-formal-canonical-v4`', '精确 predecessor `2026-08-28-formal-canonical-v3`'] }
+      ]
+    },
+    {
+      label: '05-通用导入与批次审计.md',
+      path: IMPORT_AUDIT_MANUAL_PATH,
+      groups: [
+        { label: '29 项下载生命周期', allOf: ['artifact 01—06、08—10、26、28、29 属于 `stateless-formal-import`', 'artifact 07、11、12、13—25、27 属于 `managed-context-auto-runtime`'] },
+        { label: 'artifact 07/12 边界', allOf: ['artifact 07 的下载生命周期虽为 managed', '`direct-upload`', '真实 `monthlyEnergyBatchId`', '正式无 context preview/execute'] },
+        { label: 'cleaning 阻断', allOf: ['`cleanup-in-progress-blocked`', 'HTTP 409 `DEMO_RUN_CLEANUP_IN_PROGRESS`', '不会签发 context'] }
+      ]
+    },
+    {
+      label: '07-用能预算.md',
+      path: BUDGET_MANUAL_PATH,
+      groups: [
+        { label: 'artifact 10 stateless 生命周期', allOf: ['`10-energy-budgets` artifact 单独属于 `stateless-formal-import`', '必须先开启 runtime', '正式无 context preview/execute', '不创建 run/context', '不登记演示 ownership'] }
+      ]
+    },
+    {
+      label: '08-基础台账.md',
+      path: SUPPLIER_MANUAL_PATH,
+      groups: [
+        { label: '基础台账 stateless 生命周期', allOf: ['artifact 01—06、08、09 精确属于 `stateless-formal-import`', '不再以“01—12 全部无状态”概括', '必须先开启 runtime', 'Stateless 下载不修改 runtime', '不创建 dataset run', '不签发 context', '不登记演示 ownership'] }
+      ]
+    },
+    {
+      label: '10-预测管理.md',
+      path: PREDICTION_MANUAL_PATH,
+      groups: [
+        { label: 'artifact 12 managed 下载', allOf: ['`12-prediction-configs`', '`managed-context-auto-runtime`', '未修改的原文件', '当前标签页 context'] },
+        { label: '修改后正式导入', allOf: ['真实 `monthlyEnergyBatchId`', 'SHA-256 绑定失效', '清除旧 token', '正式无 context 流程重新 preview'] }
+      ]
+    },
+    {
+      label: '12-备份恢复与维护态.md',
+      path: BACKUP_MAINTENANCE_MANUAL_PATH,
+      groups: [
+        { label: 'current canonical schema', allOf: ['当前代码执行后的 schema 为 `2026-08-30-formal-canonical-v4`', '`2026-08-28-formal-canonical-v3` 仅是当前迁移接受的精确 predecessor', '2026-08-28 历史执行快照'] }
+      ]
+    }
+  ];
+
+  for (const documentContract of turnoverDocumentContracts) {
+    // 当前自动换代文档文本用于逐份检查最低合同，禁止从其他文件借用标识。
+    const documentContent = readText(documentContract.path);
+    if (!documentContent) {
+      addFailure(`自动换代合同文件不存在或为空：${documentContract.label}`);
+      continue;
+    }
+    for (const markerGroup of documentContract.groups) {
+      if (!satisfiesMarkerGroup(documentContent, markerGroup)) {
+        addFailure(`${documentContract.label} 缺少自动换代合同：${markerGroup.label}`);
+      }
+    }
+  }
+}
+
+/**
  * 校验侧边栏模块总览的二十个正式模块均包含九个固定主题。
  */
 function verifySidebarOverviewTopics() {
@@ -770,8 +892,8 @@ function verifySidebarOverviewTopics() {
  * 校验根 README 和说明书内全部本地 Markdown 相对链接有效且未逃逸项目目录。
  */
 function verifyLocalMarkdownLinks() {
-  // 参与链接校验的文件包含根入口和说明书全部 Markdown 文件。
-  const markdownFiles = [path.join(PROJECT_ROOT, 'README.md'), ...collectMarkdownFiles(MANUAL_ROOT)];
+  // 参与链接校验的文件包含根入口、根级演示说明和说明书全部 Markdown 文件。
+  const markdownFiles = [path.join(PROJECT_ROOT, 'README.md'), ROOT_DEMO_GUIDE_PATH, ...collectMarkdownFiles(MANUAL_ROOT)];
   for (const markdownFile of markdownFiles) {
     // 当前 Markdown 文本用于提取本地链接。
     const markdownContent = readText(markdownFile);
@@ -1039,6 +1161,7 @@ function main() {
   verifyRootReadmeEntry();
   verifyManualIndexLinks();
   verifyProjectSteps();
+  verifyDemoRunTurnoverManualContract();
   verifySidebarOverviewTopics();
   verifyLocalMarkdownLinks();
   verifyCoverageMatrix();

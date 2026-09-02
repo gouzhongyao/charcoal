@@ -14,8 +14,8 @@ process.env.UPLOADS_DIR = path.join(tmpDir, 'uploads');
 process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
-// current canonical 初始化身份为 v2；历史能流 predecessor fixture 继续保留业务模型 v1。
-const CURRENT_CANONICAL_SCHEMA_VERSION = '2026-08-28-formal-canonical-v3';
+// current canonical 初始化身份为 v4；历史能流 predecessor fixture 继续保留业务模型 v1。
+const CURRENT_CANONICAL_SCHEMA_VERSION = '2026-08-30-formal-canonical-v4';
 const HISTORICAL_ENERGY_FLOW_PREDECESSOR_MODEL_VERSION = 'legacy:v1';
 
 // 能源分析底座与 N8 canonical v2 必须创建的二十七张业务表。
@@ -165,26 +165,42 @@ function weakenDemoDatasetRunsSha256Contract(db, runId, weakManifestDigest) {
       dataset_id TEXT NOT NULL,
       manifest_version TEXT NOT NULL,
       manifest_digest TEXT NOT NULL CHECK (length(manifest_digest) = 64),
-      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'cleanup_pending', 'cleaning', 'cleaned', 'failed')),
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'cleanup_pending', 'cleaning', 'cleaned', 'failed', 'superseded')),
       created_by INTEGER,
       created_at TEXT NOT NULL,
       completed_at TEXT,
       cleanup_started_at TEXT,
       cleaned_at TEXT,
       failure_reason TEXT,
+      superseded_at TEXT,
+      successor_run_id TEXT,
+      superseded_by INTEGER,
+      supersede_reason TEXT,
+      supersede_trigger TEXT,
       FOREIGN KEY (created_by) REFERENCES sys_users(id) ON DELETE SET NULL,
+      FOREIGN KEY (successor_run_id) REFERENCES demo_dataset_runs_sha256_weak(run_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+      FOREIGN KEY (superseded_by) REFERENCES sys_users(id) ON DELETE SET NULL,
       CHECK (length(trim(run_id)) BETWEEN 1 AND 128),
       CHECK (length(trim(dataset_id)) BETWEEN 1 AND 128),
       CHECK (length(trim(manifest_version)) BETWEEN 1 AND 64),
       CHECK ((status = 'cleaned' AND cleaned_at IS NOT NULL)
-        OR (status <> 'cleaned' AND cleaned_at IS NULL))
+        OR (status <> 'cleaned' AND cleaned_at IS NULL)),
+      CHECK (successor_run_id IS NULL OR successor_run_id <> run_id),
+      CHECK (
+        (status = 'superseded' AND superseded_at IS NOT NULL AND successor_run_id IS NOT NULL
+          AND supersede_reason IS NOT NULL AND supersede_trigger IS NOT NULL)
+        OR (status <> 'superseded' AND superseded_at IS NULL AND successor_run_id IS NULL
+          AND superseded_by IS NULL AND supersede_reason IS NULL AND supersede_trigger IS NULL)
+      )
     );
     INSERT INTO demo_dataset_runs_sha256_weak
       (run_id, dataset_id, manifest_version, manifest_digest, status, created_by, created_at,
-       completed_at, cleanup_started_at, cleaned_at, failure_reason)
+       completed_at, cleanup_started_at, cleaned_at, failure_reason, superseded_at,
+       successor_run_id, superseded_by, supersede_reason, supersede_trigger)
     SELECT run_id, dataset_id, manifest_version,
       CASE WHEN run_id = '${runId}' THEN '${weakManifestDigest}' ELSE manifest_digest END,
-      status, created_by, created_at, completed_at, cleanup_started_at, cleaned_at, failure_reason
+      status, created_by, created_at, completed_at, cleanup_started_at, cleaned_at, failure_reason,
+      superseded_at, successor_run_id, superseded_by, supersede_reason, supersede_trigger
     FROM demo_dataset_runs;
     DROP TABLE demo_dataset_runs;
     ALTER TABLE demo_dataset_runs_sha256_weak RENAME TO demo_dataset_runs;
@@ -848,10 +864,10 @@ try {
     EXPECTED_INDEXES.forEach((indexName) => assert(indexNames.has(indexName), `新库缺少 ${indexName}。`));
 
     assert.strictEqual(newDatabaseModule.CANONICAL_SCHEMA_VERSION, CURRENT_CANONICAL_SCHEMA_VERSION,
-      '数据库模块导出的 current canonical 版本必须保持 v2。');
+      '数据库模块导出的 current canonical 版本必须保持 v4。');
     assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_stage'").get().value, 'formal-canonical');
     assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value,
-      CURRENT_CANONICAL_SCHEMA_VERSION, 'current 初始化必须写入 formal-canonical v3。');
+      CURRENT_CANONICAL_SCHEMA_VERSION, 'current 初始化必须写入 formal-canonical v4。');
     const freshSchemaFingerprint = newDatabaseModule.calculateSchemaFingerprint(newDb);
     const freshTrustedProfile = newDatabaseModule.matchTrustedCanonicalSchemaProfile(
       newDb,
@@ -1461,22 +1477,11 @@ try {
     strategyProvenanceDb.close();
   }
 
-  // strategy_rules v2 predecessor 必须继续由 canonical profile 派生并原子迁移到 v3。
+  // strategy_rules v2 已退出唯一 predecessor 白名单，初始化必须原子拒绝且不改写历史结构。
   const strategyMigrationPath = path.join(dataDir, 'energy-analysis-strategy-migration.sqlite');
   const strategyMigrationModule = loadDatabaseModule(strategyMigrationPath);
   const legacyStrategyRuleId = 42;
   const legacyStrategySequenceHighWater = 200;
-  const legacyStrategyBusinessColumns = [
-    'id', 'rule_code', 'rule_name', 'rule_version', 'formula_version', 'metric_code',
-    'threshold_operator', 'threshold_value', 'threshold_min', 'threshold_max',
-    'threshold_unit', 'reduction_rate', 'priority', 'evidence_requirements_json',
-    'recommendation_text', 'source', 'effective_start_utc', 'effective_end_utc',
-    'source_timezone', 'status', 'created_at', 'updated_at'
-  ];
-  let legacyStrategyRuleSnapshot;
-  let legacyStrategyHitSnapshot;
-  let migratedStrategyFingerprint;
-  let postMigrationAutoRuleId;
   strategyMigrationModule.initDatabase();
   const strategyMigrationSeedDb = strategyMigrationModule.openDatabase();
   try {
@@ -1547,13 +1552,12 @@ try {
        '2026-03-01T00:00:00Z', '2026-04-01T00:00:00Z', 'Asia/Shanghai',
        '2026-04-02T00:00:00Z', '迁移后必须保留入向外键行')`)
       .run(legacyEvaluationRunId, legacyStrategyRuleId);
-    legacyStrategyRuleSnapshot = strategyMigrationSeedDb.prepare(
-      `SELECT ${legacyStrategyBusinessColumns.join(', ')} FROM strategy_rules WHERE id = ?`
-    ).get(legacyStrategyRuleId);
-    legacyStrategyHitSnapshot = strategyMigrationSeedDb.prepare(
-      'SELECT * FROM strategy_rule_hits WHERE strategy_rule_id = ?'
-    ).get(legacyStrategyRuleId);
-    assert(legacyStrategyHitSnapshot, 'v2 predecessor 必须建立引用显式规则 ID 的 strategy_rule_hits 夹具。');
+    assert(
+      strategyMigrationSeedDb.prepare(
+        'SELECT id FROM strategy_rule_hits WHERE strategy_rule_id = ?'
+      ).get(legacyStrategyRuleId),
+      'v2 历史夹具必须建立引用显式规则 ID 的 strategy_rule_hits 行。'
+    );
     assert.deepStrictEqual(strategyMigrationSeedDb.prepare('PRAGMA foreign_key_check').all(), []);
     const predecessorFingerprint = strategyMigrationModule.calculateSchemaFingerprint(strategyMigrationSeedDb);
     strategyMigrationSeedDb.prepare("UPDATE app_meta SET value = ? WHERE key = 'schema_version'")
@@ -1563,112 +1567,25 @@ try {
   } finally {
     strategyMigrationSeedDb.close();
   }
-  strategyMigrationModule.initDatabase();
-  const strategyMigrationDb = strategyMigrationModule.openDatabase();
-  try {
-    assert.strictEqual(strategyMigrationDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value,
-      CURRENT_CANONICAL_SCHEMA_VERSION, 'strategy_rules predecessor 迁移后必须写入 current canonical v3。');
-    const migratedStrategyColumns = new Set(strategyMigrationDb.prepare('PRAGMA table_info(strategy_rules)').all()
-      .map((column) => column.name));
-    assert(migratedStrategyColumns.has('source_batch_id'));
-    assert(migratedStrategyColumns.has('source_row_number'));
-    assert.deepStrictEqual(
-      strategyMigrationDb.prepare(
-        `SELECT ${legacyStrategyBusinessColumns.join(', ')} FROM strategy_rules WHERE id = ?`
-      ).get(legacyStrategyRuleId),
-      legacyStrategyRuleSnapshot,
-      'strategy_rules predecessor 迁移必须逐值保留显式非默认主键与全部历史业务字段。'
-    );
-    assert.deepStrictEqual(
-      strategyMigrationDb.prepare(`SELECT source_batch_id AS sourceBatchId,
-        source_row_number AS sourceRowNumber FROM strategy_rules WHERE id = ?`).get(legacyStrategyRuleId),
-      { sourceBatchId: null, sourceRowNumber: null },
-      'strategy_rules predecessor 迁移必须将历史规则 provenance 补为 NULL/NULL。'
-    );
-    assert.deepStrictEqual(
-      strategyMigrationDb.prepare('SELECT * FROM strategy_rule_hits WHERE strategy_rule_id = ?')
-        .get(legacyStrategyRuleId),
-      legacyStrategyHitSnapshot,
-      'strategy_rules 重建后必须逐值保留 strategy_rule_hits 入向外键业务行。'
-    );
-    const migratedHitForeignKey = strategyMigrationDb.prepare('PRAGMA foreign_key_list(strategy_rule_hits)').all()
-      .find((foreignKey) => foreignKey.from === 'strategy_rule_id');
-    assert(migratedHitForeignKey, 'strategy_rule_hits 必须继续引用 strategy_rules.id。');
-    assert.strictEqual(migratedHitForeignKey.table, 'strategy_rules');
-    assert.strictEqual(migratedHitForeignKey.to, 'id');
-    assert.strictEqual(String(migratedHitForeignKey.on_delete).toUpperCase(), 'RESTRICT');
-    const migratedStrategyForeignKey = strategyMigrationDb.prepare('PRAGMA foreign_key_list(strategy_rules)').all()
-      .find((foreignKey) => foreignKey.from === 'source_batch_id');
-    assert(migratedStrategyForeignKey);
-    assert.strictEqual(migratedStrategyForeignKey.table, 'import_batches');
-    assert.strictEqual(String(migratedStrategyForeignKey.on_delete).toUpperCase(), 'RESTRICT');
-    const migratedStrategySql = getCreateSql(strategyMigrationDb, 'strategy_rules');
-    assert(migratedStrategySql.includes('UNIQUE (rule_code, rule_version)'),
-      'strategy_rules 迁移后必须保留直接 UNIQUE(rule_code, rule_version) 表级约束。');
-    assert(strategyMigrationDb.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_strategy_rules_status_metric'").get(),
-      'strategy_rules 迁移后必须保留显式候选查询索引。');
-    assert(
-      strategyMigrationDb.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'strategy_rules'").get().seq
-        >= legacyStrategySequenceHighWater,
-      'strategy_rules 迁移后不得降低 sqlite_sequence 历史高水位。'
-    );
-    postMigrationAutoRuleId = Number(
-      insertStrategyRule(strategyMigrationDb, null, null, 'post-migration-auto').lastInsertRowid
-    );
-    assert(postMigrationAutoRuleId >= legacyStrategySequenceHighWater + 1,
-      'strategy_rules 迁移后的下一自增 ID 必须从历史高水位之后继续。');
-    assert.throws(
-      () => insertStrategyRule(strategyMigrationDb, null, null, 'post-migration-auto'),
-      (error) => error.code === 'SQLITE_CONSTRAINT_UNIQUE'
-        && /strategy_rules\.rule_code, strategy_rules\.rule_version/i.test(String(error.message || '')),
-      'strategy_rules 迁移后必须由直接 UNIQUE(rule_code, rule_version) 约束拒绝重复身份。'
-    );
-    assert.deepStrictEqual(strategyMigrationDb.prepare('PRAGMA foreign_key_check').all(), []);
-    migratedStrategyFingerprint = strategyMigrationModule.calculateSchemaFingerprint(strategyMigrationDb);
-  } finally {
-    strategyMigrationDb.close();
-  }
-  // populated v2→v3 完成后再次初始化必须幂等，不得丢失规则、hit、索引或序列。
-  strategyMigrationModule.initDatabase();
-  const reinitializedStrategyMigrationDb = strategyMigrationModule.openDatabase();
+  assert.throws(
+    () => strategyMigrationModule.initDatabase(),
+    (error) => error.code === 'INCOMPATIBLE_EXISTING_SCHEMA'
+      && error.details.actualVersion === '2026-08-27-formal-canonical-v2',
+    '历史 strategy_rules v2 不再是唯一 predecessor，必须 fail-closed。'
+  );
+  const rejectedStrategyMigrationDb = strategyMigrationModule.openDatabase();
   try {
     assert.strictEqual(
-      strategyMigrationModule.calculateSchemaFingerprint(reinitializedStrategyMigrationDb),
-      migratedStrategyFingerprint,
-      'strategy_rules populated 迁移后二次初始化必须保持 schema fingerprint 稳定。'
+      rejectedStrategyMigrationDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value,
+      '2026-08-27-formal-canonical-v2'
     );
-    assert.deepStrictEqual(
-      reinitializedStrategyMigrationDb.prepare(
-        `SELECT ${legacyStrategyBusinessColumns.join(', ')} FROM strategy_rules WHERE id = ?`
-      ).get(legacyStrategyRuleId),
-      legacyStrategyRuleSnapshot,
-      '二次初始化后必须继续保留显式历史规则 ID 与业务字段。'
-    );
-    assert.deepStrictEqual(
-      reinitializedStrategyMigrationDb.prepare('SELECT * FROM strategy_rule_hits WHERE strategy_rule_id = ?')
-        .get(legacyStrategyRuleId),
-      legacyStrategyHitSnapshot,
-      '二次初始化后必须继续保留 strategy_rule_hits 入向外键行。'
-    );
-    assert.strictEqual(
-      reinitializedStrategyMigrationDb.prepare('SELECT COUNT(*) AS total FROM strategy_rules WHERE id = ?')
-        .get(postMigrationAutoRuleId).total,
-      1,
-      '二次初始化后必须保留迁移后生成的自增规则。'
-    );
-    assert(
-      reinitializedStrategyMigrationDb.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'strategy_rules'").get().seq
-        >= postMigrationAutoRuleId,
-      '二次初始化不得回退 strategy_rules sqlite_sequence。'
-    );
-    assert(reinitializedStrategyMigrationDb.prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_strategy_rules_status_metric'"
-    ).get());
-    assert.deepStrictEqual(reinitializedStrategyMigrationDb.prepare('PRAGMA foreign_key_check').all(), []);
+    assert(!new Set(rejectedStrategyMigrationDb.prepare('PRAGMA table_info(strategy_rules)').all()
+      .map((column) => column.name)).has('source_batch_id'),
+    '拒绝历史 v2 后不得半途改写 strategy_rules。');
+    assert.deepStrictEqual(rejectedStrategyMigrationDb.prepare('PRAGMA foreign_key_check').all(), []);
   } finally {
-    reinitializedStrategyMigrationDb.close();
+    rejectedStrategyMigrationDb.close();
   }
-
   // 触发器名称包含双引号、分号和 SQL 元字符时，拆装必须只作用于目标触发器。
   const specialTriggerPath = path.join(dataDir, 'energy-analysis-trigger-identifier.sqlite');
   const specialTriggerModule = loadDatabaseModule(specialTriggerPath);

@@ -100,6 +100,10 @@ async function run() {
     [
       'x-demo-dataset-id',
       'x-demo-run-id',
+      'x-demo-run-reused',
+      'x-demo-run-auto-superseded',
+      'x-demo-run-superseded-from',
+      'x-demo-runtime-epoch',
       'x-demo-artifact-key',
       'x-demo-handler-key',
       'x-demo-manifest-version',

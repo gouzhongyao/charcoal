@@ -5,6 +5,10 @@ const fs = require('fs');
 const path = require('path');
 const XLSX = require('xlsx');
 const {
+  DEMO_ACTUAL_ENERGY_ORGANIZATION,
+  DEMO_ACTUAL_ENERGY_ROWS
+} = require('../services/demoActualEnergyFixture');
+const {
   DEMO_CANONICALIZATION_VERSION,
   DEMO_DATASET_ID,
   DEMO_MANIFEST_VERSION,
@@ -99,7 +103,7 @@ function assertUserVisibleHeaders(actualHeaders, expectedHeaders, contractName) 
 assert.strictEqual(validateDemoParkManifest(), true);
 assert.doesNotThrow(() => validateDemoParkManifest(), 'manifest 必须通过组织、仪表、产能、班次、能流、平衡、能源类型和有效期跨文件校验。');
 assert.strictEqual(DEMO_DATASET_ID, 'qinglan-park-v1');
-assert.strictEqual(DEMO_MANIFEST_VERSION, '1.4.0');
+assert.strictEqual(DEMO_MANIFEST_VERSION, '1.7.0');
 assert.strictEqual(DEMO_CANONICALIZATION_VERSION, 'canonical-json-v1');
 assert.strictEqual(DEMO_PARK_CODE_PREFIX, 'QL-');
 assert.strictEqual(DEMO_PARK_SOURCE_TIME_ZONE, 'Asia/Shanghai');
@@ -111,7 +115,7 @@ assert.strictEqual(
   JSON.stringify(canonicalizeJsonValue({ z: 1, a: { y: 2, b: 3 } })),
   JSON.stringify(canonicalizeJsonValue({ a: { b: 3, y: 2 }, z: 1 }))
 );
-assert.strictEqual(getDemoParkManifestDigest(), 'ae6b87c040ad98d7282d8013afaede5d3cafe011c54b3dc4dbf74e77dbf5bb62');
+assert.strictEqual(getDemoParkManifestDigest(), 'fdee24ea8bb686a8d3174df313b464e3ff3edeaa886384fe31f373499008e503');
 const changedCanonicalPayload = structuredClone(canonicalPayload);
 changedCanonicalPayload.artifacts[0].postAction = `${changedCanonicalPayload.artifacts[0].postAction}-changed`;
 const changedCanonicalJson = JSON.stringify(canonicalizeJsonValue(changedCanonicalPayload));
@@ -140,12 +144,55 @@ assert.deepStrictEqual(DEMO_PARK_ARTIFACTS.slice(0, 3).map((artifact) => artifac
   '02-organization-departments',
   '03-organization-process-equipment'
 ]);
+const rootOrganizationRows = getDemoParkArtifact('01-organization-root').rows;
+assert.strictEqual(rootOrganizationRows.length, 2);
+assert.deepStrictEqual(rootOrganizationRows.map((row) => row.slice(0, 5)), [
+  ['QL-PARK', '天坤集团', '', '', 'enterprise'],
+  ['QL-ACTUAL-PARK', '实际能耗样例企业', '', '', 'enterprise']
+]);
+assert.deepStrictEqual(rootOrganizationRows.map((row) => row[7]), ['active', 'active']);
+assert.deepStrictEqual(rootOrganizationRows[1].slice(0, 2), [
+  DEMO_ACTUAL_ENERGY_ORGANIZATION.code,
+  DEMO_ACTUAL_ENERGY_ORGANIZATION.name
+]);
 
 // 目录响应不得暴露原始行或本地文件路径，并为每个格式提供稳定下载路由。
 const manifest = listDemoParkArtifacts();
 assert.strictEqual(manifest.length, DEMO_PARK_ARTIFACTS.length);
 assert.strictEqual(manifest.reduce((total, artifact) => total + artifact.batchRoles.length, 0), 31);
-assert.strictEqual(manifest.find((artifact) => artifact.artifactKey === '07-monthly-energy').permissions.execute, 'imports:create');
+const monthlyEnergyManifest = manifest.find((artifact) => artifact.artifactKey === '07-monthly-energy');
+assert.strictEqual(monthlyEnergyManifest.permissions.execute, 'imports:create');
+assert.strictEqual(monthlyEnergyManifest.name, '月度能耗与实际历史');
+assert.strictEqual(monthlyEnergyManifest.mode, 'direct-upload');
+assert.strictEqual(
+  monthlyEnergyManifest.downloadLifecycle,
+  DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME
+);
+assert.strictEqual(monthlyEnergyManifest.blocker.previewExecuteContext, null);
+assert(monthlyEnergyManifest.postAction.includes('11 条'));
+assert(monthlyEnergyManifest.postAction.includes('59 条'));
+assert(monthlyEnergyManifest.postAction.includes('QL-ACTUAL-PARK'));
+assert(monthlyEnergyManifest.postAction.includes('无计量器具关联'));
+assert(monthlyEnergyManifest.postAction.includes('普通上传即执行'));
+assert(monthlyEnergyManifest.postAction.includes('skip'));
+// 阶段 A 把 11/27 两类碳输入接入中央 managed context，并冻结各自 ownership 实体类型。
+const carbonFactorManifest = manifest.find((artifact) => artifact.artifactKey === '11-carbon-factors');
+assert.strictEqual(carbonFactorManifest.downloadLifecycle, DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME);
+assert.strictEqual(carbonFactorManifest.handlerKey, 'carbon-factors-import');
+assert.deepStrictEqual(carbonFactorManifest.ownershipTargets, ['carbon_factor']);
+assert.strictEqual(carbonFactorManifest.blocker.previewExecuteContext, null);
+const predictionConfigManifest = manifest.find((artifact) => artifact.artifactKey === '12-prediction-configs');
+assert.strictEqual(predictionConfigManifest.downloadLifecycle, DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME);
+assert.strictEqual(predictionConfigManifest.handlerKey, 'prediction-configs-import');
+assert.deepStrictEqual(predictionConfigManifest.ownershipTargets, ['prediction_config']);
+assert.strictEqual(predictionConfigManifest.blocker.previewExecuteContext, null);
+assert.deepStrictEqual(predictionConfigManifest.routes.preview, ['/api/predictions/configs/import/preview']);
+assert.deepStrictEqual(predictionConfigManifest.routes.execute, ['/api/predictions/configs/import/execute']);
+const carbonActivityManifest = manifest.find((artifact) => artifact.artifactKey === '27-carbon-activities');
+assert.strictEqual(carbonActivityManifest.downloadLifecycle, DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME);
+assert.strictEqual(carbonActivityManifest.handlerKey, 'carbon-activity-import');
+assert.deepStrictEqual(carbonActivityManifest.ownershipTargets, ['carbon_activity_record']);
+assert.strictEqual(carbonActivityManifest.blocker.previewExecuteContext, null);
 assert.deepStrictEqual(manifest.find((artifact) => artifact.artifactKey === '17-tou-schemes').ownershipTargets, ['tou_scheme']);
 assert.strictEqual(
   manifest.find((artifact) => artifact.artifactKey === '24-energy-flow-edges')
@@ -234,8 +281,29 @@ getDemoParkArtifact('03-organization-process-equipment').rows.forEach((row) => {
   assert(organizationDepartmentCodes.has(row[2]), `artifact 03 父级必须已由前序条目导入：${row[0]} -> ${row[2]}`);
 });
 
-// 预测历史和筛选值必须精确匹配生产服务的等值查询契约。
+// artifact 07 保留原有 11 条联动事实，并追加独立企业实际样例的 59 条正式能耗模板行。
 const monthlyEnergyRows = getDemoParkArtifact('07-monthly-energy').rows;
+assert.strictEqual(monthlyEnergyRows.length, 70);
+assert.deepStrictEqual(monthlyEnergyRows.slice(0, 11), [
+  ['2026-01', 'electricity', 368000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '预测训练历史'],
+  ['2026-02', 'electricity', 376000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '预测训练历史'],
+  ['2026-03', 'electricity', 389000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '预测训练历史'],
+  ['2026-04', 'electricity', 401000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '预测训练历史'],
+  ['2026-05', 'electricity', 410000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '预测训练历史'],
+  ['2026-06', 'electricity', 420000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '预测训练历史'],
+  ['2026-07', 'electricity', 445000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '平衡与预测历史'],
+  ['2026-07', 'natural_gas', 18600, 'm3', 'QL-UTILITY', 'QL-M-GAS-UTILITY', '动力站天然气'],
+  ['2026-08', 'electricity', 458000, 'kWh', 'QL-PARK', 'QL-M-ELEC-PARK', '园区电费结算实际；与 artifact 08 园区总表抄表用量一致，不由抄表自动派生'],
+  ['2026-08', 'natural_gas', 19300, 'm3', 'QL-UTILITY', 'QL-M-GAS-UTILITY', '动力站天然气结算实际'],
+  ['2026-08', 'electricity', 138000, 'kWh', 'QL-WORKSHOP-A', '', '一车间结算实际；用于单位产品能耗']
+]);
+assert.deepStrictEqual(monthlyEnergyRows.slice(11), DEMO_ACTUAL_ENERGY_ROWS);
+assert.strictEqual(monthlyEnergyRows.filter((row) => row[4] === 'QL-ACTUAL-PARK').length, 59);
+assert.strictEqual(monthlyEnergyRows.filter((row) => row[4] === 'QL-PARK').length, 8);
+assert(monthlyEnergyRows.slice(11).every((row) => row[5] === ''));
+assert.strictEqual(new Set(monthlyEnergyRows.map((row) => [row[0], row[1], row[3], row[4], row[5] || 'direct'].join('|'))).size, 70);
+
+// 预测历史和筛选值必须精确匹配生产服务的等值查询契约。
 const electricityHistoryRows = monthlyEnergyRows.filter((row) => (
   row[0] >= '2026-01'
   && row[0] <= '2026-07'
@@ -279,7 +347,7 @@ assert.deepStrictEqual(augustParkReading.slice(0, 9), [
   '2026-08-01', 'QL-M-ELEC-PARK', '园区总进线电表', 1250000, 1708000, 1, '', 'kWh', '天坤集团'
 ]);
 assert.strictEqual((Number(augustParkReading[4]) - Number(augustParkReading[3])) * Number(augustParkReading[5]), augustParkElectricity[2]);
-assert.strictEqual(getDemoParkArtifact('07-monthly-energy').postAction, '创建导入批次；2026-01 至 2026-07 园区电力仅作为预测历史，2026-08 园区电力结算实际绑定 QL-M-ELEC-PARK，直接用于预算和强度分析；artifact 08 同表抄表预演遇同月同表直接事实时受控 conflict 跳过，conflict 为正常受控跳过，不视为错误。');
+assert.strictEqual(getDemoParkArtifact('07-monthly-energy').postAction, '创建导入批次；保留天坤集团现有预测、预算、抄表联动的 11 条事实，并追加实际能耗样例企业 QL-ACTUAL-PARK 的 59 条历史实际；实际样例企业无计量器具关联，下载后普通上传即执行，重复记录按 skip 处理；2026-08 天坤集团园区总表 QL-M-ELEC-PARK conflict 及后续联动边界保持不变，conflict 为正常受控跳过，不视为错误。');
 
 // 固定窗口必须恰好包含 16 条连续、唯一来源键的 15 分钟时序事实。
 const timeseriesRows = getDemoParkArtifact('15-energy-timeseries').rows;
@@ -383,15 +451,31 @@ assert(balanceConfigPostAction.includes('手工发起平衡快照计算'));
 // 历史单表模板也必须注入天坤集团数据而非模板默认烟测样例。
 const organizationXlsx = generateDemoParkArtifact('01-organization-root', 'xlsx');
 const organizationWorkbook = XLSX.read(organizationXlsx.buffer, { type: 'buffer' });
-const organizationRows = XLSX.utils.sheet_to_json(organizationWorkbook.Sheets['用能单元模板'], { header: 1, blankrows: false });
-assert.strictEqual(organizationRows.length, 2);
-assert.strictEqual(organizationRows[1][0], 'QL-PARK');
-assert.strictEqual(organizationRows[1][1], '天坤集团');
+const organizationRows = readWorkbookBusinessRows(organizationWorkbook, '用能单元模板');
+assert.strictEqual(organizationRows.length, 3);
+assert.deepStrictEqual(organizationRows.slice(1).map((row) => row.slice(0, 5)), [
+  ['QL-PARK', '天坤集团', '', '', 'enterprise'],
+  ['QL-ACTUAL-PARK', '实际能耗样例企业', '', '', 'enterprise']
+]);
 
-// 26—29 正式模板必须冻结 XLSX-only、中文表头、用户可见名称和业务事实投影。
+// artifact 07 下载继续使用正式中文表头，并完整输出 70 条业务行且不暴露根目录 Excel 复合表头。
+const monthlyEnergyXlsx = generateDemoParkArtifact('07-monthly-energy', 'xlsx');
+assert.strictEqual(monthlyEnergyXlsx.fileName, '07-月度能耗与实际历史.xlsx');
+const monthlyEnergyWorkbook = XLSX.read(monthlyEnergyXlsx.buffer, { type: 'buffer' });
+const monthlyEnergyWorkbookRows = readWorkbookBusinessRows(monthlyEnergyWorkbook, '能耗导入模板');
+assertUserVisibleHeaders(monthlyEnergyWorkbookRows[0], ['月份', '能源类型编码', '用量', '单位', '用能单元编码', '计量器具编码', '备注'], '07 月度能耗');
+assert.strictEqual(monthlyEnergyWorkbookRows.length - 1, 70);
+assert.strictEqual(monthlyEnergyWorkbookRows.filter((row) => row[4] === 'QL-ACTUAL-PARK').length, 59);
+assert(!monthlyEnergyWorkbookRows.flat().some((cell) => ['合计', 'Q', 'R', '产值', '产量', '折标', '强度'].includes(String(cell))));
+const monthlyEnergyCsv = generateDemoParkArtifact('07-monthly-energy', 'csv');
+assert.strictEqual(monthlyEnergyCsv.fileName, '07-月度能耗与实际历史.csv');
+assert.deepStrictEqual([...monthlyEnergyCsv.buffer.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+assert.strictEqual(monthlyEnergyCsv.buffer.toString('utf8').split(/\r?\n/).filter(Boolean).length, 71);
+
+// 26、28、29 正式无状态模板必须冻结 XLSX-only、中文表头、用户可见名称和业务事实投影。
 const registry = listDemoArtifactRegistrations();
 assert.strictEqual(registry.length, 29);
-const statelessFormalArtifactKeys = ['26-suppliers', '27-carbon-activities', '28-carbon-emission-report', '29-ghg-report'];
+const statelessFormalArtifactKeys = ['26-suppliers', '28-carbon-emission-report', '29-ghg-report'];
 statelessFormalArtifactKeys.forEach((artifactKey) => {
   const registration = registry.find((item) => item.artifactKey === artifactKey);
   assert(registration, `${artifactKey} 必须存在 registry 注册项。`);
@@ -402,6 +486,14 @@ statelessFormalArtifactKeys.forEach((artifactKey) => {
   assert.strictEqual(registration.routes.preview.length, 1);
   assert.strictEqual(registration.routes.execute.length, 1);
 });
+const managedCarbonActivityRegistration = registry.find((item) => item.artifactKey === '27-carbon-activities');
+assert.strictEqual(
+  managedCarbonActivityRegistration.downloadLifecycle,
+  DEMO_ARTIFACT_DOWNLOAD_LIFECYCLES.MANAGED_CONTEXT_AUTO_RUNTIME
+);
+assert.strictEqual(managedCarbonActivityRegistration.blocker.previewExecuteContext, null);
+assert.deepStrictEqual(managedCarbonActivityRegistration.ownershipTargets, ['carbon_activity_record']);
+assert.deepStrictEqual(managedCarbonActivityRegistration.routes.download, ['/api/templates/demo-park/27-carbon-activities.xlsx']);
 
 const supplierArtifact = getDemoParkArtifact('26-suppliers');
 const supplierWorkbookResult = generateDemoParkArtifact('26-suppliers', 'xlsx');

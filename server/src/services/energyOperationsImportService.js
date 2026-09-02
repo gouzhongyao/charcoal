@@ -37,6 +37,13 @@ const OPERATIONS_TEMPLATE_CONFIGS = Object.freeze({
   [DEVICE_STATE_TEMPLATE_TYPE]: Object.freeze({ sheetName: '设备状态' })
 });
 
+// UTC 单元格解析错误用于抑制同一字段的必填和通用 UTC 格式级联错误。
+const UTC_TEMPLATE_CELL_ERROR_CODES = new Set([
+  'INVALID_TEMPLATE_CELL_TYPE',
+  'STRICT_UTC_INPUT_INVALID',
+  'STRICT_UTC_INPUT_PRECISION_INVALID'
+]);
+
 /**
  * 判断导入单元格是否为空白。
  * @param {*} value 原始单元格值。
@@ -97,6 +104,18 @@ function mapTemplateIssue(issue, fallbackRowNumber) {
     issue.message || '模板结构不符合冻结契约。',
     issue.severity === 'warning' ? 'warning' : 'error'
   );
+}
+
+/**
+ * 判断指定 UTC 字段是否已被模板单元格解析错误阻断。
+ * @param {object[]} issues 已映射的模板问题。
+ * @param {string} fieldName 内部 UTC 字段名。
+ * @returns {boolean} 是否已有字段级解析错误。
+ */
+function hasUtcTemplateCellError(issues, fieldName) {
+  return (issues || []).some((issue) => issue.fieldName === fieldName
+    && issue.severity === 'error'
+    && UTC_TEMPLATE_CELL_ERROR_CODES.has(issue.code));
 }
 
 /**
@@ -162,12 +181,15 @@ function parseEnergyOperationsRows(templateType, buffer, originalFilename) {
  * @param {string} templateType 冻结模板类型。
  * @param {object} mapped 模板映射记录。
  * @param {number} rowNumber 物理来源行号。
+ * @param {object[]} existingIssues 当前行已有模板问题。
  * @returns {object[]} 缺失字段问题。
  */
-function validateRequiredFields(templateType, mapped, rowNumber) {
+function validateRequiredFields(templateType, mapped, rowNumber, existingIssues = []) {
   const definition = getEnergyAnalysisTemplateDefinition(templateType);
   return definition.sheets[0].columns
-    .filter((column) => column.required && isBlank(mapped[column.key]))
+    .filter((column) => column.required
+      && isBlank(mapped[column.key])
+      && !(column.dataType === 'utc' && hasUtcTemplateCellError(existingIssues, column.key)))
     .map((column) => createOperationsIssue(
       rowNumber,
       column.key,
@@ -187,10 +209,10 @@ function validateOperationsInterval(input) {
   const startUtc = normalizeText(input.startUtc);
   const endUtc = normalizeText(input.endUtc);
   const sourceTimeZone = normalizeText(input.sourceTimeZone);
-  if (!isStrictUtcIso(startUtc)) {
+  if (!isStrictUtcIso(startUtc) && !hasUtcTemplateCellError(input.existingIssues, input.startField)) {
     issues.push(createOperationsIssue(input.rowNumber, input.startField, input.startUtc, 'INVALID_START_UTC', '开始时间必须是严格 UTC Z 格式。'));
   }
-  if (!isStrictUtcIso(endUtc)) {
+  if (!isStrictUtcIso(endUtc) && !hasUtcTemplateCellError(input.existingIssues, input.endField)) {
     issues.push(createOperationsIssue(input.rowNumber, input.endField, input.endUtc, 'INVALID_END_UTC', '结束时间必须是严格 UTC Z 格式。'));
   }
   if (!isIanaTimeZone(sourceTimeZone)) {
@@ -425,7 +447,14 @@ function validateShiftScheduleAlignment(record, definition, rowNumber) {
 function validateShiftScheduleRow(row, masterData) {
   const mapped = row.mapped || {};
   const rowNumber = row.sourceRowNumber;
-  const issues = [...(row.issues || []), ...validateRequiredFields(SHIFT_SCHEDULE_TEMPLATE_TYPE, mapped, rowNumber)];
+  // 模板问题单独保留，供后续字段校验识别已阻断的非空 UTC 单元格。
+  const templateIssues = row.issues || [];
+  const issues = [...templateIssues, ...validateRequiredFields(
+    SHIFT_SCHEDULE_TEMPLATE_TYPE,
+    mapped,
+    rowNumber,
+    templateIssues
+  )];
   const organizationCode = normalizeText(mapped.organizationUnitCode);
   const shiftCode = normalizeText(mapped.shiftCode);
   const organization = organizationCode ? masterData.organizations.get(organizationCode) : null;
@@ -465,7 +494,8 @@ function validateShiftScheduleRow(row, masterData) {
     endField: 'scheduleEndUtc',
     startUtc: mapped.scheduleStartUtc,
     endUtc: mapped.scheduleEndUtc,
-    sourceTimeZone: mapped.sourceTimeZone
+    sourceTimeZone: mapped.sourceTimeZone,
+    existingIssues: templateIssues
   }));
   issues.push(...validateOperationsInterval({
     rowNumber,
@@ -473,7 +503,8 @@ function validateShiftScheduleRow(row, masterData) {
     endField: 'definitionEffectiveEndUtc',
     startUtc: mapped.definitionEffectiveStartUtc,
     endUtc: mapped.definitionEffectiveEndUtc,
-    sourceTimeZone: mapped.sourceTimeZone
+    sourceTimeZone: mapped.sourceTimeZone,
+    existingIssues: templateIssues
   }));
 
   const sourceReference = normalizeText(mapped.sourceReference);
@@ -543,7 +574,14 @@ function loadDeviceStateMasterData(db) {
 function validateDeviceStateRow(row, masterData) {
   const mapped = row.mapped || {};
   const rowNumber = row.sourceRowNumber;
-  const issues = [...(row.issues || []), ...validateRequiredFields(DEVICE_STATE_TEMPLATE_TYPE, mapped, rowNumber)];
+  // 模板问题单独保留，供后续字段校验识别已阻断的非空 UTC 单元格。
+  const templateIssues = row.issues || [];
+  const issues = [...templateIssues, ...validateRequiredFields(
+    DEVICE_STATE_TEMPLATE_TYPE,
+    mapped,
+    rowNumber,
+    templateIssues
+  )];
   const organizationCode = normalizeText(mapped.organizationUnitCode);
   const meterCode = normalizeText(mapped.meterCode);
   const organization = organizationCode ? masterData.organizations.get(organizationCode) : null;
@@ -580,7 +618,8 @@ function validateDeviceStateRow(row, masterData) {
     endField: 'endUtc',
     startUtc: mapped.startUtc,
     endUtc: mapped.endUtc,
-    sourceTimeZone: mapped.sourceTimeZone
+    sourceTimeZone: mapped.sourceTimeZone,
+    existingIssues: templateIssues
   }));
   issues.push(...validateDeviceStateDatabaseSecondRange({
     rowNumber,
@@ -1101,5 +1140,6 @@ module.exports = {
   isExactShiftScheduleFact,
   parseEnergyOperationsRows,
   previewDeviceStateImport,
-  previewShiftScheduleImport
+  previewShiftScheduleImport,
+  validateDeviceStateDatabaseSecondRange
 };

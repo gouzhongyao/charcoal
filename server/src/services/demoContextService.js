@@ -7,6 +7,10 @@ const { getUserPermissions, isSuperAdmin } = require('./authService');
 const { requireDemoArtifactHandler } = require('./demoArtifactRegistry');
 const { parseEnergyAnalysisTemplateBuffer } = require('./energyAnalysisTemplateService');
 const { assertDemoRuntimeEnabled, requireDemoDatasetRun } = require('./demoRunService');
+const {
+  getImportAuditBatchDetail,
+  getImportAuditSummary
+} = require('./importAuditService');
 const { AppError, badRequest } = require('../utils/errors');
 
 const DEMO_CONTEXT_TOKEN_BYTES = 32;
@@ -16,6 +20,12 @@ const MAX_DEMO_CONTEXT_TTL_MS = 8 * 60 * 60 * 1000;
 const DEMO_CONTEXT_REASSOCIATE_GRACE_MS = 15 * 60 * 1000;
 const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/;
 const PREVIEW_AUDIT_DIGEST_PATTERN = /^hmac-sha256:v1:audit:[a-f0-9]{64}$/;
+// 需要原样回放的 managed retained artifact 必须上传下载时签发的同一字节，禁止替换模板或自行改写来源批次。
+const DOWNLOAD_ARTIFACT_UPLOAD_BINDING_KEYS = new Set([
+  '11-carbon-factors',
+  '12-prediction-configs',
+  '27-carbon-activities'
+]);
 // 重新关联预检见证仅以当前进程内对象身份保存，普通对象、JSON 副本和字符串都无法伪造。
 const reassociatePreflightWitnesses = new WeakMap();
 
@@ -517,8 +527,11 @@ function validateDemoContext(input = {}) {
     }
     if (phase === 'preview' && input.uploadFileSha256) {
       const uploadFileSha256 = validateSha256(input.uploadFileSha256, 'uploadFileSha256');
-      if (context.uploadFileSha256 && context.uploadFileSha256 !== uploadFileSha256) {
-        throw new AppError('DEMO_CONTEXT_REASSOCIATED_FILE_MISMATCH', '上传文件与重新关联预绑定文件摘要不一致。', {
+      // 重新关联 context 始终校验预绑定字节；阶段 A 两类碳输入还必须上传下载时签发的原始字节。
+      const expectedUploadFileSha256 = context.uploadFileSha256
+        || (DOWNLOAD_ARTIFACT_UPLOAD_BINDING_KEYS.has(artifact.artifactKey) ? context.artifactFileSha256 : null);
+      if (expectedUploadFileSha256 && expectedUploadFileSha256 !== uploadFileSha256) {
+        throw new AppError('DEMO_CONTEXT_REASSOCIATED_FILE_MISMATCH', '上传文件与演示 context 绑定文件摘要不一致。', {
           statusCode: 409,
           details: { artifactKey: artifact.artifactKey }
         });
@@ -603,6 +616,115 @@ function bindDemoContextPreview(input = {}) {
   }
 }
 
+/** 规范化 terminal replay 的固定批次角色绑定。 */
+function normalizeTerminalReplayBatchBindings(artifact, batchBindings) {
+  if (!Array.isArray(batchBindings) || batchBindings.length !== artifact.batchRoles.length) {
+    throw new AppError('DEMO_CONTEXT_BATCH_BINDING_MISMATCH', '演示终态回放批次角色集合无效。', { statusCode: 409 });
+  }
+  const declaredRoles = new Map(artifact.batchRoles.map((item) => [item.role, item.entityType]));
+  const seenRoles = new Set();
+  return batchBindings.map((binding) => {
+    const batchId = Number(binding && binding.batchId);
+    const batchRole = String(binding && binding.batchRole || '').trim();
+    const importType = String(binding && binding.importType || '').trim();
+    if (!Number.isSafeInteger(batchId) || batchId < 1 || !declaredRoles.has(batchRole)
+      || seenRoles.has(batchRole) || !importType) {
+      throw new AppError('DEMO_CONTEXT_BATCH_BINDING_MISMATCH', '演示终态回放批次角色绑定无效。', { statusCode: 409 });
+    }
+    seenRoles.add(batchRole);
+    return { batchId, batchRole, importType };
+  }).sort((left, right) => left.batchRole.localeCompare(right.batchRole));
+}
+
+/**
+ * 严格校验已执行 context 并只读恢复持久化 execute 结果。
+ * 该入口不修改 context、批次、ownership 或业务表。
+ */
+function validateDemoContextTerminalReplay(input = {}) {
+  const token = validateDemoContextToken(input.token);
+  const userId = input.userId;
+  if (typeof userId !== 'number' || !Number.isSafeInteger(userId) || userId < 1) {
+    throw new AppError('UNAUTHENTICATED', '请先登录。', { statusCode: 401 });
+  }
+  const artifact = requireDemoArtifactHandler(input.artifactKey, input.handlerKey);
+  const uploadFileSha256 = validateSha256(input.uploadFileSha256, 'uploadFileSha256');
+  const previewDigest = validatePreviewAuditDigest(input.previewDigest);
+  const expectedBindings = normalizeTerminalReplayBatchBindings(artifact, input.batchBindings);
+  const ownedDb = !input.db;
+  const db = input.db || openDatabase();
+  try {
+    assertDemoDomainPermission(userId, artifact.permissions.execute, { db });
+    const runtime = assertDemoRuntimeEnabled({ db });
+    const context = readContextByTokenHash(db, hashDemoContextToken(token));
+    if (!context) {
+      throw new AppError('DEMO_CONTEXT_NOT_FOUND', '演示 context 不存在或已失效。', { statusCode: 409 });
+    }
+    const run = requireDemoDatasetRun(db, context.runId);
+    const bindingsMatch = context.status === 'executed'
+      && context.issuedToUserId === userId
+      && context.artifactKey === artifact.artifactKey
+      && context.handlerKey === artifact.handlerKey
+      && context.runtimeEpoch === runtime.runtimeEpoch
+      && context.datasetId === run.datasetId
+      && context.manifestVersion === run.manifestVersion
+      && context.manifestDigest === run.manifestDigest;
+    if (!bindingsMatch) {
+      throw new AppError('DEMO_CONTEXT_BINDING_MISMATCH', '演示 context 与终态回放请求绑定不一致。', {
+        statusCode: 409,
+        details: { artifactKey: artifact.artifactKey, phase: 'terminal-replay' }
+      });
+    }
+    if (context.uploadFileSha256 !== uploadFileSha256 || context.previewDigest !== previewDigest) {
+      throw new AppError('DEMO_CONTEXT_PREVIEW_MISMATCH', '终态回放请求与已执行预演摘要或文件摘要不一致。', {
+        statusCode: 409,
+        details: { artifactKey: artifact.artifactKey }
+      });
+    }
+    const persistedBindings = db.prepare(`SELECT rib.import_batch_id AS batchId,
+        rib.batch_role AS batchRole, ib.import_type AS importType
+      FROM demo_run_import_batches rib
+      JOIN import_batches ib ON ib.id = rib.import_batch_id
+      WHERE rib.context_id = ? AND rib.run_id = ? AND rib.artifact_key = ?
+      ORDER BY rib.batch_role, rib.import_batch_id`).all(
+      context.contextId,
+      context.runId,
+      context.artifactKey
+    );
+    const expectedKeys = expectedBindings.map((binding) => (
+      `${binding.batchRole}\0${binding.batchId}\0${binding.importType}`
+    ));
+    const actualKeys = persistedBindings.map((binding) => (
+      `${binding.batchRole}\0${Number(binding.batchId)}\0${binding.importType}`
+    ));
+    if (expectedKeys.length !== actualKeys.length
+      || expectedKeys.some((binding, index) => binding !== actualKeys[index])) {
+      throw new AppError('DEMO_CONTEXT_BATCH_BINDING_MISMATCH', '演示终态回放批次角色与持久绑定不一致。', { statusCode: 409 });
+    }
+    const batches = expectedBindings.map((binding) => {
+      const batch = getImportAuditBatchDetail(binding.batchId, { db, includeIssues: false });
+      if (batch.importType !== binding.importType || batch.auditPhase !== 'execute'
+        || !['completed', 'completed_with_errors'].includes(batch.status)
+        || !batch.executeResult || typeof batch.executeResult !== 'object'
+        || Array.isArray(batch.executeResult) || batch.executeResult.executed !== true) {
+        throw new AppError('DEMO_CONTEXT_TERMINAL_REPLAY_INVALID', '演示终态回放缺少可信成功执行结果。', {
+          statusCode: 409,
+          details: { artifactKey: artifact.artifactKey, batchRole: binding.batchRole }
+        });
+      }
+      return {
+        batchId: binding.batchId,
+        batchRole: binding.batchRole,
+        importType: binding.importType,
+        executeResult: batch.executeResult,
+        auditBatch: getImportAuditSummary(binding.batchId, { db })
+      };
+    });
+    return { context, batches };
+  } finally {
+    if (ownedDb) db.close();
+  }
+}
+
 /** 在调用者持有的同一写事务内消费 previewed context。 */
 function markDemoContextExecutedInTransaction(input = {}) {
   const db = requireTransactionDatabase(input);
@@ -661,6 +783,7 @@ module.exports = {
   sha256Buffer,
   sha256File,
   validateDemoContext,
+  validateDemoContextTerminalReplay,
   validateDemoContextReassociateCandidate,
   validateDemoContextReassociateUpload,
   validateDemoContextToken,

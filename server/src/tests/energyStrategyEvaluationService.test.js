@@ -1,5 +1,14 @@
 'use strict';
 
+const demoTestBootstrap = require('./helpers/demoServiceTestHarness');
+if (!demoTestBootstrap.fixedIsolatedChild && module.parent) {
+  throw new Error('Demo ownership 固定测试入口不允许被普通模块间接加载。');
+}
+const { runFixedDemoOwnershipTest } = demoTestBootstrap;
+// private registration contract 仅注入隔离子进程中的当前固定测试 Module。
+const fixedDemoTestResult = runFixedDemoOwnershipTest('energy-strategy-evaluation-service');
+if (fixedDemoTestResult.delegated) process.exit(0);
+
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
@@ -14,12 +23,14 @@ process.env.BACKUPS_DIR = path.join(tmpDir, 'backups');
 process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
 const database = require('../db/database');
+const energyStrategyEvaluationService = require('../services/energyStrategyEvaluationService');
 const {
   DEFAULT_MAX_EVIDENCE_ITEMS,
   MAX_EVIDENCE_ITEMS,
   MAX_RULE_CODES,
   MAX_STRATEGY_RULES,
   SUPPORTED_FORMULA_VERSION,
+  assertEnergyStrategyExactScopeCapability,
   buildEnergyStrategyExactScope,
   getEnergyStrategyExactScopeMetadata,
   normalizeRuleCodes,
@@ -30,14 +41,20 @@ const {
   updateStrategyRuleHitStatus
 } = require('../services/energyStrategyEvaluationService');
 const {
+  assertEnergyLoadExactScopeCapability
+} = require('../services/energyConsumptionAnalysisService');
+const demoOwnershipService = require('../services/demoOwnershipService');
+const {
   calculateDemoEntityIdentityDigest,
   calculateDemoEntitySnapshotDigest,
-  _test: {
-    buildDemoEntityRegistrationContract,
-    getDemoOwnershipEntityHandler
-  }
-} = require('../services/demoOwnershipService');
+  DEMO_OWNERSHIP_ENTITY_HANDLERS
+} = demoOwnershipService;
+const { createDemoOwnershipTestHarness } = require('./helpers/demoServiceTestHarness');
+const {
+  buildDemoEntityRegistrationContract
+} = createDemoOwnershipTestHarness();
 const { getOrCreateActiveDemoDatasetRun } = require('../services/demoRunService');
+const strategyOwnershipProtocol = require('../services/energyStrategyOwnershipProtocol');
 const { toggleDemoRuntime } = require('../services/demoRuntimeService');
 
 // 策略测试统一使用上海来源时区。
@@ -82,6 +99,20 @@ function assertBadRequestCode(action, expectedCode) {
   assert.strictEqual(capturedError.statusCode, 400);
   assert(capturedError.details, '业务错误必须包含安全 details。');
   assert.strictEqual(capturedError.details.code, expectedCode);
+  return capturedError;
+}
+
+/** 捕获同步服务错误并断言稳定顶层错误码。 */
+function assertServiceErrorCode(action, expectedCode) {
+  let capturedError = null;
+  try {
+    action();
+  } catch (error) {
+    capturedError = error;
+  }
+  assert(capturedError, `预期抛出 ${expectedCode}，实际未抛错。`);
+  assert.strictEqual(capturedError.code, expectedCode);
+  assert.strictEqual(capturedError.statusCode, 500);
   return capturedError;
 }
 
@@ -139,6 +170,21 @@ function resetScenario(db) {
   db.prepare('DELETE FROM strategy_evaluation_runs').run();
   db.prepare('DELETE FROM strategy_rules').run();
   db.prepare('DELETE FROM energy_timeseries_records').run();
+}
+
+/**
+ * 读取策略正式运行、命中和运行审计数量。
+ * @param {object} db SQLite 连接。
+ * @returns {object} 三类业务写入数量。
+ */
+function getStrategyWriteCounts(db) {
+  return {
+    runCount: db.prepare('SELECT COUNT(*) AS total FROM strategy_evaluation_runs').get().total,
+    hitCount: db.prepare('SELECT COUNT(*) AS total FROM strategy_rule_hits').get().total,
+    auditCount: db.prepare(
+      "SELECT COUNT(*) AS total FROM sys_operation_logs WHERE operation = 'energy.strategy.run'"
+    ).get().total
+  };
 }
 
 /**
@@ -374,7 +420,7 @@ function getEvaluation(result, ruleCode) {
  */
 function insertDerivedStrategyHitOwnership(db, runRecord, hitId) {
   // 固定 handler 是命中快照和摘要的唯一来源。
-  const handler = getDemoOwnershipEntityHandler('strategy_rule_hit');
+  const handler = DEMO_OWNERSHIP_ENTITY_HANDLERS.strategy_rule_hit;
   const projection = handler.readProjection(db, hitId);
   assert(projection, `缺少策略命中 ${hitId} 的 ownership projection。`);
   const identityDigest = calculateDemoEntityIdentityDigest('strategy_rule_hit', String(hitId));
@@ -1421,7 +1467,7 @@ function testDerivedOwnershipReviewRefresh(db, ids, insertTimeseries, insertRule
     manualStatus: 'accepted',
     reviewNote: 'derived snapshot 已随人工复核刷新。'
   }, createWriteOptions(db));
-  const successProjection = getDemoOwnershipEntityHandler('strategy_rule_hit')
+  const successProjection = DEMO_OWNERSHIP_ENTITY_HANDLERS.strategy_rule_hit
     .readProjection(db, successHit.id);
   const expectedSuccessDigest = calculateDemoEntitySnapshotDigest(
     'strategy_rule_hit',
@@ -1446,7 +1492,7 @@ function testDerivedOwnershipReviewRefresh(db, ids, insertTimeseries, insertRule
   assert.strictEqual(refreshedSuccessRegistry.sourceRowNumber, null);
 
   // 审计位于 refresh 之后；审计故障必须由私有 SAVEPOINT 同时回滚 hit 和 registry。
-  const auditFailureProjectionBefore = getDemoOwnershipEntityHandler('strategy_rule_hit')
+  const auditFailureProjectionBefore = DEMO_OWNERSHIP_ENTITY_HANDLERS.strategy_rule_hit
     .readProjection(db, auditFailureHit.id);
   const auditFailureRegistryBefore = db.prepare(
     'SELECT snapshot_digest AS snapshotDigest FROM demo_data_registry WHERE registry_id = ?'
@@ -1471,7 +1517,7 @@ function testDerivedOwnershipReviewRefresh(db, ids, insertTimeseries, insertRule
     })), /injected derived review audit failure/);
     assert.strictEqual(db.inTransaction, true, '审计故障后调用方事务必须继续保持 active。');
     assert.deepStrictEqual(
-      getDemoOwnershipEntityHandler('strategy_rule_hit').readProjection(db, auditFailureHit.id),
+      DEMO_OWNERSHIP_ENTITY_HANDLERS.strategy_rule_hit.readProjection(db, auditFailureHit.id),
       auditFailureProjectionBefore,
       '审计故障必须回滚命中状态、复核字段和 updated_at。'
     );
@@ -1503,8 +1549,194 @@ function testDerivedOwnershipReviewRefresh(db, ids, insertTimeseries, insertRule
     auditCountBeforeFailure
   );
 
+  // review ROLLBACK TO 失败后严禁 RELEASE，必须完整回滚并终止 caller transaction。
+  const originalReviewRecoveryExec = db.exec;
+  let reviewRollbackToFailed = false;
+  let reviewReleaseAfterRollbackFailure = false;
+  db.exec = function failReviewRollbackTo(sql, ...args) {
+    const normalizedSql = String(sql);
+    if (/^ROLLBACK TO SAVEPOINT energy_strategy_review_/i.test(normalizedSql)) {
+      reviewRollbackToFailed = true;
+      const recoveryError = new Error('forced review rollback-to failure');
+      recoveryError.code = 'TEST_REVIEW_ROLLBACK_TO_FAILED';
+      throw recoveryError;
+    }
+    if (reviewRollbackToFailed
+      && /^RELEASE SAVEPOINT energy_strategy_review_/i.test(normalizedSql)) {
+      reviewReleaseAfterRollbackFailure = true;
+    }
+    return originalReviewRecoveryExec.call(db, sql, ...args);
+  };
+  try {
+    originalReviewRecoveryExec.call(db, 'BEGIN IMMEDIATE');
+    db.prepare(
+      `INSERT INTO organization_units
+         (unit_code, unit_name, unit_path, unit_type, status)
+       VALUES ('DERIVED-REVIEW-RECOVERY-SENTINEL', '复核恢复哨兵', '/复核恢复哨兵', 'workshop', 'active')`
+    ).run();
+    const reviewRecoveryError = assertServiceErrorCode(() => updateStrategyRuleHitStatus(
+      auditFailureHit.id,
+      {
+        manualStatus: 'accepted',
+        reviewNote: 'ROLLBACK TO 失败必须完整回滚。'
+      },
+      createWriteOptions(db, {
+        auditWriter() {
+          throw new Error('injected review recovery audit failure');
+        }
+      })
+    ), 'ENERGY_STRATEGY_REVIEW_SAVEPOINT_RECOVERY_FAILED');
+    assert.strictEqual(reviewRecoveryError.details.rollbackCode, 'TEST_REVIEW_ROLLBACK_TO_FAILED');
+    assert.strictEqual(reviewRecoveryError.details.releaseCode, null);
+    assert.strictEqual(reviewRecoveryError.details.fullRollbackCode, null);
+    assert.strictEqual(reviewRollbackToFailed, true);
+    assert.strictEqual(reviewReleaseAfterRollbackFailure, false);
+    assert.strictEqual(db.inTransaction, false, 'review recovery 失败后 caller transaction 必须结束。');
+    assert.throws(
+      () => originalReviewRecoveryExec.call(db, 'COMMIT'),
+      /no transaction is active/i
+    );
+    assert.deepStrictEqual(
+      DEMO_OWNERSHIP_ENTITY_HANDLERS.strategy_rule_hit.readProjection(db, auditFailureHit.id),
+      auditFailureProjectionBefore,
+      '完整回滚后 manual_status、reviewed_at、review_note 与 updated_at 必须保持基线。'
+    );
+    assert.deepStrictEqual(
+      db.prepare('SELECT snapshot_digest AS snapshotDigest FROM demo_data_registry WHERE registry_id = ?')
+        .get(auditFailureOwnership.registryId),
+      auditFailureRegistryBefore,
+      '完整回滚后 ownership snapshot 必须保持基线。'
+    );
+    assert.strictEqual(
+      db.prepare(
+        "SELECT COUNT(*) AS total FROM sys_operation_logs WHERE operation = 'energy.strategy.hit.review'"
+      ).get().total,
+      auditCountBeforeFailure,
+      '完整回滚后 review audit 必须保持基线。'
+    );
+    assert.strictEqual(
+      db.prepare(
+        "SELECT COUNT(*) AS total FROM organization_units WHERE unit_code = 'DERIVED-REVIEW-RECOVERY-SENTINEL'"
+      ).get().total,
+      0,
+      '完整回滚必须同时撤销 caller transaction 内的哨兵写入。'
+    );
+  } finally {
+    db.exec = originalReviewRecoveryExec;
+    if (db.inTransaction) db.exec('ROLLBACK');
+  }
+
+  // 完整 ROLLBACK 仍失败时必须关闭连接，由 SQLite close 回滚全部 review 半成品。
+  const closeRecoveryProjectionBefore = DEMO_OWNERSHIP_ENTITY_HANDLERS.strategy_rule_hit
+    .readProjection(db, refreshFailureHit.id);
+  const closeRecoveryRegistryBefore = db.prepare(
+    'SELECT snapshot_digest AS snapshotDigest FROM demo_data_registry WHERE registry_id = ?'
+  ).get(refreshFailureOwnership.registryId);
+  const closeRecoveryDb = database.openDatabase();
+  const originalCloseRecoveryExec = closeRecoveryDb.exec;
+  const originalCloseRecoveryClose = closeRecoveryDb.close;
+  let closeRecoveryRollbackToFailed = false;
+  let closeRecoveryReleaseAfterFailure = false;
+  let closeRecoveryFullRollbackFailed = false;
+  let closeRecoveryConnectionClosed = false;
+  closeRecoveryDb.exec = function failReviewFullRollback(sql, ...args) {
+    const normalizedSql = String(sql);
+    if (/^ROLLBACK TO SAVEPOINT energy_strategy_review_/i.test(normalizedSql)) {
+      closeRecoveryRollbackToFailed = true;
+      const recoveryError = new Error('forced review rollback-to failure before close');
+      recoveryError.code = 'TEST_REVIEW_CLOSE_ROLLBACK_TO_FAILED';
+      throw recoveryError;
+    }
+    if (closeRecoveryRollbackToFailed
+      && /^RELEASE SAVEPOINT energy_strategy_review_/i.test(normalizedSql)) {
+      closeRecoveryReleaseAfterFailure = true;
+    }
+    if (/^ROLLBACK$/i.test(normalizedSql.trim())) {
+      closeRecoveryFullRollbackFailed = true;
+      const recoveryError = new Error('forced review full rollback failure');
+      recoveryError.code = 'TEST_REVIEW_FULL_ROLLBACK_FAILED';
+      throw recoveryError;
+    }
+    return originalCloseRecoveryExec.call(closeRecoveryDb, sql, ...args);
+  };
+  closeRecoveryDb.close = function closeReviewRecoveryConnection(...args) {
+    closeRecoveryConnectionClosed = true;
+    return originalCloseRecoveryClose.call(closeRecoveryDb, ...args);
+  };
+  try {
+    originalCloseRecoveryExec.call(closeRecoveryDb, 'BEGIN IMMEDIATE');
+    closeRecoveryDb.prepare(
+      `INSERT INTO organization_units
+         (unit_code, unit_name, unit_path, unit_type, status)
+       VALUES ('DERIVED-REVIEW-CLOSE-SENTINEL', '复核关闭哨兵', '/复核关闭哨兵', 'workshop', 'active')`
+    ).run();
+    const closeRecoveryError = assertServiceErrorCode(() => updateStrategyRuleHitStatus(
+      refreshFailureHit.id,
+      {
+        manualStatus: 'accepted',
+        reviewNote: '完整 ROLLBACK 失败必须关闭连接。'
+      },
+      createWriteOptions(closeRecoveryDb, {
+        auditWriter() {
+          throw new Error('injected review close recovery audit failure');
+        }
+      })
+    ), 'ENERGY_STRATEGY_REVIEW_SAVEPOINT_RECOVERY_FAILED');
+    assert.strictEqual(
+      closeRecoveryError.details.rollbackCode,
+      'TEST_REVIEW_CLOSE_ROLLBACK_TO_FAILED'
+    );
+    assert.strictEqual(closeRecoveryError.details.releaseCode, null);
+    assert.strictEqual(
+      closeRecoveryError.details.fullRollbackCode,
+      'TEST_REVIEW_FULL_ROLLBACK_FAILED'
+    );
+    assert.strictEqual(closeRecoveryError.details.closeCode, null);
+    assert.strictEqual(closeRecoveryRollbackToFailed, true);
+    assert.strictEqual(closeRecoveryReleaseAfterFailure, false);
+    assert.strictEqual(closeRecoveryFullRollbackFailed, true);
+    assert.strictEqual(closeRecoveryConnectionClosed, true);
+    assert.strictEqual(closeRecoveryDb.open, false, '完整回滚失败后 SQLite 连接必须关闭。');
+    assert.throws(
+      () => originalCloseRecoveryExec.call(closeRecoveryDb, 'COMMIT'),
+      /database connection is not open/i
+    );
+    assert.deepStrictEqual(
+      DEMO_OWNERSHIP_ENTITY_HANDLERS.strategy_rule_hit.readProjection(db, refreshFailureHit.id),
+      closeRecoveryProjectionBefore,
+      '关闭连接后 review 字段必须保持基线。'
+    );
+    assert.deepStrictEqual(
+      db.prepare('SELECT snapshot_digest AS snapshotDigest FROM demo_data_registry WHERE registry_id = ?')
+        .get(refreshFailureOwnership.registryId),
+      closeRecoveryRegistryBefore,
+      '关闭连接后 ownership snapshot 必须保持基线。'
+    );
+    assert.strictEqual(
+      db.prepare(
+        "SELECT COUNT(*) AS total FROM sys_operation_logs WHERE operation = 'energy.strategy.hit.review'"
+      ).get().total,
+      auditCountBeforeFailure,
+      '关闭连接后 review audit 必须保持基线。'
+    );
+    assert.strictEqual(
+      db.prepare(
+        "SELECT COUNT(*) AS total FROM organization_units WHERE unit_code = 'DERIVED-REVIEW-CLOSE-SENTINEL'"
+      ).get().total,
+      0,
+      '关闭连接必须由 SQLite 回滚 caller transaction 的哨兵写入。'
+    );
+  } finally {
+    closeRecoveryDb.exec = originalCloseRecoveryExec;
+    closeRecoveryDb.close = originalCloseRecoveryClose;
+    if (closeRecoveryDb.open) {
+      if (closeRecoveryDb.inTransaction) originalCloseRecoveryExec.call(closeRecoveryDb, 'ROLLBACK');
+      originalCloseRecoveryClose.call(closeRecoveryDb);
+    }
+  }
+
   // 注入 registry CAS 更新故障，验证 refresh 失败同样只回滚本次 review SAVEPOINT。
-  const refreshFailureProjectionBefore = getDemoOwnershipEntityHandler('strategy_rule_hit')
+  const refreshFailureProjectionBefore = DEMO_OWNERSHIP_ENTITY_HANDLERS.strategy_rule_hit
     .readProjection(db, refreshFailureHit.id);
   const refreshFailureRegistryBefore = db.prepare(
     'SELECT snapshot_digest AS snapshotDigest FROM demo_data_registry WHERE registry_id = ?'
@@ -1529,7 +1761,7 @@ function testDerivedOwnershipReviewRefresh(db, ids, insertTimeseries, insertRule
     }, createWriteOptions(db)), /injected derived registry refresh failure/);
     assert.strictEqual(db.inTransaction, true, 'refresh 故障后调用方事务必须继续保持 active。');
     assert.deepStrictEqual(
-      getDemoOwnershipEntityHandler('strategy_rule_hit').readProjection(db, refreshFailureHit.id),
+      DEMO_OWNERSHIP_ENTITY_HANDLERS.strategy_rule_hit.readProjection(db, refreshFailureHit.id),
       refreshFailureProjectionBefore,
       'refresh 故障必须回滚命中状态、复核字段和 updated_at。'
     );
@@ -1708,7 +1940,7 @@ function testServerPrivateExactScope(db, ids, insertTimeseries, insertRule) {
       snapshots: exactScope.strategyRules.expectedStrategyRuleSnapshots
     }
   ].forEach(({ entityType, entityIds, snapshots }) => {
-    const handler = getDemoOwnershipEntityHandler(entityType);
+    const handler = DEMO_OWNERSHIP_ENTITY_HANDLERS[entityType];
     entityIds.forEach((entityId) => {
       const registration = buildDemoEntityRegistrationContract({
         entityType,
@@ -2095,9 +2327,287 @@ function testServerPrivateExactScope(db, ids, insertTimeseries, insertRule) {
 }
 
 /**
+ * 验证 strategy exact scope、metadata 和 completion witness 只允许创建连接对象消费。
+ * @param {object} dbA 创建 exact capability 的 SQLite 连接。
+ * @param {object} ids 主数据 ID。
+ * @param {Function} insertTimeseries 时序写入函数。
+ * @param {Function} insertRule 规则写入函数。
+ */
+function testExactScopeDatabaseIdentity(dbA, ids, insertTimeseries, insertRule) {
+  resetScenario(dbA);
+  // 清除前序用例的策略运行审计，跨连接拒绝后的三类写入必须保持绝对零值。
+  dbA.prepare("DELETE FROM sys_operation_logs WHERE operation = 'energy.strategy.run'").run();
+  // exact 时序和策略规则分别绑定独立来源批次。
+  const timeseriesBatchId = createImportBatch(dbA, 'energy_timeseries');
+  const strategyRuleBatchId = createImportBatch(dbA, 'strategy_rule');
+  // 四条完整时序事实用于同连接 exact、legacy 和跨连接拒绝共用。
+  const timeseriesRecordIds = insertQuarterHourSeries(insertTimeseries, [10, 20, 30, 40], {
+    sourceBatchId: timeseriesBatchId,
+    sourceRowNumber: 1,
+    sourceReference: 'strategy-db-identity-timeseries'
+  });
+  // 单条规则足以验证 run、hit 和 audit 的零写入边界。
+  const strategyRuleId = insertRule({
+    sourceBatchId: strategyRuleBatchId,
+    sourceRowNumber: 1,
+    ruleCode: 'STRATEGY_DB_IDENTITY_RULE'
+  });
+  // 复合 exact scope 的外层和内嵌 load scope 都必须由 dbA 创建。
+  const exactScope = buildEnergyStrategyExactScope(dbA, {
+    timeseriesRecordIds,
+    timeseriesSourceBatchId: timeseriesBatchId,
+    strategyRuleIds: [strategyRuleId],
+    strategyRuleSourceBatchId: strategyRuleBatchId
+  });
+  assertEnergyStrategyExactScopeCapability(exactScope, dbA);
+  assertEnergyLoadExactScopeCapability(exactScope.timeseries, dbA);
+
+  // 同一连接上的 exact preview 和私有 metadata 读取必须继续成功。
+  const exactPreview = previewEnergyStrategies(createInput(ids.meterDeviceId), {
+    db: dbA,
+    exactRequired: true,
+    exactScope
+  });
+  assert.strictEqual(exactPreview.ruleSelection.selectedRuleCount, 1);
+  const exactMetadata = getEnergyStrategyExactScopeMetadata(exactPreview, { db: dbA });
+  assert.deepStrictEqual(exactMetadata.timeseries.recordIds, timeseriesRecordIds);
+  assert.deepStrictEqual(exactMetadata.strategyRules.recordIds, [strategyRuleId]);
+
+  // 同一连接上的 exact run 在 caller transaction 中成功，随后由测试回滚恢复零写入基线。
+  dbA.exec('BEGIN IMMEDIATE');
+  try {
+    const exactRun = runEnergyStrategyEvaluation(
+      createInput(ids.meterDeviceId),
+      createWriteOptions(dbA, { exactRequired: true, exactScope })
+    );
+    assert.strictEqual(exactRun.hits.length, 1);
+    assert.strictEqual(exactRun.meta.reusedCallerTransaction, true);
+    assert.deepStrictEqual(getStrategyWriteCounts(dbA), {
+      runCount: 1,
+      hitCount: 1,
+      auditCount: 1
+    });
+  } finally {
+    if (dbA.inTransaction) dbA.exec('ROLLBACK');
+  }
+  assert.deepStrictEqual(getStrategyWriteCounts(dbA), {
+    runCount: 0,
+    hitCount: 0,
+    auditCount: 0
+  });
+
+  // 普通 JSON clone 在创建连接上仍不是 capability，preview 和 run 都必须保持拒绝。
+  const clonedExactScope = JSON.parse(JSON.stringify(exactScope));
+  assertBadRequestCode(
+    () => assertEnergyStrategyExactScopeCapability(clonedExactScope, dbA),
+    'ENERGY_STRATEGY_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  assertBadRequestCode(
+    () => previewEnergyStrategies(createInput(ids.meterDeviceId), {
+      db: dbA,
+      exactScope: clonedExactScope
+    }),
+    'ENERGY_STRATEGY_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  assertBadRequestCode(
+    () => runEnergyStrategyEvaluation(
+      createInput(ids.meterDeviceId),
+      createWriteOptions(dbA, { exactScope: clonedExactScope })
+    ),
+    'ENERGY_STRATEGY_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  assert.deepStrictEqual(getStrategyWriteCounts(dbA), {
+    runCount: 0,
+    hitCount: 0,
+    auditCount: 0
+  });
+
+  // dbB 指向同一物理临时 SQLite 文件，但保持独立连接对象身份。
+  const dbB = database.openDatabase();
+  // 保存原始方法，用计数证明跨连接 exact 拒绝不触发 dbB SQL 或事务。
+  const originalPrepare = dbB.prepare;
+  const originalExec = dbB.exec;
+  const originalClose = dbB.close;
+  // dbB SQL 计数仅统计服务调用，不统计通过 dbA 完成的持久化断言。
+  let prepareCount = 0;
+  let execCount = 0;
+  dbB.prepare = function monitoredPrepare(...args) {
+    prepareCount += 1;
+    return originalPrepare.apply(dbB, args);
+  };
+  dbB.exec = function monitoredExec(...args) {
+    execCount += 1;
+    return originalExec.apply(dbB, args);
+  };
+
+  try {
+    assert.notStrictEqual(dbA, dbB, 'dbA/dbB 必须是不同 SQLite 连接对象。');
+    assert.strictEqual(
+      path.resolve(dbA.name),
+      path.resolve(dbB.name),
+      'dbA/dbB 必须指向同一物理临时 SQLite 文件。'
+    );
+
+    // legacy preview/run 不消费 exact capability，独立 dbB 连接必须继续正常工作。
+    const legacyPreview = previewEnergyStrategies(createInput(ids.meterDeviceId), { db: dbB });
+    assert.strictEqual(legacyPreview.ruleSelection.selectedRuleCount, 1);
+    dbB.exec('BEGIN IMMEDIATE');
+    try {
+      const legacyRun = runEnergyStrategyEvaluation(
+        createInput(ids.meterDeviceId),
+        createWriteOptions(dbB)
+      );
+      assert.strictEqual(legacyRun.hits.length, 1);
+      assert.strictEqual(legacyRun.meta.reusedCallerTransaction, true);
+    } finally {
+      if (dbB.inTransaction) dbB.exec('ROLLBACK');
+    }
+    assert.strictEqual(prepareCount > 0, true, 'legacy 路径必须真实读取和写入 dbB。');
+    assert.strictEqual(execCount > 0, true, 'legacy 路径必须真实管理 dbB caller transaction。');
+    prepareCount = 0;
+    execCount = 0;
+
+    // 外层 strategy capability 和内嵌 load capability 都必须按连接对象身份拒绝 dbB。
+    assertBadRequestCode(
+      () => assertEnergyStrategyExactScopeCapability(exactScope, dbB),
+      'ENERGY_STRATEGY_EXACT_SCOPE_DATABASE_MISMATCH'
+    );
+    assertBadRequestCode(
+      () => assertEnergyLoadExactScopeCapability(exactScope.timeseries, dbB),
+      'ENERGY_LOAD_EXACT_SCOPE_DATABASE_MISMATCH'
+    );
+
+    // preview 和 run 必须在 dbB 任何业务 SQL、事务或审计写入前稳定拒绝。
+    assertBadRequestCode(
+      () => previewEnergyStrategies(createInput(ids.meterDeviceId), { db: dbB, exactScope }),
+      'ENERGY_STRATEGY_EXACT_SCOPE_DATABASE_MISMATCH'
+    );
+    assertBadRequestCode(
+      () => runEnergyStrategyEvaluation(
+        createInput(ids.meterDeviceId),
+        createWriteOptions(dbB, { exactRequired: true, exactScope })
+      ),
+      'ENERGY_STRATEGY_EXACT_SCOPE_DATABASE_MISMATCH'
+    );
+
+    // exact preview metadata 只能由生成响应的 dbA 对象读取，缺失 db 同样 fail-closed。
+    assertBadRequestCode(
+      () => getEnergyStrategyExactScopeMetadata(exactPreview, { db: dbB }),
+      'ENERGY_STRATEGY_EXACT_SCOPE_DATABASE_MISMATCH'
+    );
+    assertBadRequestCode(
+      () => getEnergyStrategyExactScopeMetadata(exactPreview),
+      'ENERGY_STRATEGY_EXACT_SCOPE_DATABASE_MISMATCH'
+    );
+    assert.strictEqual(prepareCount, 0, '跨连接 exact/metadata 路径不得执行 dbB prepare。');
+    assert.strictEqual(execCount, 0, '跨连接 exact/metadata 路径不得执行 dbB exec。');
+    assert.strictEqual(dbB.inTransaction, false);
+    assert.deepStrictEqual(getStrategyWriteCounts(dbA), {
+      runCount: 0,
+      hitCount: 0,
+      auditCount: 0
+    });
+
+  } finally {
+    if (dbB.open) originalClose.call(dbB);
+    resetScenario(dbA);
+  }
+}
+
+/**
  * 验证公开纯函数的严格边界，避免配置解析宽松化。
  */
 function testPublicValidationHelpers() {
+  assert.strictEqual(typeof energyStrategyEvaluationService.consumeEnergyStrategyEvaluationCompletionWitness, 'undefined');
+  assert.strictEqual(typeof energyStrategyEvaluationService.getEnergyStrategyRegistrationRegistrarCapability, 'undefined');
+  assert.strictEqual(typeof energyStrategyEvaluationService.resolveEnergyStrategyRegistrarCapability, 'undefined');
+  assert.strictEqual(
+    typeof energyStrategyEvaluationService.consumeEnergyStrategyEvaluationWitnessForOwnership,
+    'undefined'
+  );
+  const witnessConsumerSymbol = Symbol.for('charcoal.energyStrategy.consumeWitness.v1');
+  const witnessConsumerDescriptor = Object.getOwnPropertyDescriptor(
+    energyStrategyEvaluationService,
+    witnessConsumerSymbol
+  );
+  assert.strictEqual(typeof witnessConsumerDescriptor?.value, 'function');
+  assert.strictEqual(witnessConsumerDescriptor.enumerable, false);
+  assert.strictEqual(witnessConsumerDescriptor.writable, false);
+  assert.strictEqual(witnessConsumerDescriptor.configurable, false);
+  assertBadRequestCode(
+    () => witnessConsumerDescriptor.value({}),
+    'ENERGY_STRATEGY_COMPLETION_WITNESS_INPUT_INVALID'
+  );
+  assert.strictEqual(Object.isFrozen(energyStrategyEvaluationService), true);
+  assert.strictEqual(Object.getPrototypeOf(energyStrategyEvaluationService), Object.prototype);
+  [
+    energyStrategyEvaluationService,
+    demoOwnershipService,
+    strategyOwnershipProtocol,
+    strategyOwnershipProtocol.energyStrategyEvaluatorProtocol,
+    strategyOwnershipProtocol.energyStrategyOwnershipProtocol
+  ].forEach((exportsObject) => {
+    Object.entries(Object.getOwnPropertyDescriptors(exportsObject)).forEach(([fieldName, descriptor]) => {
+      assert.strictEqual(descriptor.writable, false, `${fieldName} writable 必须为 false`);
+      assert.strictEqual(descriptor.configurable, false, `${fieldName} configurable 必须为 false`);
+      assert.strictEqual(descriptor.enumerable, true, `${fieldName} enumerable 必须为 true`);
+    });
+  });
+
+  // evaluator 先加载后整体替换两侧 require.cache.exports，固定协议仍必须调用初始化期真实闭包。
+  const evaluatorModulePath = require.resolve('../services/energyStrategyEvaluationService');
+  const ownershipModulePath = require.resolve('../services/demoOwnershipService');
+  const protocolModulePath = require.resolve('../services/energyStrategyOwnershipProtocol');
+  [evaluatorModulePath, ownershipModulePath, protocolModulePath].forEach((modulePath) => {
+    const descriptor = Object.getOwnPropertyDescriptor(require.cache[modulePath], 'exports');
+    assert.strictEqual(descriptor.writable, false);
+    assert.strictEqual(descriptor.configurable, false);
+    assert.strictEqual(descriptor.enumerable, true);
+  });
+  const originalEvaluatorExports = require.cache[evaluatorModulePath].exports;
+  const originalOwnershipExports = require.cache[ownershipModulePath].exports;
+  const originalProtocolExports = require.cache[protocolModulePath].exports;
+  let attackerProtocolExecuted = false;
+  const attackerProtocolCall = () => {
+    attackerProtocolExecuted = true;
+    return { success: true, fake: true };
+  };
+  const attackerEvaluatorExports = Object.freeze({
+    ...originalEvaluatorExports,
+    assertEnergyStrategyExactScopeCapability: attackerProtocolCall,
+    bindEnergyStrategyRegistrationScopeCapability: attackerProtocolCall
+  });
+  const attackerOwnershipExports = Object.freeze({
+    ...originalOwnershipExports,
+    activateStrategyEvaluationRegistrationScopeInTransaction: attackerProtocolCall,
+    abortStrategyEvaluationRegistrationScopeInTransaction: attackerProtocolCall,
+    registerDerivedStrategyEvaluationInTransaction: attackerProtocolCall,
+    verifyDerivedStrategyEvaluationReceiptInTransaction: attackerProtocolCall
+  });
+  const attackerProtocolExports = Object.freeze({
+    ...originalProtocolExports,
+    energyStrategyEvaluatorProtocol: { assertExactScope: attackerProtocolCall },
+    energyStrategyOwnershipProtocol: { verifyReceipt: attackerProtocolCall }
+  });
+  assert.strictEqual(Reflect.set(require.cache[evaluatorModulePath], 'exports', attackerEvaluatorExports), false);
+  assert.strictEqual(Reflect.set(require.cache[ownershipModulePath], 'exports', attackerOwnershipExports), false);
+  assert.strictEqual(Reflect.set(require.cache[protocolModulePath], 'exports', attackerProtocolExports), false);
+  assert.strictEqual(require.cache[evaluatorModulePath].exports, originalEvaluatorExports);
+  assert.strictEqual(require.cache[ownershipModulePath].exports, originalOwnershipExports);
+  assert.strictEqual(require.cache[protocolModulePath].exports, originalProtocolExports);
+  assertBadRequestCode(
+    () => strategyOwnershipProtocol.energyStrategyEvaluatorProtocol.assertExactScope(
+      Object.freeze({}),
+      Object.freeze({})
+    ),
+    'ENERGY_STRATEGY_EXACT_SCOPE_CAPABILITY_REQUIRED'
+  );
+  assert.throws(
+    () => strategyOwnershipProtocol.energyStrategyOwnershipProtocol.verifyReceipt({}),
+    (error) => (error.details?.code || error.code)
+      === 'DEMO_DERIVED_STRATEGY_RECEIPT_INPUT_INVALID'
+  );
+  assert.strictEqual(attackerProtocolExecuted, false);
   assert.deepStrictEqual(normalizeRuleCodes(undefined), []);
   assert.deepStrictEqual(normalizeRuleCodes([]), []);
   assert.deepStrictEqual(normalizeRuleCodes([' A ', 'A', 'B']), ['A', 'B']);
@@ -2155,6 +2665,7 @@ try {
   testNonFiniteEvaluationDigestEncoding(db, ids, insertTimeseries, insertRule);
   testAutomationAndSavingGates(db, ids, insertTimeseries, insertRule);
   testServerPrivateExactScope(db, ids, insertTimeseries, insertRule);
+  testExactScopeDatabaseIdentity(db, ids, insertTimeseries, insertRule);
   testConsistentReadSnapshot(db, ids, insertTimeseries, insertRule);
   testInjectionAndDatabaseOwnership(db, ids, insertTimeseries, insertRule);
   testPersistentEvaluationAndManualStatus(db, ids, insertTimeseries, insertRule);

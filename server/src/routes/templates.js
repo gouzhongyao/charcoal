@@ -175,6 +175,32 @@ function requireDemoParkArtifactPermission(req, res, next) {
   });
 }
 
+/** 将新旧 run service DTO 统一投影为安全的下载换代响应合同。 */
+function projectDemoRunTurnover(run = {}) {
+  const defaultTurnover = {
+    performed: false,
+    previousRun: null
+  };
+  const turnover = run?.turnover;
+  if (!turnover || typeof turnover !== 'object' || Array.isArray(turnover)) {
+    return defaultTurnover;
+  }
+
+  const performed = turnover.performed === true;
+  const previousRunId = turnover.previousRun?.runId;
+  const previousRunIdValid = typeof previousRunId === 'string'
+    && previousRunId.length > 0
+    && previousRunId.length <= 255
+    && previousRunId.trim() === previousRunId
+    && !/[\x00-\x1f\x7f]/.test(previousRunId);
+  return {
+    performed,
+    previousRun: performed && previousRunIdValid
+      ? { runId: previousRunId }
+      : null
+  };
+}
+
 /** 设置天坤集团示例文件的公共下载响应头，不包含任何运行期或 context 状态。 */
 function setDemoParkArtifactFileHeaders(res, result) {
   res.setHeader('Content-Type', result.mimeType);
@@ -188,8 +214,13 @@ function prepareManagedDemoArtifactDownload(req, result) {
   const db = openDatabase();
   try {
     return db.transaction(() => {
-      const runtime = assertDemoRuntimeEnabled({ db });
-      const run = getOrCreateActiveDemoDatasetRun({ actorUserId: req.user.id, actorIp: req.ip, db });
+      const run = getOrCreateActiveDemoDatasetRun({
+        actorUserId: req.user.id,
+        actorIp: req.ip,
+        trigger: 'managed-artifact-download',
+        artifactKey: result.artifact.artifactKey,
+        db
+      });
       const context = createDemoContext({
         userId: req.user.id,
         runId: run.runId,
@@ -198,7 +229,7 @@ function prepareManagedDemoArtifactDownload(req, result) {
         artifactFileSha256: sha256Buffer(result.buffer),
         db
       });
-      return { runtime, run, context };
+      return { run, context };
     }).immediate();
   } finally {
     db.close();
@@ -222,13 +253,15 @@ function sendDemoParkArtifact(req, res, next, format) {
     return;
   }
 
-  let context;
+  let managedDownload;
   try {
-    ({ context } = prepareManagedDemoArtifactDownload(req, result));
+    managedDownload = prepareManagedDemoArtifactDownload(req, result);
   } catch (error) {
     next(error);
     return;
   }
+  const { run, context } = managedDownload;
+  const turnover = projectDemoRunTurnover(run);
   let responseCompleted = false;
   const revokeIfSendFailed = () => {
     if (responseCompleted || res.writableFinished) return;
@@ -246,6 +279,12 @@ function sendDemoParkArtifact(req, res, next, format) {
     setDemoParkArtifactFileHeaders(res, result);
     res.setHeader('X-Demo-Dataset-Id', context.datasetId);
     res.setHeader('X-Demo-Run-Id', context.runId);
+    res.setHeader('X-Demo-Run-Reused', String(run.reused));
+    res.setHeader('X-Demo-Run-Auto-Superseded', String(turnover.performed));
+    if (turnover.performed && turnover.previousRun) {
+      res.setHeader('X-Demo-Run-Superseded-From', turnover.previousRun.runId);
+    }
+    res.setHeader('X-Demo-Runtime-Epoch', String(run.runtimeEpoch));
     res.setHeader('X-Demo-Artifact-Key', context.artifactKey);
     res.setHeader('X-Demo-Handler-Key', context.handlerKey);
     res.setHeader('X-Demo-Manifest-Version', context.manifestVersion);
@@ -371,3 +410,4 @@ router.get('/:templateType.csv', (req, res, next) => {
 });
 
 module.exports = router;
+module.exports.projectDemoRunTurnover = projectDemoRunTurnover;

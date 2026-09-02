@@ -3,7 +3,7 @@
 const express = require('express');
 const { openDatabase } = require('../db/database');
 const { authenticate } = require('../middleware/auth');
-const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
+const { demoContextPreflight } = require('../middleware/demoContext');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { requireWritable } = require('../middleware/maintenance');
 const { requirePermission } = require('../middleware/permission');
@@ -64,6 +64,17 @@ function getActor(req) {
   return { userId: req.user?.id || null, ip: req.ip || null };
 }
 
+/** 构造只含路由固定身份的 managed demo context 服务参数。 */
+function getCarbonActivityDemoContext(req) {
+  if (!req.demoContext) return null;
+  return {
+    token: req.demoContext.token,
+    userId: req.user.id,
+    artifactKey: req.demoContext.artifactKey,
+    handlerKey: req.demoContext.handlerKey
+  };
+}
+
 /** 生成 UTF-8 和稳定 ASCII 下载文件名。 */
 function buildContentDisposition(fileName, asciiFileName) {
   return `attachment; filename="${asciiFileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
@@ -107,7 +118,10 @@ function carbonActivityPreviewHandler(req, res, next) {
       return;
     }
     Promise.resolve()
-      .then(() => previewCarbonActivityImport(req.file, { actor: getActor(req) }))
+      .then(() => previewCarbonActivityImport(req.file, {
+        actor: getActor(req),
+        demoContext: getCarbonActivityDemoContext(req)
+      }))
       .then((preview) => sendSuccess(res, preview))
       .catch((error) => {
         cleanupUnreferencedCarbonActivityFile(req.file);
@@ -173,7 +187,12 @@ router.post(
   authenticate,
   requirePermission(CARBON_ACTIVITY_PERMISSIONS.importPreview),
   requireWritable('carbon-activities:import-preview'),
-  rejectUnconnectedDemoContext,
+  demoContextPreflight({
+    artifactKey: '27-carbon-activities',
+    handlerKey: 'carbon-activity-import',
+    phase: 'preview',
+    allowFormal: true
+  }),
   carbonActivityPreviewHandler
 );
 
@@ -182,11 +201,19 @@ router.post(
   authenticate,
   requirePermission(CARBON_ACTIVITY_PERMISSIONS.importExecute),
   requireWritable('carbon-activities:import-execute'),
-  rejectUnconnectedDemoContext,
+  demoContextPreflight({
+    artifactKey: '27-carbon-activities',
+    handlerKey: 'carbon-activity-import',
+    phase: 'execute',
+    allowFormal: true
+  }),
   parseCarbonActivityJsonBody,
   asyncHandler(async (req, res) => {
     const body = normalizeCarbonActivityExecuteBody(req.body || {});
-    const result = await executeCarbonActivityImport(body, { actor: getActor(req) });
+    const result = await executeCarbonActivityImport(body, {
+      actor: getActor(req),
+      demoContext: getCarbonActivityDemoContext(req)
+    });
     sendSuccess(res, result);
   })
 );

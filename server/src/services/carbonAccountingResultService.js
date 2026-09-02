@@ -1,6 +1,7 @@
 'use strict';
 
 const XLSX = require('xlsx');
+const { AsyncLocalStorage } = require('async_hooks');
 const { openDatabase } = require('../db/database');
 const { AppError, badRequest, notFound } = require('../utils/errors');
 const {
@@ -8,13 +9,27 @@ const {
   formatWallClockMinuteForUser
 } = require('../utils/userVisibleDateTime');
 const { escapeSpreadsheetFormula } = require('./carbonActivityService');
+const carbonCalculationRunService = require('./carbonCalculationRunService');
 const {
   assertCarbonAccountingQueryContract,
   hasOwnQueryField,
-  invokeCarbonAccountingFaultInjectorForTest,
   normalizeCarbonAccountingServiceError,
   normalizeCarbonAccountingUtc
-} = require('./carbonCalculationRunService');
+} = carbonCalculationRunService;
+
+// 查询故障作用域独立保存在本模块私有闭包中，正常 consumer 无法取得或安装 hook。
+const CARBON_ACCOUNTING_RESULT_FAULT_SCOPE = new AsyncLocalStorage();
+
+/** 在当前查询异步作用域触发固定阶段，只向 hook 提供冻结阶段和空安全摘要。 */
+function invokeCarbonAccountingFaultStage(stage) {
+  const faultInjector = CARBON_ACCOUNTING_RESULT_FAULT_SCOPE.getStore();
+  if (typeof faultInjector === 'function') {
+    faultInjector(Object.freeze({
+      stage: String(stage),
+      summary: Object.freeze({})
+    }));
+  }
+}
 
 // 新核算查询只接受三个显式来源投影，默认来源在服务边界固定为独立活动。
 const CARBON_ACCOUNTING_RESULT_SOURCE_TYPES = Object.freeze([
@@ -594,7 +609,7 @@ function listCarbonAccountingResults(query = {}) {
     const pagination = normalizeResultPagination(query);
     const db = openDatabase();
     try {
-      invokeCarbonAccountingFaultInjectorForTest('list-results', { db });
+      invokeCarbonAccountingFaultStage('list-results');
       if (filters.sourceType === 'independent_activity') {
         return listIndependentResultFacet(db, filters, pagination);
       }
@@ -714,7 +729,7 @@ function getCarbonAccountingStatistics(query = {}) {
     const filters = normalizeAccountingResultFilters(query);
     const db = openDatabase();
     try {
-      invokeCarbonAccountingFaultInjectorForTest('statistics', { db });
+      invokeCarbonAccountingFaultStage('statistics');
       if (filters.sourceType === 'independent_activity') return buildIndependentStatisticsFacet(db, filters);
       if (filters.sourceType === 'energy_record') return buildEnergyStatisticsFacet(db, filters);
       return {
@@ -842,7 +857,7 @@ function exportCarbonAccountingResults(query = {}) {
     }
     const db = openDatabase();
     try {
-      invokeCarbonAccountingFaultInjectorForTest('export', { db });
+      invokeCarbonAccountingFaultStage('export');
       const facets = [];
       if (filters.sourceType !== 'energy_record') facets.push(selectIndependentExportRows(db, filters));
       if (filters.sourceType !== 'independent_activity') facets.push(selectEnergyExportRows(db, filters));

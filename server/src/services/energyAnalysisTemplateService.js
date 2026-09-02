@@ -85,6 +85,12 @@ const NUMBER_COLUMN_KEYS = new Set([
   'y'
 ]);
 
+// UTC 单元格只允许投影日期时间工具定义的稳定错误码，避免透传任意异常内容。
+const PROJECTABLE_UTC_CELL_ERROR_CODES = new Set([
+  'STRICT_UTC_INPUT_INVALID',
+  'STRICT_UTC_INPUT_PRECISION_INVALID'
+]);
+
 /**
  * 根据内部字段键推导最小数据类型。
  * @param {string} key 内部 camelCase 键。
@@ -920,7 +926,7 @@ function excelSerialToIso(serial) {
  * 按列 dataType 规范化 XLSX 单元格。
  * @param {*} value 原始单元格值。
  * @param {object} column 列定义。
- * @returns {{ value: *, valid: boolean }} 规范化结果。
+ * @returns {{ value: *, valid: boolean, issueCode?: string, issueMessage?: string }} 规范化结果。
  */
 function normalizeWorkbookCellValue(value, column) {
   if (isBlankCell(value)) {
@@ -947,8 +953,15 @@ function normalizeWorkbookCellValue(value, column) {
   }
   try {
     return { value: normalizeUserVisibleStrictUtcInput(rawValue), valid: true };
-  } catch (_error) {
-    return { value: null, valid: false };
+  } catch (error) {
+    // 只投影受信任的 UTC 格式错误，其他异常继续收敛为通用单元格类型错误。
+    const issueCode = PROJECTABLE_UTC_CELL_ERROR_CODES.has(error?.code)
+      ? error.code
+      : 'INVALID_TEMPLATE_CELL_TYPE';
+    const issueMessage = PROJECTABLE_UTC_CELL_ERROR_CODES.has(error?.code)
+      ? error.message
+      : null;
+    return { value: null, valid: false, issueCode, issueMessage };
   }
 }
 
@@ -987,7 +1000,7 @@ function resolveTemplateCells(templateId, cells, headerValidation, options = {})
 
     if (!normalizedCell.valid) {
       issues.push({
-        code: 'INVALID_TEMPLATE_CELL_TYPE',
+        code: normalizedCell.issueCode || 'INVALID_TEMPLATE_CELL_TYPE',
         severity: 'error',
         blocking: true,
         sheetName: headerValidation.sheetName,
@@ -996,7 +1009,7 @@ function resolveTemplateCells(templateId, cells, headerValidation, options = {})
         header: rawHeader,
         key: column.key,
         dataType: column.dataType,
-        message: `字段“${column.name}”不能按 ${column.dataType} 类型解析。`
+        message: normalizedCell.issueMessage || `字段“${column.name}”不能按 ${column.dataType} 类型解析。`
       });
       return;
     }

@@ -8,12 +8,27 @@ const {
   DEMO_MANIFEST_VERSION,
   getDemoParkManifestDigest
 } = require('./demoParkDatasetService');
-const { readCanonicalDemoRuntime } = require('./demoRuntimeService');
+const {
+  advanceDemoRuntimeForManifestTurnover,
+  readCanonicalDemoRuntime
+} = require('./demoRuntimeService');
 
-// 数据集 active 身份覆盖后续 cleanup 中间态，避免并行创建相同 Dataset run。
-const ACTIVE_RUN_STATUSES = Object.freeze(['active', 'completed', 'cleanup_pending', 'cleaning']);
-// 只读历史汇总允许读取已结束 run；未知状态仍不得被解释为可读或可执行。
-const READABLE_DEMO_RUN_STATUSES = Object.freeze([...ACTIVE_RUN_STATUSES, 'cleaned', 'failed']);
+// active identity 覆盖 cleanup 执行中状态，用于唯一身份读取和并发占位。
+const ACTIVE_IDENTITY_RUN_STATUSES = Object.freeze(['active', 'completed', 'cleanup_pending', 'cleaning']);
+// 通用业务写入口只接受尚未进入实际 cleanup 执行的生命周期。
+const BUSINESS_WRITE_ELIGIBLE_RUN_STATUSES = Object.freeze(['active', 'completed', 'cleanup_pending']);
+// manifest 自动换代与普通业务写共享同一未 cleaning 状态边界。
+const TURNOVER_ELIGIBLE_RUN_STATUSES = BUSINESS_WRITE_ELIGIBLE_RUN_STATUSES;
+// 只读历史汇总允许读取已结束和已换代 run；未知状态仍不得被解释为可读或可执行。
+const READABLE_DEMO_RUN_STATUSES = Object.freeze([
+  ...ACTIVE_IDENTITY_RUN_STATUSES,
+  'cleaned',
+  'failed',
+  'superseded'
+]);
+// manifest 自动换代的稳定业务原因和失效原因必须保持一致。
+const MANIFEST_TURNOVER_REASON = 'manifest_identity_changed';
+const MANIFEST_SUPERSEDE_REASON = 'manifest_run_superseded';
 
 /** 严格校验正整数用户主键。 */
 function validateRunActorUserId(userId) {
@@ -21,6 +36,25 @@ function validateRunActorUserId(userId) {
     throw badRequest('演示 run 用户主键无效。', { code: 'INVALID_DEMO_RUN_USER_ID' });
   }
   return userId;
+}
+
+/** 校验并返回稳定换代触发入口。 */
+function normalizeRunTrigger(trigger) {
+  const normalizedTrigger = String(trigger || 'service-run-prepare').trim();
+  if (!normalizedTrigger || normalizedTrigger.length > 128) {
+    throw badRequest('演示 run 换代触发入口无效。', { code: 'INVALID_DEMO_RUN_TRIGGER' });
+  }
+  return normalizedTrigger;
+}
+
+/** 校验可选 managed artifact 标识，不允许审计载荷携带任意大字符串。 */
+function normalizeOptionalArtifactKey(artifactKey) {
+  if (artifactKey === undefined || artifactKey === null || artifactKey === '') return null;
+  const normalizedArtifactKey = String(artifactKey).trim();
+  if (!normalizedArtifactKey || normalizedArtifactKey.length > 128) {
+    throw badRequest('演示 artifactKey 无效。', { code: 'INVALID_DEMO_RUN_ARTIFACT_KEY' });
+  }
+  return normalizedArtifactKey;
 }
 
 /** 系统开关属于业务安全边界，即使超级管理员也不能绕过。 */
@@ -45,15 +79,28 @@ function mapDemoDatasetRun(row) {
     manifestDigest: row.manifestDigest,
     status: row.status,
     createdBy: row.createdBy,
-    createdAt: row.createdAt
+    createdAt: row.createdAt,
+    supersededAt: row.supersededAt || null,
+    successorRunId: row.successorRunId || null,
+    supersededBy: row.supersededBy || null,
+    supersedeReason: row.supersedeReason || null,
+    supersedeTrigger: row.supersedeTrigger || null
   };
+}
+
+/** 生成 run 查询共用字段，避免 active 与历史投影发生字段漂移。 */
+function getDemoRunSelectSql() {
+  return `run_id AS runId, dataset_id AS datasetId,
+    manifest_version AS manifestVersion, manifest_digest AS manifestDigest,
+    status, created_by AS createdBy, created_at AS createdAt,
+    superseded_at AS supersededAt, successor_run_id AS successorRunId,
+    superseded_by AS supersededBy, supersede_reason AS supersedeReason,
+    supersede_trigger AS supersedeTrigger`;
 }
 
 /** 从指定连接读取当前 Dataset active run。 */
 function readActiveDemoDatasetRun(db) {
-  return mapDemoDatasetRun(db.prepare(`SELECT run_id AS runId, dataset_id AS datasetId,
-      manifest_version AS manifestVersion, manifest_digest AS manifestDigest,
-      status, created_by AS createdBy, created_at AS createdAt
+  return mapDemoDatasetRun(db.prepare(`SELECT ${getDemoRunSelectSql()}
     FROM demo_dataset_runs
     WHERE dataset_id = ? AND status IN ('active', 'completed', 'cleanup_pending', 'cleaning')
     ORDER BY created_at DESC LIMIT 1`).get(DEMO_DATASET_ID));
@@ -63,9 +110,7 @@ function readActiveDemoDatasetRun(db) {
 function readDemoDatasetRunRow(db, runId) {
   const normalizedRunId = String(runId || '').trim();
   if (!normalizedRunId) return null;
-  return mapDemoDatasetRun(db.prepare(`SELECT run_id AS runId, dataset_id AS datasetId,
-      manifest_version AS manifestVersion, manifest_digest AS manifestDigest,
-      status, created_by AS createdBy, created_at AS createdAt
+  return mapDemoDatasetRun(db.prepare(`SELECT ${getDemoRunSelectSql()}
     FROM demo_dataset_runs WHERE run_id = ?`).get(normalizedRunId));
 }
 
@@ -77,6 +122,8 @@ function getDemoDatasetRunReadCompatibility(run) {
       readable: false,
       readOnly: true,
       writeEligible: false,
+      turnoverEligible: false,
+      retryable: false,
       state: 'missing',
       code: 'DEMO_RUN_NOT_FOUND',
       manifestCompatible: false,
@@ -93,8 +140,12 @@ function getDemoDatasetRunReadCompatibility(run) {
   const manifestCompatible = datasetCompatible
     && run.manifestVersion === DEMO_MANIFEST_VERSION
     && run.manifestDigest === expectedManifestDigest;
-  const active = ACTIVE_RUN_STATUSES.includes(run.status);
-  const historical = ['cleaned', 'failed'].includes(run.status);
+  const active = ACTIVE_IDENTITY_RUN_STATUSES.includes(run.status);
+  const businessWriteEligible = BUSINESS_WRITE_ELIGIBLE_RUN_STATUSES.includes(run.status);
+  const historical = ['cleaned', 'failed', 'superseded'].includes(run.status);
+  const turnoverEligible = datasetCompatible && !manifestCompatible
+    && TURNOVER_ELIGIBLE_RUN_STATUSES.includes(run.status);
+  const retryable = datasetCompatible && run.status === 'cleaning';
   let state = 'readable';
   let code = 'DEMO_RUN_READABLE';
   if (!datasetCompatible) {
@@ -103,9 +154,15 @@ function getDemoDatasetRunReadCompatibility(run) {
   } else if (!statusReadable) {
     state = 'unknown-status';
     code = 'DEMO_RUN_STATUS_UNREADABLE';
-  } else if (!manifestCompatible && active) {
-    state = 'manifest-conflict';
-    code = 'DEMO_RUN_MANIFEST_CONFLICT_READ_ONLY';
+  } else if (run.status === 'superseded') {
+    state = 'historical-superseded';
+    code = 'DEMO_RUN_HISTORICAL_SUPERSEDED';
+  } else if (run.status === 'cleaning') {
+    state = 'cleanup-in-progress-blocked';
+    code = 'DEMO_RUN_CLEANUP_IN_PROGRESS';
+  } else if (!manifestCompatible && TURNOVER_ELIGIBLE_RUN_STATUSES.includes(run.status)) {
+    state = 'manifest-turnover-pending';
+    code = 'DEMO_RUN_MANIFEST_TURNOVER_PENDING';
   } else if (!manifestCompatible && historical) {
     state = 'historical-manifest-conflict';
     code = 'DEMO_RUN_HISTORICAL_MANIFEST_CONFLICT';
@@ -119,7 +176,9 @@ function getDemoDatasetRunReadCompatibility(run) {
   return {
     readable: datasetCompatible && statusReadable,
     readOnly: true,
-    writeEligible: datasetCompatible && statusReadable && active && manifestCompatible,
+    writeEligible: datasetCompatible && statusReadable && businessWriteEligible && manifestCompatible,
+    turnoverEligible,
+    retryable,
     state,
     code,
     manifestCompatible,
@@ -147,7 +206,7 @@ function readActiveDemoDatasetRunProjection(options = {}) {
   }
 }
 
-/** 返回指定 run 的无副作用投影，供历史/manifest 冲突只读查询使用。 */
+/** 返回指定 run 的无副作用投影，供历史和待换代 run 只读查询使用。 */
 function readDemoDatasetRunProjection(options = {}) {
   const ownedDb = !options.db;
   const db = options.db || openDatabase();
@@ -164,33 +223,206 @@ function readDemoDatasetRunProjection(options = {}) {
 
 /** 读取固定 Dataset 中不属于已知状态集合的异常 run，异常状态必须阻断创建。 */
 function readUnknownDemoDatasetRun(db) {
-  const knownStatuses = [...ACTIVE_RUN_STATUSES, 'cleaned', 'failed'];
+  const knownStatuses = [...READABLE_DEMO_RUN_STATUSES];
   const placeholders = knownStatuses.map(() => '?').join(', ');
-  return mapDemoDatasetRun(db.prepare(`SELECT run_id AS runId, dataset_id AS datasetId,
-      manifest_version AS manifestVersion, manifest_digest AS manifestDigest,
-      status, created_by AS createdBy, created_at AS createdAt
+  return mapDemoDatasetRun(db.prepare(`SELECT ${getDemoRunSelectSql()}
     FROM demo_dataset_runs
     WHERE dataset_id = ? AND (status IS NULL OR status NOT IN (${placeholders}))
     ORDER BY created_at DESC LIMIT 1`).get(DEMO_DATASET_ID, ...knownStatuses));
 }
 
-/** 构造 manifest 冲突错误，统一保留旧 run 身份和 fail-closed 细节。 */
-function createManifestConflictError(current, extraDetails = {}) {
-  return new AppError('DEMO_ACTIVE_RUN_MANIFEST_CONFLICT', '现有演示 run 与当前 manifest 不一致，必须保留并人工处置。', {
+/** 构造未知生命周期错误，禁止误归类为普通 manifest 漂移。 */
+function createUnsupportedRunStateError(run) {
+  return new AppError('DEMO_RUN_STATE_UNSUPPORTED', '演示 run 处于服务端不支持的生命周期状态。', {
     statusCode: 409,
     details: {
-      runId: current.runId,
-      datasetId: current.datasetId,
-      expectedManifestVersion: DEMO_MANIFEST_VERSION,
-      actualManifestVersion: current.manifestVersion,
-      ...extraDetails
+      runId: run.runId,
+      status: run.status,
+      retryable: false
     }
   });
 }
 
-/** 创建或复用固定 Dataset 的 active run，并拒绝相同 Dataset 身份下 manifest 漂移。 */
+/** 构造清理执行中错误，调用方可在清理事务完成后稳定重试。 */
+function createCleanupInProgressError(run) {
+  return new AppError('DEMO_RUN_CLEANUP_IN_PROGRESS', '演示 run 正在执行清理，请稍后重试。', {
+    statusCode: 409,
+    details: {
+      runId: run.runId,
+      status: run.status,
+      retryable: true
+    }
+  });
+}
+
+/** 将 runtime canonical 行映射为固定 generation 快照。 */
+function mapRuntimeGeneration(runtime) {
+  return {
+    enabled: runtime.enabled === 1 || runtime.enabled === true,
+    runtimeEpoch: runtime.runtimeEpoch,
+    revision: runtime.revision
+  };
+}
+
+/** 将 run 投影为 turnover 中不含无关字段的稳定身份快照。 */
+function mapTurnoverRun(run) {
+  if (!run) return null;
+  return {
+    runId: run.runId,
+    status: run.status,
+    manifestVersion: run.manifestVersion,
+    manifestDigest: run.manifestDigest
+  };
+}
+
+/** 生成未发生换代时的统一 metadata。 */
+function buildNoTurnover(trigger) {
+  return {
+    performed: false,
+    reason: null,
+    trigger,
+    previousRun: null,
+    successorRun: null,
+    revokedContextCount: 0,
+    supersededCleanupPreviewCount: 0,
+    runtimeBefore: null,
+    runtimeAfter: null
+  };
+}
+
+/** 将 current run 与 runtime 组合为 POST 和 managed 下载共享的稳定返回合同。 */
+function buildCurrentRunResult(run, runtime, reused, turnover) {
+  return {
+    runId: run.runId,
+    datasetId: run.datasetId,
+    manifestVersion: run.manifestVersion,
+    manifestDigest: run.manifestDigest,
+    status: run.status,
+    createdBy: run.createdBy,
+    createdAt: run.createdAt,
+    reused,
+    runtimeEpoch: runtime.runtimeEpoch,
+    runtimeRevision: runtime.revision,
+    turnover
+  };
+}
+
+/** 写入首次创建审计，detail 仅包含治理身份，不包含 token 或文件内容。 */
+function writeDemoRunCreateAudit(db, input) {
+  db.prepare(`INSERT INTO sys_operation_logs
+    (user_id, operation, target_type, target_id, detail_json, ip, created_at)
+    VALUES (?, 'system.demo.run.create', 'demo_dataset_runs', ?, ?, ?, ?)`).run(
+    input.actorUserId,
+    input.run.runId,
+    JSON.stringify({
+      runId: input.run.runId,
+      datasetId: input.run.datasetId,
+      manifestVersion: input.run.manifestVersion,
+      manifestDigest: input.run.manifestDigest,
+      trigger: input.trigger,
+      artifactKey: input.artifactKey,
+      runtime: mapRuntimeGeneration(input.runtime)
+    }),
+    input.actorIp,
+    input.createdAt
+  );
+}
+
+/** 在同一事务内完成旧 run 失效、runtime 提升、successor 创建和审计。 */
+function supersedeDemoDatasetRun(db, input) {
+  const successorRunId = `demo-run-${crypto.randomUUID()}`;
+  const supersededAt = new Date().toISOString();
+  const cleanupResult = db.prepare(`UPDATE demo_cleanup_runs
+    SET status = 'superseded', completed_at = ?, failure_reason = ?
+    WHERE run_id = ? AND status = 'previewed'`).run(
+    supersededAt,
+    MANIFEST_SUPERSEDE_REASON,
+    input.current.runId
+  );
+  const contextResult = db.prepare(`UPDATE demo_import_contexts
+    SET status = 'revoked', revoked_at = ?, revoke_reason = ?
+    WHERE run_id = ? AND status IN ('issued', 'previewed')`).run(
+    supersededAt,
+    MANIFEST_SUPERSEDE_REASON,
+    input.current.runId
+  );
+  const runtimeChange = advanceDemoRuntimeForManifestTurnover({
+    db,
+    actorUserId: input.actorUserId,
+    actorIp: input.actorIp,
+    previousRunId: input.current.runId,
+    successorRunId
+  });
+  const supersedeResult = db.prepare(`UPDATE demo_dataset_runs
+    SET status = 'superseded', superseded_at = ?, successor_run_id = ?, superseded_by = ?,
+      supersede_reason = ?, supersede_trigger = ?
+    WHERE run_id = ? AND status = ?`).run(
+    supersededAt,
+    successorRunId,
+    input.actorUserId,
+    MANIFEST_SUPERSEDE_REASON,
+    input.trigger,
+    input.current.runId,
+    input.current.status
+  );
+  if (supersedeResult.changes !== 1) {
+    throw new Error('旧演示 run 在换代事务内发生并发状态漂移。');
+  }
+  db.prepare(`INSERT INTO demo_dataset_runs
+    (run_id, dataset_id, manifest_version, manifest_digest, status, created_by, created_at)
+    VALUES (?, ?, ?, ?, 'active', ?, ?)`).run(
+    successorRunId,
+    DEMO_DATASET_ID,
+    DEMO_MANIFEST_VERSION,
+    input.expectedDigest,
+    input.actorUserId,
+    supersededAt
+  );
+  const successor = readActiveDemoDatasetRun(db);
+  const turnover = {
+    performed: true,
+    reason: MANIFEST_TURNOVER_REASON,
+    trigger: input.trigger,
+    previousRun: mapTurnoverRun(input.current),
+    successorRun: mapTurnoverRun(successor),
+    revokedContextCount: contextResult.changes,
+    supersededCleanupPreviewCount: cleanupResult.changes,
+    runtimeBefore: runtimeChange.before,
+    runtimeAfter: runtimeChange.after
+  };
+  db.prepare(`INSERT INTO sys_operation_logs
+    (user_id, operation, target_type, target_id, detail_json, ip, created_at)
+    VALUES (?, 'system.demo.run.auto-supersede', 'demo_dataset_runs', ?, ?, ?, ?)`).run(
+    input.actorUserId,
+    input.current.runId,
+    JSON.stringify({
+      oldRunId: input.current.runId,
+      newRunId: successor.runId,
+      datasetId: DEMO_DATASET_ID,
+      oldStatus: input.current.status,
+      oldManifestVersion: input.current.manifestVersion,
+      oldManifestDigest: input.current.manifestDigest,
+      newManifestVersion: successor.manifestVersion,
+      newManifestDigest: successor.manifestDigest,
+      trigger: input.trigger,
+      artifactKey: input.artifactKey,
+      revokedContextCount: contextResult.changes,
+      supersededCleanupPreviewCount: cleanupResult.changes,
+      runtimeBefore: runtimeChange.before,
+      runtimeAfter: runtimeChange.after
+    }),
+    input.actorIp,
+    supersededAt
+  );
+  return buildCurrentRunResult(successor, runtimeChange.after, false, turnover);
+}
+
+/** 创建、复用或原子换代固定 Dataset 的 active run。 */
 function getOrCreateActiveDemoDatasetRun(input = {}) {
   const actorUserId = validateRunActorUserId(input.actorUserId);
+  const actorIp = input.actorIp ? String(input.actorIp) : null;
+  const trigger = normalizeRunTrigger(input.trigger);
+  const artifactKey = normalizeOptionalArtifactKey(input.artifactKey);
   const ownedDb = !input.db;
   const db = input.db || openDatabase();
   try {
@@ -203,21 +435,26 @@ function getOrCreateActiveDemoDatasetRun(input = {}) {
     const execute = db.transaction(() => {
       const runtime = assertDemoRuntimeEnabled({ db });
       const unknownRun = readUnknownDemoDatasetRun(db);
-      if (unknownRun) {
-        throw createManifestConflictError(unknownRun, {
-          retirement: 'blocked_unknown_status',
-          status: unknownRun.status
-        });
-      }
+      if (unknownRun) throw createUnsupportedRunStateError(unknownRun);
       const current = readActiveDemoDatasetRun(db);
       if (current) {
-        if (current.manifestVersion !== DEMO_MANIFEST_VERSION || current.manifestDigest !== expectedDigest) {
-          // 写路径遇到任何 manifest/digest 冲突都保持旧 run 不变并 fail-closed；只读接口另行使用 projection。
-          throw createManifestConflictError(current, {
-            retirement: 'blocked_manifest_conflict'
-          });
+        const manifestCompatible = current.manifestVersion === DEMO_MANIFEST_VERSION
+          && current.manifestDigest === expectedDigest;
+        if (current.status === 'cleaning') throw createCleanupInProgressError(current);
+        if (manifestCompatible) {
+          return buildCurrentRunResult(current, runtime, true, buildNoTurnover(trigger));
         }
-        return { ...current, reused: true, runtimeEpoch: runtime.runtimeEpoch };
+        if (!TURNOVER_ELIGIBLE_RUN_STATUSES.includes(current.status)) {
+          throw createUnsupportedRunStateError(current);
+        }
+        return supersedeDemoDatasetRun(db, {
+          actorUserId,
+          actorIp,
+          trigger,
+          artifactKey,
+          current,
+          expectedDigest
+        });
       }
       const runId = `demo-run-${crypto.randomUUID()}`;
       const createdAt = new Date().toISOString();
@@ -231,15 +468,33 @@ function getOrCreateActiveDemoDatasetRun(input = {}) {
         actorUserId,
         createdAt
       );
-      return { ...readActiveDemoDatasetRun(db), reused: false, runtimeEpoch: runtime.runtimeEpoch };
+      const createdRun = readActiveDemoDatasetRun(db);
+      writeDemoRunCreateAudit(db, {
+        actorUserId,
+        actorIp,
+        trigger,
+        artifactKey,
+        run: createdRun,
+        runtime,
+        createdAt
+      });
+      return buildCurrentRunResult(createdRun, runtime, false, buildNoTurnover(trigger));
     });
     return ownedDb ? execute.immediate() : execute();
   } catch (error) {
     if (error && /UNIQUE constraint failed: demo_dataset_runs\.dataset_id/.test(error.message)) {
       const current = readActiveDemoDatasetRun(db);
-      if (current && current.manifestVersion === DEMO_MANIFEST_VERSION && current.manifestDigest === getDemoParkManifestDigest()) {
-        return { ...current, reused: true, runtimeEpoch: readCanonicalDemoRuntime({ db }).runtimeEpoch };
+      const runtime = readCanonicalDemoRuntime({ db });
+      if (current?.status === 'cleaning') throw createCleanupInProgressError(current);
+      if (current && current.manifestVersion === DEMO_MANIFEST_VERSION
+        && current.manifestDigest === getDemoParkManifestDigest()
+        && BUSINESS_WRITE_ELIGIBLE_RUN_STATUSES.includes(current.status)) {
+        return buildCurrentRunResult(current, runtime, true, buildNoTurnover(trigger));
       }
+      throw new AppError('DEMO_RUN_CONCURRENT_TURNOVER_FAILED', '演示 run 并发换代未能收敛到唯一 successor。', {
+        statusCode: 409,
+        details: { retryable: true }
+      });
     }
     throw error;
   } finally {
@@ -275,7 +530,7 @@ function requireReadableDemoDatasetRun(db, runId) {
   };
 }
 
-/** 返回历史或 manifest 冲突 run 的只读 ownership 汇总，写路径仍使用严格校验。 */
+/** 返回历史或待换代 run 的只读 ownership 汇总，写路径仍使用严格校验。 */
 function getReadableDemoOwnershipSummary(input = {}) {
   const ownedDb = !input.db;
   const db = input.db || openDatabase();
@@ -311,15 +566,18 @@ function getReadableDemoOwnershipSummary(input = {}) {
   }
 }
 
-/** 按 run 主键读取并严格验证固定 Dataset 当前 manifest 绑定。 */
+/** 按 run 主键读取并严格验证固定 Dataset 当前 manifest 与通用业务可写生命周期。 */
 function requireDemoDatasetRun(db, runId) {
   const normalizedRunId = String(runId || '').trim();
   const row = readDemoDatasetRunRow(db, normalizedRunId);
+  if (row?.datasetId === DEMO_DATASET_ID && row.status === 'cleaning') {
+    throw createCleanupInProgressError(row);
+  }
   if (!row || row.datasetId !== DEMO_DATASET_ID
     || row.manifestVersion !== DEMO_MANIFEST_VERSION
     || row.manifestDigest !== getDemoParkManifestDigest()
-    || !ACTIVE_RUN_STATUSES.includes(row.status)) {
-    throw new AppError('DEMO_RUN_INVALID', '演示数据 run 不存在、已结束或 manifest 不匹配。', {
+    || !BUSINESS_WRITE_ELIGIBLE_RUN_STATUSES.includes(row.status)) {
+    throw new AppError('DEMO_RUN_INVALID', '演示数据 run 不存在、已结束、不可写或 manifest 不匹配。', {
       statusCode: 409,
       details: { runId: normalizedRunId || null }
     });
@@ -328,8 +586,10 @@ function requireDemoDatasetRun(db, runId) {
 }
 
 module.exports = {
-  ACTIVE_RUN_STATUSES,
+  ACTIVE_IDENTITY_RUN_STATUSES,
+  BUSINESS_WRITE_ELIGIBLE_RUN_STATUSES,
   READABLE_DEMO_RUN_STATUSES,
+  TURNOVER_ELIGIBLE_RUN_STATUSES,
   assertDemoRuntimeEnabled,
   getOrCreateActiveDemoDatasetRun,
   mapDemoDatasetRun,
@@ -341,7 +601,9 @@ module.exports = {
   requireDemoDatasetRun,
   validateRunActorUserId,
   _test: {
-    createManifestConflictError,
+    buildNoTurnover,
+    createCleanupInProgressError,
+    createUnsupportedRunStateError,
     getDemoDatasetRunReadCompatibility,
     readUnknownDemoDatasetRun
   }

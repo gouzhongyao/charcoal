@@ -1,5 +1,14 @@
 'use strict';
 
+const carbonTestBootstrap = require('./helpers/carbonAccountingFaultHarness');
+if (!carbonTestBootstrap.fixedIsolatedChild && module.parent) {
+  throw new Error('Carbon 固定测试入口不允许被普通模块间接加载。');
+}
+const { runFixedCarbonAccountingTest } = carbonTestBootstrap;
+// 父进程只接收固定断言结果；私有 ALS runner 仅存在于隔离子进程的本测试 Module。
+const fixedCarbonTestResult = runFixedCarbonAccountingTest('carbon-accounting-routes');
+if (fixedCarbonTestResult.delegated) process.exit(0);
+
 const assert = require('assert');
 const crypto = require('crypto');
 const express = require('express');
@@ -21,15 +30,17 @@ process.env.CHARCOAL_ADMIN_PASSWORD = 'CarbonAccountingRoutes123!';
 process.env.CHARCOAL_ALLOW_REGISTER = 'true';
 
 const { initDatabase, openDatabase } = require('../db/database');
+const {
+  carbonAccountingResultService,
+  carbonCalculationRunService,
+  runWithCarbonAccountingFaultInjectorForTest
+} = require('./helpers/carbonAccountingFaultHarness');
 const { errorHandler, notFoundHandler } = require('../middleware/errorHandler');
 const carbonAccountingRoutes = require('../routes/carbonAccounting');
 const { login, register } = require('../services/authService');
 const {
-  setCarbonAccountingFaultInjectorForTest
-} = require('../services/carbonCalculationRunService');
-const {
   getCarbonAccountingStatistics
-} = require('../services/carbonAccountingResultService');
+} = carbonAccountingResultService;
 const { runWithMaintenance } = require('../services/maintenanceState');
 
 // 专项固定运行期间。
@@ -37,6 +48,23 @@ const RUN_PERIOD = Object.freeze({
   startUtc: '2026-08-24T00:00:00Z',
   endUtc: '2026-08-25T00:00:00Z'
 });
+
+/** 使用独立临时 HTTP server 在服务端请求调用链内安装故障作用域，并在请求后可靠关闭。 */
+async function withFaultScopedServer(app, faultInjector, operation) {
+  const faultServer = http.createServer((request, response) => (
+    runWithCarbonAccountingFaultInjectorForTest(
+      faultInjector,
+      () => app(request, response)
+    )
+  ));
+  faultServer.listen(0, '127.0.0.1');
+  await new Promise((resolve) => faultServer.once('listening', resolve));
+  try {
+    return await operation(faultServer);
+  } finally {
+    await new Promise((resolve) => faultServer.close(resolve));
+  }
+}
 
 /** 发起原始 HTTP 请求并按响应类型解析。 */
 function requestRaw(server, method, pathname, rawBody, token, extraHeaders = {}) {
@@ -677,15 +705,56 @@ function formatExpectedUserVisibleUtc(value) {
       ['export', 'GET', '/api/carbon/accounting/export?format=csv', undefined, activityExportToken]
     ];
     for (const [faultStage, method, pathname, body, token] of faultCases) {
-      setCarbonAccountingFaultInjectorForTest((stage) => {
-        if (stage === faultStage) {
-          throw new Error(`SELECT secret FROM ${process.env.SQLITE_PATH}; token=${token}`);
-        }
-      });
-      const response = await requestJson(server, method, pathname, body, token);
-      setCarbonAccountingFaultInjectorForTest(null);
+      const response = await withFaultScopedServer(
+        app,
+        (event) => {
+          assert.deepStrictEqual(Object.keys(event).sort(), ['stage', 'summary']);
+          assert(Object.isFrozen(event));
+          assert(Object.isFrozen(event.summary));
+          assert.deepStrictEqual(event.summary, {});
+          assert.strictEqual('db' in event, false);
+          if (event.stage === faultStage) {
+            throw new Error(`SELECT secret FROM ${process.env.SQLITE_PATH}; token=${token}`);
+          }
+        },
+        (faultServer) => requestJson(faultServer, method, pathname, body, token)
+      );
       assertFixedAccountingInternalError(response, token);
     }
+    const [isolatedFaultResponse, concurrentNormalResponse] = await withFaultScopedServer(
+      app,
+      (event) => {
+        if (event.stage === 'list-runs') throw new Error('concurrent isolated fault');
+      },
+      (faultServer) => Promise.all([
+        requestJson(
+          faultServer,
+          'GET',
+          '/api/carbon/accounting/runs',
+          undefined,
+          activityViewToken
+        ),
+        requestJson(
+          server,
+          'GET',
+          '/api/carbon/accounting/runs',
+          undefined,
+          activityViewToken
+        )
+      ])
+    );
+    assertFixedAccountingInternalError(isolatedFaultResponse, activityViewToken);
+    assert.strictEqual(concurrentNormalResponse.status, 200,
+      '隔离故障请求不得污染并发生产测试 server 请求。');
+    const faultScopeLeakCheck = await requestJson(
+      server,
+      'GET',
+      '/api/carbon/accounting/runs',
+      undefined,
+      activityViewToken
+    );
+    assert.strictEqual(faultScopeLeakCheck.status, 200,
+      '独立故障 server 关闭后不得把 hook 泄漏到后续请求。');
 
     // RBAC 前置中间件的原生 SQLite 异常也必须被 accounting router 领域边界固定脱敏。
     const rbacFaultCases = [
@@ -777,7 +846,6 @@ function formatExpectedUserVisibleUtc(value) {
 
     console.log('carbonAccountingRoutes tests passed');
   } finally {
-    setCarbonAccountingFaultInjectorForTest(null);
     if (server) await new Promise((resolve) => server.close(resolve));
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   }

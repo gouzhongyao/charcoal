@@ -3,8 +3,10 @@ import { readFileSync } from 'node:fs';
 import { aggregateMonthlyTrend, buildEnergyFilters, ENERGY_TYPE_COLORS, fixedEnergyTypeBreakdown } from '../utils/energyStatistics.js';
 import { hasPermission } from '../utils/permissionCore.js';
 
-const filters = buildEnergyFilters({ normalizedMonthStart: '2026-01', normalizedMonthEnd: '', energyTypeCode: 'coal', organization: '第一工厂', keyword: '仪表 Alpha', search: '兼容搜索字段' });
-assert.deepEqual(filters, { normalizedMonthStart: '2026-01', energyTypeCode: 'coal', organization: '第一工厂', keyword: '仪表 Alpha', search: '兼容搜索字段' });
+// 能耗统计筛选契约：用能单元编码按精确参数透传，并忽略旧 organization 参数。
+const filters = buildEnergyFilters({ normalizedMonthStart: '2026-01', normalizedMonthEnd: '', energyTypeCode: 'coal', organizationUnitCode: 'QL-ACTUAL-PARK', organization: '旧组织参数', keyword: '仪表 Alpha', search: '兼容搜索字段' });
+assert.deepEqual(filters, { normalizedMonthStart: '2026-01', energyTypeCode: 'coal', organizationUnitCode: 'QL-ACTUAL-PARK', keyword: '仪表 Alpha', search: '兼容搜索字段' });
+assert.deepEqual(buildEnergyFilters({ organization: 'QL-PARK' }), {}, '旧 organization 参数不得继续发送。');
 
 assert.deepEqual(aggregateMonthlyTrend([
   { month: '2026-02', totalNormalizedValue: 5, recordCount: 1 },
@@ -41,6 +43,12 @@ for (const fieldName of ['draftFilters.normalizedMonthStart', 'draftFilters.norm
     `${fieldName} 必须使用可编辑的 YYYY-MM 月份控件。`
   );
 }
+
+// 能耗统计用能单元筛选契约：页面字段、文案与请求字段必须使用精确编码语义。
+assert.match(statisticsPageSource, /label="用能单元编码（精确）"/, '筛选文案必须明确用能单元编码精确匹配。');
+assert.match(statisticsPageSource, /v-model\.trim="draftFilters\.organizationUnitCode"/, '筛选输入必须绑定 organizationUnitCode。');
+assert.doesNotMatch(statisticsPageSource, /draftFilters\.organization\b/, '页面不得继续使用旧 organization 筛选字段。');
+assert.doesNotMatch(statisticsPageSource, /精确组织名称|组织名称|后代/, '筛选文案不得误写为组织名称或后代范围。');
 
 // 能耗统计维度契约：页面必须发送后端 canonical dimension 值，禁止回退旧枚举。
 assert.match(statisticsPageSource, /const dimension = ref\('organizationUnit'\)/, '默认维度必须使用 organizationUnit。');

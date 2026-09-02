@@ -15,6 +15,7 @@ process.env.CHARCOAL_ADMIN_PASSWORD = 'AdminPassword123!';
 
 const {
   CANONICAL_SCHEMA_VERSION,
+  CANONICAL_SCHEMA_PREDECESSOR_VERSION,
   blockDatabaseAdmission,
   calculateSchemaFingerprint,
   getDatabaseAdmissionState,
@@ -36,11 +37,12 @@ const {
 } = require('../services/demoRuntimeService');
 const { runWithMaintenance } = require('../services/maintenanceState');
 const { toPublicRestoreResult } = require('../routes/backups');
+const { _test: demoDataRouteTest } = require('../routes/demoData');
 
-// 当前初始化必须写入 v3；唯一可信 predecessor 是 strategy_rules 尚无 provenance 的 v2。
-const CURRENT_CANONICAL_SCHEMA_VERSION = '2026-08-28-formal-canonical-v3';
-const CANONICAL_PREDECESSOR_VERSION = '2026-08-27-formal-canonical-v2';
-const REJECTED_LEGACY_SCHEMA_VERSION = '2026-08-26-formal-canonical-v1';
+// 当前初始化必须写入 v4；唯一可信 predecessor 是尚无 run 自动换代结构的精确 v3。
+const CURRENT_CANONICAL_SCHEMA_VERSION = '2026-08-30-formal-canonical-v4';
+const CANONICAL_PREDECESSOR_VERSION = '2026-08-28-formal-canonical-v3';
+const REJECTED_LEGACY_SCHEMA_VERSION = '2026-08-27-formal-canonical-v2';
 
 // 生产 server/src 仅数据库基础层可加载 SQLite driver；backupService 仅允许只读备份验证例外。
 function assertProductionSqliteDriverBoundary() {
@@ -445,12 +447,33 @@ function assertDemoSha256Constraints(db) {
   let server;
   try {
     assertProductionSqliteDriverBoundary();
+    assert.deepStrictEqual(demoDataRouteTest.buildUnavailableActiveRunProjection(), {
+      activeRun: null,
+      compatibility: {
+        readable: false,
+        readOnly: true,
+        writeEligible: false,
+        turnoverEligible: false,
+        retryable: false,
+        state: 'unavailable',
+        code: 'DEMO_ACTIVE_RUN_PROJECTION_UNAVAILABLE',
+        manifestCompatible: false,
+        historical: false,
+        active: false,
+        expectedManifestVersion: null,
+        expectedManifestDigest: null,
+        actualManifestVersion: null,
+        actualManifestDigest: null
+      }
+    }, 'active run 投影不可用时必须返回完整、稳定且 fail-closed 的 compatibility shape。');
     assert.strictEqual(CANONICAL_SCHEMA_VERSION, CURRENT_CANONICAL_SCHEMA_VERSION,
-      '生产数据库模块导出的 current canonical 版本必须保持 v3。');
+      '生产数据库模块导出的 current canonical 版本必须保持 v4。');
+    assert.strictEqual(CANONICAL_SCHEMA_PREDECESSOR_VERSION, CANONICAL_PREDECESSOR_VERSION,
+      '生产数据库模块导出的唯一 predecessor 必须保持精确 v3。');
     assert.notStrictEqual(CANONICAL_SCHEMA_VERSION, CANONICAL_PREDECESSOR_VERSION,
-      'strategy_rules provenance v2 predecessor 不得被误当成 current canonical。');
+      'run 自动换代 v3 predecessor 不得被误当成 current canonical。');
     assert(![CANONICAL_SCHEMA_VERSION, CANONICAL_PREDECESSOR_VERSION].includes(REJECTED_LEGACY_SCHEMA_VERSION),
-      'v1 不得被列入 current 或唯一 accepted predecessor。');
+      'v2 不得被列入 current 或唯一 accepted predecessor。');
     initDatabase();
 
     backupServiceTest.assertCheckpointComplete([{ busy: 0, log: 7, checkpointed: 7 }], 'TEST_CHECKPOINT');
@@ -520,7 +543,7 @@ function assertDemoSha256Constraints(db) {
       assert.strictEqual(newDb.prepare('SELECT COUNT(*) AS total FROM demo_runtime_settings').get().total, 1);
       assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_stage'").get().value, 'formal-canonical');
       assert.strictEqual(newDb.prepare("SELECT value FROM app_meta WHERE key = 'schema_version'").get().value,
-        CURRENT_CANONICAL_SCHEMA_VERSION, 'fresh/current 初始化必须写入 formal-canonical v2。');
+        CURRENT_CANONICAL_SCHEMA_VERSION, 'fresh/current 初始化必须写入 formal-canonical v4。');
 
       const activeRegistryIndex = newDb.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'ux_demo_data_registry_active_entity'").get();
       assert(activeRegistryIndex && /WHERE cleaned_at IS NULL/i.test(activeRegistryIndex.sql), 'active registry 必须使用部分唯一索引。');
@@ -536,6 +559,48 @@ function assertDemoSha256Constraints(db) {
       const contextColumns = new Set(newDb.prepare('PRAGMA table_info(demo_import_contexts)').all().map((column) => column.name));
       ['artifact_key', 'handler_key', 'issued_to_user_id', 'runtime_epoch', 'upload_file_sha256', 'preview_digest']
         .forEach((columnName) => assert(contextColumns.has(columnName), `演示 context 缺少绑定字段 ${columnName}`));
+      const runColumns = new Set(newDb.prepare('PRAGMA table_info(demo_dataset_runs)').all().map((column) => column.name));
+      ['superseded_at', 'successor_run_id', 'superseded_by', 'supersede_reason', 'supersede_trigger']
+        .forEach((columnName) => assert(runColumns.has(columnName), `演示 run 缺少自动换代字段 ${columnName}`));
+      const runTableSql = newDb.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'demo_dataset_runs'").get().sql;
+      assert(/status IN \([^)]*'superseded'/i.test(runTableSql), 'run 状态约束必须包含 superseded。');
+      assert(/successor_run_id[\s\S]*REFERENCES demo_dataset_runs\s*\(run_id\)[\s\S]*DEFERRABLE INITIALLY DEFERRED/i.test(runTableSql),
+        'successor_run_id 必须使用延迟自引用外键。');
+      const cleanupTableSql = newDb.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'demo_cleanup_runs'").get().sql;
+      assert(/status IN \([^)]*'superseded'/i.test(cleanupTableSql), 'cleanup 状态约束必须包含 superseded。');
+      assert(cleanupTableSql.includes('manifest_run_superseded'), 'cleanup superseded 必须绑定固定失败原因。');
+      const constraintNow = new Date().toISOString();
+      newDb.prepare(`INSERT INTO demo_dataset_runs
+        (run_id, dataset_id, manifest_version, manifest_digest, status, created_at)
+        VALUES ('turnover-constraint-base', 'turnover-constraint-dataset', 'v1', ?, 'failed', ?)`)
+        .run('9'.repeat(64), constraintNow);
+      assert.throws(() => newDb.prepare(`INSERT INTO demo_dataset_runs
+        (run_id, dataset_id, manifest_version, manifest_digest, status, created_at)
+        VALUES ('turnover-missing-fields', 'turnover-constraint-missing', 'v1', ?, 'superseded', ?)`)
+        .run('8'.repeat(64), constraintNow), /CHECK constraint failed/,
+      'superseded run 缺少时间、successor、原因或触发入口时必须拒绝。');
+      assert.throws(() => newDb.prepare(`INSERT INTO demo_dataset_runs
+        (run_id, dataset_id, manifest_version, manifest_digest, status, created_at,
+          superseded_at, successor_run_id, supersede_reason, supersede_trigger)
+        VALUES ('turnover-fields-on-active', 'turnover-constraint-active', 'v1', ?, 'active', ?, ?,
+          'turnover-constraint-base', 'manifest_run_superseded', 'test')`)
+        .run('7'.repeat(64), constraintNow, constraintNow), /CHECK constraint failed/,
+      '非 superseded run 携带换代字段时必须拒绝。');
+      assert.throws(() => newDb.prepare(`INSERT INTO demo_dataset_runs
+        (run_id, dataset_id, manifest_version, manifest_digest, status, created_at,
+          superseded_at, successor_run_id, supersede_reason, supersede_trigger)
+        VALUES ('turnover-self-successor', 'turnover-constraint-self', 'v1', ?, 'superseded', ?, ?,
+          'turnover-self-successor', 'manifest_run_superseded', 'test')`)
+        .run('6'.repeat(64), constraintNow, constraintNow), /CHECK constraint failed/,
+      'superseded run 不得把 successor 指向自身。');
+      assert.throws(() => newDb.prepare(`INSERT INTO demo_cleanup_runs
+        (cleanup_run_id, run_id, client_request_id, preview_digest, preview_expires_at,
+          runtime_revision, registry_watermark, status, created_at)
+        VALUES ('turnover-cleanup-invalid', 'turnover-constraint-base', 'turnover-cleanup-invalid', ?, ?,
+          1, 'turnover-constraint-watermark', 'superseded', ?)`)
+        .run('5'.repeat(64), constraintNow, constraintNow), (error) => error.code === 'SQLITE_CONSTRAINT_CHECK',
+      'superseded cleanup preview 缺少完成时间和固定失败原因时必须拒绝。');
+      newDb.prepare("DELETE FROM demo_dataset_runs WHERE run_id = 'turnover-constraint-base'").run();
       assertDemoSha256Constraints(newDb);
       const registryColumns = new Set(newDb.prepare('PRAGMA table_info(demo_data_registry)').all().map((column) => column.name));
       ['run_id', 'artifact_key', 'entity_type', 'entity_pk', 'source_batch_id', 'source_row_number']
@@ -1025,7 +1090,7 @@ function assertDemoSha256Constraints(db) {
       readCleanupRunStatus: true
     }, 'capability 只描述服务实现，viewer 的 allowedActions 必须严格按真实 RBAC 收敛。');
     assert.strictEqual(viewerStatus.body.data.activeRun.runId, 'shape-run');
-    assert.strictEqual(viewerStatus.body.data.activeRunCompatibility.state, 'manifest-conflict');
+    assert.strictEqual(viewerStatus.body.data.activeRunCompatibility.state, 'manifest-turnover-pending');
     assert.strictEqual(viewerStatus.body.data.activeRunCompatibility.manifestCompatible, false);
     assert.strictEqual(viewerStatus.body.data.activeRunCompatibility.writeEligible, false);
     assert.strictEqual((await request(server, 'POST', '/api/system/demo-data/toggle', { enabled: false }, viewerToken)).status, 403);
@@ -1079,34 +1144,87 @@ function assertDemoSha256Constraints(db) {
     assert.strictEqual(conflictCatalog.status, 200, JSON.stringify(conflictCatalog.body));
     assert.strictEqual(conflictCatalog.body.data.datasetId, 'qinglan-park-v1');
     assert.strictEqual(conflictCatalog.body.data.run.runId, 'shape-run');
-    assert.strictEqual(conflictCatalog.body.data.activeRunCompatibility.state, 'manifest-conflict');
+    assert.strictEqual(conflictCatalog.body.data.activeRunCompatibility.state, 'manifest-turnover-pending');
     assert.strictEqual(conflictCatalog.body.data.activeRunCompatibility.writeEligible, false);
     const conflictManifest = await request(server, 'GET', '/api/templates/demo-park/manifest', null, adminToken);
     assert.strictEqual(conflictManifest.status, 200, JSON.stringify(conflictManifest.body));
     assert.strictEqual(conflictManifest.body.data.datasetId, 'qinglan-park-v1');
     assert.strictEqual(conflictManifest.body.data.run.runId, 'shape-run');
-    assert.strictEqual(conflictManifest.body.data.activeRunCompatibility.state, 'manifest-conflict');
+    assert.strictEqual(conflictManifest.body.data.activeRunCompatibility.state, 'manifest-turnover-pending');
     assert.deepStrictEqual(snapshotDemoReadState(), readStateBeforeCatalogs,
       'GET catalog 与 GET manifest 必须零副作用，不能自动退役、创建 run、签发 context 或写审计。');
 
     const conflictOwnership = await request(server, 'GET', '/api/system/demo-data/runs/shape-run/ownership-summary', null, adminToken);
     assert.strictEqual(conflictOwnership.status, 200, JSON.stringify(conflictOwnership.body));
     assert.strictEqual(conflictOwnership.body.data.run.runId, 'shape-run');
-    assert.strictEqual(conflictOwnership.body.data.compatibility.state, 'manifest-conflict');
+    assert.strictEqual(conflictOwnership.body.data.compatibility.state, 'manifest-turnover-pending');
     assert.strictEqual(conflictOwnership.body.data.compatibility.readable, true);
     assert.strictEqual(conflictOwnership.body.data.cleanupWriteEligible, false);
+    assert.deepStrictEqual(snapshotDemoReadState(), readStateBeforeCatalogs,
+      'status、catalog、manifest 与 ownership projection 必须保持纯读取且零副作用。');
+
     const conflictPrepareRun = await request(server, 'POST', '/api/system/demo-data/run', {}, adminToken);
-    assert.strictEqual(conflictPrepareRun.status, 409);
-    assert.strictEqual(conflictPrepareRun.body.error.code, 'DEMO_ACTIVE_RUN_MANIFEST_CONFLICT');
-    assert.strictEqual(conflictPrepareRun.body.error.details.retirement, 'blocked_manifest_conflict');
+    assert.strictEqual(conflictPrepareRun.status, 200, JSON.stringify(conflictPrepareRun.body));
+    const successorRun = conflictPrepareRun.body.data;
+    assert.notStrictEqual(successorRun.runId, 'shape-run');
+    assert.strictEqual(successorRun.status, 'active');
+    assert.strictEqual(successorRun.manifestVersion, conflictCatalog.body.data.manifestVersion);
+    assert.strictEqual(successorRun.manifestDigest, conflictCatalog.body.data.manifestDigest);
+    assert.strictEqual(successorRun.reused, false);
+    assert.deepStrictEqual(successorRun.turnover, {
+      performed: true,
+      reason: 'manifest_identity_changed',
+      trigger: 'explicit-run-prepare',
+      previousRun: {
+        runId: 'shape-run',
+        status: 'active',
+        manifestVersion: '1.0.0',
+        manifestDigest: 'a'.repeat(64)
+      },
+      successorRun: {
+        runId: successorRun.runId,
+        status: 'active',
+        manifestVersion: successorRun.manifestVersion,
+        manifestDigest: successorRun.manifestDigest
+      },
+      revokedContextCount: 2,
+      supersededCleanupPreviewCount: 0,
+      runtimeBefore: { enabled: true, runtimeEpoch: 4, revision: 4 },
+      runtimeAfter: { enabled: true, runtimeEpoch: 5, revision: 5 }
+    });
+    assert.strictEqual(successorRun.runtimeEpoch, 5);
+    assert.strictEqual(successorRun.runtimeRevision, 5);
+    const turnoverDb = openDatabase();
+    try {
+      const predecessor = turnoverDb.prepare(`SELECT status, successor_run_id AS successorRunId,
+          supersede_reason AS supersedeReason, supersede_trigger AS supersedeTrigger
+        FROM demo_dataset_runs WHERE run_id = 'shape-run'`).get();
+      assert.deepStrictEqual(predecessor, {
+        status: 'superseded',
+        successorRunId: successorRun.runId,
+        supersedeReason: 'manifest_run_superseded',
+        supersedeTrigger: 'explicit-run-prepare'
+      });
+      assert.strictEqual(turnoverDb.prepare(`SELECT COUNT(*) AS total FROM demo_import_contexts
+        WHERE run_id = 'shape-run' AND status = 'revoked'
+          AND revoke_reason = 'manifest_run_superseded'`).get().total, 2);
+    } finally {
+      turnoverDb.close();
+    }
+    const historicalOwnership = await request(server, 'GET', '/api/system/demo-data/runs/shape-run/ownership-summary', null, adminToken);
+    assert.strictEqual(historicalOwnership.status, 200, JSON.stringify(historicalOwnership.body));
+    assert.strictEqual(historicalOwnership.body.data.compatibility.state, 'historical-superseded');
+    assert.strictEqual(historicalOwnership.body.data.compatibility.readable, true);
+    assert.strictEqual(historicalOwnership.body.data.cleanupWriteEligible, false);
+    const stateAfterTurnover = snapshotDemoReadState();
     const conflictCleanupPreview = await request(server, 'POST', '/api/system/demo-data/cleanup/preview', {
       runId: 'shape-run',
       clientRequestId: 'shape-run-conflict-cleanup'
     }, adminToken);
     assert.strictEqual(conflictCleanupPreview.status, 409);
     assert.strictEqual(conflictCleanupPreview.body.error.code, 'DEMO_RUN_INVALID');
-    assert.deepStrictEqual(snapshotDemoReadState(), readStateBeforeCatalogs,
-      'manifest 冲突下 POST /run、cleanup preview 与 ownership 只读查询均不得改写治理状态。');
+    assert.deepStrictEqual(snapshotDemoReadState(), stateAfterTurnover,
+      '已 superseded 的历史 run 必须只读可见且拒绝 cleanup 写入。');
 
     const unassociatedConflictDb = openDatabase();
     try {
@@ -1120,20 +1238,90 @@ function assertDemoSha256Constraints(db) {
       unassociatedConflictDb.close();
     }
     const unassociatedConflictState = snapshotDemoReadState();
-    const unassociatedConflictPrepareRun = await request(server, 'POST', '/api/system/demo-data/run', {}, adminToken);
-    assert.strictEqual(unassociatedConflictPrepareRun.status, 409);
-    assert.strictEqual(unassociatedConflictPrepareRun.body.error.code, 'DEMO_ACTIVE_RUN_MANIFEST_CONFLICT');
-    assert.strictEqual(unassociatedConflictPrepareRun.body.error.details.retirement, 'blocked_manifest_conflict');
+    const reusedSuccessorResponse = await request(server, 'POST', '/api/system/demo-data/run', {}, adminToken);
+    assert.strictEqual(reusedSuccessorResponse.status, 200);
+    assert.strictEqual(reusedSuccessorResponse.body.data.runId, successorRun.runId);
+    assert.strictEqual(reusedSuccessorResponse.body.data.reused, true);
+    assert.deepStrictEqual(reusedSuccessorResponse.body.data.turnover, {
+      performed: false,
+      reason: null,
+      trigger: 'explicit-run-prepare',
+      previousRun: null,
+      successorRun: null,
+      revokedContextCount: 0,
+      supersededCleanupPreviewCount: 0,
+      runtimeBefore: null,
+      runtimeAfter: null
+    });
     assert.deepStrictEqual(snapshotDemoReadState(), unassociatedConflictState,
-      '旧 manifest run 即使无 context、ownership、关系和业务批次关联，POST /run 仍必须 409 且旧 run 保持不变。');
+      'current successor 的幂等复用不得改写历史 run、runtime、context 或审计。');
+
+    // manifest 一致但 cleanup 执行中的 active identity 只允许 GET 投影，不得复用、换代或签发业务写资格。
+    const cleaningDb = openDatabase();
+    try {
+      cleaningDb.prepare("UPDATE demo_dataset_runs SET status = 'cleaning' WHERE run_id = ?")
+        .run(successorRun.runId);
+    } finally {
+      cleaningDb.close();
+    }
+    const cleaningReadState = snapshotDemoReadState();
+    const cleaningStatus = await request(server, 'GET', '/api/system/demo-data/status', null, adminToken);
+    assert.strictEqual(cleaningStatus.status, 200, JSON.stringify(cleaningStatus.body));
+    assert.strictEqual(cleaningStatus.body.data.activeRun.runId, successorRun.runId);
+    assert.deepStrictEqual({
+      state: cleaningStatus.body.data.activeRunCompatibility.state,
+      code: cleaningStatus.body.data.activeRunCompatibility.code,
+      manifestCompatible: cleaningStatus.body.data.activeRunCompatibility.manifestCompatible,
+      turnoverEligible: cleaningStatus.body.data.activeRunCompatibility.turnoverEligible,
+      writeEligible: cleaningStatus.body.data.activeRunCompatibility.writeEligible,
+      retryable: cleaningStatus.body.data.activeRunCompatibility.retryable
+    }, {
+      state: 'cleanup-in-progress-blocked',
+      code: 'DEMO_RUN_CLEANUP_IN_PROGRESS',
+      manifestCompatible: true,
+      turnoverEligible: false,
+      writeEligible: false,
+      retryable: true
+    });
+    const cleaningCatalog = await request(server, 'GET', '/api/system/demo-data/catalog', null, adminToken);
+    assert.strictEqual(cleaningCatalog.status, 200, JSON.stringify(cleaningCatalog.body));
+    assert.strictEqual(cleaningCatalog.body.data.activeRunCompatibility.state, 'cleanup-in-progress-blocked');
+    assert.strictEqual(cleaningCatalog.body.data.activeRunCompatibility.turnoverEligible, false);
+    assert.strictEqual(cleaningCatalog.body.data.activeRunCompatibility.writeEligible, false);
+    const cleaningManifest = await request(server, 'GET', '/api/templates/demo-park/manifest', null, adminToken);
+    assert.strictEqual(cleaningManifest.status, 200, JSON.stringify(cleaningManifest.body));
+    assert.strictEqual(cleaningManifest.body.data.activeRunCompatibility.state, 'cleanup-in-progress-blocked');
+    assert.strictEqual(cleaningManifest.body.data.activeRunCompatibility.retryable, true);
+    assert.strictEqual(cleaningManifest.headers['x-demo-context'], undefined);
+    const cleaningOwnership = await request(server, 'GET',
+      `/api/system/demo-data/runs/${successorRun.runId}/ownership-summary`, null, adminToken);
+    assert.strictEqual(cleaningOwnership.status, 200, JSON.stringify(cleaningOwnership.body));
+    assert.strictEqual(cleaningOwnership.body.data.compatibility.state, 'cleanup-in-progress-blocked');
+    assert.strictEqual(cleaningOwnership.body.data.compatibility.writeEligible, false);
+    assert.strictEqual(cleaningOwnership.body.data.cleanupWriteEligible, false);
+    assert.deepStrictEqual(snapshotDemoReadState(), cleaningReadState,
+      'cleaning run 的 status、catalog、manifest 与 ownership GET 必须保持零副作用。');
+    const cleaningPrepareRun = await request(server, 'POST', '/api/system/demo-data/run', {}, adminToken);
+    assert.strictEqual(cleaningPrepareRun.status, 409, JSON.stringify(cleaningPrepareRun.body));
+    assert.strictEqual(cleaningPrepareRun.body.error.code, 'DEMO_RUN_CLEANUP_IN_PROGRESS');
+    assert.strictEqual(cleaningPrepareRun.body.error.details.retryable, true);
+    assert.deepStrictEqual(snapshotDemoReadState(), cleaningReadState,
+      'manifest 一致的 cleaning run 必须阻断 POST run 且不改写 run、runtime、context 或审计。');
+    const restoreSuccessorDb = openDatabase();
+    try {
+      restoreSuccessorDb.prepare("UPDATE demo_dataset_runs SET status = 'active' WHERE run_id = ?")
+        .run(successorRun.runId);
+    } finally {
+      restoreSuccessorDb.close();
+    }
 
     const invalidToggle = await request(server, 'POST', '/api/system/demo-data/toggle', { enabled: 'false' }, adminToken);
     assert.strictEqual(invalidToggle.status, 400);
     const adminToggle = await request(server, 'POST', '/api/system/demo-data/toggle', { enabled: false }, adminToken);
     assert.strictEqual(adminToggle.status, 200);
     assert.strictEqual(adminToggle.body.data.runtime.enabled, false);
-    assert.strictEqual(adminToggle.body.data.runtime.runtimeEpoch, 5);
-    assert.strictEqual(adminToggle.body.data.runtime.revision, 5);
+    assert.strictEqual(adminToggle.body.data.runtime.runtimeEpoch, 6);
+    assert.strictEqual(adminToggle.body.data.runtime.revision, 6);
     const toggleAuditDb = openDatabase();
     try {
       const toggleAudit = toggleAuditDb.prepare(`SELECT user_id AS userId, ip, detail_json AS detailJson
@@ -1143,8 +1331,8 @@ function assertDemoSha256Constraints(db) {
       assert(toggleAudit.ip, 'toggle 审计必须记录请求 IP。');
       assert.strictEqual(toggleDetail.previousEnabled, true);
       assert.strictEqual(toggleDetail.enabled, false);
-      assert.strictEqual(toggleDetail.runtimeEpoch, 5);
-      assert.strictEqual(toggleDetail.revision, 5);
+      assert.strictEqual(toggleDetail.runtimeEpoch, 6);
+      assert.strictEqual(toggleDetail.revision, 6);
     } finally {
       toggleAuditDb.close();
     }

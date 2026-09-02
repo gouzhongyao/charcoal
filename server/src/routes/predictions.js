@@ -4,7 +4,7 @@ const { authenticate } = require('../middleware/auth');
 const { requireAnyPermission, requirePermission } = require('../middleware/permission');
 const { requireWritable } = require('../middleware/maintenance');
 const { cleanupUploadedImportFile, normalizeUploadError, uploadImportFile } = require('../middleware/upload');
-const { rejectUnconnectedDemoContext } = require('../middleware/demoContext');
+const { demoContextPreflight } = require('../middleware/demoContext');
 const { recordOperation } = require('../services/sessionService');
 const {
   buildPredictionStats,
@@ -29,6 +29,18 @@ const {
 const { sendSuccess } = require('../utils/response');
 
 const router = express.Router();
+const predictionConfigImportPreviewPreflight = demoContextPreflight({
+  artifactKey: '12-prediction-configs',
+  handlerKey: 'prediction-configs-import',
+  phase: 'preview',
+  allowFormal: true
+});
+const predictionConfigImportExecutePreflight = demoContextPreflight({
+  artifactKey: '12-prediction-configs',
+  handlerKey: 'prediction-configs-import',
+  phase: 'execute',
+  allowFormal: true
+});
 // 旧综合 prediction:view 仅用于未完成菜单迁移的历史会话兼容；新的细分角色必须按资源域读取。
 const requirePredictionContractView = requireAnyPermission('prediction:config:view', 'prediction:run:view', 'prediction:result:view', 'prediction:view');
 const requirePredictionConfigView = requireAnyPermission('prediction:config:view', 'prediction:view');
@@ -57,20 +69,53 @@ router.get('/configs/export', authenticate, requirePermission('prediction:config
   res.status(200).send(result.body);
 }));
 
-router.post('/configs/import/preview', authenticate, requirePermission('prediction:config:import'), requireWritable('prediction:config:import-preview'), rejectUnconnectedDemoContext, (req, res, next) => {
+router.post('/configs/import/preview', authenticate, requirePermission('prediction:config:import'), requireWritable('prediction:config:import-preview'), predictionConfigImportPreviewPreflight, (req, res, next) => {
   uploadImportFile(req, res, (uploadError) => {
     const error = normalizeUploadError(uploadError);
     if (error) { cleanupUploadedImportFile(req.file); next(error); return; }
-    Promise.resolve().then(() => createPredictionConfigImportPreviewFromUpload(req.file)).then((preview) => {
-      audit(req, 'prediction.config.import.preview', 'prediction_config_import', preview.batchId, { wouldImport: preview.summary.wouldImport, blocked: preview.summary.blocked });
-      sendSuccess(res, preview);
-    }).catch((reason) => { cleanupUploadedImportFile(req.file); next(reason); });
+    const demoContext = req.demoContext ? Object.freeze({
+      token: req.demoContext.token,
+      userId: req.user.id,
+      artifactKey: '12-prediction-configs',
+      handlerKey: 'prediction-configs-import'
+    }) : null;
+    // managedUploadState 只记录服务是否已提交 retained 文件所有权，不进入客户端合同。
+    const managedUploadState = { committed: false };
+    Promise.resolve()
+      .then(() => createPredictionConfigImportPreviewFromUpload(req.file, {
+        demoContext,
+        actor: { userId: req.user.id, ip: req.ip },
+        managedUploadState
+      }))
+      .then((preview) => {
+        if (!demoContext) {
+          audit(req, 'prediction.config.import.preview', 'prediction_config_import', preview.batchId, { wouldImport: preview.summary.wouldImport, blocked: preview.summary.blocked });
+        }
+        sendSuccess(res, preview);
+      })
+      .catch((reason) => {
+        if (!demoContext || managedUploadState.committed !== true) {
+          cleanupUploadedImportFile(req.file);
+        }
+        next(reason);
+      });
   });
 });
 
-router.post('/configs/import/execute', authenticate, requirePermission('prediction:config:import'), requireWritable('prediction:config:import-execute'), rejectUnconnectedDemoContext, asyncHandler(async (req, res) => {
-  const result = await executePredictionConfigImport(req.body || {});
-  audit(req, 'prediction.config.import.execute', 'prediction_config_import', result.batchId, { imported: result.imported, writesPredictionRuns: false, writesPredictionResults: false });
+router.post('/configs/import/execute', authenticate, requirePermission('prediction:config:import'), requireWritable('prediction:config:import-execute'), predictionConfigImportExecutePreflight, asyncHandler(async (req, res) => {
+  const demoContext = req.demoContext ? Object.freeze({
+    token: req.demoContext.token,
+    userId: req.user.id,
+    artifactKey: '12-prediction-configs',
+    handlerKey: 'prediction-configs-import'
+  }) : null;
+  const result = await executePredictionConfigImport(req.body || {}, {
+    demoContext,
+    actor: { userId: req.user.id, ip: req.ip }
+  });
+  if (!demoContext) {
+    audit(req, 'prediction.config.import.execute', 'prediction_config_import', result.batchId, { imported: result.imported, writesPredictionRuns: false, writesPredictionResults: false });
+  }
   sendSuccess(res, result);
 }));
 
