@@ -301,7 +301,7 @@ assert.match(dashboardSource, /onBeforeUnmount/);
 assert.match(dashboardSource, /已保留沉浸模式/);
 
 // 沉浸布局必须锁定动态视口并在退出、路由切换和卸载时恢复普通页面滚动。
-assert.match(immersiveSource, /grid-template-rows:auto auto minmax\(0,1fr\)/);
+assert.match(immersiveSource, /grid-template-rows:auto auto minmax\(0,1fr\);/);
 assert.match(immersiveSource, /height:100dvh/);
 assert.match(immersiveSource, /min-height:0/);
 assert.match(immersiveSource, /padding:clamp\(/);
