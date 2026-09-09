@@ -61,6 +61,35 @@ export const ENERGY_ANALYSIS_COLORS = Object.freeze(['#2a78d6', '#eb6834', '#1ba
 /** 固定 UTC 负荷曲线允许的输出网格分钟数。 */
 export const ENERGY_ANALYSIS_OUTPUT_INTERVAL_MINUTES = Object.freeze([15, 30, 60]);
 
+/** 分析页各领域请求的稳定状态，区分未请求、请求中、成功和失败。 */
+export const ENERGY_ANALYSIS_REQUEST_STATUS = Object.freeze({
+  notRequested: 'not_requested',
+  pending: 'pending',
+  success: 'success',
+  failure: 'failure'
+});
+
+/** 分析页请求状态覆盖的结果切片键。 */
+export const ENERGY_ANALYSIS_REQUEST_KEYS = Object.freeze([
+  'monthlyAnalysis', 'intensityAnalysis', 'loadSummary', 'loadCurve',
+  'shiftAnalysis', 'deviceStateAnalysis', 'touAnalysis', 'peakContribution'
+]);
+
+/** 分析页必填筛选字段的用户可见标签。 */
+const ENERGY_ANALYSIS_FILTER_LABELS = Object.freeze({
+  startMonth: '统计月起',
+  endMonth: '统计月止',
+  meterDeviceId: '表计',
+  energyTypeCode: '能源类型',
+  unit: '单位',
+  startUtc: '时序开始',
+  endUtc: '时序结束',
+  sourceTimeZone: '来源时区',
+  organizationUnitId: '组织',
+  outputIntervalMinutes: '时序粒度',
+  productionUnitId: '产能单元'
+});
+
 /** 来源时区日期时间格式器缓存，避免同一查询重复创建 Intl 实例。 */
 const energyAnalysisDateTimeFormatterCache = new Map();
 
@@ -192,6 +221,104 @@ export function createEmptyEnergyAnalysisResult() {
     deviceStateAnalysis: { states: [] },
     peakContribution: { contributors: [] }
   };
+}
+
+/** 创建分析页结果切片请求状态，首次进入时所有切片均为未请求。 */
+export function createEnergyAnalysisRequestStates() {
+  return Object.fromEntries(ENERGY_ANALYSIS_REQUEST_KEYS.map((key) => [key, {
+    status: ENERGY_ANALYSIS_REQUEST_STATUS.notRequested,
+    message: ''
+  }]));
+}
+
+/** 判断筛选值是否已填写；数值 0 仍按已填写处理，避免误把合法值当成空值。 */
+function isEnergyAnalysisFilterFilled(value) {
+  return value !== '' && value !== null && value !== undefined;
+}
+
+/** 构造一个分析领域的筛选就绪状态和待填写字段。 */
+function buildEnergyAnalysisFilterReadiness(filters, fields) {
+  const missingFields = fields.filter(([key]) => !isEnergyAnalysisFilterFilled(filters[key])).map(([key]) => key);
+  return {
+    ready: missingFields.length === 0,
+    missingFields,
+    missingLabels: missingFields.map((key) => ENERGY_ANALYSIS_FILTER_LABELS[key] || key)
+  };
+}
+
+/** 计算月度、时序、强度和高峰贡献各自的请求前置筛选状态。 */
+export function getEnergyAnalysisFilterReadiness(filters = {}) {
+  const monthly = buildEnergyAnalysisFilterReadiness(filters, [
+    ['startMonth', '统计月起'], ['endMonth', '统计月止']
+  ]);
+  const timeseries = buildEnergyAnalysisFilterReadiness(filters, [
+    ['meterDeviceId', '表计'], ['energyTypeCode', '能源类型'], ['unit', '单位'],
+    ['startUtc', '时序开始'], ['endUtc', '时序结束'], ['sourceTimeZone', '来源时区']
+  ]);
+  const intensity = buildEnergyAnalysisFilterReadiness(filters, [
+    ['productionUnitId', '产能单元'], ['startMonth', '统计月起'], ['endMonth', '统计月止']
+  ]);
+  const peak = buildEnergyAnalysisFilterReadiness(filters, [
+    ['organizationUnitId', '组织'], ['energyTypeCode', '能源类型'], ['unit', '单位'],
+    ['startUtc', '时序开始'], ['endUtc', '时序结束'], ['sourceTimeZone', '来源时区'],
+    ['outputIntervalMinutes', '时序粒度']
+  ]);
+  return { monthly, timeseries, intensity, peak };
+}
+
+/** 将未就绪筛选状态转成页面可见的“未请求”诊断文案。 */
+export function energyAnalysisFilterRequirementText(readiness, label) {
+  if (readiness?.ready) return '';
+  const missingLabels = Array.isArray(readiness?.missingLabels) ? readiness.missingLabels : [];
+  return `${label || '该分析'}未请求：请填写${missingLabels.length ? missingLabels.join('、') : '必填筛选字段'}后点击查询。`;
+}
+
+/** 根据服务端稳定状态识别已请求结果中的无事实、覆盖不足或可用状态。 */
+export function classifyEnergyAnalysisResult(result = {}, options = {}) {
+  const label = options.label || '分析';
+  const quality = result?.quality || {};
+  const reasonCodes = [...new Set([
+    ...(Array.isArray(result?.reasonCodes) ? result.reasonCodes : []),
+    ...(Array.isArray(quality.reasonCodes) ? quality.reasonCodes : [])
+  ].filter(Boolean))];
+  const qualityStatus = quality.status || '';
+  const emptyResultCollection = ['facets', 'buckets', 'periods', 'shifts', 'states', 'contributors']
+    .some((key) => Array.isArray(result?.[key]) && result[key].length === 0);
+  const explicitNoFacts = result?.dataStatus === 'no_data'
+    || ['no_data', 'no_numerator_facets'].includes(qualityStatus)
+    || result?.recordCount === 0
+    || result?.sourceRecordCounts?.energyRecords === 0;
+  const coverageInsufficient = (
+    ['insufficient', 'coverage_below_threshold', 'missing_shift_schedule', 'device_state_gap'].includes(qualityStatus)
+    || (Number.isFinite(Number(quality.coverageRate)) && Number(quality.coverageRate) < 1)
+    || reasonCodes.some((code) => ['COVERAGE_BELOW_THRESHOLD', 'MISSING_SHIFT_SCHEDULE', 'DEVICE_STATE_GAP'].includes(code))
+  );
+  // 空集合只是无元数据时的兜底；明确质量状态、原因码或覆盖率时必须优先保留覆盖不足语义。
+  const noFacts = explicitNoFacts || (!coverageInsufficient && emptyResultCollection);
+  const reasonText = reasonCodes.length ? `原因：${reasonCodesText(reasonCodes)}` : '';
+  if (noFacts) return { kind: 'no_facts', message: `${label}已请求，但当前筛选未找到匹配事实。${reasonText}` };
+  if (coverageInsufficient) return { kind: 'insufficient_coverage', message: `${label}已请求，但事实覆盖不足。${reasonText || '请检查时序事实与查询范围。'}` };
+  return { kind: 'available', message: `${label}已请求，返回数据可用于当前分析。` };
+}
+
+/** 将请求状态和结果质量统一转换为页面状态标签与说明。 */
+export function energyAnalysisRequestStateView(state = {}, label = '分析') {
+  if (state.status === ENERGY_ANALYSIS_REQUEST_STATUS.notRequested) {
+    return { tag: 'warning', label: '未请求', message: state.message || `${label}未请求。` };
+  }
+  if (state.status === ENERGY_ANALYSIS_REQUEST_STATUS.pending) {
+    return { tag: 'warning', label: '请求中', message: `${label}正在请求。` };
+  }
+  if (state.status === ENERGY_ANALYSIS_REQUEST_STATUS.failure) {
+    return { tag: 'blocked', label: '接口失败', message: state.message || `${label}接口请求失败。` };
+  }
+  if (state.resultKind === 'no_facts') {
+    return { tag: 'warning', label: '无事实', message: state.message || `${label}已请求但没有匹配事实。` };
+  }
+  if (state.resultKind === 'insufficient_coverage') {
+    return { tag: 'warning', label: '覆盖不足', message: state.message || `${label}已请求但覆盖不足。` };
+  }
+  return { tag: 'active', label: '已返回', message: state.message || `${label}已请求并返回数据。` };
 }
 
 /** 开始分析结果状态转换；刷新期间继续展示上一已提交查询快照。 */

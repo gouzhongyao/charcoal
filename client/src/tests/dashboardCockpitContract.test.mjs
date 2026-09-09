@@ -91,6 +91,8 @@ const toggleFunction = dashboardSource.match(/function toggleImmersiveMode\(\) \
 assert.match(toggleFunction, /enterImmersiveMode|exitImmersiveMode/);
 assert.doesNotMatch(toggleFunction, /load|refresh/);
 assert.match(dashboardSource, /const viewModel = computed\(\(\) => \(\{/);
+assert.doesNotMatch(dashboardSource, /UNCONNECTED_CAPABILITIES/);
+assert.doesNotMatch(dashboardSource, /unconnectedCapabilities/);
 assert.match(dashboardSource, /function formatDateTime\(value\)/, '控制器必须定义导入活动时间格式化方法，避免场景信号计算时报未定义。');
 assert.match(dashboardSource, /sceneState: sceneState\.value/);
 assert.match(dashboardSource, /projectSeriesChange/);
@@ -120,7 +122,7 @@ for (const source of [standardSource, immersiveSource]) {
   assert.doesNotMatch(source, /getDashboard|getCarbonEmissionStats|getEnergyBudgetExecutionComparison|ledgerApi/);
 }
 
-// 普通视图必须是浅色多摘要卡，包含趋势、单单位环图、五类真实面板、边界和快捷入口。
+// 普通视图必须是浅色多摘要卡，包含趋势、单单位环图、五类真实面板和快捷入口。
 const energySummarySource = standardSource.match(/<article class="summary-card summary-card--energy">([\s\S]*?)<\/article>/)?.[1] || '';
 /** 普通模式顶部导入累计摘要卡片段，避免由下方详细面板满足断言。 */
 const importSummarySource = standardSource.match(/<article class="summary-card summary-card--import">([\s\S]*?)<\/article>/)?.[1] || '';
@@ -144,6 +146,7 @@ assert.match(standardSource, /年度碳排分析/);
 assert.match(standardSource, /用能预算执行明细/);
 assert.match(standardSource, /当前快照来自本地计量器具台账，不是实时遥测/);
 assert.match(standardSource, /全历史导入累计/);
+assert.doesNotMatch(standardTemplateSource, /boundary-section|boundary-grid|尚未接入的能力/);
 assert.match(importSummarySource, /导入累计/);
 assert.match(importSummarySource, /batchCount/);
 assert.match(importSummarySource, /importedRowCount/);
@@ -199,19 +202,13 @@ assert.match(immersiveSource, /@media \(max-width:960px\)/);
 assert.match(immersiveSource, /上月无数据（自然上月/);
 assert.match(immersiveSource, /formatDashboardMeasurement\(viewModel\.carbonTrendChange\.latestValue, \{ kind: 'carbon' \}\)/);
 assert.match(immersiveSource, /formatDashboardPercentage\(Math\.abs\(change\.rate\)\)/, '沉浸变化率必须避免把极小非零值显示成 0.0%。');
+assert.doesNotMatch(immersiveTemplateSource, /immersive-boundary|未接入能力不参与摘要/);
+assert.doesNotMatch(immersiveSource, /\.immersive-boundary|immersive-boundary/);
 assert.match(immersiveSource, /loading: '正在汇总已授权的真实业务信号。'/);
 assert.match(immersiveSource, /empty: '已完成读取，但当前范围内暂无可展示的真实业务信号。'/);
 assert.match(immersiveSource, /forbidden: '当前账号没有可用于园区摘要的领域数据权限。'/);
 assert.match(immersiveSource, /error: '真实业务摘要读取失败，请使用各面板的重试入口。'/);
 assert.doesNotMatch(immersiveSource, /当前授权真实业务面板尚未返回|等待已授权真实业务面板返回/);
-
-// 未接入能力必须固定列全，不能展示伪零、正常状态或重试。
-for (const label of ['能源成本', '供应商、客户', '碳资产', '碳预算', '统一预警中心', '重点设备主数据', '实时遥测', '应用中心']) {
-  assert.match(dashboardSource, new RegExp(label));
-}
-assert.match(dashboardSource, /不显示伪零资产/);
-assert.match(standardSource, /不显示 0、正常状态或重试入口/);
-assert.match(immersiveSource, /不显示伪零或正常状态/);
 
 // 环图必须接收单一单位，保留真实零，具备 ARIA、键盘、tooltip、图例和等价表格。
 assert.match(donutSource, /unit: \{ type: String, required: true \}/);
@@ -304,7 +301,7 @@ assert.match(dashboardSource, /onBeforeUnmount/);
 assert.match(dashboardSource, /已保留沉浸模式/);
 
 // 沉浸布局必须锁定动态视口并在退出、路由切换和卸载时恢复普通页面滚动。
-assert.match(immersiveSource, /grid-template-rows:auto auto minmax\(0,1fr\) auto/);
+assert.match(immersiveSource, /grid-template-rows:auto auto minmax\(0,1fr\)/);
 assert.match(immersiveSource, /height:100dvh/);
 assert.match(immersiveSource, /min-height:0/);
 assert.match(immersiveSource, /padding:clamp\(/);

@@ -27,16 +27,21 @@
           <PageState v-if="trendError" :error="trendError" @retry="loadData" />
           <PageState v-else-if="!visibleTrend.length" description="暂无趋势数据" />
           <template v-else>
-            <svg class="trend-chart" viewBox="0 0 640 270" role="img" aria-label="月度标准化值趋势折线图" @mouseleave="trendTooltip = null">
-              <line v-for="tick in 5" :key="tick" x1="52" :y1="44 + (tick - 1) * 38" x2="616" :y2="44 + (tick - 1) * 38" class="grid-line" />
-              <text v-for="tick in 5" :key="`label-${tick}`" x="44" :y="48 + (tick - 1) * 38" text-anchor="end" class="axis-text">{{ formatNumber(trendMax * (1 - (tick - 1) / 4), 0) }}</text>
-              <polyline :points="linePoints" class="trend-line" />
-              <g v-for="(row, index) in visibleTrend" :key="row.month" class="trend-point" tabindex="0" role="button" :aria-label="trendLabel(row)" @mouseenter="trendTooltip = row" @focus="trendTooltip = row">
-                <circle :cx="xFor(index, visibleTrend.length)" :cy="yFor(row.totalNormalizedValue)" r="12" class="point-hit" />
-                <circle :cx="xFor(index, visibleTrend.length)" :cy="yFor(row.totalNormalizedValue)" r="4" class="point-dot" />
-              </g>
-              <text v-for="(row, index) in visibleTrend" :key="`month-${row.month}`" :x="xFor(index, visibleTrend.length)" y="244" text-anchor="middle" class="axis-text">{{ row.month }}</text>
-            </svg>
+            <div class="trend-chart-scroll">
+              <svg class="trend-chart" viewBox="0 0 640 270" role="img" aria-label="月度标准化值趋势折线图" @mouseleave="trendTooltip = null">
+                <line v-for="tick in 5" :key="tick" x1="52" :y1="44 + (tick - 1) * 38" x2="616" :y2="44 + (tick - 1) * 38" class="grid-line" />
+                <text v-for="tick in 5" :key="`label-${tick}`" x="44" :y="48 + (tick - 1) * 38" text-anchor="end" class="axis-text">{{ formatNumber(trendMax * (1 - (tick - 1) / 4), 0) }}</text>
+                <polyline :points="linePoints" class="trend-line" />
+                <g v-for="(row, index) in visibleTrend" :key="row.month" class="trend-point" tabindex="0" role="button" :aria-label="trendLabel(row)" @mouseenter="trendTooltip = row" @focus="trendTooltip = row">
+                  <circle :cx="xFor(index, visibleTrend.length)" :cy="yFor(row.totalNormalizedValue)" r="12" class="point-hit" />
+                  <circle :cx="xFor(index, visibleTrend.length)" :cy="yFor(row.totalNormalizedValue)" r="4" class="point-dot" />
+                </g>
+                <text v-for="tick in trendAxisTicks" :key="`month-${tick.month}`" :x="xFor(tick.index, visibleTrend.length)" y="231" text-anchor="middle" class="axis-text trend-axis-label">
+                  <tspan :x="xFor(tick.index, visibleTrend.length)" dy="0">{{ tick.yearLabel }}</tspan>
+                  <tspan :x="xFor(tick.index, visibleTrend.length)" dy="14">{{ tick.monthLabel }}</tspan>
+                </text>
+              </svg>
+            </div>
             <p v-if="trendTooltip" class="chart-tooltip" role="status">{{ trendLabel(trendTooltip) }}</p>
             <el-table :data="visibleTrend" size="small" class="chart-table">
               <el-table-column prop="month" label="月份" min-width="92" />
@@ -106,7 +111,7 @@ import PageState from '@/components/PageState.vue';
 import StatCard from '@/components/StatCard.vue';
 import StatusTag from '@/components/StatusTag.vue';
 import { executeLedgerBackfill, exportEnergyRecords, exportLedgerBackfillPreview, getDimensionBreakdown, getEnergyRecords, getEnergySummary, getEnergyTypes, getEnergyTypeBreakdown, getLedgerBackfillPreview, getMonthlyTrend, LEDGER_BACKFILL_CONFIRM_TEXT, safeEnergyRequest } from '@/api/energy';
-import { aggregateMonthlyTrend, buildEnergyFilters, ENERGY_TYPE_COLORS, fixedEnergyTypeBreakdown, ledgerAssociationLabel, numberValue } from '@/utils/energyStatistics';
+import { aggregateMonthlyTrend, buildEnergyFilters, buildMonthlyTrendAxisTicks, ENERGY_TYPE_COLORS, fixedEnergyTypeBreakdown, ledgerAssociationLabel, numberValue } from '@/utils/energyStatistics';
 import { hasPermi } from '@/utils/permission';
 
 const emptyFilters = () => ({ normalizedMonthStart: '', normalizedMonthEnd: '', energyTypeCode: '', organizationUnitCode: '', keyword: '' });
@@ -122,6 +127,8 @@ const formatNumber = (value, digits = 2) => new Intl.NumberFormat('zh-CN', { max
 const formatInteger = (value) => formatNumber(value, 0);
 const monthRange = computed(() => summary.value.monthRange?.start && summary.value.monthRange?.end ? `${summary.value.monthRange.start} 至 ${summary.value.monthRange.end}` : '暂无');
 const visibleTrend = computed(() => aggregateMonthlyTrend(trendRows.value).slice(-24));
+// 趋势图横轴只控制标签显示密度，数据点和 tooltip 仍覆盖最近 24 月全部数据。
+const trendAxisTicks = computed(() => buildMonthlyTrendAxisTicks(visibleTrend.value));
 const trendMax = computed(() => Math.max(...visibleTrend.value.map((row) => numberValue(row.totalNormalizedValue)), 1));
 const linePoints = computed(() => visibleTrend.value.map((row, index) => `${xFor(index, visibleTrend.value.length)},${yFor(row.totalNormalizedValue)}`).join(' '));
 const typeBreakdown = computed(() => fixedEnergyTypeBreakdown(breakdownRows.value));
@@ -165,5 +172,5 @@ onMounted(async () => { await loadEnergyTypes(); await loadData(); });
 </script>
 
 <style scoped>
-.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.chart-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.chart-panel{min-width:0}.chart-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.chart-heading h2{margin:0;color:#123b79;font-size:16px}.chart-heading span{color:#7385a2;font-size:12px}.heading-with-help{display:flex;align-items:center}.trend-chart{width:100%;min-height:270px;background:#fcfcfb;border:1px solid #e1e0d9;border-radius:10px}.grid-line{stroke:#e1e0d9;stroke-width:1}.axis-text{fill:#898781;font-size:11px}.trend-line{fill:none;stroke:#2a78d6;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.point-hit{fill:transparent}.point-dot{fill:#2a78d6;stroke:#fcfcfb;stroke-width:2}.trend-point{cursor:pointer}.trend-point:focus{outline:none}.trend-point:focus .point-dot,.trend-point:hover .point-dot{r:6;filter:drop-shadow(0 2px 5px rgba(42,120,214,.35))}.chart-tooltip{margin:8px 0;padding:8px 10px;color:#183153;background:#edf5ff;border:1px solid #c9dcf5;border-radius:8px;font-size:13px}.chart-table{margin-top:10px;width:100%}.bar-chart{display:grid;gap:10px}.bar-row{display:grid;grid-template-columns:minmax(96px,.8fr) minmax(130px,2fr) minmax(112px,.8fr);align-items:center;gap:10px;width:100%;padding:5px 0;color:#183153;text-align:left;background:transparent;border:0;border-radius:6px}.bar-row:focus-visible{outline:2px solid #1769e0;outline-offset:2px}.bar-row:hover{background:#f7fbff}.bar-name{display:flex;align-items:center;gap:7px;min-width:0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bar-name i{width:10px;height:10px;flex:0 0 10px;border:1px solid rgba(11,11,11,.1);border-radius:2px}.bar-track{height:14px;padding-right:2px;background:#e7f1ff;border-radius:999px}.bar-fill{display:block;height:14px;border-right:2px solid #fcfcfb;border-radius:0 999px 999px 0}.single-bar{background:#2a78d6}.bar-value{color:#516170;font-size:12px;text-align:right;white-space:nowrap}.dimension-chart{max-width:880px}.ledger-card{display:grid;gap:12px}.panel-alert{margin-top:4px}.preview-summary{display:flex;flex-wrap:wrap;gap:16px;color:#516170;font-size:13px}.pagination{display:flex;justify-content:flex-end;margin-top:16px}.drawer-notice{margin:0 0 16px;color:#516170;line-height:1.7}@media (max-width:1120px){.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-grid{grid-template-columns:1fr}}@media (max-width:720px){.stat-grid{grid-template-columns:1fr}.bar-row{grid-template-columns:1fr}.bar-value{text-align:left}.trend-chart{min-width:620px}.chart-panel{overflow-x:auto}}
+.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.chart-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.chart-panel{min-width:0}.chart-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.chart-heading h2{margin:0;color:#123b79;font-size:16px}.chart-heading span{color:#7385a2;font-size:12px}.heading-with-help{display:flex;align-items:center}.trend-chart-scroll{width:100%;overflow-x:auto;overscroll-behavior-inline:contain}.trend-chart{display:block;width:100%;min-width:560px;min-height:270px;background:#fcfcfb;border:1px solid #e1e0d9;border-radius:10px}.grid-line{stroke:#e1e0d9;stroke-width:1}.axis-text{fill:#898781;font-size:11px}.trend-axis-label{font-variant-numeric:tabular-nums}.trend-line{fill:none;stroke:#2a78d6;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.point-hit{fill:transparent}.point-dot{fill:#2a78d6;stroke:#fcfcfb;stroke-width:2}.trend-point{cursor:pointer}.trend-point:focus{outline:none}.trend-point:focus .point-dot,.trend-point:hover .point-dot{r:6;filter:drop-shadow(0 2px 5px rgba(42,120,214,.35))}.chart-tooltip{margin:8px 0;padding:8px 10px;color:#183153;background:#edf5ff;border:1px solid #c9dcf5;border-radius:8px;font-size:13px}.chart-table{margin-top:10px;width:100%}.bar-chart{display:grid;gap:10px}.bar-row{display:grid;grid-template-columns:minmax(96px,.8fr) minmax(130px,2fr) minmax(112px,.8fr);align-items:center;gap:10px;width:100%;padding:5px 0;color:#183153;text-align:left;background:transparent;border:0;border-radius:6px}.bar-row:focus-visible{outline:2px solid #1769e0;outline-offset:2px}.bar-row:hover{background:#f7fbff}.bar-name{display:flex;align-items:center;gap:7px;min-width:0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bar-name i{width:10px;height:10px;flex:0 0 10px;border:1px solid rgba(11,11,11,.1);border-radius:2px}.bar-track{height:14px;padding-right:2px;background:#e7f1ff;border-radius:999px}.bar-fill{display:block;height:14px;border-right:2px solid #fcfcfb;border-radius:0 999px 999px 0}.single-bar{background:#2a78d6}.bar-value{color:#516170;font-size:12px;text-align:right;white-space:nowrap}.dimension-chart{max-width:880px}.ledger-card{display:grid;gap:12px}.panel-alert{margin-top:4px}.preview-summary{display:flex;flex-wrap:wrap;gap:16px;color:#516170;font-size:13px}.pagination{display:flex;justify-content:flex-end;margin-top:16px}.drawer-notice{margin:0 0 16px;color:#516170;line-height:1.7}@media (max-width:1120px){.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-grid{grid-template-columns:1fr}}@media (max-width:720px){.stat-grid{grid-template-columns:1fr}.bar-row{grid-template-columns:1fr}.bar-value{text-align:left}}
 </style>

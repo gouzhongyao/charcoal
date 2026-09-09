@@ -71,17 +71,6 @@ import StandardDashboardView from './StandardDashboardView.vue';
 
 /** 碳排趋势使用的驾驶舱单系列强调色。 */
 const CARBON_TREND_COLOR = '#38bdf8';
-/** 未接入能力的固定边界说明，禁止用伪零或正常状态替代。 */
-const UNCONNECTED_CAPABILITIES = Object.freeze([
-  { key: 'cost', label: '能源成本', description: '当前没有权威价格或计费数据。' },
-  { key: 'partners', label: '供应商、客户', description: '供应商和客户主数据尚未接入。' },
-  { key: 'carbon-assets', label: '碳资产', description: '配额、碳信用、交易和履约资产尚未接入，不显示伪零资产。' },
-  { key: 'carbon-budget', label: '碳预算', description: '尚未接入，不能使用用能预算代替。' },
-  { key: 'alerts', label: '统一预警中心', description: '尚未接入，当前仅展示用能预算执行风险。' },
-  { key: 'equipment', label: '重点设备主数据', description: '尚未接入，计量器具不能直接等同重点设备。' },
-  { key: 'telemetry', label: '实时遥测', description: '尚未接入，计量器具数据仅为台账快照。' },
-  { key: 'applications', label: '应用中心', description: '尚未接入，继续使用真实授权的业务快捷入口。' }
-]);
 /** 当前自然年度。 */
 const currentYear = new Date().getFullYear();
 /** 应用级沉浸模式状态。 */
@@ -289,7 +278,6 @@ const viewModel = computed(() => ({
   meterActivePercentage: meterActivePercentage.value,
   meterInactivePercentage: meterInactivePercentage.value,
   quickLinks: quickLinks.value,
-  unconnectedCapabilities: UNCONNECTED_CAPABILITIES,
   sceneState: sceneState.value,
   sceneSignals: sceneSignals.value
 }));

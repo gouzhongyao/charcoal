@@ -43,6 +43,28 @@ export function aggregateMonthlyTrend(rows = []) {
   return [...byMonth.values()].sort((left, right) => left.month.localeCompare(right.month));
 }
 
+/** 按最大数量抽样生成趋势图横轴刻度，保留首尾月份并拆分年份与月份文本。 */
+export function buildMonthlyTrendAxisTicks(rows = [], maxTickCount = 8) {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const safeMaxTickCount = Math.max(2, Math.floor(numberValue(maxTickCount)));
+  const lastIndex = rows.length - 1;
+  const tickCount = Math.min(rows.length, safeMaxTickCount);
+  const indexes = rows.length <= safeMaxTickCount
+    ? rows.map((_, index) => index)
+    : Array.from({ length: tickCount }, (_, tickIndex) => Math.round((tickIndex * lastIndex) / (tickCount - 1)));
+
+  let previousYear = '';
+  return indexes.map((index) => {
+    const month = String(rows[index]?.month || '').trim();
+    const match = /^(\d{4})-(\d{2})$/.exec(month);
+    const year = match?.[1] || '';
+    const monthLabel = match ? `${match[2]}月` : month;
+    const yearLabel = year && year !== previousYear ? year : '';
+    previousYear = year || previousYear;
+    return { index, month, yearLabel, monthLabel };
+  });
+}
+
 export function fixedEnergyTypeBreakdown(rows = []) {
   const known = new Map();
   const unknown = [];

@@ -4,6 +4,8 @@ import {
   ENERGY_ANALYSIS_CONFIGURATION_CONTRACT,
   ENERGY_ANALYSIS_IMPORT_TYPES,
   ENERGY_ANALYSIS_PERMISSIONS,
+  ENERGY_ANALYSIS_REQUEST_STATUS,
+  classifyEnergyAnalysisResult,
   ENERGY_ANALYSIS_TOU_PRESENTATION,
   STRATEGY_STATUS_LABELS,
   allowedStrategyStatuses,
@@ -21,11 +23,15 @@ import {
   createDefaultEnergyAnalysisFilters,
   createEmptyEnergyAnalysisResult,
   createEnergyAnalysisConfigForm,
+  createEnergyAnalysisRequestStates,
   createEnergyAnalysisSnapshot,
   createLatestEnergyAnalysisRequestGate,
   createDefaultEnergyAnalysisTimeseriesWindow,
   energyAnalysisBarPercentage,
   energyAnalysisErrorText,
+  energyAnalysisFilterRequirementText,
+  energyAnalysisRequestStateView,
+  getEnergyAnalysisFilterReadiness,
   floorEnergyAnalysisDateToUtcGrid,
   formatAnalysisValue,
   formatEnergyAnalysisWallClock,
@@ -150,6 +156,45 @@ assert.equal(reasonCodeLabel('MISSING_SHIFT_SCHEDULE'), '排班记录存在缺�
 assert.equal(reasonCodeLabel('MISSING_PRODUCTION_OUTPUT'), '缺少产量分母');
 assert.equal(reasonCodeLabel('CUSTOM_BACKEND_REASON'), '后端原因码：CUSTOM_BACKEND_REASON');
 assert.match(reasonCodesText(['NO_TIMESERIES_DATA', 'DEVICE_STATE_GAP']), /缺少时序能耗数据.*设备状态存在缺口/);
+
+// 页面请求状态必须区分筛选未完成、接口失败、无事实和覆盖不足。
+const incompleteReadiness = getEnergyAnalysisFilterReadiness({ startMonth: '2026-01', endMonth: '2026-06' });
+assert.equal(incompleteReadiness.monthly.ready, true);
+assert.equal(incompleteReadiness.timeseries.ready, false);
+assert.equal(incompleteReadiness.intensity.ready, false);
+assert.equal(incompleteReadiness.peak.ready, false);
+const monthlyIntensityReadiness = getEnergyAnalysisFilterReadiness({ startMonth: '2026-01', endMonth: '2026-06', productionUnitId: 3 });
+assert.equal(monthlyIntensityReadiness.monthly.ready, true);
+assert.equal(monthlyIntensityReadiness.intensity.ready, true);
+assert.equal(monthlyIntensityReadiness.timeseries.ready, false);
+const peakReadiness = getEnergyAnalysisFilterReadiness(filters);
+assert.equal(peakReadiness.peak.ready, true);
+assert.match(energyAnalysisFilterRequirementText(incompleteReadiness.timeseries, '时序分析'), /时序分析未请求.*表计.*能源类型.*单位/);
+const requestStates = createEnergyAnalysisRequestStates();
+assert.equal(requestStates.loadCurve.status, ENERGY_ANALYSIS_REQUEST_STATUS.notRequested);
+assert.equal(energyAnalysisRequestStateView({ status: 'not_requested', message: '请先选择表计。' }, '时序负荷曲线').label, '未请求');
+assert.equal(energyAnalysisRequestStateView({ status: 'failure', message: '服务不可用。' }, '时序负荷曲线').label, '接口失败');
+assert.equal(classifyEnergyAnalysisResult({ dataStatus: 'no_data', reasonCodes: ['NO_TIMESERIES_DATA'] }, { label: '月度消费' }).kind, 'no_facts');
+for (const collectionKey of ['facets', 'buckets', 'periods', 'shifts', 'states', 'contributors']) {
+  assert.equal(classifyEnergyAnalysisResult({ [collectionKey]: [] }, { label: collectionKey }).kind, 'no_facts');
+}
+assert.equal(classifyEnergyAnalysisResult({
+  recordCount: 1,
+  shifts: [],
+  quality: { status: 'missing_shift_schedule' }
+}, { label: '班次分析' }).kind, 'insufficient_coverage');
+assert.equal(classifyEnergyAnalysisResult({
+  recordCount: 1,
+  states: [],
+  quality: { status: 'sufficient', coverageRate: 0.5 }
+}, { label: '设备状态' }).kind, 'insufficient_coverage');
+assert.equal(classifyEnergyAnalysisResult({
+  recordCount: 1,
+  contributors: [],
+  quality: { status: 'sufficient', reasonCodes: ['DEVICE_STATE_GAP'] }
+}, { label: '高峰贡献' }).kind, 'insufficient_coverage');
+assert.equal(classifyEnergyAnalysisResult({ quality: { status: 'insufficient', coverageRate: 0.5, reasonCodes: ['COVERAGE_BELOW_THRESHOLD'] } }, { label: '时序负荷摘要' }).kind, 'insufficient_coverage');
+assert.equal(classifyEnergyAnalysisResult({ quality: { status: 'sufficient' }, recordCount: 1 }, { label: '时序负荷摘要' }).kind, 'available');
 assert.equal(energyAnalysisErrorText({ response: { status: 401, data: { error: {} } } }), '登录状态已失效，请重新登录后再试。');
 assert.equal(energyAnalysisErrorText({ response: { status: 403, data: { error: {} } } }), '权限不足：当前账号没有执行该操作的权限。');
 assert.equal(energyAnalysisErrorText({ response: { status: 403, data: { error: {} } } }, '失败', { suppressGlobalHandledStatus: true }), '');
@@ -513,7 +558,12 @@ assert.doesNotMatch(pageSource, /label="窗口总能耗"/);
 assert.match(pageSource, /普通能耗导入只进入月度分析/);
 assert.match(pageSource, /成功 0、失败 1 或仅完成 preview 都不会产生可分析事实/);
 assert.match(pageSource, /validateEnergyAnalysisLoadCurveGrid\(filters\)/);
-assert.match(pageSource, /requests\.push\(Promise\.resolve\(\{ key: 'loadCurve'/);
+assert.match(pageSource, /if \(readiness\.monthly\.ready\) addRequest\('monthlyAnalysis'/);
+assert.match(pageSource, /if \(filters\.productionUnitId && readiness\.intensity\.ready\) addRequest\('intensityAnalysis'/);
+assert.match(pageSource, /if \(readiness\.peak\.ready\) addRequest\('peakContribution'/);
+assert.match(pageSource, /setAnalysisRequestState\('loadCurve', ENERGY_ANALYSIS_REQUEST_STATUS\.notRequested/);
+assert.match(pageSource, /analysisRequestStatusItems/);
+assert.match(pageSource, /接口失败/);
 assert.match(pageSource, /预演完成，未写业务事实/);
 assert.match(pageSource, /if \(executeSummary\.status === 'zero'\)/);
 assert.match(pageSource, /if \(executeSummary\.status === 'partial'\)/);

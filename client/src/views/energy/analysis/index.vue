@@ -26,6 +26,15 @@
       </ManagementToolbar>
 
       <el-alert v-if="masterDataError" type="warning" :closable="false" show-icon :title="masterDataError" />
+      <section v-if="!analysisInitialLoading" class="page-card analysis-state-panel" aria-live="polite">
+        <header class="panel-heading"><div><h2>本次分析请求状态</h2><span>只解释当前已提交筛选；普通月度事实不会替代时序事实</span></div></header>
+        <div class="analysis-state-list">
+          <div v-for="item in analysisRequestStatusItems" :key="item.key" class="analysis-state-item">
+            <div class="analysis-state-heading"><strong>{{ item.label }}</strong><StatusTag :status="item.tag" :label="item.statusLabel" /></div>
+            <span>{{ item.message }}</span>
+          </div>
+        </div>
+      </section>
       <el-tabs v-model="activeTab" class="analysis-tabs">
         <el-tab-pane label="消费分析" name="analysis">
           <div class="tab-stack">
@@ -46,9 +55,12 @@
 
               <article class="page-card chart-panel">
                 <header class="panel-heading"><div><h2>固定 UTC 负荷曲线</h2><span>单轴 · 2px 折线 · 缺失桶断线 · 真实零值落在基线</span></div><div class="quality-tags"><StatusTag :status="loadSummary.quality?.status || 'unknown'" :label="`摘要：${qualityStatusText(loadSummary.quality)}`" /><StatusTag :status="loadCurve.quality?.status || 'unknown'" :label="`曲线：${qualityStatusText(loadCurve.quality)}`" /></div></header>
-                <PageState v-if="!timeseriesReady" description="时序卡片和曲线不会由普通能耗导入填充。请完成时序 preview + execute 且实际写入大于 0，再选择精确表计、能源类型、标准化单位、来源时区和相交时间范围。" />
-                <PageState v-else-if="!curveRows.length" :description="`暂无时序曲线数据。成功 0、失败 1 或仅完成 preview 都不会产生可分析事实。${reasonCodesText(loadCurve.quality?.reasonCodes)}`" />
+                <PageState v-if="!timeseriesReady" description="时序负荷曲线未请求：请完成时序 preview + execute 且实际写入大于 0，再选择精确表计、能源类型、标准化单位、来源时区和相交时间范围。成功 0、失败 1 或仅完成 preview 都不会产生可分析事实；普通月度 energy_records 不会替代时序事实。" />
+                <PageState v-else-if="loadCurveRequestStateView.label === '未请求'" :description="loadCurveRequestStateView.message" />
+                <PageState v-else-if="loadCurveRequestStateView.label === '接口失败'" :error="loadCurveRequestStateView.message" />
+                <PageState v-else-if="loadCurveResultState.kind === 'no_facts'" :description="loadCurveResultState.message" />
                 <template v-else>
+                  <el-alert v-if="loadCurveResultState.kind === 'insufficient_coverage'" type="warning" :closable="false" show-icon :title="loadCurveResultState.message" />
                   <div class="wide-scroll">
                     <svg class="line-chart" viewBox="0 0 720 260" role="img" aria-labelledby="energy-load-curve-title energy-load-curve-desc" @mouseleave="curveTooltip = null">
                       <title id="energy-load-curve-title">固定 UTC 网格能耗折线图</title>
@@ -71,8 +83,11 @@
               <section class="two-column-grid">
                 <article class="page-card chart-panel">
                   <header class="panel-heading"><div><h2>月度消费量与同环比</h2><span>缺月为“缺失”，有记录且为零显示 0</span></div></header>
-                  <PageState v-if="!monthlyFacets.length" :description="monthlyEmptyDescription" />
+                  <PageState v-if="monthlyRequestStateView.label === '未请求'" :description="monthlyRequestStateView.message" />
+                  <PageState v-else-if="monthlyRequestStateView.label === '接口失败'" :error="monthlyRequestStateView.message" />
+                  <PageState v-else-if="monthlyResultState.kind === 'no_facts'" :description="monthlyResultState.message" />
                   <template v-else>
+                    <el-alert v-if="monthlyResultState.kind === 'insufficient_coverage'" type="warning" :closable="false" show-icon :title="monthlyResultState.message" />
                     <el-select v-model="selectedMonthlyFacet" placeholder="选择能源与单位分面"><el-option v-for="(facet, index) in monthlyFacets" :key="monthlyFacetKey(facet)" :label="`${facet.energyType?.name || facet.energyType?.code || facet.energyTypeCode} / ${facet.unit}`" :value="index" /></el-select>
                     <div class="wide-scroll"><el-table :data="selectedMonthlyTrend" size="small" max-height="360"><el-table-column prop="month" label="月份" width="90" /><el-table-column label="消费量" min-width="130"><template #default="{ row }">{{ formatAnalysisValue(row.value, { unit: selectedMonthlyFacetData?.unit }) }}</template></el-table-column><el-table-column label="环比" min-width="150"><template #default="{ row }">{{ monthlyComparisonText(row.periodOverPeriod) }}</template></el-table-column><el-table-column label="同比" min-width="150"><template #default="{ row }">{{ monthlyComparisonText(row.yearOverYear) }}</template></el-table-column><el-table-column prop="recordCount" label="记录数" width="88" /></el-table></div>
                   </template>
@@ -205,14 +220,14 @@ import { hasPermi } from '@/utils/permission';
 import { formatStrictUtcDateTimeDisplay } from '@/utils/dateTimeDisplay';
 import {
   ENERGY_ANALYSIS_CONFIGURATION_CONTRACT, ENERGY_ANALYSIS_IMPORT_TYPES, ENERGY_ANALYSIS_PERMISSIONS,
-  ENERGY_ANALYSIS_TOU_PRESENTATION, STRATEGY_STATUS_LABELS,
+  ENERGY_ANALYSIS_REQUEST_STATUS, ENERGY_ANALYSIS_TOU_PRESENTATION, STRATEGY_STATUS_LABELS,
   allowedStrategyStatuses, buildEnergyAnalysisConfigPayload, buildImportExecutePayload, buildIntensityParams,
   buildLoadCurveParams, buildLoadCurvePoints, buildLoadCurveSegments, buildLoadSummaryParams,
   buildMonthlyAnalysisParams, buildPeakContributionParams, buildStrategyParams, buildTimeseriesAnalysisParams,
-  buildTouParams, canExecuteEnergyAnalysisImport, commitEnergyAnalysisStrategyResult,
+  buildTouParams, canExecuteEnergyAnalysisImport, classifyEnergyAnalysisResult, commitEnergyAnalysisStrategyResult,
   completeEnergyAnalysisResultTransition, createDefaultEnergyAnalysisFilters, createEmptyEnergyAnalysisResult,
-  createEnergyAnalysisConfigForm, createEnergyAnalysisSnapshot, createLatestEnergyAnalysisRequestGate,
-  energyAnalysisBarPercentage, energyAnalysisErrorText, formatAnalysisValue, formatCoverageRate, masterDataItems,
+  createEnergyAnalysisConfigForm, createEnergyAnalysisRequestStates, createEnergyAnalysisSnapshot, createLatestEnergyAnalysisRequestGate,
+  energyAnalysisBarPercentage, energyAnalysisErrorText, energyAnalysisFilterRequirementText, energyAnalysisRequestStateView, formatAnalysisValue, formatCoverageRate, getEnergyAnalysisFilterReadiness, masterDataItems,
   monthlyComparisonText, normalizeLoadCurveRows, qualityStatusText, reasonCodesText,
   replaceEnergyAnalysisStrategyHit, responseItems, startEnergyAnalysisResultTransition,
   summarizeEnergyAnalysisImportExecuteResult, touPresentation, validateEnergyAnalysisLoadCurveGrid,
@@ -237,6 +252,7 @@ const importDefinitions = Object.values(ENERGY_ANALYSIS_IMPORT_TYPES);
 const analysisLoading = ref(false);
 const analysisError = ref('');
 const analysisRequestGate = createLatestEnergyAnalysisRequestGate();
+const analysisRequestStates = ref(createEnergyAnalysisRequestStates());
 const analysisResultState = ref(createEnergyAnalysisSnapshot({ displaySnapshot: null, pendingSnapshot: null }));
 const curveTooltip = ref(null);
 const selectedMonthlyFacet = ref(0);
@@ -289,6 +305,15 @@ const canManageRule = computed(() => hasPermi(ENERGY_ANALYSIS_PERMISSIONS.strate
 const analysisDisplaySnapshot = computed(() => analysisResultState.value.displaySnapshot);
 const analysisDisplayFilters = computed(() => analysisDisplaySnapshot.value?.inputSnapshot || appliedFilters.value);
 const analysisResultData = computed(() => analysisDisplaySnapshot.value?.resultSnapshot || createEmptyEnergyAnalysisResult());
+const analysisRequestStatusItems = computed(() => [
+  ['monthlyAnalysis', '月度消费'], ['loadSummary', '时序负荷摘要'], ['loadCurve', '时序负荷曲线'],
+  ['intensityAnalysis', '消费强度'], ['touAnalysis', '峰平谷'], ['shiftAnalysis', '班次'],
+  ['deviceStateAnalysis', '设备状态'], ['peakContribution', '高峰贡献']
+].map(([key, label]) => {
+  const state = analysisRequestStates.value[key] || { status: ENERGY_ANALYSIS_REQUEST_STATUS.notRequested };
+  const view = energyAnalysisRequestStateView(state, label);
+  return { key, ...view, label, statusLabel: view.label };
+}));
 const loadSummary = computed(() => analysisResultData.value.loadSummary);
 const loadCurve = computed(() => analysisResultData.value.loadCurve);
 const monthlyAnalysis = computed(() => analysisResultData.value.monthlyAnalysis);
@@ -297,6 +322,10 @@ const touAnalysis = computed(() => analysisResultData.value.touAnalysis);
 const shiftAnalysis = computed(() => analysisResultData.value.shiftAnalysis);
 const deviceStateAnalysis = computed(() => analysisResultData.value.deviceStateAnalysis);
 const peakContribution = computed(() => analysisResultData.value.peakContribution);
+const monthlyRequestStateView = computed(() => energyAnalysisRequestStateView(analysisRequestStates.value.monthlyAnalysis, '月度消费'));
+const loadCurveRequestStateView = computed(() => energyAnalysisRequestStateView(analysisRequestStates.value.loadCurve, '时序负荷曲线'));
+const loadCurveResultState = computed(() => classifyEnergyAnalysisResult(loadCurve.value, { label: '时序负荷曲线' }));
+const monthlyResultState = computed(() => classifyEnergyAnalysisResult(monthlyAnalysis.value, { label: '月度消费' }));
 const timeseriesReady = computed(() => isTimeseriesReady(analysisDisplayFilters.value));
 const analysisInitialLoading = computed(() => analysisLoading.value && !analysisDisplaySnapshot.value);
 const analysisRefreshing = computed(() => analysisLoading.value && Boolean(analysisDisplaySnapshot.value));
@@ -398,6 +427,37 @@ function clearStrategyResults(message = '') {
   else if (!message) strategyInputChangedNotice.value = '';
 }
 
+/** 更新单个分析切片的请求状态，保留未请求和接口失败诊断。 */
+function setAnalysisRequestState(key, status, message = '', resultKind = '') {
+  analysisRequestStates.value = {
+    ...analysisRequestStates.value,
+    [key]: { status, message, resultKind }
+  };
+}
+
+/** 为当前筛选初始化各分析切片的未请求原因。 */
+function initializeAnalysisRequestStates(filters) {
+  const readiness = getEnergyAnalysisFilterReadiness(filters);
+  const states = createEnergyAnalysisRequestStates();
+  const timeseriesMessage = energyAnalysisFilterRequirementText(readiness.timeseries, '时序分析');
+  const monthlyMessage = energyAnalysisFilterRequirementText(readiness.monthly, '月度消费');
+  const intensityMessage = filters.productionUnitId
+    ? energyAnalysisFilterRequirementText(readiness.intensity, '消费强度')
+    : '消费强度未请求：请选择产能单元后点击查询。';
+  const peakMessage = energyAnalysisFilterRequirementText(readiness.peak, '高峰贡献');
+  ['loadSummary', 'loadCurve', 'shiftAnalysis', 'deviceStateAnalysis'].forEach((key) => {
+    states[key].message = timeseriesMessage;
+  });
+  states.monthlyAnalysis.message = monthlyMessage;
+  states.intensityAnalysis.message = intensityMessage;
+  states.touAnalysis.message = !readiness.timeseries.ready
+    ? timeseriesMessage
+    : (filters.touSchemeId ? '' : '峰平谷未请求：请显式选择 TOU 方案后点击查询。');
+  states.peakContribution.message = peakMessage;
+  analysisRequestStates.value = states;
+  return readiness;
+}
+
 /** 应用草稿筛选快照并仅在按钮触发时请求分析。 */
 function applyFilters() {
   appliedFilters.value = createEnergyAnalysisSnapshot(draftFilters.value);
@@ -420,31 +480,38 @@ async function loadAnalysis() {
   const filters = run.inputSnapshot;
   const nextResult = createEmptyEnergyAnalysisResult();
   const requests = [];
+  const readiness = initializeAnalysisRequestStates(filters);
   analysisResultState.value = startEnergyAnalysisResultTransition(analysisDisplaySnapshot.value, run);
-  const addRequest = (key, label, task) => requests.push(safeRequest(task).then((result) => ({ key, label, ...result })));
+  const addRequest = (key, label, task) => {
+    setAnalysisRequestState(key, ENERGY_ANALYSIS_REQUEST_STATUS.pending);
+    requests.push(safeRequest(task).then((result) => ({ key, label, ...result })));
+  };
   analysisLoading.value = true;
   analysisError.value = '';
-  addRequest('monthlyAnalysis', '月度消费分析', () => getMonthlyConsumptionAnalysis(buildMonthlyAnalysisParams(filters)));
-  if (filters.productionUnitId) addRequest('intensityAnalysis', '消费强度', () => getEnergyIntensityAnalysis(buildIntensityParams(filters)));
-  if (isTimeseriesReady(filters)) {
+  if (readiness.monthly.ready) addRequest('monthlyAnalysis', '月度消费分析', () => getMonthlyConsumptionAnalysis(buildMonthlyAnalysisParams(filters)));
+  if (filters.productionUnitId && readiness.intensity.ready) addRequest('intensityAnalysis', '消费强度', () => getEnergyIntensityAnalysis(buildIntensityParams(filters)));
+  if (readiness.timeseries.ready) {
     const loadCurveGridValidation = validateEnergyAnalysisLoadCurveGrid(filters);
     addRequest('loadSummary', '负荷摘要', () => getEnergyLoadSummary(buildLoadSummaryParams(filters)));
     if (loadCurveGridValidation.valid) addRequest('loadCurve', '负荷曲线', () => getEnergyLoadCurve(buildLoadCurveParams(filters)));
-    else requests.push(Promise.resolve({ key: 'loadCurve', label: '负荷曲线', ok: false, validationMessage: loadCurveGridValidation.message }));
+    else setAnalysisRequestState('loadCurve', ENERGY_ANALYSIS_REQUEST_STATUS.notRequested, loadCurveGridValidation.message);
     addRequest('shiftAnalysis', '班次分析', () => getShiftConsumptionAnalysis(buildTimeseriesAnalysisParams(filters)));
     addRequest('deviceStateAnalysis', '设备状态', () => getDeviceStateConsumptionAnalysis(buildTimeseriesAnalysisParams(filters)));
     if (filters.touSchemeId) addRequest('touAnalysis', '峰平谷分析', () => getTimeOfUseAnalysis(buildTouParams(filters)));
   }
-  if (filters.organizationUnitId && filters.energyTypeCode && filters.unit && filters.startUtc && filters.endUtc) {
-    addRequest('peakContribution', '高峰贡献', () => getPeakContributionAnalysis(buildPeakContributionParams(filters)));
-  }
+  if (readiness.peak.ready) addRequest('peakContribution', '高峰贡献', () => getPeakContributionAnalysis(buildPeakContributionParams(filters)));
   const settled = await Promise.all(requests);
   if (!analysisRequestGate.isLatest(run)) return;
   const failures = [];
   settled.forEach((result) => {
-    if (result.ok) nextResult[result.key] = createEnergyAnalysisSnapshot(responseData(result.response));
-    else {
+    if (result.ok) {
+      const responseDataSnapshot = createEnergyAnalysisSnapshot(responseData(result.response));
+      nextResult[result.key] = responseDataSnapshot;
+      const resultState = classifyEnergyAnalysisResult(responseDataSnapshot, { label: result.label });
+      setAnalysisRequestState(result.key, ENERGY_ANALYSIS_REQUEST_STATUS.success, resultState.message, resultState.kind);
+    } else {
       const message = result.validationMessage || energyAnalysisErrorText(result.error, '接口请求失败。', { suppressGlobalHandledStatus: true });
+      setAnalysisRequestState(result.key, ENERGY_ANALYSIS_REQUEST_STATUS.failure, message || '接口请求失败。');
       if (message) failures.push(result.validationMessage ? message : `${result.label}：${message}`);
     }
   });
@@ -619,5 +686,5 @@ onMounted(async () => { if (!canView.value) return; await Promise.all([loadMaste
 </script>
 
 <style scoped>
-.analysis-tabs{min-width:0}.tab-stack,.analysis-results{display:grid;gap:16px;min-width:0}.applied-note{align-self:center;color:#7385a2;font-size:12px}.stat-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.two-column-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.three-column-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.chart-panel,.compact-panel{min-width:0}.panel-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.panel-heading h2{margin:0;color:#123b79;font-size:16px}.panel-heading span{color:#7385a2;font-size:12px}.quality-tags{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px}.wide-scroll{max-width:100%;overflow-x:auto}.line-chart{width:100%;min-width:680px;min-height:260px;background:#fcfcfb;border:1px solid #dce9fb;border-radius:10px}.grid-line{stroke:#e1e7ef;stroke-width:1}.curve-line{fill:none;stroke:#1769e0;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.point-hit{fill:transparent}.point-dot{fill:#1769e0;stroke:#fcfcfb;stroke-width:2}g:hover .point-dot{r:6}.axis-text{fill:#728199;font-size:10px}.chart-tooltip{margin:8px 0;padding:8px 10px;color:#183153;background:#edf5ff;border:1px solid #c9dcf5;border-radius:8px;font-size:13px}.legend{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px;color:#516170;font-size:12px}.legend span{display:flex;align-items:center;gap:6px}.legend i{width:12px;height:12px;border:1px solid #fff;border-radius:3px;box-shadow:0 0 0 1px #c8d5e7}.metric-bar{display:grid;grid-template-columns:34px minmax(100px,1fr) minmax(92px,auto);align-items:center;gap:10px;width:100%;padding:7px 0;color:#183153;background:transparent;border:0;text-align:left}.metric-track{height:14px;background:#e7f1ff;border-radius:999px;overflow:hidden}.metric-track i{display:block;height:100%;border-radius:999px}.metric-bar strong{font-size:12px}.boundary-note{margin-bottom:10px;padding:9px;color:#516170;background:#f6f9fd;border-left:3px solid #1769e0;font-size:12px;line-height:1.6}.quality-line{color:#516170;font-size:12px}.peak-summary{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:12px;padding:12px;background:#f6f9fd;border-radius:8px}.subheading{margin:18px 0 8px;color:#183153;font-size:14px}.panel-alert{margin:12px 0}.config-actions{display:flex;justify-content:flex-end;gap:8px;margin-bottom:12px}.import-downloads{flex-wrap:wrap}.import-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.import-card{display:grid;align-content:start;gap:12px;min-width:0}.preview-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:0}.preview-facts div{padding:8px;background:#f6f9fd;border-radius:8px}.preview-facts dt{color:#7385a2;font-size:12px}.preview-facts dd{margin:4px 0 0;color:#183153;font-weight:600;overflow-wrap:anywhere}.drawer-form{padding-right:4px}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.field-help{margin-top:6px;color:#7385a2;font-size:12px;line-height:1.5}@media (max-width:1200px){.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.three-column-grid,.import-grid{grid-template-columns:1fr}}@media (max-width:900px){.two-column-grid{grid-template-columns:1fr}}@media (max-width:680px){.stat-grid,.form-grid{grid-template-columns:1fr}.panel-heading{align-items:stretch;flex-direction:column}.peak-summary{flex-direction:column}.import-grid{grid-template-columns:minmax(0,1fr)}}
+.analysis-tabs{min-width:0}.tab-stack,.analysis-results{display:grid;gap:16px;min-width:0}.applied-note{align-self:center;color:#7385a2;font-size:12px}.analysis-state-panel{padding:14px 16px}.analysis-state-list{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.analysis-state-item{display:grid;gap:6px;padding:10px;background:#f6f9fd;border:1px solid #dce9fb;border-radius:8px;color:#516170;font-size:12px;line-height:1.5}.analysis-state-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#183153}.stat-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.two-column-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.three-column-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.chart-panel,.compact-panel{min-width:0}.panel-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.panel-heading h2{margin:0;color:#123b79;font-size:16px}.panel-heading span{color:#7385a2;font-size:12px}.quality-tags{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px}.wide-scroll{max-width:100%;overflow-x:auto}.line-chart{width:100%;min-width:680px;min-height:260px;background:#fcfcfb;border:1px solid #dce9fb;border-radius:10px}.grid-line{stroke:#e1e7ef;stroke-width:1}.curve-line{fill:none;stroke:#1769e0;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.point-hit{fill:transparent}.point-dot{fill:#1769e0;stroke:#fcfcfb;stroke-width:2}g:hover .point-dot{r:6}.axis-text{fill:#728199;font-size:10px}.chart-tooltip{margin:8px 0;padding:8px 10px;color:#183153;background:#edf5ff;border:1px solid #c9dcf5;border-radius:8px;font-size:13px}.legend{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px;color:#516170;font-size:12px}.legend span{display:flex;align-items:center;gap:6px}.legend i{width:12px;height:12px;border:1px solid #fff;border-radius:3px;box-shadow:0 0 0 1px #c8d5e7}.metric-bar{display:grid;grid-template-columns:34px minmax(100px,1fr) minmax(92px,auto);align-items:center;gap:10px;width:100%;padding:7px 0;color:#183153;background:transparent;border:0;text-align:left}.metric-track{height:14px;background:#e7f1ff;border-radius:999px;overflow:hidden}.metric-track i{display:block;height:100%;border-radius:999px}.metric-bar strong{font-size:12px}.boundary-note{margin-bottom:10px;padding:9px;color:#516170;background:#f6f9fd;border-left:3px solid #1769e0;font-size:12px;line-height:1.6}.quality-line{color:#516170;font-size:12px}.peak-summary{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:12px;padding:12px;background:#f6f9fd;border-radius:8px}.subheading{margin:18px 0 8px;color:#183153;font-size:14px}.panel-alert{margin:12px 0}.config-actions{display:flex;justify-content:flex-end;gap:8px;margin-bottom:12px}.import-downloads{flex-wrap:wrap}.import-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.import-card{display:grid;align-content:start;gap:12px;min-width:0}.preview-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:0}.preview-facts div{padding:8px;background:#f6f9fd;border-radius:8px}.preview-facts dt{color:#7385a2;font-size:12px}.preview-facts dd{margin:4px 0 0;color:#183153;font-weight:600;overflow-wrap:anywhere}.drawer-form{padding-right:4px}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.field-help{margin-top:6px;color:#7385a2;font-size:12px;line-height:1.5}@media (max-width:1200px){.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.three-column-grid,.import-grid{grid-template-columns:1fr}.analysis-state-list{grid-template-columns:repeat(2,minmax(0,1fr))}}@media (max-width:900px){.two-column-grid{grid-template-columns:1fr}}@media (max-width:680px){.stat-grid,.form-grid,.analysis-state-list{grid-template-columns:1fr}.panel-heading{align-items:stretch;flex-direction:column}.peak-summary{flex-direction:column}.import-grid{grid-template-columns:minmax(0,1fr)}}
 </style>
